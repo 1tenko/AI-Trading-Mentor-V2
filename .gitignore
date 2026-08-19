@@ -1,0 +1,9 @@
+.env
+.env.*
+!.env.example
+__pycache__/
+.pytest_cache/
+*.sqlite3
+*.db
+dist/
+node_modules/
