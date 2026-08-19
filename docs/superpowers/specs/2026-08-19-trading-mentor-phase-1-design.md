@@ -131,8 +131,11 @@ The mandatory manual prompts are:
 
 - Always: keep the API key out of the browser and Git; preserve raw transcript
   provenance; show evidence; run the evaluation prompts before expanding scope.
-- Ask first: add dependencies, change data retention, upload new source types,
-  add external access, or begin any Phase 2 capability.
+- Ask first: introduce a major architectural dependency or external service not
+  approved by this design; materially change privacy or retention; add recurring
+  infrastructure or cost; upload new source types; add external access; or begin
+  any Phase 2 capability. Normal implementation dependencies needed for this
+  approved proof do not require repeated approval.
 - Never: execute trades, provide profitability guarantees, silently attribute
   AI reasoning to Jacob, or reuse the old application's retrieval architecture.
 
