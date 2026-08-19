@@ -1,7 +1,24 @@
 """Small SQLite store for private Phase 1 state."""
 
+import json
 import sqlite3
+from dataclasses import dataclass
 from pathlib import Path
+
+
+@dataclass(frozen=True)
+class Source:
+    relative_path: str
+    filename: str
+    year: int
+    local_path: str
+    file_id: str
+
+
+@dataclass(frozen=True)
+class Thread:
+    id: int
+    title: str
 
 
 class Storage:
@@ -24,6 +41,16 @@ class Storage:
                     local_path TEXT NOT NULL,
                     file_id TEXT NOT NULL,
                     vector_store_file_id TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS threads (
+                    id INTEGER PRIMARY KEY,
+                    title TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS thread_items (
+                    thread_id INTEGER NOT NULL REFERENCES threads(id),
+                    position INTEGER NOT NULL,
+                    item_json TEXT NOT NULL,
+                    PRIMARY KEY(thread_id, position)
                 );
                 """
             )
@@ -82,6 +109,52 @@ class Storage:
         with self._connect() as connection:
             row = connection.execute("SELECT COUNT(*) FROM sources").fetchone()
         return int(row[0])
+
+    def source_for_file(self, file_id: str) -> Source | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT relative_path, filename, year, local_path, file_id "
+                "FROM sources WHERE file_id = ?",
+                (file_id,),
+            ).fetchone()
+        return None if row is None else Source(*row)
+
+    def create_thread(self, title: str) -> int:
+        with self._connect() as connection:
+            cursor = connection.execute("INSERT INTO threads(title) VALUES (?)", (title,))
+        return int(cursor.lastrowid)
+
+    def threads(self) -> list[Thread]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT id, title FROM threads ORDER BY id DESC"
+            ).fetchall()
+        return [Thread(*row) for row in rows]
+
+    def append_thread_items(self, thread_id: int, items: list[dict]) -> None:
+        if not items:
+            return
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT COALESCE(MAX(position), -1) FROM thread_items WHERE thread_id = ?",
+                (thread_id,),
+            ).fetchone()
+            start = int(row[0]) + 1
+            connection.executemany(
+                "INSERT INTO thread_items(thread_id, position, item_json) VALUES (?, ?, ?)",
+                [
+                    (thread_id, start + index, json.dumps(item))
+                    for index, item in enumerate(items)
+                ],
+            )
+
+    def thread_items(self, thread_id: int) -> list[dict]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT item_json FROM thread_items WHERE thread_id = ? ORDER BY position",
+                (thread_id,),
+            ).fetchall()
+        return [json.loads(row[0]) for row in rows]
 
     def _connect(self) -> sqlite3.Connection:
         return sqlite3.connect(self.database_path)
