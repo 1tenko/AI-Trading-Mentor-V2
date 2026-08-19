@@ -6,7 +6,7 @@ plan is approved.
 - [ ] Task 1 — Minimal local application foundation
 - [ ] Task 2 — Raw Jacob transcript import and registry
 - [ ] Checkpoint — Source library ready
-- [ ] Task 3 — Grounded multi-turn chat service
-- [ ] Task 4 — Private browser chat and source evidence
+- [ ] Task 3 — Grounded multi-turn chat with stateless reasoning continuity
+- [ ] Task 4 — Private browser chat with retrieved evidence inspection
 - [ ] Checkpoint — End-to-end proof available
-- [ ] Task 5 — Human quality gate
+- [ ] Task 5 — Human quality gate and frontier-quality escalation

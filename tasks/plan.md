@@ -14,17 +14,25 @@ Speculates' 2025–2026 transcripts.
 ## Verified Integration Decisions
 
 - **Model:** start with `gpt-5.6-sol`, OpenAI's current flagship model for
-  complex professional work, and use the Responses API. Test `xhigh` reasoning
-  only if the quality gate shows that `high` is insufficient. [Model catalog](https://developers.openai.com/api/docs/models/gpt-5.6-sol)
+  complex professional work, and use the Responses API. A mandatory quality
+  failure is compared at `xhigh`, `max`, and/or Pro mode where appropriate
+  before rejecting the architecture. [Model guidance](https://developers.openai.com/api/docs/guides/latest-model)
 - **Knowledge search:** use the hosted `file_search` Responses tool over one
-  vector store containing raw transcripts. It performs semantic and keyword
-  search; the model decides when to call it. [File Search guide](https://developers.openai.com/api/docs/guides/tools-file-search)
-- **Citations:** parse the returned file-citation annotations and request file
-  search results when a source excerpt is needed. [File Search citations](https://developers.openai.com/api/docs/guides/tools-file-search#file-citations)
-- **Conversation state:** store threads and messages locally in SQLite and send
-  the selected thread's explicit history on each turn with `store=false`.
-  This avoids creating remote response history while retaining local control.
-  [Conversation state](https://developers.openai.com/api/docs/guides/conversation-state)
+  vector store containing raw transcripts. Fixed mentor policy requires enabled
+  Jacob evidence for substantive new methodology claims; the model may reuse
+  already cited thread evidence or make further native search calls as needed.
+  No custom retrieval loop is added. [File Search guide](https://developers.openai.com/api/docs/guides/tools-file-search)
+- **Citations and evidence:** parse file-citation annotations and include
+  `file_search_call.results` so the browser can show the retrieved excerpt.
+  [File Search citations](https://developers.openai.com/api/docs/guides/tools-file-search#file-citations)
+- **Conversation state:** SQLite remains the local source of truth. With
+  `store=false`, persist and replay the complete response items required for
+  continuity—not only rendered user/assistant text—including encrypted
+  reasoning items returned through `reasoning.encrypted_content`. This retains
+  stateless multi-turn reasoning continuity without remote response history;
+  preserve GPT-5.6's `all_turns` reasoning context unless evaluation demonstrates
+  a reason to change it.
+  [Responses reference](https://developers.openai.com/api/reference)
 - **Streaming:** use the Responses API's `stream=True` server-sent event stream
   and relay it to the local browser. [Streaming responses](https://developers.openai.com/api/docs/guides/streaming-responses)
 - **No Agents SDK in Phase 1:** OpenAI recommends direct Responses calls when
@@ -47,8 +55,9 @@ Speculates' 2025–2026 transcripts.
 - Python standard library serves the browser page and SQLite handles local
   state. The only Phase 1 runtime package is the official `openai` SDK.
 - Import is a command over the existing transcript directory, not an upload UI.
-- A citation opens a read-only local transcript view; no document viewer,
-  source-management screen, or custom retrieval ranking is added.
+- Evidence inspection shows one returned File Search excerpt and a link to the
+  immutable local transcript. No document-management UI or custom retrieval
+  ranking is added.
 
 ## Dependency Graph
 
@@ -139,23 +148,36 @@ duplicate registration.
 
 **Description:** Add a small service that reads a local thread, calls
 `gpt-5.6-sol` through the Responses API with native File Search, persists the
-new messages locally, and returns answer text plus provenance-labelled source
-citations. Its fixed instructions enforce the Jacob-only teaching policy and
-make unsupported claims explicit. Responses use `store=false`.
+complete local continuation state, and returns answer text plus
+provenance-labelled source citations and retrieved evidence excerpts. Its fixed
+instructions enforce the Jacob-only teaching policy and make unsupported claims
+explicit. Responses use `store=false` and include both
+`reasoning.encrypted_content` and `file_search_call.results`, retaining
+GPT-5.6's `all_turns` reasoning context.
 
 **Acceptance criteria:**
 
-- [ ] A turn can use the registered vector store and returns file citations
-  when it relies on Jacob material.
-- [ ] Follow-up turns use the selected local thread history.
+- [ ] A substantive new Jacob/trading-methodology claim is grounded in enabled
+  Jacob evidence, unless the active thread already contains sufficient cited
+  evidence.
+- [ ] When evidence is missing or insufficient—or Theo asks to search again—the
+  model performs native File Search rather than silently relying on pretrained
+  trading knowledge.
+- [ ] One response may conduct multiple model-chosen File Search research
+  passes; the implementation does not impose a one-search limit or build a
+  custom retrieval loop.
+- [ ] Follow-up turns replay the selected thread's required prior response
+  items, including encrypted reasoning state where returned.
 - [ ] The fixed instruction distinguishes direct teaching, source synthesis,
   AI hypothesis, and unsupported claims.
 
 **Verification:**
 
-- [ ] Unit tests cover message persistence and citation extraction using saved
-  API-shaped fixtures.
-- [ ] A manual smoke prompt returns a reply and at least one source citation.
+- [ ] Unit tests cover continuation-state persistence, citation/excerpt
+  extraction, and File Search results using saved API-shaped fixtures.
+- [ ] Manual smoke checks cover a searched answer, a context-follow-up, “Are
+  you sure? Search Jacob again,” and a prompt that requires additional research
+  after insufficient initial evidence.
 
 **Dependencies:** Task 2
 
@@ -168,22 +190,24 @@ make unsupported claims explicit. Responses use `store=false`.
 
 **Description:** Add a standard-library local HTTP server and a single static
 chat page. It lists/creates local threads, streams a response, renders citation
-links, and serves the registered original transcript read-only when a citation
-is opened. Bind only to loopback and never send the API key to the browser.
+links with their retrieved evidence excerpt, and serves the registered original
+transcript read-only when requested. Bind only to loopback and never send the
+API key to the browser.
 
 **Acceptance criteria:**
 
 - [ ] Theo can create a thread, ask a question, receive streamed text, and
   return to that thread for a follow-up.
-- [ ] Clicking a citation opens its registered original transcript locally.
+- [ ] A citation shows the retrieved excerpt, source filename, year, available
+  metadata, and a link to the registered full original transcript locally.
 - [ ] The browser network requests contain no API key and the server listens
   only on `127.0.0.1`.
 
 **Verification:**
 
 - [ ] HTTP handler tests cover local-only routing and missing-source errors.
-- [ ] Manual browser check completes one question, one follow-up, and one
-  citation open.
+- [ ] Manual browser check completes one question, one follow-up, one
+  search-again request, and one evidence-excerpt/full-transcript inspection.
 
 **Dependencies:** Task 3
 
@@ -209,7 +233,13 @@ outside Git if they contain private conversation content.
 
 - [ ] The nine approved adversarial prompts are available in one worksheet.
 - [ ] The worksheet checks clarity, correction handling, evidence relevance,
-  year comparison, and unsupported attribution.
+  year comparison, unsupported attribution, and research-again behavior.
+- [ ] The baseline uses `gpt-5.6-sol` with `high` reasoning effort. A mandatory
+  prompt that materially misses Theo's quality bar is compared with `xhigh`,
+  `max`, and/or Pro mode where appropriate before rejecting the architecture.
+- [ ] Each comparison records configuration, answer quality, latency, usage,
+  and estimated cost. Higher-quality modes are an evaluation escalation, not
+  the default for every everyday message.
 - [ ] Theo explicitly decides whether Phase 1 passes; no later phase begins
   automatically.
 
@@ -229,12 +259,15 @@ outside Git if they contain private conversation content.
 | Risk | Impact | Mitigation |
 |---|---|---|
 | Fluent answer lacks source fidelity | High | Fixed provenance policy, visible citations, unsupported-attribution prompt, human gate |
-| File search finds a mention but not a teaching explanation | High | Let the model search again; judge the actual answer before expanding scope |
+| File search finds a mention but not a teaching explanation | High | Let the model search again and retain returned results for inspection; judge the actual answer before expanding scope |
+| Stateless turns lose reasoning continuity | High | Persist/replay necessary response items, including encrypted reasoning items, with `store=false` |
 | Remote source state persists | Medium | Record remote IDs and document deletion; use local SQLite for chat history and `store=false` for responses |
 | Poor local UI masks a good mentor | Medium | Keep the chat page intentionally simple; assess conversational quality, not visual polish |
 | Import errors distort year comparisons | High | Preserve original paths, assign year explicitly, assert the 22/128 import counts |
 
 ## Approval Gate
 
-Do not implement this plan until Theo explicitly approves it. The next action
-after approval is Task 1 only.
+Do not implement this plan until Theo explicitly approves it. After approval,
+Tasks 1–4 run sequentially with their checkpoints and commits; stop at Task 5
+for Theo's personal intelligence-quality decision. Automated tests, citations,
+and successful API calls cannot approve Phase 1 on Theo's behalf.
