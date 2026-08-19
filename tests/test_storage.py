@@ -25,3 +25,4 @@ def test_storage_registers_a_source_once(tmp_path):
 
     assert storage.vector_store_id() == "vs_jacob"
     assert storage.source_count() == 1
+    assert storage.source_counts_by_year() == {2025: 1, 2026: 0}

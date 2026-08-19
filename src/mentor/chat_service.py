@@ -19,6 +19,7 @@ class Evidence:
     filename: str
     excerpt: str
     year: str | None
+    metadata: dict[str, str]
 
 
 @dataclass(frozen=True)
@@ -28,6 +29,13 @@ class Answer:
     evidence: list[Evidence]
 
 
+@dataclass(frozen=True)
+class StreamEvent:
+    type: str
+    text: str = ""
+    answer: Answer | None = None
+
+
 class ChatService:
     def __init__(self, storage: Storage, client: Any, model: str = "gpt-5.6-sol"):
         self.storage = storage
@@ -35,24 +43,41 @@ class ChatService:
         self.model = model
 
     def reply(self, thread_id: int, question: str) -> Answer:
+        user_item, request = self._request(thread_id, question)
+        response = self.client.responses.create(**request)
+        output = [_as_dict(item) for item in response.output]
+        self.storage.append_thread_items(thread_id, [user_item, *output])
+        return _answer(output)
+
+    def stream_reply(self, thread_id: int, question: str):
+        user_item, request = self._request(thread_id, question)
+        stream = self.client.responses.create(**request, stream=True)
+        for event in stream:
+            if event.type == "response.output_text.delta":
+                yield StreamEvent("delta", event.delta)
+            elif event.type == "response.completed":
+                output = [_as_dict(item) for item in event.response.output]
+                self.storage.append_thread_items(thread_id, [user_item, *output])
+                yield StreamEvent("complete", answer=_answer(output))
+                return
+        raise RuntimeError("OpenAI ended the response stream without a completed response.")
+
+    def _request(self, thread_id: int, question: str) -> tuple[dict, dict]:
         question = _question(question)
         vector_store_id = self.storage.vector_store_id()
         if vector_store_id is None:
             raise RuntimeError("Import the Jacob transcripts before starting a chat.")
-
         user_item = {"role": "user", "content": [{"type": "input_text", "text": question}]}
-        response = self.client.responses.create(
-            model=self.model,
-            instructions=MENTOR_INSTRUCTIONS,
-            input=[*self.storage.thread_items(thread_id), user_item],
-            tools=[{"type": "file_search", "vector_store_ids": [vector_store_id]}],
-            include=["reasoning.encrypted_content", "file_search_call.results"],
-            reasoning={"effort": "high"},
-            store=False,
-        )
-        output = [_as_dict(item) for item in response.output]
-        self.storage.append_thread_items(thread_id, [user_item, *output])
-        return _answer(output)
+        return user_item, {
+            "model": self.model,
+            "instructions": MENTOR_INSTRUCTIONS,
+            "input": [*self.storage.thread_items(thread_id), user_item],
+            "tools": [{"type": "file_search", "vector_store_ids": [vector_store_id]}],
+            "include": ["reasoning.encrypted_content", "file_search_call.results"],
+            "reasoning": {"effort": "high"},
+            "max_output_tokens": 4_000,
+            "store": False,
+        }
 
 
 def _question(question: str) -> str:
@@ -84,6 +109,7 @@ def _answer(output: list[dict]) -> Answer:
                         filename=result.get("filename", "Unknown source"),
                         excerpt=result.get("text", ""),
                         year=attributes.get("year"),
+                        metadata={str(key): str(value) for key, value in attributes.items()},
                     )
                 )
         if item.get("type") != "message" or item.get("role") != "assistant":

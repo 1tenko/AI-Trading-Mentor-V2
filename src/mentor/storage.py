@@ -110,6 +110,14 @@ class Storage:
             row = connection.execute("SELECT COUNT(*) FROM sources").fetchone()
         return int(row[0])
 
+    def source_counts_by_year(self) -> dict[int, int]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT year, COUNT(*) FROM sources GROUP BY year"
+            ).fetchall()
+        counts = dict(rows)
+        return {year: counts.get(year, 0) for year in (2025, 2026)}
+
     def source_for_file(self, file_id: str) -> Source | None:
         with self._connect() as connection:
             row = connection.execute(
@@ -130,6 +138,13 @@ class Storage:
                 "SELECT id, title FROM threads ORDER BY id DESC"
             ).fetchall()
         return [Thread(*row) for row in rows]
+
+    def has_thread(self, thread_id: int) -> bool:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT 1 FROM threads WHERE id = ?", (thread_id,)
+            ).fetchone()
+        return row is not None
 
     def append_thread_items(self, thread_id: int, items: list[dict]) -> None:
         if not items:

@@ -106,7 +106,13 @@ def main() -> None:
         f"Registered {result.uploaded_count} files and skipped {result.skipped_count}. "
         f"Vector store: {result.vector_store_id}"
     )
-    print("Delete this vector store and its uploaded files from the OpenAI dashboard/API to remove remote copies.")
+    counts = storage.source_counts_by_year()
+    print(f"Registered sources: {counts[2025]} from 2025, {counts[2026]} from 2026.")
+    print(
+        "Remote cleanup: delete vector store "
+        f"{result.vector_store_id}, then delete the uploaded file IDs recorded in "
+        "data/mentor.sqlite3 (the sources.file_id column)."
+    )
 
 
 if __name__ == "__main__":

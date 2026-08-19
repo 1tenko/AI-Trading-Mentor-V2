@@ -32,7 +32,7 @@ def test_reply_persists_continuation_state_and_extracts_evidence(tmp_path):
                         "file_id": "file_2025",
                         "filename": "lesson.txt",
                         "text": "Jacob explains the setup here.",
-                        "attributes": {"year": "2025"},
+                        "attributes": {"year": "2025", "relative_path": "2025/lesson.txt"},
                     }
                 ],
             },
@@ -63,6 +63,7 @@ def test_reply_persists_continuation_state_and_extracts_evidence(tmp_path):
     assert answer.text == "Jacob teaches patience."
     assert answer.citations[0].file_id == "file_2025"
     assert answer.evidence[0].excerpt == "Jacob explains the setup here."
+    assert answer.evidence[0].metadata == {"year": "2025", "relative_path": "2025/lesson.txt"}
     assert storage.thread_items(thread_id) == [
         {"role": "user", "content": [{"type": "input_text", "text": "What does Jacob teach?"}]},
         *response.output,
@@ -74,6 +75,7 @@ def test_reply_persists_continuation_state_and_extracts_evidence(tmp_path):
         "file_search_call.results",
     ]
     assert request["tools"] == [{"type": "file_search", "vector_store_ids": ["vs_jacob"]}]
+    assert request["max_output_tokens"] == 4_000
 
 
 def test_reply_replays_prior_response_items_and_rejects_blank_questions(tmp_path):
@@ -106,3 +108,38 @@ def test_reply_replays_prior_response_items_and_rejects_blank_questions(tmp_path
         {"type": "reasoning", "encrypted_content": "prior-reasoning"},
         {"role": "user", "content": [{"type": "input_text", "text": "Second"}]},
     ]
+
+
+def test_stream_reply_relays_deltas_then_persists_completed_response(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    storage.set_vector_store("vs_jacob")
+    thread_id = storage.create_thread("Question")
+    response = SimpleNamespace(
+        output=[
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "Completed."}],
+            }
+        ]
+    )
+    responses = FakeResponses(
+        [
+            SimpleNamespace(type="response.output_text.delta", delta="Complete"),
+            SimpleNamespace(type="response.output_text.delta", delta="d."),
+            SimpleNamespace(type="response.completed", response=response),
+        ]
+    )
+    service = ChatService(storage, SimpleNamespace(responses=responses))
+
+    events = list(service.stream_reply(thread_id, "Question"))
+
+    assert [(event.type, event.text) for event in events] == [
+        ("delta", "Complete"),
+        ("delta", "d."),
+        ("complete", ""),
+    ]
+    assert events[-1].answer.text == "Completed."
+    assert storage.thread_items(thread_id)[-1] == response.output[0]
+    assert responses.calls[0]["stream"] is True

@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Theo's Trading Mentor</title>
+    <style>
+      body { font: 16px/1.5 system-ui, sans-serif; margin: 0 auto; max-width: 860px; padding: 2rem 1rem; }
+      textarea, button { font: inherit; } textarea { box-sizing: border-box; min-height: 8rem; width: 100%; }
+      #threads button { display: block; margin: .25rem 0; } .message { margin: 1.5rem 0; white-space: pre-wrap; }
+      .evidence { border-left: 3px solid #777; margin: .75rem 0; padding-left: .75rem; }
+    </style>
+  </head>
+  <body>
+    <h1>Theo's Trading Mentor</h1>
+    <p>Private Phase 1 proof. Teaching claims should cite Jacob Speculates source material.</p>
+    <button id="new-thread" type="button">New conversation</button>
+    <div id="threads" aria-label="Conversations"></div>
+    <main id="messages" aria-live="polite"></main>
+    <form id="question-form">
+      <label for="question">Ask about Jacob's trading teaching</label>
+      <textarea id="question" required maxlength="8000"></textarea>
+      <button type="submit">Send</button>
+    </form>
+    <p id="status" role="status"></p>
+    <script src="/app.js"></script>
+  </body>
+</html>
