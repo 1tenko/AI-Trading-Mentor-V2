@@ -331,11 +331,6 @@ class Storage:
     def _backfill_display_turns(self, connection: sqlite3.Connection) -> None:
         thread_ids = connection.execute("SELECT id FROM threads").fetchall()
         for (thread_id,) in thread_ids:
-            existing = connection.execute(
-                "SELECT 1 FROM display_turns WHERE thread_id = ? LIMIT 1", (thread_id,)
-            ).fetchone()
-            if existing is not None:
-                continue
             items = [
                 (row[0], json.loads(row[1]))
                 for row in connection.execute(
@@ -343,6 +338,17 @@ class Storage:
                     (thread_id,),
                 )
             ]
+            first_user = next((item for _, item in items if _user_text(item)), None)
+            if first_user is not None:
+                connection.execute(
+                    "UPDATE threads SET title = ? WHERE id = ? AND title = 'New conversation'",
+                    (_compact_title(_user_text(first_user) or ""), thread_id),
+                )
+            existing = connection.execute(
+                "SELECT 1 FROM display_turns WHERE thread_id = ? LIMIT 1", (thread_id,)
+            ).fetchone()
+            if existing is not None:
+                continue
             diagnostics = [
                 json.loads(row[0])
                 for row in connection.execute(

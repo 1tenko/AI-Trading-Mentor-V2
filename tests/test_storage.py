@@ -97,12 +97,15 @@ def test_storage_backfills_safe_display_turns_without_changing_legacy_replay_ite
         "resp_legacy",
         {"response_id": "resp_legacy", "model": "gpt-5.6-sol", "reasoning_effort": "high"},
     )
+    with sqlite3.connect(storage.database_path) as connection:
+        connection.execute("UPDATE threads SET title = 'New conversation' WHERE id = ?", (thread_id,))
 
     storage.initialize()
 
     turns = storage.display_turns(thread_id)
     assert storage.thread_items(thread_id) == replay_items
     assert storage.threads()[0].title == "What is SMT?"
+    assert storage.thread(thread_id).title == "What is SMT?"
     assert turns == [
         {
             "turn_number": 1,
@@ -127,6 +130,10 @@ def test_storage_backfills_safe_display_turns_without_changing_legacy_replay_ite
 
     storage.initialize()
     assert storage.display_turns(thread_id) == turns
+    with sqlite3.connect(storage.database_path) as connection:
+        connection.execute("UPDATE threads SET title = 'New conversation' WHERE id = ?", (thread_id,))
+    storage.initialize()
+    assert storage.thread(thread_id).title == "What is SMT?"
 
 
 def test_storage_deletes_only_thread_owned_state_in_one_transaction(tmp_path):
