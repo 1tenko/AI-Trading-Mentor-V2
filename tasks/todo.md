@@ -4,8 +4,8 @@ The binding design is
 [2026-08-20-trading-mentor-phase-2-design.md](../docs/superpowers/specs/2026-08-20-trading-mentor-phase-2-design.md).
 The detailed proposed execution plan is [plan.md](plan.md).
 
-**Status:** Proposed — do not implement until Theo approves this checklist and
-plan. All work remains on feature/phase-2-unified-mentor.
+**Status:** Tasks 1–8 complete on feature/phase-2-unified-mentor. Task 9 awaits
+Theo's human evaluation; do not begin Phase 3.
 
 ## conversation-lifecycle
 
@@ -30,10 +30,10 @@ plan. All work remains on feature/phase-2-unified-mentor.
 
 ### Checkpoint A — Conversation storage and API contract
 
-- [ ] A migrated Phase 1 thread restores through the safe timeline route.
-- [ ] Deletion persists after reread/reload and shared source state survives.
-- [ ] Encrypted reasoning state never appears in browser JSON.
-- [ ] Full pytest passes.
+- [x] A migrated Phase 1 thread restores through the safe timeline route.
+- [x] Deletion persists after reread/reload and shared source state survives.
+- [x] Encrypted reasoning state never appears in browser JSON.
+- [x] Full pytest passes.
 
 ## mentor-orchestration
 
@@ -51,19 +51,19 @@ plan. All work remains on feature/phase-2-unified-mentor.
 
 ### Checkpoint B — Mentor policy and observability contract
 
-- [ ] Phase 1 exhaustive-search safeguards remain intact.
-- [ ] Auto/manual depth and reasoning controls are independently historical.
-- [ ] Full pytest passes.
+- [x] Phase 1 exhaustive-search safeguards remain intact.
+- [x] Auto/manual depth and reasoning controls are independently historical.
+- [x] Full pytest passes.
 
 ## chat-foundation-ui
 
-- [ ] **Task 6 — Restored conversations, switching, titles, and delete UI**
+- [x] **Task 6 — Restored conversations, switching, titles, and delete UI**
   - Acceptance: history restores through reload/switch; title is useful; delete
     is confirmed, keyboard reachable, and permanent locally.
   - Verify: full pytest plus two-chat browser restore/delete smoke flow.
   - Depends on: Checkpoint B.
 
-- [ ] **Task 7 — Research-depth control and compact disclosures**
+- [x] **Task 7 — Research-depth control and compact disclosures**
   - Acceptance: future-turn depth control; historical settings remain intact;
     evidence/diagnostics are compact; NaN. is diagnosed before any fix.
   - Verify: fixtures/static tests, full pytest, desktop/mobile browser smoke.
@@ -71,13 +71,13 @@ plan. All work remains on feature/phase-2-unified-mentor.
 
 ### Checkpoint C — Persistent-chat user flow
 
-- [ ] New and restored turns show their own settings/evidence.
-- [ ] Delete survives reload and leaves shared sources available.
-- [ ] Static responsive chat remains intact; full pytest passes.
+- [x] New and restored turns show their own settings/evidence.
+- [x] Delete survives reload and leaves shared sources available.
+- [x] Static responsive chat remains intact; full pytest passes.
 
 ## phase-2-regression
 
-- [ ] **Task 8 — Deterministic Phase 2 regression suite**
+- [x] **Task 8 — Deterministic Phase 2 regression suite**
   - Acceptance: lifecycle, migration, replay, provenance, security, semantic
     prompts, and resolved NaN. behavior are covered without paid API calls.
   - Verify: full pytest, diff check, secret scan, local browser smoke.
@@ -91,7 +91,7 @@ plan. All work remains on feature/phase-2-unified-mentor.
 
 ### Final checkpoint — Await Theo's Phase 2 decision
 
-- [ ] All deterministic and browser checks pass.
+- [x] All deterministic and browser checks pass.
 - [ ] The branch is committed and pushed.
 - [ ] Theo has made the human acceptance decision.
 - [ ] Stop: do not merge to main or begin Phase 3.
