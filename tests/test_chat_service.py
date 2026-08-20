@@ -1,8 +1,10 @@
+import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from mentor.chat_service import ChatService, EvaluationConfig
+from mentor.chat_service import ChatService, EvaluationConfig, _effective_research_depth
 from mentor.prompts import MENTOR_INSTRUCTIONS
 from mentor.storage import Storage
 
@@ -356,3 +358,20 @@ def test_policy_requires_a_complementary_search_before_claiming_completeness():
     assert "never call an\nanswer exhaustive" in MENTOR_INSTRUCTIONS
     assert "gaps,\nintermediate categories" in MENTOR_INSTRUCTIONS
     assert "underlying mechanism" in MENTOR_INSTRUCTIONS
+
+
+def test_semantic_regression_fixtures_preserve_phase_1_research_and_provenance_policy():
+    fixtures = json.loads((Path(__file__).parent / "fixtures" / "phase2_semantic_prompts.json").read_text())
+    assert [fixture["name"] for fixture in fixtures] == [
+        "SMT definition",
+        "TPD definition",
+        "all reversion-level alignments",
+        "exhaustive SMT teaching",
+        "false attribution",
+        "correction follow-up",
+    ]
+    assert [
+        _effective_research_depth(fixture["prompt"], "auto") for fixture in fixtures
+    ] == [fixture["effective_depth"] for fixture in fixtures]
+    assert "Direct source teaching requires" in MENTOR_INSTRUCTIONS
+    assert "complementary File Search query" in MENTOR_INSTRUCTIONS

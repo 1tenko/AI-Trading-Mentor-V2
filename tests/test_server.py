@@ -139,6 +139,28 @@ def test_server_serves_the_external_stylesheet(tmp_path):
         worker.join()
 
 
+def test_server_serves_the_persistent_chat_controls(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    server = create_server(storage, FakeChatService(), port=0)
+    worker = threading.Thread(target=server.serve_forever)
+    worker.start()
+    try:
+        status, _, page = request(server, "GET", "/")
+        assert status == 200
+        assert b'id="research-depth"' in page
+        status, _, script = request(server, "GET", "/app.js")
+        assert status == 200
+        assert b"/api/threads/${threadId}" in script
+        assert b'method: "DELETE"' in script
+        assert b"turn.answer_markdown" in script
+        assert b"File Search/platform cost" in script
+        assert b"Number.isFinite(diagnostics.latency_ms)" in script
+    finally:
+        server.shutdown()
+        worker.join()
+
+
 def test_server_restores_only_safe_display_turns_and_permanently_deletes_one_thread(tmp_path):
     storage = Storage(tmp_path / "mentor.sqlite3")
     storage.initialize()

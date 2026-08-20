@@ -8,9 +8,19 @@ const status = document.querySelector("#status");
 const send = form.querySelector("button[type=submit]");
 const effort = document.querySelector("#reasoning-effort");
 const mode = document.querySelector("#reasoning-mode");
+const researchDepth = document.querySelector("#research-depth");
 const SETTINGS_KEY = "trading-mentor-evaluation-settings";
+const ACTIVE_THREAD_KEY = "trading-mentor-active-thread";
 const CONTINUE_PROMPT = "Continue the previous response from where it stopped. Do not repeat completed material.";
 let activeThreadId;
+
+function showEmpty() {
+  messages.replaceChildren();
+  const empty = document.createElement("p");
+  empty.className = "empty";
+  empty.textContent = "Ask a question to start a private, source-grounded conversation.";
+  messages.append(empty);
+}
 
 function showMessage(label, text) {
   messages.querySelector(".empty")?.remove();
@@ -38,14 +48,13 @@ function renderMarkdown(target, text) {
 
 function showEvidence(evidence, citations) {
   const cited = new Set(citations.map((citation) => citation.file_id));
-  const relevant = evidence.filter((item) => cited.has(item.file_id));
-  const items = relevant.length ? relevant : evidence.slice(0, 1);
+  const items = [...evidence].sort((left, right) => Number(cited.has(right.file_id)) - Number(cited.has(left.file_id)));
   if (!items.length && citations[0]) items.push({ ...citations[0], excerpt: "", metadata: {} });
   if (!items.length) return;
   const block = document.createElement("details");
   block.className = "evidence";
   const summary = document.createElement("summary");
-  summary.textContent = `${items.length} ${relevant.length ? "cited" : "retrieved"} evidence ${items.length === 1 ? "result" : "results"}`;
+  summary.textContent = `${cited.size} cited · ${evidence.length} retrieved evidence ${evidence.length === 1 ? "result" : "results"}`;
   const content = document.createElement("div");
   content.className = "evidence-content";
   const seen = new Set();
@@ -74,13 +83,23 @@ function showEvidence(evidence, citations) {
 
 function showDiagnostics(diagnostics) {
   if (!diagnostics) return;
+  const latency = Number.isFinite(diagnostics.latency_ms) ? `${(diagnostics.latency_ms / 1000).toFixed(1)}s` : "Unavailable";
+  const research = diagnostics.requested_research_depth && diagnostics.effective_research_depth
+    ? `${diagnostics.requested_research_depth} requested · ${diagnostics.effective_research_depth} used`
+    : "Unavailable";
+  const searches = Number.isFinite(diagnostics.file_search_calls)
+    ? `${diagnostics.file_search_calls} calls · ${diagnostics.file_search_queries?.length ?? 0} queries · ${diagnostics.returned_evidence_count ?? 0} results · ${diagnostics.cited_evidence_count ?? 0} cited`
+    : "Unavailable";
   const rows = [
-    ["Model", diagnostics.model],
-    ["Reasoning", `${diagnostics.reasoning_effort} / ${diagnostics.reasoning_mode}`],
-    ["Status", diagnostics.status],
-    ["Latency", `${(diagnostics.latency_ms / 1000).toFixed(1)}s`],
+    ["Model", diagnostics.model || "Unavailable"],
+    ["Reasoning", diagnostics.reasoning_effort && diagnostics.reasoning_mode ? `${diagnostics.reasoning_effort} / ${diagnostics.reasoning_mode}` : "Unavailable"],
+    ["Research depth", research],
+    ["Research", searches],
+    ["Status", diagnostics.status || "Unavailable"],
+    ["Latency", latency],
     ["Tokens", `${diagnostics.input_tokens ?? "—"} input · ${diagnostics.output_tokens ?? "—"} output · ${diagnostics.reasoning_tokens ?? "—"} reasoning`],
     ["Text-token estimate", diagnostics.estimated_text_cost_usd == null ? "Unavailable" : `$${diagnostics.estimated_text_cost_usd.toFixed(4)} (excludes File Search fees)`],
+    ["File Search/platform cost", "Unknown; OpenAI does not return it in this response."],
   ];
   const block = document.createElement("details");
   block.className = "diagnostics";
@@ -116,7 +135,7 @@ function showIncomplete(answer, mentor) {
 }
 
 function evaluation() {
-  return { reasoning_effort: effort.value, reasoning_mode: mode.value };
+  return { reasoning_effort: effort.value, reasoning_mode: mode.value, research_depth: researchDepth.value };
 }
 
 function restoreEvaluation() {
@@ -124,6 +143,7 @@ function restoreEvaluation() {
     const saved = JSON.parse(localStorage.getItem(SETTINGS_KEY));
     if (["high", "xhigh", "max"].includes(saved?.reasoning_effort)) effort.value = saved.reasoning_effort;
     if (["standard", "pro"].includes(saved?.reasoning_mode)) mode.value = saved.reasoning_mode;
+    if (["auto", "normal", "deep", "exhaustive"].includes(saved?.research_depth)) researchDepth.value = saved.research_depth;
   } catch { /* The defaults remain safe when local settings are unavailable. */ }
 }
 
@@ -141,6 +161,8 @@ async function loadThreads() {
   const data = await response.json();
   threads.replaceChildren();
   data.threads.forEach((thread) => {
+    const row = document.createElement("div");
+    row.className = "thread-row";
     const button = document.createElement("button");
     button.className = "thread";
     button.type = "button";
@@ -148,12 +170,59 @@ async function loadThreads() {
     button.setAttribute("aria-current", String(thread.id === activeThreadId));
     button.addEventListener("click", () => {
       activeThreadId = thread.id;
-      messages.replaceChildren();
+      localStorage.setItem(ACTIVE_THREAD_KEY, String(thread.id));
       status.textContent = `Conversation: ${thread.title}`;
+      loadThread(thread.id).catch(() => { status.textContent = "Could not restore this conversation."; });
       loadThreads().catch(() => { status.textContent = "Could not refresh conversations."; });
     });
-    threads.append(button);
+    const remove = document.createElement("button");
+    remove.className = "thread-delete";
+    remove.type = "button";
+    remove.textContent = "Delete";
+    remove.setAttribute("aria-label", `Delete conversation: ${thread.title}`);
+    remove.addEventListener("click", () => deleteThread(thread).catch((error) => { status.textContent = error.message; }));
+    row.append(button, remove);
+    threads.append(row);
   });
+}
+
+async function loadThread(threadId) {
+  const response = await fetch(`/api/threads/${threadId}`);
+  if (!response.ok) throw new Error("Could not restore this conversation.");
+  const thread = await response.json();
+  activeThreadId = thread.id;
+  localStorage.setItem(ACTIVE_THREAD_KEY, String(thread.id));
+  renderTimeline(thread.turns);
+  status.textContent = `Conversation: ${thread.title}`;
+}
+
+function renderTimeline(turns) {
+  messages.replaceChildren();
+  if (!turns.length) {
+    showEmpty();
+    return;
+  }
+  turns.forEach((turn) => {
+    showMessage("Theo", turn.user_text);
+    if (!turn.answer_markdown && !turn.incomplete_reason) return;
+    const mentor = showMessage("Mentor", turn.answer_markdown || "");
+    showEvidence(turn.evidence || [], turn.citations || []);
+    showDiagnostics(turn.diagnostics);
+    if (turn.incomplete_reason) showIncomplete(turn, mentor);
+  });
+}
+
+async function deleteThread(thread) {
+  if (!window.confirm(`Permanently delete “${thread.title}”? This only removes this local conversation.`)) return;
+  const response = await fetch(`/api/threads/${thread.id}`, { method: "DELETE" });
+  if (!response.ok) throw new Error("Could not delete this conversation.");
+  if (activeThreadId === thread.id) {
+    activeThreadId = undefined;
+    localStorage.removeItem(ACTIVE_THREAD_KEY);
+    showEmpty();
+    status.textContent = "Conversation deleted.";
+  }
+  await loadThreads();
 }
 
 async function createThread(title = "New conversation") {
@@ -161,7 +230,8 @@ async function createThread(title = "New conversation") {
   if (!response.ok) throw new Error("Could not create a conversation.");
   const thread = await response.json();
   activeThreadId = thread.id;
-  messages.replaceChildren();
+  localStorage.setItem(ACTIVE_THREAD_KEY, String(thread.id));
+  showEmpty();
   await loadThreads();
 }
 
@@ -230,4 +300,14 @@ form.addEventListener("submit", async (event) => {
 restoreEvaluation();
 effort.addEventListener("change", persistEvaluation);
 mode.addEventListener("change", persistEvaluation);
-loadThreads().catch(() => { status.textContent = "Could not load conversations."; });
+researchDepth.addEventListener("change", persistEvaluation);
+loadThreads().then(async () => {
+  const savedThreadId = Number(localStorage.getItem(ACTIVE_THREAD_KEY));
+  const firstThread = threads.querySelector(".thread");
+  if (Number.isInteger(savedThreadId) && savedThreadId > 0) {
+    try { await loadThread(savedThreadId); }
+    catch { localStorage.removeItem(ACTIVE_THREAD_KEY); if (firstThread) firstThread.click(); else showEmpty(); }
+  }
+  else if (firstThread) firstThread.click();
+  else showEmpty();
+}).catch(() => { status.textContent = "Could not load conversations."; });

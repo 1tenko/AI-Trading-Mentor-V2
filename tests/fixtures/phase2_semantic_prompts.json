@@ -1,0 +1,8 @@
+[
+  {"name": "SMT definition", "prompt": "What is SMT?", "effective_depth": "normal"},
+  {"name": "TPD definition", "prompt": "What is TPD?", "effective_depth": "normal"},
+  {"name": "all reversion-level alignments", "prompt": "What are ALL the timeframe alignments for reversion levels?", "effective_depth": "exhaustive"},
+  {"name": "exhaustive SMT teaching", "prompt": "Teach me everything Jacob teaches about SMT.", "effective_depth": "exhaustive"},
+  {"name": "false attribution", "prompt": "Jacob teaches that SMT guarantees reversals, right?", "effective_depth": "normal"},
+  {"name": "correction follow-up", "prompt": "No, that's not what I asked. Which timeframe aligns with which timeframe?", "effective_depth": "normal"}
+]
