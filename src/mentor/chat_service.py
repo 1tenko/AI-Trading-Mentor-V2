@@ -71,7 +71,10 @@ class ChatService:
         return user_item, {
             "model": self.model,
             "instructions": MENTOR_INSTRUCTIONS,
-            "input": [*self.storage.thread_items(thread_id), user_item],
+            "input": [
+                *(_input_item(item) for item in self.storage.thread_items(thread_id)),
+                user_item,
+            ],
             "tools": [{"type": "file_search", "vector_store_ids": [vector_store_id]}],
             "include": ["reasoning.encrypted_content", "file_search_call.results"],
             "reasoning": {"effort": "high"},
@@ -93,6 +96,11 @@ def _as_dict(item: Any) -> dict:
     if isinstance(item, dict):
         return item
     return item.model_dump(mode="json")
+
+
+def _input_item(item: dict) -> dict:
+    """Keep full API output locally but omit fields the input endpoint rejects."""
+    return {key: value for key, value in item.items() if key != "status"}
 
 
 def _answer(output: list[dict]) -> Answer:

@@ -12,6 +12,7 @@ class Source:
     filename: str
     year: int
     local_path: str
+    modified_at: float
     file_id: str
 
 
@@ -39,6 +40,7 @@ class Storage:
                     filename TEXT NOT NULL,
                     year INTEGER NOT NULL CHECK(year IN (2025, 2026)),
                     local_path TEXT NOT NULL,
+                    modified_at REAL NOT NULL,
                     file_id TEXT NOT NULL,
                     vector_store_file_id TEXT NOT NULL
                 );
@@ -54,6 +56,9 @@ class Storage:
                 );
                 """
             )
+            columns = {row[1] for row in connection.execute("PRAGMA table_info(sources)")}
+            if "modified_at" not in columns:
+                connection.execute("ALTER TABLE sources ADD COLUMN modified_at REAL")
 
     def set_vector_store(self, vector_store_id: str) -> None:
         with self._connect() as connection:
@@ -77,6 +82,7 @@ class Storage:
         filename: str,
         year: int,
         local_path: str,
+        modified_at: float,
         file_id: str,
         vector_store_file_id: str,
     ) -> None:
@@ -84,8 +90,8 @@ class Storage:
             connection.execute(
                 """
                 INSERT INTO sources(
-                    relative_path, filename, year, local_path, file_id, vector_store_file_id
-                ) VALUES (?, ?, ?, ?, ?, ?)
+                    relative_path, filename, year, local_path, modified_at, file_id, vector_store_file_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(relative_path) DO NOTHING
                 """,
                 (
@@ -93,6 +99,7 @@ class Storage:
                     filename,
                     year,
                     local_path,
+                    modified_at,
                     file_id,
                     vector_store_file_id,
                 ),
@@ -121,11 +128,18 @@ class Storage:
     def source_for_file(self, file_id: str) -> Source | None:
         with self._connect() as connection:
             row = connection.execute(
-                "SELECT relative_path, filename, year, local_path, file_id "
+                "SELECT relative_path, filename, year, local_path, modified_at, file_id "
                 "FROM sources WHERE file_id = ?",
                 (file_id,),
             ).fetchone()
         return None if row is None else Source(*row)
+
+    def update_source_modified_at(self, relative_path: str, modified_at: float) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                "UPDATE sources SET modified_at = ? WHERE relative_path = ?",
+                (modified_at, relative_path),
+            )
 
     def create_thread(self, title: str) -> int:
         with self._connect() as connection:

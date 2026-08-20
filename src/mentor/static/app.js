@@ -19,7 +19,8 @@ function showMessage(label, text) {
 
 function showEvidence(evidence, citations) {
   const cited = new Set(citations.map((citation) => citation.file_id));
-  evidence.forEach((item) => {
+  const item = evidence.find((entry) => cited.has(entry.file_id)) || evidence[0];
+  if (item) {
     const block = document.createElement("section");
     block.className = "evidence";
     const link = document.createElement("a");
@@ -33,15 +34,17 @@ function showEvidence(evidence, citations) {
     metadata.textContent = item.metadata.relative_path || "";
     block.append(link, excerpt, metadata);
     messages.append(block);
-  });
-  citations.filter((citation) => !evidence.some((item) => item.file_id === citation.file_id)).forEach((citation) => {
+    return;
+  }
+  if (citations[0]) {
+    const citation = citations[0];
     const link = document.createElement("a");
     link.href = `/api/sources/${encodeURIComponent(citation.file_id)}`;
     link.target = "_blank";
     link.rel = "noopener";
     link.textContent = `Cited source: ${citation.filename}`;
     messages.append(link);
-  });
+  }
 }
 
 async function loadThreads() {

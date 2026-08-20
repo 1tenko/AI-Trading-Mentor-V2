@@ -37,6 +37,7 @@ def test_server_binds_loopback_and_only_serves_registered_sources(tmp_path):
         filename="lesson.txt",
         year=2026,
         local_path=str(transcript),
+        modified_at=transcript.stat().st_mtime,
         file_id="file_allowed",
         vector_store_file_id="vsf_allowed",
     )

@@ -14,3 +14,4 @@ def test_discover_transcripts_preserves_paths_and_assigns_years(tmp_path):
         ("2025/lesson.txt", 2025),
         ("May/lesson.txt", 2026),
     ]
+    assert transcripts[0].modified_at == (tmp_path / "2025" / "lesson.txt").stat().st_mtime

@@ -10,6 +10,7 @@ class Transcript:
     relative_path: str
     filename: str
     year: int
+    modified_at: float
 
 
 def discover_transcripts(root: Path) -> list[Transcript]:
@@ -27,6 +28,7 @@ def discover_transcripts(root: Path) -> list[Transcript]:
                 relative_path=relative_path,
                 filename=path.name,
                 year=year,
+                modified_at=path.stat().st_mtime,
             )
         )
     return transcripts

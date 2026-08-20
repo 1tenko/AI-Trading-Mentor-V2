@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
 from mentor.chat_service import ChatService
+from mentor.prompts import MENTOR_INSTRUCTIONS
 from mentor.storage import Storage
 
 
@@ -143,3 +144,32 @@ def test_stream_reply_relays_deltas_then_persists_completed_response(tmp_path):
     assert events[-1].answer.text == "Completed."
     assert storage.thread_items(thread_id)[-1] == response.output[0]
     assert responses.calls[0]["stream"] is True
+
+
+def test_reply_replays_complete_state_without_response_only_status_fields(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    storage.set_vector_store("vs_jacob")
+    thread_id = storage.create_thread("Question")
+    stored_item = {
+        "type": "reasoning",
+        "id": "rs_123",
+        "summary": [],
+        "content": [],
+        "encrypted_content": "encrypted-state",
+        "status": "completed",
+    }
+    storage.append_thread_items(thread_id, [stored_item])
+    responses = FakeResponses(SimpleNamespace(output=[]))
+
+    ChatService(storage, SimpleNamespace(responses=responses)).reply(thread_id, "Second")
+
+    assert storage.thread_items(thread_id)[0] == stored_item
+    assert "status" not in responses.calls[0]["input"][0]
+    assert responses.calls[0]["input"][0]["encrypted_content"] == "encrypted-state"
+
+
+def test_policy_reserves_direct_teaching_for_affirmative_source_claims():
+    assert "Direct source teaching requires" in MENTOR_INSTRUCTIONS
+    assert "affirmative source claim." in MENTOR_INSTRUCTIONS
+    assert "Do not label missing evidence or an unsupported claim" in MENTOR_INSTRUCTIONS
