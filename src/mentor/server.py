@@ -13,6 +13,11 @@ from mentor.storage import Storage
 
 MAX_JSON_BYTES = 16_384
 FILE_ID = re.compile(r"^[A-Za-z0-9_-]+$")
+STATIC_ASSETS = {
+    "/app.js": ("app.js", "text/javascript; charset=utf-8"),
+    "/vendor/marked.esm.js": ("vendor/marked.esm.js", "text/javascript; charset=utf-8"),
+    "/vendor/purify.min.js": ("vendor/purify.min.js", "text/javascript; charset=utf-8"),
+}
 
 
 def create_server(storage: Storage, chat_service: Any, port: int = 8765) -> ThreadingHTTPServer:
@@ -35,8 +40,9 @@ class _Handler(BaseHTTPRequestHandler):
         if path == "/":
             self._send_bytes(HTTPStatus.OK, _static("index.html"), "text/html; charset=utf-8")
             return
-        if path == "/app.js":
-            self._send_bytes(HTTPStatus.OK, _static("app.js"), "text/javascript; charset=utf-8")
+        if path in STATIC_ASSETS:
+            filename, content_type = STATIC_ASSETS[path]
+            self._send_bytes(HTTPStatus.OK, _static(filename), content_type)
             return
         if path == "/api/threads":
             self._send_json(

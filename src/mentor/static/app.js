@@ -7,14 +7,29 @@ let activeThreadId;
 
 function showMessage(label, text) {
   const message = document.createElement("section");
-  message.className = "message";
+  message.className = `message message--${label.toLowerCase()}`;
   const heading = document.createElement("strong");
+  heading.className = "message-label";
   heading.textContent = label;
   const content = document.createElement("div");
-  content.textContent = text;
+  content.className = label === "Mentor" ? "message-content markdown" : "message-content";
+  if (label === "Mentor") {
+    renderMarkdown(content, text);
+  } else {
+    content.textContent = text;
+  }
   message.append(heading, content);
   messages.append(message);
-  return message;
+  return { message, content };
+}
+
+function renderMarkdown(target, text) {
+  const html = marked.parse(text, { breaks: true, gfm: true });
+  target.innerHTML = DOMPurify.sanitize(html, { USE_PROFILES: { html: true } });
+  target.querySelectorAll("a").forEach((link) => {
+    link.target = "_blank";
+    link.rel = "noopener noreferrer";
+  });
 }
 
 function showEvidence(evidence, citations) {
@@ -91,15 +106,18 @@ form.addEventListener("submit", async (event) => {
     }
     if (response.headers.get("Content-Type").startsWith("text/event-stream")) {
       const answer = showMessage("Mentor", "");
-      const content = answer.querySelector("div");
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
       let buffer = "";
+      let answerText = "";
       while (true) {
         const chunk = await reader.read();
         if (chunk.done) break;
         buffer = parseEventBuffer(buffer + decoder.decode(chunk.value, { stream: true }), (event) => {
-          if (event.type === "delta") content.textContent += event.text;
+          if (event.type === "delta") {
+            answerText += event.text;
+            renderMarkdown(answer.content, answerText);
+          }
           if (event.type === "complete") showEvidence(event.answer.evidence, event.answer.citations);
         });
       }
@@ -115,3 +133,4 @@ form.addEventListener("submit", async (event) => {
 });
 
 loadThreads().catch(() => { status.textContent = "Could not load conversations."; });
+import { marked } from "/vendor/marked.esm.js";

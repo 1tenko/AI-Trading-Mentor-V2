@@ -5,10 +5,34 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Theo's Trading Mentor</title>
     <style>
-      body { font: 16px/1.5 system-ui, sans-serif; margin: 0 auto; max-width: 860px; padding: 2rem 1rem; }
-      textarea, button { font: inherit; } textarea { box-sizing: border-box; min-height: 8rem; width: 100%; }
-      #threads button { display: block; margin: .25rem 0; } .message { margin: 1.5rem 0; white-space: pre-wrap; }
-      .evidence { border-left: 3px solid #777; margin: .75rem 0; padding-left: .75rem; }
+      :root { color: #202123; background: #fff; font-family: system-ui, sans-serif; line-height: 1.6; }
+      body { margin: 0 auto; max-width: 900px; padding: 2rem 1rem 3rem; }
+      textarea, button { font: inherit; }
+      textarea { box-sizing: border-box; min-height: 7rem; padding: .75rem; width: 100%; }
+      #threads { display: flex; flex-wrap: wrap; gap: .5rem; margin: .75rem 0 1.5rem; }
+      #threads button { background: #fff; border: 1px solid #d9d9e3; border-radius: .5rem; padding: .4rem .65rem; }
+      .message { margin: 2rem 0; }
+      .message-label { color: #5c5c66; display: block; font-size: .85rem; font-weight: 700; margin-bottom: .5rem; }
+      .message--theo .message-content { background: #f4f4f6; border-radius: .75rem; max-width: 80%; padding: .75rem 1rem; white-space: pre-wrap; }
+      .markdown { color: #202123; max-width: 780px; overflow-wrap: anywhere; }
+      .markdown > :first-child { margin-top: 0; }
+      .markdown > :last-child { margin-bottom: 0; }
+      .markdown h1, .markdown h2, .markdown h3, .markdown h4 { line-height: 1.25; margin: 1.5rem 0 .75rem; }
+      .markdown h1 { font-size: 1.6rem; } .markdown h2 { font-size: 1.35rem; } .markdown h3 { font-size: 1.15rem; } .markdown h4 { font-size: 1rem; }
+      .markdown p, .markdown ul, .markdown ol, .markdown blockquote { margin: .9rem 0; }
+      .markdown ul, .markdown ol { padding-left: 1.5rem; }
+      .markdown li + li { margin-top: .25rem; }
+      .markdown blockquote { border-left: 3px solid #a0a0aa; color: #4b4b55; padding-left: 1rem; }
+      .markdown hr { border: 0; border-top: 1px solid #d9d9e3; margin: 1.5rem 0; }
+      .markdown code { background: #f2f2f4; border-radius: .25rem; font-family: ui-monospace, monospace; font-size: .9em; padding: .1rem .3rem; }
+      .markdown pre { background: #202123; border-radius: .5rem; color: #f7f7f8; overflow-x: auto; padding: 1rem; }
+      .markdown pre code { background: none; color: inherit; padding: 0; }
+      .markdown table { border-collapse: collapse; display: block; margin: 1rem 0; max-width: 100%; overflow-x: auto; width: fit-content; }
+      .markdown th, .markdown td { border: 1px solid #d9d9e3; padding: .5rem .75rem; text-align: left; vertical-align: top; }
+      .markdown th { background: #f4f4f6; font-weight: 700; }
+      .evidence { background: #fafafa; border: 1px solid #e5e5e8; border-radius: .5rem; color: #4b4b55; font-size: .9rem; margin: 2rem 0; padding: 1rem; }
+      .evidence a { font-weight: 700; } .evidence div { margin: .6rem 0; white-space: pre-wrap; } .evidence small { color: #70707a; }
+      @media (max-width: 600px) { body { padding: 1rem .75rem 2rem; } .message--theo .message-content { max-width: none; } }
     </style>
   </head>
   <body>
@@ -23,6 +47,7 @@
       <button type="submit">Send</button>
     </form>
     <p id="status" role="status"></p>
-    <script src="/app.js"></script>
+    <script src="/vendor/purify.min.js"></script>
+    <script type="module" src="/app.js"></script>
   </body>
 </html>

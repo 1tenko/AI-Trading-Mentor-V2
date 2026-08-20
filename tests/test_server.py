@@ -95,3 +95,20 @@ def test_server_streams_chat_events(tmp_path):
     finally:
         server.shutdown()
         worker.join()
+
+
+def test_server_serves_local_markdown_dependencies(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    server = create_server(storage, FakeChatService(), port=0)
+    worker = threading.Thread(target=server.serve_forever)
+    worker.start()
+    try:
+        for path in ("/vendor/marked.esm.js", "/vendor/purify.min.js"):
+            status, headers, body = request(server, "GET", path)
+            assert status == 200
+            assert headers["Content-Type"] == "text/javascript; charset=utf-8"
+            assert body
+    finally:
+        server.shutdown()
+        worker.join()
