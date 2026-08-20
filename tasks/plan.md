@@ -1,273 +1,453 @@
-# Implementation Plan: Phase 1 Intelligence Proof
+# Implementation Plan: Phase 2 Unified Trading Mentor Foundation
+
+**Status:** Proposed — requires Theo's approval before implementation.
 
 ## Scope
 
-Implement only the approved Phase 1 proof from
-[`docs/superpowers/specs/2026-08-19-trading-mentor-phase-1-design.md`](../docs/superpowers/specs/2026-08-19-trading-mentor-phase-1-design.md).
-`SPEC.md` supplies the permanent product direction but does not authorize
-Phase 2+ work.
+Implement only the approved Phase 2 design at
+[2026-08-20-trading-mentor-phase-2-design.md](../docs/superpowers/specs/2026-08-20-trading-mentor-phase-2-design.md).
 
-The only product question this plan answers is whether Theo can hold a
-high-quality, source-grounded, multi-turn browser conversation about Jacob
-Speculates' 2025–2026 transcripts.
+The work makes the proven mentor a reliable personal chat application. It does
+not alter the Phase 1 intelligence architecture and does not begin Phase 3 or
+later capabilities.
 
-## Verified Integration Decisions
+## Phase 1 Closure and Branch
 
-- **Model:** start with `gpt-5.6-sol`, OpenAI's current flagship model for
-  complex professional work, and use the Responses API. A mandatory quality
-  failure is compared at `xhigh`, `max`, and/or Pro mode where appropriate
-  before rejecting the architecture. [Model guidance](https://developers.openai.com/api/docs/guides/latest-model)
-- **Knowledge search:** use the hosted `file_search` Responses tool over one
-  vector store containing raw transcripts. Fixed mentor policy requires enabled
-  Jacob evidence for substantive new methodology claims; the model may reuse
-  already cited thread evidence or make further native search calls as needed.
-  No custom retrieval loop is added. [File Search guide](https://developers.openai.com/api/docs/guides/tools-file-search)
-- **Citations and evidence:** parse file-citation annotations and include
-  `file_search_call.results` so the browser can show the retrieved excerpt.
-  [File Search citations](https://developers.openai.com/api/docs/guides/tools-file-search#file-citations)
-- **Conversation state:** SQLite remains the local source of truth. With
-  `store=false`, persist and replay the complete response items required for
-  continuity—not only rendered user/assistant text—including encrypted
-  reasoning items returned through `reasoning.encrypted_content`. This retains
-  stateless multi-turn reasoning continuity without remote response history;
-  preserve GPT-5.6's `all_turns` reasoning context unless evaluation demonstrates
-  a reason to change it.
-  [Responses reference](https://developers.openai.com/api/reference)
-- **Streaming:** use the Responses API's `stream=True` server-sent event stream
-  and relay it to the local browser. [Streaming responses](https://developers.openai.com/api/docs/guides/streaming-responses)
-- **No Agents SDK in Phase 1:** OpenAI recommends direct Responses calls when
-  the workflow is short-lived and the application owns state/tool handling;
-  Phase 1 has no multi-agent orchestration or custom tools. [Agents SDK guidance](https://openai.github.io/openai-agents-python/)
-- **Retention:** API inputs are not used for training without opt-in, but files
-  and vector stores persist until deleted. The importer must record remote IDs
-  and document cleanup. [Data controls](https://developers.openai.com/api/docs/guides/your-data)
+- Phase 1 human Intelligence Proof: **passed** by Theo.
+- Acceptance record: [phase-1-acceptance.md](../docs/phase-1-acceptance.md).
+- Implementation branch: feature/phase-2-unified-mentor.
+- Base contract: local replay state, GPT-5.6 Sol, Responses API, store=false,
+  native File Search, raw Jacob source authority, and loopback-only serving.
 
-## Local Findings
+## Verified Integration Constraints
 
-- Python 3.14.7 is installed.
-- The current transcript directory contains 150 `.txt` files: 22 under `2025`
-  and 128 outside it, treated as 2026 source material.
+- GPT-5.6 Sol remains OpenAI's frontier model. It supports high, xhigh, and
+  max reasoning effort; Pro is an independent reasoning mode. The plan retains
+  the existing evaluated controls instead of automatically escalating them.
+  [OpenAI model guidance](https://developers.openai.com/api/docs/guides/latest-model)
+- When local code manages conversation state with store=false, OpenAI documents
+  preserving previous user inputs and every response output item, including
+  encrypted reasoning items, for later turns. This remains the raw replay
+  record; it must never be returned to the browser.
+  [OpenAI model guidance](https://developers.openai.com/api/docs/guides/latest-model)
+- Native File Search results are absent by default unless
+  file_search_call.results is requested through include. The response item
+  contains the model's File Search queries, and the tool supports a
+  max_num_results setting. Phase 2 retains all returned results without custom
+  ranking.
+  [OpenAI File Search guide](https://developers.openai.com/api/docs/guides/tools-file-search)
 
-## Deliberate Simplifications
+## Architecture Decisions
 
-- One local server bound to `127.0.0.1`; no accounts, deployment, or network
-  sharing.
-- Python standard library serves the browser page and SQLite handles local
-  state. The only Phase 1 runtime package is the official `openai` SDK.
-- Import is a command over the existing transcript directory, not an upload UI.
-- Evidence inspection shows one returned File Search excerpt and a link to the
-  immutable local transcript. No document-management UI or custom retrieval
-  ranking is added.
+1. **Dual local records:** retain raw thread_items for stateless replay and add
+   a browser-safe display-turn projection. Do not make the browser parse or
+   receive encrypted reasoning state.
+2. **Physical local deletion:** delete a thread and all thread-owned rows in
+   one SQLite transaction. Never touch sources, source registry settings, local
+   transcripts, OpenAI Files, or the shared vector store.
+3. **Minimal unified boundary:** add one private request-composition seam for
+   an active Jacob-source capability. It supplies request policy/context only;
+   it does not create a capability registry, future tool, or another bot.
+4. **Two independent axes:** research depth controls source-research policy;
+   reasoning effort/mode controls GPT-5.6 configuration. Auto depth resolves
+   via transparent local intent rules and is recorded. No automatic effort or
+   Pro escalation occurs.
+5. **Static frontend retained:** the existing static UI can satisfy the
+   approved flows. No framework or dependency is planned.
 
 ## Dependency Graph
 
-```text
-Project setup
-  -> local storage + source importer
-      -> grounded chat service
-          -> local browser chat
-              -> manual quality gate
-```
+    Task 1: migrate storage + atomic deletion primitive
+      -> Task 2: persist safe display turns and historical configuration
+          -> Task 3: safe restore/delete HTTP API
+              -> Checkpoint A
+                  -> Task 4: unified turn composition + research depth
+                      -> Task 5: evidence and diagnostics aggregation
+                          -> Checkpoint B
+                              -> Task 6: restored conversation UI
+                                  -> Task 7: controls and compact disclosure UI
+                                      -> Checkpoint C
+                                          -> Task 8: deterministic regressions
+                                              -> Task 9: explicit human quality checkpoint
 
-## Commands After Task 1
-
-```powershell
-py -m venv .venv
-.\.venv\Scripts\python -m pip install -e ".[dev]"
-.\.venv\Scripts\python -m mentor.import_jacob "D:\courses\Jacob Speculates 2026\Transcripts"
-.\.venv\Scripts\python -m mentor
-.\.venv\Scripts\python -m pytest
-```
+Tasks are deliberately sequential because the shared storage and API contracts
+must settle before static UI work begins. No parallel implementation is planned.
 
 ## Task List
 
-### Task 1: Create the minimal local application foundation
+### Module: conversation-lifecycle
 
-**Description:** Add the Python package, isolated environment metadata, test
-runner, and documented local configuration. Keep the API key in `.env` only;
-the application must refuse to start without it.
+## Task 1: Add an idempotent display-turn migration and deletion primitive
 
-**Acceptance criteria:**
+**Purpose:** Extend SQLite with the minimum display-turn structure needed to
+restore Phase 1 conversations, backfill legacy threads without losing raw replay
+items, and provide one atomic local deletion operation.
 
-- [ ] The project installs in a virtual environment with the official OpenAI
-  Python SDK and a test dependency.
-- [ ] `.env.example` documents the required API key without containing one.
-- [ ] A focused test command runs successfully before any OpenAI call is made.
+**Dependencies:** None.
 
-**Verification:**
+**Files/components likely affected:**
 
-- [ ] `python -m pytest` passes.
-- [ ] Starting without `OPENAI_API_KEY` produces a clear local error.
-
-**Dependencies:** None
-
-**Files likely touched:** `pyproject.toml`, `.env.example`, `src/mentor/config.py`,
-`tests/test_config.py`, `README.md`
-
-**Estimated scope:** Medium
-
-### Task 2: Register and import the raw Jacob transcript library
-
-**Description:** Create the local SQLite schema and one repeatable command that
-walks the supplied transcript directory, preserves original relative paths and
-timestamps, assigns 2025/2026 metadata, uploads files to one vector store, and
-records remote file/vector-store IDs locally. It must be safe to rerun without
-duplicate registration.
+- src/mentor/storage.py
+- tests/test_storage.py
+- tests/fixtures/phase1_thread_state.json
 
 **Acceptance criteria:**
 
-- [ ] The import reports 22 2025 and 128 2026 registered `.txt` files from the
-  current source directory.
-- [ ] Each local registration preserves filename, source-relative path, year,
-  and remote file ID.
-- [ ] The import output records how to delete the created remote vector store
-  and files if Theo wants to remove them.
+- [ ] Initializing a Phase 1-shaped database creates/backfills display turns
+  idempotently while retaining the original chronological raw item sequence.
+- [ ] A display turn identifies its user content, answer Markdown, evidence,
+  diagnostics/configuration, completion state, and raw replay-item positions.
+- [ ] One storage deletion operation removes every thread-owned row
+  transactionally while source registry rows and vector-store settings survive.
 
-**Verification:**
+**Automated verification:**
 
-- [ ] Importer unit tests use a temporary fixture directory and make no network
-  call.
-- [ ] A single real import completes, records the expected counts, and the
-  remote vector store reports ready before chat is enabled.
+- [ ] Focused storage tests cover fresh initialization, legacy migration rerun,
+  transaction rollback/failure behavior, and source/settings survival.
+- [ ] Full suite: .\.venv\Scripts\python -m pytest -q.
 
-**Dependencies:** Task 1
+**Browser verification:** None; this is a local storage contract.
 
-**Files likely touched:** `src/mentor/storage.py`, `src/mentor/import_jacob.py`,
-`src/mentor/source_registry.py`, `tests/test_import_jacob.py`, `README.md`
+**Estimated scope:** Medium.
 
-**Estimated scope:** Medium
+## Task 2: Persist new turns as safe display projections without changing replay
 
-### Checkpoint: Source library ready
+**Purpose:** Make each new completed or incomplete response write both its
+existing raw replay state and a safe display projection containing the actual
+historical configuration that produced it.
 
-- [ ] Test suite passes.
-- [ ] All 150 transcripts are registered exactly once with the intended year.
-- [ ] Remote IDs and deletion instructions are visible locally.
-- [ ] Human verifies that no transcript text was rewritten or summarized.
+**Dependencies:** Task 1.
 
-### Task 3: Build the grounded multi-turn chat service
+**Files/components likely affected:**
 
-**Description:** Add a small service that reads a local thread, calls
-`gpt-5.6-sol` through the Responses API with native File Search, persists the
-complete local continuation state, and returns answer text plus
-provenance-labelled source citations and retrieved evidence excerpts. Its fixed
-instructions enforce the Jacob-only teaching policy and make unsupported claims
-explicit. Responses use `store=false` and include both
-`reasoning.encrypted_content` and `file_search_call.results`, retaining
-GPT-5.6's `all_turns` reasoning context.
+- src/mentor/chat_service.py
+- src/mentor/storage.py
+- tests/test_chat_service.py
 
 **Acceptance criteria:**
 
-- [ ] A substantive new Jacob/trading-methodology claim is grounded in enabled
-  Jacob evidence, unless the active thread already contains sufficient cited
-  evidence.
-- [ ] When evidence is missing or insufficient—or Theo asks to search again—the
-  model performs native File Search rather than silently relying on pretrained
-  trading knowledge.
-- [ ] One response may conduct multiple model-chosen File Search research
-  passes; the implementation does not impose a one-search limit or build a
-  custom retrieval loop.
-- [ ] Follow-up turns replay the selected thread's required prior response
-  items, including encrypted reasoning state where returned.
-- [ ] The fixed instruction distinguishes direct teaching, source synthesis,
-  AI hypothesis, and unsupported claims.
+- [ ] A streamed completed or incomplete response stores a matching display
+  turn with citations, all returned evidence, diagnostics, and exact historical
+  model/reasoning/research settings.
+- [ ] Replay input remains the complete raw output sequence required by the
+  Responses API, including encrypted reasoning items when present.
+- [ ] No browser-facing representation includes encrypted reasoning content or
+  opaque raw response items.
 
-**Verification:**
+**Automated verification:**
 
-- [ ] Unit tests cover continuation-state persistence, citation/excerpt
-  extraction, and File Search results using saved API-shaped fixtures.
-- [ ] Manual smoke checks cover a searched answer, a context-follow-up, “Are
-  you sure? Search Jacob again,” and a prompt that requires additional research
-  after insufficient initial evidence.
+- [ ] API-shaped fixtures assert display projection, incomplete handling, and
+  unchanged raw replay input.
+- [ ] Full suite: .\.venv\Scripts\python -m pytest -q.
 
-**Dependencies:** Task 2
+**Browser verification:** None; HTTP exposure follows Task 3.
 
-**Files likely touched:** `src/mentor/chat_service.py`, `src/mentor/prompts.py`,
-`src/mentor/storage.py`, `tests/test_chat_service.py`, `tests/fixtures/response.json`
+**Estimated scope:** Medium.
 
-**Estimated scope:** Medium
+## Task 3: Expose safe thread restoration and permanent-delete routes
 
-### Task 4: Serve the private browser chat and original evidence
+**Purpose:** Add the smallest loopback API surface for loading a thread's safe
+timeline and permanently deleting one local conversation.
 
-**Description:** Add a standard-library local HTTP server and a single static
-chat page. It lists/creates local threads, streams a response, renders citation
-links with their retrieved evidence excerpt, and serves the registered original
-transcript read-only when requested. Bind only to loopback and never send the
-API key to the browser.
+**Dependencies:** Tasks 1–2.
+
+**Files/components likely affected:**
+
+- src/mentor/server.py
+- src/mentor/storage.py
+- tests/test_server.py
 
 **Acceptance criteria:**
 
-- [ ] Theo can create a thread, ask a question, receive streamed text, and
-  return to that thread for a follow-up.
-- [ ] A citation shows the retrieved excerpt, source filename, year, available
-  metadata, and a link to the registered full original transcript locally.
-- [ ] The browser network requests contain no API key and the server listens
-  only on `127.0.0.1`.
+- [ ] GET /api/threads/{id} returns chronological display turns only and never
+  contacts OpenAI or reveals raw/encrypted replay state.
+- [ ] DELETE /api/threads/{id} uses the storage transaction, returns a clear
+  success/not-found result, and does not affect sources or vector-store state.
+- [ ] Existing list/create/message/source routes and loopback-only binding
+  continue to behave as before.
 
-**Verification:**
+**Automated verification:**
 
-- [ ] HTTP handler tests cover local-only routing and missing-source errors.
-- [ ] Manual browser check completes one question, one follow-up, one
-  search-again request, and one evidence-excerpt/full-transcript inspection.
+- [ ] HTTP tests cover restore, malformed/missing IDs, delete persistence, and
+  absence of encrypted reasoning/API keys in JSON.
+- [ ] Full suite: .\.venv\Scripts\python -m pytest -q.
 
-**Dependencies:** Task 3
+**Browser verification:** Request one existing thread endpoint from the local
+browser and confirm it returns no raw reasoning content.
 
-**Files likely touched:** `src/mentor/server.py`, `src/mentor/static/index.html`,
-`src/mentor/static/app.js`, `tests/test_server.py`
+**Estimated scope:** Medium.
 
-**Estimated scope:** Medium
+### Checkpoint A: Conversation storage and API contract
 
-### Checkpoint: End-to-end proof available
+- [ ] All tests pass.
+- [ ] A representative Phase 1 thread migrates and can be read through the
+  safe timeline route.
+- [ ] Deleting a representative thread removes it after reread/reload while
+  the Jacob source registry and vector-store setting remain intact.
+- [ ] No browser route exposes encrypted reasoning state.
 
-- [ ] `python -m pytest` passes.
-- [ ] Import → browser question → streamed answer → local source view works.
-- [ ] No Phase 2 capability, external service, or custom retrieval system was
-  introduced.
+### Module: mentor-orchestration
 
-### Task 5: Run and record the human quality gate
+## Task 4: Add minimal unified turn composition and research-depth policy
 
-**Description:** Add the approved manual evaluation worksheet and run it in the
-browser. Record each prompt, answer, cited evidence, and Theo's pass/fail notes
-outside Git if they contain private conversation content.
+**Purpose:** Separate current Jacob source-research policy from future
+capability attachment without implementing a generic registry or any future
+capability. Add Auto, Normal, Deep, and Exhaustive depth handling independently
+of existing reasoning controls.
+
+**Dependencies:** Checkpoint A.
+
+**Files/components likely affected:**
+
+- src/mentor/chat_service.py
+- src/mentor/prompts.py
+- tests/test_chat_service.py
 
 **Acceptance criteria:**
 
-- [ ] The nine approved adversarial prompts are available in one worksheet.
-- [ ] The worksheet checks clarity, correction handling, evidence relevance,
-  year comparison, unsupported attribution, and research-again behavior.
-- [ ] The baseline uses `gpt-5.6-sol` with `high` reasoning effort. A mandatory
-  prompt that materially misses Theo's quality bar is compared with `xhigh`,
-  `max`, and/or Pro mode where appropriate before rejecting the architecture.
-- [ ] Each comparison records configuration, answer quality, latency, usage,
-  and estimated cost. Higher-quality modes are an evaluation escalation, not
-  the default for every everyday message.
-- [ ] Theo explicitly decides whether Phase 1 passes; no later phase begins
-  automatically.
+- [ ] One server-owned turn-composition path builds the existing Jacob
+  instructions, native File Search tool, include fields, and research-depth
+  policy; no user-facing bot or future capability is created.
+- [ ] Auto deterministically resolves to Normal, Deep, or Exhaustive from
+  transparent intent criteria; an explicit manual depth cannot be downgraded.
+- [ ] Research depth is stored separately from reasoning effort/mode and does
+  not automatically raise effort or enable Pro.
 
-**Verification:**
+**Automated verification:**
 
-- [ ] The worksheet is complete enough to run without developer knowledge.
-- [ ] Theo completes the browser evaluation and records a pass/fail decision.
+- [ ] Fixtures assert policy resolution, request composition, preserved native
+  File Search configuration, and unchanged provenance/exhaustive safeguards.
+- [ ] Full suite: .\.venv\Scripts\python -m pytest -q.
 
-**Dependencies:** Task 4
+**Browser verification:** None; UI control follows Task 7.
 
-**Files likely touched:** `docs/phase-1-evaluation.md`, `README.md`
+**Estimated scope:** Medium.
 
-**Estimated scope:** Small
+## Task 5: Retain compact evidence and truthful usage diagnostics
 
-## Risks and Mitigations
+**Purpose:** Record the native research details needed for compact display:
+returned evidence count, cited count, File Search calls/queries/results, and
+known response usage—without inventing total platform cost.
 
-| Risk | Impact | Mitigation |
-|---|---|---|
-| Fluent answer lacks source fidelity | High | Fixed provenance policy, visible citations, unsupported-attribution prompt, human gate |
-| File search finds a mention but not a teaching explanation | High | Let the model search again and retain returned results for inspection; judge the actual answer before expanding scope |
-| Stateless turns lose reasoning continuity | High | Persist/replay necessary response items, including encrypted reasoning items, with `store=false` |
-| Remote source state persists | Medium | Record remote IDs and document deletion; use local SQLite for chat history and `store=false` for responses |
-| Poor local UI masks a good mentor | Medium | Keep the chat page intentionally simple; assess conversational quality, not visual polish |
-| Import errors distort year comparisons | High | Preserve original paths, assign year explicitly, assert the 22/128 import counts |
+**Dependencies:** Task 4.
+
+**Files/components likely affected:**
+
+- src/mentor/chat_service.py
+- src/mentor/storage.py
+- tests/test_chat_service.py
+
+**Acceptance criteria:**
+
+- [ ] Each display turn retains all returned source evidence and enough
+  aggregate metadata to show research/citation counts.
+- [ ] Historical diagnostics retain requested/effective depth, model,
+  effort/mode, status, latency, available tokens, and clearly labelled
+  text-token estimate.
+- [ ] Unknown File Search/platform charges remain unknown; no custom ranking,
+  summarization, or quote rewriting is introduced.
+
+**Automated verification:**
+
+- [ ] Fixtures cover multiple File Search calls, absent usage fields, and
+  historical diagnostics fidelity.
+- [ ] Full suite: .\.venv\Scripts\python -m pytest -q.
+
+**Browser verification:** Inspect the safe timeline JSON for counts and all
+evidence records; verify no raw reasoning item is present.
+
+**Estimated scope:** Medium.
+
+### Checkpoint B: Unified mentor policy and observability contract
+
+- [ ] All tests pass.
+- [ ] The existing Phase 1 exhaustive-query policy still requires a
+  complementary omission/falsification search.
+- [ ] Auto/manual depth, effort, and mode are independently persisted.
+- [ ] Evidence and usage metadata are complete enough for the approved UI but
+  do not expose reasoning state or misstate costs.
+
+### Module: chat-foundation-ui
+
+## Task 6: Restore conversations, switching, reload, titles, and delete flow
+
+**Purpose:** Use the safe timeline API in the existing static chat page so
+saved conversations faithfully reappear and can be deleted through a restrained
+confirmed action.
+
+**Dependencies:** Checkpoint B.
+
+**Files/components likely affected:**
+
+- src/mentor/static/index.html
+- src/mentor/static/app.js
+- src/mentor/static/app.css
+
+**Acceptance criteria:**
+
+- [ ] Selecting a saved thread and reloading the page render historical Theo
+  and Mentor messages, Markdown, citations/evidence, diagnostics, and
+  incomplete state in chronological order.
+- [ ] Sidebar titles use the persisted first meaningful question and switch
+  reliably without clearing historical content.
+- [ ] A keyboard-accessible delete affordance confirms intent, removes the
+  conversation immediately on success, and leaves sources untouched.
+
+**Automated verification:**
+
+- [ ] Existing server tests continue to pass; add browser-safe route fixtures
+  needed by the static flow.
+- [ ] Full suite: .\.venv\Scripts\python -m pytest -q.
+
+**Browser verification:** Create two chats, add a follow-up to one, switch both
+ways, reload, delete one with confirmation, reload again, and verify the other
+still restores.
+
+**Estimated scope:** Medium.
+
+## Task 7: Add research-depth control and compact historical disclosures
+
+**Purpose:** Extend the static UI—not the intelligence architecture—with an
+advanced research-depth control, historical configuration display, compact
+evidence disclosure, and the approved NaN. diagnosis.
+
+**Dependencies:** Task 6.
+
+**Files/components likely affected:**
+
+- src/mentor/static/index.html
+- src/mentor/static/app.js
+- src/mentor/static/app.css
+- tests/test_server.py
+
+**Acceptance criteria:**
+
+- [ ] Auto/Normal/Deep/Exhaustive is sent only for future turns and does not
+  relabel historical turns; the existing effort/mode controls remain separate.
+- [ ] Evidence is collapsed by default with cited results first, a compact
+  researched/cited count, and an explicit way to reveal all retained evidence.
+- [ ] Live UI and a saved fixture determine whether NaN. is an application
+  defect; only a reproducible in-app defect receives a minimal code fix and
+  regression.
+
+**Automated verification:**
+
+- [ ] HTTP/static asset tests pass and fixture coverage protects any confirmed
+  NaN. rendering fix.
+- [ ] Full suite: .\.venv\Scripts\python -m pytest -q.
+
+**Browser verification:** At desktop and mobile widths, verify controls,
+streaming, Markdown tables, collapsed evidence/diagnostics, no console errors,
+and no horizontal sidebar-button pile.
+
+**Estimated scope:** Medium.
+
+### Checkpoint C: Persistent-chat user flow
+
+- [ ] All tests pass.
+- [ ] A new streamed answer and a restored historical answer display their own
+  distinct historical settings and evidence.
+- [ ] Browser deletion persists through reload without affecting a different
+  conversation or shared source access.
+- [ ] The UI remains a static, responsive personal chat—not a dashboard.
+
+### Module: phase-2-regression
+
+## Task 8: Complete deterministic Phase 2 regression coverage
+
+**Purpose:** Consolidate migration, lifecycle, provenance, security, and
+semantic behavior into small deterministic fixtures so routine tests do not
+make paid model requests.
+
+**Dependencies:** Checkpoint C.
+
+**Files/components likely affected:**
+
+- tests/test_storage.py
+- tests/test_chat_service.py
+- tests/test_server.py
+- tests/fixtures/
+
+**Acceptance criteria:**
+
+- [ ] Tests cover create/list/title/restore/reload/switch/delete, shared-source
+  survival, raw replay continuity, historical configuration fidelity, and
+  incomplete responses.
+- [ ] Tests retain the Phase 1 semantic fixtures: SMT, TPD, all
+  reversion-level alignments, exhaustive SMT teaching, false attribution, and
+  correction/follow-up.
+- [ ] Tests cover loopback-only routing, API-key secrecy, source restrictions,
+  provenance, Auto/manual depth, and the resolved NaN. finding.
+
+**Automated verification:**
+
+- [ ] Full suite: .\.venv\Scripts\python -m pytest -q.
+- [ ] Diff check and secret scan before the task commit.
+
+**Browser verification:** Run the defined smoke flow once against a local
+server; do not send paid model requests during ordinary regression runs.
+
+**Estimated scope:** Medium.
+
+## Task 9: Run the explicit Phase 2 human quality checkpoint
+
+**Purpose:** Prepare and run a small paid browser evaluation only after all
+deterministic checks pass. Theo, not the agent, decides whether Phase 2 passes.
+
+**Dependencies:** Task 8.
+
+**Files/components likely affected:**
+
+- docs/phase-2-evaluation.md
+- README.md
+
+**Acceptance criteria:**
+
+- [ ] The worksheet combines persistent-chat lifecycle checks with the compact
+  Phase 1 semantic regression prompts and records configuration/observability.
+- [ ] It explicitly checks normal versus exhaustive research behavior, restored
+  history fidelity, permanent deletion boundaries, and evidence/diagnostics UX.
+- [ ] Private full transcripts, runtime data, and API secrets remain outside
+  Git; Theo records the final pass/fail decision.
+
+**Automated verification:**
+
+- [ ] Full suite: .\.venv\Scripts\python -m pytest -q before the real run.
+- [ ] No paid API request is added to pytest or a routine browser smoke test.
+
+**Browser verification:** Theo performs the approved paid/local human
+checkpoint and decides Phase 2 pass/fail.
+
+**Estimated scope:** Small.
+
+### Final checkpoint: Await Theo's Phase 2 decision
+
+- [ ] All deterministic tests and browser smoke checks pass.
+- [ ] The explicit paid quality checkpoint is complete.
+- [ ] The completed branch is committed and pushed.
+- [ ] Theo has made the human acceptance decision.
+- [ ] Stop. Do not start Phase 3, merge to main, or add future capabilities.
+
+## Migration and Data Risks
+
+| Risk | Mitigation |
+|---|---|
+| Legacy thread grouping cannot associate all historical diagnostics | Preserve raw items; associate diagnostics in recorded response order; explicitly label genuinely absent fields unavailable. |
+| Partial deletion causes a deleted chat to reappear | Use one SQLite transaction, enabled foreign keys, explicit dependent-row deletes, and reread/reload tests. |
+| Browser-safe display data drifts from replay data | Persist both in one service finalization path and test exact historical configuration/evidence. |
+| Auto depth creates surprise cost or weak research | Use transparent deterministic baselines, manual override, stored effective depth, and actual native-search counts. |
+| Evidence disclosure hides critical sources | Keep all original returned results; show cited results first; expose explicit expand-all. |
+| A planned UI change becomes a framework migration | Stop and ask Theo; the static UI is the approved approach. |
+
+## ADRs
+
+No standalone ADR is created at planning time. The approved Phase 2 design is
+the binding decision record for dual records, physical deletion, independent
+research depth, the unified capability seam, and retention of the static UI.
+Creating duplicate ADR files now would add documentation without a new decision.
 
 ## Approval Gate
 
-Do not implement this plan until Theo explicitly approves it. After approval,
-Tasks 1–4 run sequentially with their checkpoints and commits; stop at Task 5
-for Theo's personal intelligence-quality decision. Automated tests, citations,
-and successful API calls cannot approve Phase 1 on Theo's behalf.
+Do not implement any task until Theo approves this plan and
+[todo.md](todo.md). On approval, work tasks in order, commit/push each
+significant coherent slice, and stop at Task 9 for Theo's human decision.

@@ -1,6 +1,6 @@
 # Phase 2 Design: Unified Trading Mentor Foundation
 
-**Status:** Proposed — requires Theo's approval before planning or implementation.
+**Status:** Approved by Theo on 2026-08-20 — authorizes Phase 2 planning only.
 
 ## Objective
 
@@ -415,7 +415,6 @@ change the preserved Phase 1 contract, it requires Theo's approval first.
 
 ## Approval Gate
 
-Do not create an implementation plan, task list, schema migration, API route,
-UI change, or future capability until Theo explicitly approves this Phase 2
-design. Approval authorizes planning only; it does not authorize Phase 3+
-scope or merging to main.
+Do not implement a schema migration, API route, UI change, or future capability
+until Theo explicitly approves the Phase 2 implementation plan and task list.
+That approval does not authorize Phase 3+ scope or merging to main.
