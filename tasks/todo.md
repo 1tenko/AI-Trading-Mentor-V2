@@ -92,6 +92,6 @@ Theo's human evaluation; do not begin Phase 3.
 ### Final checkpoint — Await Theo's Phase 2 decision
 
 - [x] All deterministic and browser checks pass.
-- [ ] The branch is committed and pushed.
+- [x] The branch is committed and pushed.
 - [ ] Theo has made the human acceptance decision.
 - [ ] Stop: do not merge to main or begin Phase 3.
