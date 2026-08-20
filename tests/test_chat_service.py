@@ -237,3 +237,13 @@ def test_policy_reserves_direct_teaching_for_affirmative_source_claims():
     assert "all, every, exact, exhaustive" in MENTOR_INSTRUCTIONS
     assert "each material subquestion" in MENTOR_INSTRUCTIONS
     assert "each requested year independently" in MENTOR_INSTRUCTIONS
+
+
+def test_policy_requires_a_complementary_search_before_claiming_completeness():
+    assert "candidate answer" in MENTOR_INSTRUCTIONS
+    assert "complementary File Search query" in MENTOR_INSTRUCTIONS
+    assert "not merely repeat" in MENTOR_INSTRUCTIONS
+    assert "cap the research at four" in MENTOR_INSTRUCTIONS
+    assert "never call an\nanswer exhaustive" in MENTOR_INSTRUCTIONS
+    assert "gaps,\nintermediate categories" in MENTOR_INSTRUCTIONS
+    assert "underlying mechanism" in MENTOR_INSTRUCTIONS

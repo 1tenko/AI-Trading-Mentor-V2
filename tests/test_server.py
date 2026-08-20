@@ -119,3 +119,19 @@ def test_server_serves_local_markdown_dependencies(tmp_path):
     finally:
         server.shutdown()
         worker.join()
+
+
+def test_server_serves_the_external_stylesheet(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    server = create_server(storage, FakeChatService(), port=0)
+    worker = threading.Thread(target=server.serve_forever)
+    worker.start()
+    try:
+        status, headers, body = request(server, "GET", "/app.css")
+        assert status == 200
+        assert headers["Content-Type"] == "text/css; charset=utf-8"
+        assert b".app" in body
+    finally:
+        server.shutdown()
+        worker.join()

@@ -14,6 +14,7 @@ from mentor.storage import Storage
 MAX_JSON_BYTES = 16_384
 FILE_ID = re.compile(r"^[A-Za-z0-9_-]+$")
 STATIC_ASSETS = {
+    "/app.css": ("app.css", "text/css; charset=utf-8"),
     "/app.js": ("app.js", "text/javascript; charset=utf-8"),
     "/vendor/marked.esm.js": ("vendor/marked.esm.js", "text/javascript; charset=utf-8"),
     "/vendor/purify.min.js": ("vendor/purify.min.js", "text/javascript; charset=utf-8"),
@@ -138,7 +139,7 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Content-Security-Policy", "default-src 'self'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'")
+        self.send_header("Content-Security-Policy", "default-src 'self'; connect-src 'self'; style-src 'self'; base-uri 'none'; frame-ancestors 'none'")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("X-Frame-Options", "DENY")
         self.send_header("Referrer-Policy", "no-referrer")
