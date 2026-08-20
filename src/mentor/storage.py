@@ -1,4 +1,4 @@
-"""Small SQLite store for private Phase 1 state."""
+"""Small SQLite store for private Trading Mentor state."""
 
 import json
 import sqlite3
@@ -59,11 +59,27 @@ class Storage:
                     thread_id INTEGER NOT NULL REFERENCES threads(id),
                     diagnostic_json TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS display_turns (
+                    thread_id INTEGER NOT NULL REFERENCES threads(id),
+                    turn_number INTEGER NOT NULL,
+                    user_text TEXT NOT NULL,
+                    answer_markdown TEXT NOT NULL,
+                    citations_json TEXT NOT NULL,
+                    evidence_json TEXT NOT NULL,
+                    diagnostic_json TEXT,
+                    response_id TEXT,
+                    status TEXT NOT NULL,
+                    incomplete_reason TEXT,
+                    raw_start_position INTEGER,
+                    raw_end_position INTEGER,
+                    PRIMARY KEY(thread_id, turn_number)
+                );
                 """
             )
             columns = {row[1] for row in connection.execute("PRAGMA table_info(sources)")}
             if "modified_at" not in columns:
                 connection.execute("ALTER TABLE sources ADD COLUMN modified_at REAL")
+            self._backfill_display_turns(connection)
 
     def set_vector_store(self, vector_store_id: str) -> None:
         with self._connect() as connection:
@@ -172,9 +188,9 @@ class Storage:
             ).fetchone()
         return row is not None
 
-    def append_thread_items(self, thread_id: int, items: list[dict]) -> None:
+    def append_thread_items(self, thread_id: int, items: list[dict]) -> tuple[int, int] | None:
         if not items:
-            return
+            return None
         with self._connect() as connection:
             row = connection.execute(
                 "SELECT COALESCE(MAX(position), -1) FROM thread_items WHERE thread_id = ?",
@@ -188,6 +204,13 @@ class Storage:
                     for index, item in enumerate(items)
                 ],
             )
+            title = _user_text(items[0])
+            if title:
+                connection.execute(
+                    "UPDATE threads SET title = ? WHERE id = ? AND title = 'New conversation'",
+                    (_compact_title(title), thread_id),
+                )
+        return start, start + len(items) - 1
 
     def thread_items(self, thread_id: int) -> list[dict]:
         with self._connect() as connection:
@@ -215,8 +238,151 @@ class Storage:
             ).fetchall()
         return [json.loads(row[0]) for row in rows]
 
+    def record_display_turn(
+        self,
+        thread_id: int,
+        *,
+        user_text: str,
+        answer_markdown: str,
+        citations: list[dict],
+        evidence: list[dict],
+        diagnostics: dict | None,
+        response_id: str | None,
+        status: str,
+        incomplete_reason: str | None,
+        raw_start_position: int | None = None,
+        raw_end_position: int | None = None,
+    ) -> None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT COALESCE(MAX(turn_number), 0) FROM display_turns WHERE thread_id = ?",
+                (thread_id,),
+            ).fetchone()
+            connection.execute(
+                """
+                INSERT INTO display_turns(
+                    thread_id, turn_number, user_text, answer_markdown,
+                    citations_json, evidence_json, diagnostic_json, response_id,
+                    status, incomplete_reason, raw_start_position, raw_end_position
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    thread_id,
+                    int(row[0]) + 1,
+                    user_text,
+                    answer_markdown,
+                    json.dumps(citations),
+                    json.dumps(evidence),
+                    None if diagnostics is None else json.dumps(diagnostics),
+                    response_id,
+                    status,
+                    incomplete_reason,
+                    raw_start_position,
+                    raw_end_position,
+                ),
+            )
+
+    def display_turns(self, thread_id: int) -> list[dict]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT turn_number, user_text, answer_markdown, citations_json,
+                       evidence_json, diagnostic_json, response_id, status,
+                       incomplete_reason
+                FROM display_turns WHERE thread_id = ? ORDER BY turn_number
+                """,
+                (thread_id,),
+            ).fetchall()
+        return [
+            {
+                "turn_number": row[0],
+                "user_text": row[1],
+                "answer_markdown": row[2],
+                "citations": json.loads(row[3]),
+                "evidence": json.loads(row[4]),
+                "diagnostics": None if row[5] is None else json.loads(row[5]),
+                "response_id": row[6],
+                "status": row[7],
+                "incomplete_reason": row[8],
+            }
+            for row in rows
+        ]
+
+    def delete_thread(self, thread_id: int) -> bool:
+        with self._connect() as connection:
+            exists = connection.execute(
+                "SELECT 1 FROM threads WHERE id = ?", (thread_id,)
+            ).fetchone()
+            if exists is None:
+                return False
+            connection.execute("DELETE FROM display_turns WHERE thread_id = ?", (thread_id,))
+            connection.execute("DELETE FROM response_diagnostics WHERE thread_id = ?", (thread_id,))
+            connection.execute("DELETE FROM thread_items WHERE thread_id = ?", (thread_id,))
+            connection.execute("DELETE FROM threads WHERE id = ?", (thread_id,))
+        return True
+
+    def _backfill_display_turns(self, connection: sqlite3.Connection) -> None:
+        thread_ids = connection.execute("SELECT id FROM threads").fetchall()
+        for (thread_id,) in thread_ids:
+            existing = connection.execute(
+                "SELECT 1 FROM display_turns WHERE thread_id = ? LIMIT 1", (thread_id,)
+            ).fetchone()
+            if existing is not None:
+                continue
+            items = [
+                (row[0], json.loads(row[1]))
+                for row in connection.execute(
+                    "SELECT position, item_json FROM thread_items WHERE thread_id = ? ORDER BY position",
+                    (thread_id,),
+                )
+            ]
+            diagnostics = [
+                json.loads(row[0])
+                for row in connection.execute(
+                    "SELECT diagnostic_json FROM response_diagnostics WHERE thread_id = ? ORDER BY rowid",
+                    (thread_id,),
+                )
+            ]
+            diagnostic_index = 0
+            starts = [index for index, (_, item) in enumerate(items) if _user_text(item) is not None]
+            for turn_number, start_index in enumerate(starts, start=1):
+                end_index = starts[turn_number] if turn_number < len(starts) else len(items)
+                raw_items = [item for _, item in items[start_index:end_index]]
+                user_text = _user_text(raw_items[0]) or ""
+                answer_markdown, citations, evidence = _display_content(raw_items[1:])
+                diagnostic = diagnostics[diagnostic_index] if answer_markdown and diagnostic_index < len(diagnostics) else None
+                if diagnostic is not None:
+                    diagnostic_index += 1
+                status = str((diagnostic or {}).get("status") or ("completed" if answer_markdown else "incomplete"))
+                response_id = (diagnostic or {}).get("response_id")
+                connection.execute(
+                    """
+                    INSERT INTO display_turns(
+                        thread_id, turn_number, user_text, answer_markdown,
+                        citations_json, evidence_json, diagnostic_json, response_id,
+                        status, incomplete_reason, raw_start_position, raw_end_position
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        thread_id,
+                        turn_number,
+                        user_text.strip(),
+                        answer_markdown,
+                        json.dumps(citations),
+                        json.dumps(evidence),
+                        None if diagnostic is None else json.dumps(diagnostic),
+                        response_id,
+                        status,
+                        (diagnostic or {}).get("incomplete_reason"),
+                        items[start_index][0],
+                        items[end_index - 1][0],
+                    ),
+                )
+
     def _connect(self) -> sqlite3.Connection:
-        return sqlite3.connect(self.database_path)
+        connection = sqlite3.connect(self.database_path)
+        connection.execute("PRAGMA foreign_keys = ON")
+        return connection
 
 
 def _thread_label(title: str, first_item_json: str | None) -> str:
@@ -229,3 +395,51 @@ def _thread_label(title: str, first_item_json: str | None) -> str:
         return title
     compact = " ".join(str(text).split())
     return f"{compact[:55]}…" if len(compact) > 56 else compact or title
+
+
+def _user_text(item: dict) -> str | None:
+    if item.get("role") != "user":
+        return None
+    for content in item.get("content") or []:
+        if content.get("type") == "input_text" and isinstance(content.get("text"), str):
+            return content["text"]
+    return None
+
+
+def _compact_title(text: str) -> str:
+    compact = " ".join(text.split())
+    return f"{compact[:55]}…" if len(compact) > 56 else compact
+
+
+def _display_content(items: list[dict]) -> tuple[str, list[dict], list[dict]]:
+    text_parts: list[str] = []
+    citations: list[dict] = []
+    evidence: list[dict] = []
+    for item in items:
+        if item.get("type") == "file_search_call":
+            for result in item.get("results") or []:
+                attributes = result.get("attributes") or {}
+                evidence.append(
+                    {
+                        "file_id": result["file_id"],
+                        "filename": result.get("filename", "Unknown source"),
+                        "excerpt": result.get("text", ""),
+                        "year": attributes.get("year"),
+                        "metadata": {str(key): str(value) for key, value in attributes.items()},
+                    }
+                )
+        if item.get("type") != "message" or item.get("role") != "assistant":
+            continue
+        for content in item.get("content") or []:
+            if content.get("type") != "output_text":
+                continue
+            text_parts.append(content.get("text", ""))
+            for annotation in content.get("annotations") or []:
+                if annotation.get("type") == "file_citation":
+                    citation = {
+                        "file_id": annotation["file_id"],
+                        "filename": annotation.get("filename", "Unknown source"),
+                    }
+                    if citation not in citations:
+                        citations.append(citation)
+    return "".join(text_parts), citations, evidence

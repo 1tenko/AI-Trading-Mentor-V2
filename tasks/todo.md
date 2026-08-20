@@ -9,7 +9,7 @@ plan. All work remains on feature/phase-2-unified-mentor.
 
 ## conversation-lifecycle
 
-- [ ] **Task 1 — Idempotent display-turn migration and deletion primitive**
+- [x] **Task 1 — Idempotent display-turn migration and deletion primitive**
   - Acceptance: legacy Phase 1 threads backfill safely; one transaction deletes
     all thread-owned state and preserves sources/vector-store settings.
   - Verify: focused storage migration/deletion tests; full pytest.
