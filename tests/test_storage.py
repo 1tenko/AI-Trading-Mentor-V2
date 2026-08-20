@@ -29,3 +29,28 @@ def test_storage_registers_a_source_once(tmp_path):
     assert storage.source_count() == 1
     assert storage.source_counts_by_year() == {2025: 1, 2026: 0}
     assert storage.source_for_file("file_jacob").modified_at == 1_700_000_000.0
+
+
+def test_storage_uses_the_first_question_as_a_label_for_untitled_conversations(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    thread_id = storage.create_thread("New conversation")
+    storage.append_thread_items(
+        thread_id,
+        [{"role": "user", "content": [{"type": "input_text", "text": "  Explain   Jacob's exact strategy please.  "}]}],
+    )
+
+    assert storage.threads()[0].title == "Explain Jacob's exact strategy please."
+
+
+def test_storage_omits_empty_untitled_drafts_from_the_conversation_list(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    storage.create_thread("New conversation")
+    titled_id = storage.create_thread("New conversation")
+    storage.append_thread_items(
+        titled_id,
+        [{"role": "user", "content": [{"type": "input_text", "text": "A real question"}]}],
+    )
+
+    assert [thread.title for thread in storage.threads()] == ["A real question"]

@@ -54,6 +54,11 @@ class Storage:
                     item_json TEXT NOT NULL,
                     PRIMARY KEY(thread_id, position)
                 );
+                CREATE TABLE IF NOT EXISTS response_diagnostics (
+                    response_id TEXT PRIMARY KEY,
+                    thread_id INTEGER NOT NULL REFERENCES threads(id),
+                    diagnostic_json TEXT NOT NULL
+                );
                 """
             )
             columns = {row[1] for row in connection.execute("PRAGMA table_info(sources)")}
@@ -149,9 +154,16 @@ class Storage:
     def threads(self) -> list[Thread]:
         with self._connect() as connection:
             rows = connection.execute(
-                "SELECT id, title FROM threads ORDER BY id DESC"
+                "SELECT threads.id, threads.title, ("
+                "SELECT item_json FROM thread_items "
+                "WHERE thread_id = threads.id ORDER BY position LIMIT 1"
+                ") FROM threads ORDER BY threads.id DESC"
             ).fetchall()
-        return [Thread(*row) for row in rows]
+        return [
+            Thread(row[0], label)
+            for row in rows
+            if (label := _thread_label(row[1], row[2])) != "New conversation"
+        ]
 
     def has_thread(self, thread_id: int) -> bool:
         with self._connect() as connection:
@@ -185,5 +197,35 @@ class Storage:
             ).fetchall()
         return [json.loads(row[0]) for row in rows]
 
+    def record_response_diagnostics(
+        self, thread_id: int, response_id: str, diagnostic: dict
+    ) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT OR REPLACE INTO response_diagnostics(response_id, thread_id, diagnostic_json) "
+                "VALUES (?, ?, ?)",
+                (response_id, thread_id, json.dumps(diagnostic)),
+            )
+
+    def response_diagnostics(self, thread_id: int) -> list[dict]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT diagnostic_json FROM response_diagnostics WHERE thread_id = ? ORDER BY rowid",
+                (thread_id,),
+            ).fetchall()
+        return [json.loads(row[0]) for row in rows]
+
     def _connect(self) -> sqlite3.Connection:
         return sqlite3.connect(self.database_path)
+
+
+def _thread_label(title: str, first_item_json: str | None) -> str:
+    if title != "New conversation" or not first_item_json:
+        return title
+    try:
+        item = json.loads(first_item_json)
+        text = item["content"][0]["text"]
+    except (IndexError, KeyError, TypeError, json.JSONDecodeError):
+        return title
+    compact = " ".join(str(text).split())
+    return f"{compact[:55]}…" if len(compact) > 56 else compact or title

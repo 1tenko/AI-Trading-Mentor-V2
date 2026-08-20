@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlparse
 
-from mentor.chat_service import Answer
+from mentor.chat_service import Answer, EvaluationConfig
 from mentor.storage import Storage
 
 MAX_JSON_BYTES = 16_384
@@ -75,7 +75,7 @@ class _Handler(BaseHTTPRequestHandler):
                     self._send_json(HTTPStatus.NOT_FOUND, {"error": "Conversation not found."})
                     return
                 if hasattr(self.chat_service, "stream_reply"):
-                    self._stream_answer(thread_id, question)
+                    self._stream_answer(thread_id, question, _evaluation(body.get("evaluation")))
                 else:
                     self._send_json(HTTPStatus.OK, _answer_json(self.chat_service.reply(thread_id, question)))
                 return
@@ -98,17 +98,21 @@ class _Handler(BaseHTTPRequestHandler):
             return
         self._send_bytes(HTTPStatus.OK, path.read_bytes(), "text/plain; charset=utf-8")
 
-    def _stream_answer(self, thread_id: int, question: str) -> None:
+    def _stream_answer(
+        self, thread_id: int, question: str, evaluation: EvaluationConfig
+    ) -> None:
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.send_header("Cache-Control", "no-cache")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("X-Frame-Options", "DENY")
         self.end_headers()
-        for event in self.chat_service.stream_reply(thread_id, question):
+        for event in self.chat_service.stream_reply(thread_id, question, evaluation):
             body = {"type": event.type, "text": event.text}
             if event.answer is not None:
                 body["answer"] = _answer_json(event.answer)
+            if event.incomplete_reason is not None:
+                body["incomplete_reason"] = event.incomplete_reason
             self.wfile.write(f"data: {json.dumps(body)}\n\n".encode())
             self.wfile.flush()
 
@@ -162,4 +166,18 @@ def _answer_json(answer: Answer) -> dict:
         "text": answer.text,
         "citations": [citation.__dict__ for citation in answer.citations],
         "evidence": [evidence.__dict__ for evidence in answer.evidence],
+        "diagnostics": None if answer.diagnostics is None else answer.diagnostics.__dict__,
+        "incomplete_reason": answer.incomplete_reason,
     }
+
+
+def _evaluation(value: object) -> EvaluationConfig:
+    if value is None:
+        return EvaluationConfig()
+    if not isinstance(value, dict):
+        raise ValueError("Evaluation settings must be an object.")
+    effort = value.get("reasoning_effort", "high")
+    mode = value.get("reasoning_mode", "standard")
+    if not isinstance(effort, str) or not isinstance(mode, str):
+        raise ValueError("Evaluation settings must be text.")
+    return EvaluationConfig(effort, mode)

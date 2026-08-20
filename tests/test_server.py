@@ -12,7 +12,11 @@ class FakeChatService:
 
 
 class StreamingFakeChatService:
-    def stream_reply(self, thread_id, question):
+    def __init__(self):
+        self.evaluation = None
+
+    def stream_reply(self, thread_id, question, evaluation):
+        self.evaluation = evaluation
         yield StreamEvent("delta", "A")
         yield StreamEvent("complete", answer=Answer(text="A", citations=[], evidence=[]))
 
@@ -78,7 +82,8 @@ def test_server_streams_chat_events(tmp_path):
     storage = Storage(tmp_path / "mentor.sqlite3")
     storage.initialize()
     thread_id = storage.create_thread("Plan")
-    server = create_server(storage, StreamingFakeChatService(), port=0)
+    chat_service = StreamingFakeChatService()
+    server = create_server(storage, chat_service, port=0)
     worker = threading.Thread(target=server.serve_forever)
     worker.start()
     try:
@@ -86,12 +91,14 @@ def test_server_streams_chat_events(tmp_path):
             server,
             "POST",
             f"/api/threads/{thread_id}/messages",
-            b'{"question":"Hello"}',
+            b'{"question":"Hello","evaluation":{"reasoning_effort":"xhigh","reasoning_mode":"pro"}}',
         )
         assert status == 200
         assert headers["Content-Type"] == "text/event-stream; charset=utf-8"
         assert b'"type": "delta"' in body
         assert b'"type": "complete"' in body
+        assert chat_service.evaluation.reasoning_effort == "xhigh"
+        assert chat_service.evaluation.reasoning_mode == "pro"
     finally:
         server.shutdown()
         worker.join()

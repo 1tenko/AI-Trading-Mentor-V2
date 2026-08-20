@@ -1,10 +1,38 @@
 """Grounded, stateless Responses API chat for the Phase 1 proof."""
 
 from dataclasses import dataclass
+from time import perf_counter
 from typing import Any
+from uuid import uuid4
 
 from mentor.prompts import MENTOR_INSTRUCTIONS
 from mentor.storage import Storage
+
+
+MAX_OUTPUT_TOKENS = 25_000
+SUPPORTED_REASONING_EFFORTS = frozenset({"high", "xhigh", "max"})
+SUPPORTED_REASONING_MODES = frozenset({"standard", "pro"})
+
+
+@dataclass(frozen=True)
+class EvaluationConfig:
+    reasoning_effort: str = "high"
+    reasoning_mode: str = "standard"
+
+    def __post_init__(self) -> None:
+        if self.reasoning_effort not in SUPPORTED_REASONING_EFFORTS:
+            raise ValueError("Reasoning effort must be high, xhigh, or max.")
+        if self.reasoning_mode not in SUPPORTED_REASONING_MODES:
+            raise ValueError("Reasoning mode must be standard or pro.")
+
+    def request_value(self) -> dict[str, str]:
+        value = {"effort": self.reasoning_effort}
+        if self.reasoning_mode == "pro":
+            value["mode"] = "pro"
+        return value
+
+
+DEFAULT_EVALUATION_CONFIG = EvaluationConfig()
 
 
 @dataclass(frozen=True)
@@ -23,10 +51,28 @@ class Evidence:
 
 
 @dataclass(frozen=True)
+class ResponseDiagnostics:
+    response_id: str
+    model: str
+    status: str
+    reasoning_effort: str
+    reasoning_mode: str
+    latency_ms: int
+    input_tokens: int | None
+    cached_input_tokens: int | None
+    output_tokens: int | None
+    reasoning_tokens: int | None
+    total_tokens: int | None
+    estimated_text_cost_usd: float | None
+
+
+@dataclass(frozen=True)
 class Answer:
     text: str
     citations: list[Citation]
     evidence: list[Evidence]
+    diagnostics: ResponseDiagnostics | None = None
+    incomplete_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -34,6 +80,7 @@ class StreamEvent:
     type: str
     text: str = ""
     answer: Answer | None = None
+    incomplete_reason: str | None = None
 
 
 class ChatService:
@@ -42,27 +89,45 @@ class ChatService:
         self.client = client
         self.model = model
 
-    def reply(self, thread_id: int, question: str) -> Answer:
-        user_item, request = self._request(thread_id, question)
+    def reply(
+        self,
+        thread_id: int,
+        question: str,
+        evaluation: EvaluationConfig = DEFAULT_EVALUATION_CONFIG,
+    ) -> Answer:
+        user_item, request = self._request(thread_id, question, evaluation)
+        started_at = perf_counter()
         response = self.client.responses.create(**request)
-        output = [_as_dict(item) for item in response.output]
-        self.storage.append_thread_items(thread_id, [user_item, *output])
-        return _answer(output)
+        return self._finalize(thread_id, user_item, response, evaluation, started_at)
 
-    def stream_reply(self, thread_id: int, question: str):
-        user_item, request = self._request(thread_id, question)
+    def stream_reply(
+        self,
+        thread_id: int,
+        question: str,
+        evaluation: EvaluationConfig = DEFAULT_EVALUATION_CONFIG,
+    ):
+        user_item, request = self._request(thread_id, question, evaluation)
+        started_at = perf_counter()
         stream = self.client.responses.create(**request, stream=True)
         for event in stream:
             if event.type == "response.output_text.delta":
                 yield StreamEvent("delta", event.delta)
-            elif event.type == "response.completed":
-                output = [_as_dict(item) for item in event.response.output]
-                self.storage.append_thread_items(thread_id, [user_item, *output])
-                yield StreamEvent("complete", answer=_answer(output))
+            elif event.type in {"response.completed", "response.incomplete"}:
+                answer = self._finalize(thread_id, user_item, event.response, evaluation, started_at)
+                if answer.incomplete_reason:
+                    yield StreamEvent(
+                        "incomplete",
+                        answer=answer,
+                        incomplete_reason=answer.incomplete_reason,
+                    )
+                else:
+                    yield StreamEvent("complete", answer=answer)
                 return
         raise RuntimeError("OpenAI ended the response stream without a completed response.")
 
-    def _request(self, thread_id: int, question: str) -> tuple[dict, dict]:
+    def _request(
+        self, thread_id: int, question: str, evaluation: EvaluationConfig
+    ) -> tuple[dict, dict]:
         question = _question(question)
         vector_store_id = self.storage.vector_store_id()
         if vector_store_id is None:
@@ -77,10 +142,30 @@ class ChatService:
             ],
             "tools": [{"type": "file_search", "vector_store_ids": [vector_store_id]}],
             "include": ["reasoning.encrypted_content", "file_search_call.results"],
-            "reasoning": {"effort": "high"},
-            "max_output_tokens": 4_000,
+            "reasoning": evaluation.request_value(),
+            "max_output_tokens": MAX_OUTPUT_TOKENS,
             "store": False,
         }
+
+    def _finalize(
+        self,
+        thread_id: int,
+        user_item: dict,
+        response: Any,
+        evaluation: EvaluationConfig,
+        started_at: float,
+    ) -> Answer:
+        output = [_as_dict(item) for item in response.output]
+        self.storage.append_thread_items(thread_id, [user_item, *output])
+        diagnostics = _diagnostics(response, self.model, evaluation, started_at)
+        self.storage.record_response_diagnostics(
+            thread_id, diagnostics.response_id, diagnostics.__dict__
+        )
+        return _answer(
+            output,
+            diagnostics=diagnostics,
+            incomplete_reason=_incomplete_reason(response),
+        )
 
 
 def _question(question: str) -> str:
@@ -103,7 +188,11 @@ def _input_item(item: dict) -> dict:
     return {key: value for key, value in item.items() if key != "status"}
 
 
-def _answer(output: list[dict]) -> Answer:
+def _answer(
+    output: list[dict],
+    diagnostics: ResponseDiagnostics | None = None,
+    incomplete_reason: str | None = None,
+) -> Answer:
     text_parts: list[str] = []
     citations: list[Citation] = []
     evidence: list[Evidence] = []
@@ -134,4 +223,75 @@ def _answer(output: list[dict]) -> Answer:
                     )
                     if citation not in citations:
                         citations.append(citation)
-    return Answer(text="".join(text_parts), citations=citations, evidence=evidence)
+    return Answer(
+        text="".join(text_parts),
+        citations=citations,
+        evidence=evidence,
+        diagnostics=diagnostics,
+        incomplete_reason=incomplete_reason,
+    )
+
+
+def _incomplete_reason(response: Any) -> str | None:
+    if _field(response, "status") != "incomplete":
+        return None
+    return _field(_field(response, "incomplete_details"), "reason") or "unknown"
+
+
+def _diagnostics(
+    response: Any, model: str, evaluation: EvaluationConfig, started_at: float
+) -> ResponseDiagnostics:
+    usage = _field(response, "usage")
+    input_details = _field(usage, "input_tokens_details")
+    output_details = _field(usage, "output_tokens_details")
+    input_tokens = _int_or_none(_field(usage, "input_tokens"))
+    cached_input_tokens = _int_or_none(_field(input_details, "cached_tokens"))
+    cache_write_tokens = _int_or_none(_field(input_details, "cache_write_tokens")) or 0
+    output_tokens = _int_or_none(_field(usage, "output_tokens"))
+    response_model = str(_field(response, "model") or model)
+    estimate = _estimate_text_cost(
+        response_model, input_tokens, cached_input_tokens, cache_write_tokens, output_tokens
+    )
+    return ResponseDiagnostics(
+        response_id=str(_field(response, "id") or f"local-{uuid4()}"),
+        model=response_model,
+        status=str(_field(response, "status") or "completed"),
+        reasoning_effort=evaluation.reasoning_effort,
+        reasoning_mode=evaluation.reasoning_mode,
+        latency_ms=round((perf_counter() - started_at) * 1_000),
+        input_tokens=input_tokens,
+        cached_input_tokens=cached_input_tokens,
+        output_tokens=output_tokens,
+        reasoning_tokens=_int_or_none(_field(output_details, "reasoning_tokens")),
+        total_tokens=_int_or_none(_field(usage, "total_tokens")),
+        estimated_text_cost_usd=estimate,
+    )
+
+
+def _estimate_text_cost(
+    model: str,
+    input_tokens: int | None,
+    cached_input_tokens: int | None,
+    cache_write_tokens: int,
+    output_tokens: int | None,
+) -> float | None:
+    if model != "gpt-5.6-sol" or input_tokens is None or output_tokens is None:
+        return None
+    uncached_input = max(input_tokens - (cached_input_tokens or 0) - cache_write_tokens, 0)
+    estimate = (
+        uncached_input * 5 / 1_000_000
+        + (cached_input_tokens or 0) * 0.5 / 1_000_000
+        + cache_write_tokens * 6.25 / 1_000_000
+        + output_tokens * 30 / 1_000_000
+    )
+    return round(estimate, 6)
+
+
+def _field(value: Any, name: str) -> Any:
+    if isinstance(value, dict):
+        return value.get(name)
+    return getattr(value, name, None)
+
+
+def _int_or_none(value: Any) -> int | None:
+    return int(value) if isinstance(value, int | float) else None

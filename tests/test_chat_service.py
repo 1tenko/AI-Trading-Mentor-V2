@@ -1,6 +1,8 @@
 from types import SimpleNamespace
 
-from mentor.chat_service import ChatService
+import pytest
+
+from mentor.chat_service import ChatService, EvaluationConfig
 from mentor.prompts import MENTOR_INSTRUCTIONS
 from mentor.storage import Storage
 
@@ -76,7 +78,8 @@ def test_reply_persists_continuation_state_and_extracts_evidence(tmp_path):
         "file_search_call.results",
     ]
     assert request["tools"] == [{"type": "file_search", "vector_store_ids": ["vs_jacob"]}]
-    assert request["max_output_tokens"] == 4_000
+    assert request["max_output_tokens"] == 25_000
+    assert request["reasoning"] == {"effort": "high"}
 
 
 def test_reply_replays_prior_response_items_and_rejects_blank_questions(tmp_path):
@@ -146,6 +149,64 @@ def test_stream_reply_relays_deltas_then_persists_completed_response(tmp_path):
     assert responses.calls[0]["stream"] is True
 
 
+def test_stream_reply_marks_an_output_limit_response_incomplete_and_records_diagnostics(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    storage.set_vector_store("vs_jacob")
+    thread_id = storage.create_thread("Question")
+    response = SimpleNamespace(
+        id="resp_incomplete",
+        model="gpt-5.6-sol",
+        status="incomplete",
+        incomplete_details=SimpleNamespace(reason="max_output_tokens"),
+        usage=SimpleNamespace(
+            input_tokens=100,
+            output_tokens=200,
+            total_tokens=300,
+            input_tokens_details=SimpleNamespace(cached_tokens=0),
+            output_tokens_details=SimpleNamespace(reasoning_tokens=150),
+        ),
+        output=[
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "Partial answer."}],
+            }
+        ],
+    )
+    responses = FakeResponses(
+        [
+            SimpleNamespace(type="response.output_text.delta", delta="Partial answer."),
+            SimpleNamespace(type="response.incomplete", response=response),
+        ]
+    )
+
+    events = list(ChatService(storage, SimpleNamespace(responses=responses)).stream_reply(thread_id, "Question"))
+
+    assert [event.type for event in events] == ["delta", "incomplete"]
+    assert events[-1].incomplete_reason == "max_output_tokens"
+    assert events[-1].answer.text == "Partial answer."
+    assert storage.thread_items(thread_id)[-1] == response.output[0]
+    assert storage.response_diagnostics(thread_id)[0]["status"] == "incomplete"
+
+
+def test_evaluation_configuration_validates_and_reaches_the_responses_request(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    storage.set_vector_store("vs_jacob")
+    thread_id = storage.create_thread("Question")
+    responses = FakeResponses(SimpleNamespace(output=[]))
+    service = ChatService(storage, SimpleNamespace(responses=responses))
+
+    service.reply(thread_id, "Question", evaluation=EvaluationConfig("xhigh", "pro"))
+
+    assert responses.calls[0]["reasoning"] == {"effort": "xhigh", "mode": "pro"}
+    with pytest.raises(ValueError, match="Reasoning effort"):
+        EvaluationConfig("low", "standard")
+    with pytest.raises(ValueError, match="Reasoning mode"):
+        EvaluationConfig("high", "fast")
+
+
 def test_reply_replays_complete_state_without_response_only_status_fields(tmp_path):
     storage = Storage(tmp_path / "mentor.sqlite3")
     storage.initialize()
@@ -173,3 +234,6 @@ def test_policy_reserves_direct_teaching_for_affirmative_source_claims():
     assert "Direct source teaching requires" in MENTOR_INSTRUCTIONS
     assert "affirmative source claim." in MENTOR_INSTRUCTIONS
     assert "Do not label missing evidence or an unsupported claim" in MENTOR_INSTRUCTIONS
+    assert "all, every, exact, exhaustive" in MENTOR_INSTRUCTIONS
+    assert "each material subquestion" in MENTOR_INSTRUCTIONS
+    assert "each requested year independently" in MENTOR_INSTRUCTIONS
