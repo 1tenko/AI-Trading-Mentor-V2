@@ -1,4 +1,5 @@
 import http.client
+import json
 import threading
 
 from mentor.chat_service import Answer, StreamEvent
@@ -91,7 +92,7 @@ def test_server_streams_chat_events(tmp_path):
             server,
             "POST",
             f"/api/threads/{thread_id}/messages",
-            b'{"question":"Hello","evaluation":{"reasoning_effort":"xhigh","reasoning_mode":"pro"}}',
+            b'{"question":"Hello","evaluation":{"reasoning_effort":"xhigh","reasoning_mode":"pro","research_depth":"deep"}}',
         )
         assert status == 200
         assert headers["Content-Type"] == "text/event-stream; charset=utf-8"
@@ -99,6 +100,7 @@ def test_server_streams_chat_events(tmp_path):
         assert b'"type": "complete"' in body
         assert chat_service.evaluation.reasoning_effort == "xhigh"
         assert chat_service.evaluation.reasoning_mode == "pro"
+        assert chat_service.evaluation.research_depth == "deep"
     finally:
         server.shutdown()
         worker.join()
@@ -132,6 +134,79 @@ def test_server_serves_the_external_stylesheet(tmp_path):
         assert status == 200
         assert headers["Content-Type"] == "text/css; charset=utf-8"
         assert b".app" in body
+    finally:
+        server.shutdown()
+        worker.join()
+
+
+def test_server_restores_only_safe_display_turns_and_permanently_deletes_one_thread(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    storage.set_vector_store("vs_jacob")
+    storage.register_source(
+        relative_path="lesson.txt",
+        filename="lesson.txt",
+        year=2026,
+        local_path=str(tmp_path / "lesson.txt"),
+        modified_at=1.0,
+        file_id="file_jacob",
+        vector_store_file_id="vsf_jacob",
+    )
+    thread_id = storage.create_thread("Question")
+    storage.append_thread_items(
+        thread_id,
+        [
+            {"role": "user", "content": [{"type": "input_text", "text": "Question"}]},
+            {"type": "reasoning", "encrypted_content": "must never reach the browser"},
+        ],
+    )
+    storage.record_display_turn(
+        thread_id,
+        user_text="Question",
+        answer_markdown="Answer",
+        citations=[],
+        evidence=[],
+        diagnostics={"model": "gpt-5.6-sol"},
+        response_id="resp_1",
+        status="completed",
+        incomplete_reason=None,
+    )
+    server = create_server(storage, FakeChatService(), port=0)
+    worker = threading.Thread(target=server.serve_forever)
+    worker.start()
+    try:
+        status, _, body = request(server, "GET", f"/api/threads/{thread_id}")
+        payload = json.loads(body)
+        assert status == 200
+        assert payload == {
+            "id": thread_id,
+            "title": "Question",
+            "turns": [
+                {
+                    "turn_number": 1,
+                    "user_text": "Question",
+                    "answer_markdown": "Answer",
+                    "citations": [],
+                    "evidence": [],
+                    "diagnostics": {"model": "gpt-5.6-sol"},
+                    "response_id": "resp_1",
+                    "status": "completed",
+                    "incomplete_reason": None,
+                }
+            ],
+        }
+        assert b"encrypted_content" not in body
+        assert b"must never reach" not in body
+        assert request(server, "GET", "/api/threads/999")[0] == 404
+
+        status, _, body = request(server, "DELETE", f"/api/threads/{thread_id}")
+        assert status == 200
+        assert json.loads(body) == {"deleted": True}
+        assert request(server, "GET", f"/api/threads/{thread_id}")[0] == 404
+        assert storage.source_count() == 1
+        assert storage.vector_store_id() == "vs_jacob"
+        assert request(server, "DELETE", f"/api/threads/{thread_id}")[0] == 404
+        assert request(server, "DELETE", "/api/threads/not-an-id")[0] == 404
     finally:
         server.shutdown()
         worker.join()

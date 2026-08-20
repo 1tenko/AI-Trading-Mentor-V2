@@ -15,14 +15,14 @@ plan. All work remains on feature/phase-2-unified-mentor.
   - Verify: focused storage migration/deletion tests; full pytest.
   - Depends on: none.
 
-- [ ] **Task 2 — Persist browser-safe display turns for new responses**
+- [x] **Task 2 — Persist browser-safe display turns for new responses**
   - Acceptance: every completed/incomplete turn has Markdown, evidence,
     diagnostics, historical configuration, and raw replay positions; encrypted
     reasoning remains server-only.
   - Verify: API-shaped chat-service fixtures; full pytest.
   - Depends on: Task 1.
 
-- [ ] **Task 3 — Safe restore and permanent-delete HTTP API**
+- [x] **Task 3 — Safe restore and permanent-delete HTTP API**
   - Acceptance: timeline GET is browser-safe and side-effect free; DELETE is
     local-only, transactional, and preserves sources.
   - Verify: HTTP restore/delete/security tests; full pytest.
@@ -37,13 +37,13 @@ plan. All work remains on feature/phase-2-unified-mentor.
 
 ## mentor-orchestration
 
-- [ ] **Task 4 — Unified turn composition and research-depth policy**
+- [x] **Task 4 — Unified turn composition and research-depth policy**
   - Acceptance: one Jacob capability seam; Auto/Normal/Deep/Exhaustive remains
     independent from reasoning effort/mode; no future capability is built.
   - Verify: request/policy/provenance fixtures; full pytest.
   - Depends on: Checkpoint A.
 
-- [ ] **Task 5 — Compact evidence and truthful usage diagnostics**
+- [x] **Task 5 — Compact evidence and truthful usage diagnostics**
   - Acceptance: retain all native evidence and research counts; retain accurate
     historical configuration; do not invent unavailable platform cost.
   - Verify: multi-search and missing-usage fixtures; full pytest.

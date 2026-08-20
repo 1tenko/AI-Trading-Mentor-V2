@@ -1,6 +1,7 @@
 """Grounded, stateless Responses API chat for the Phase 1 proof."""
 
 from dataclasses import dataclass
+import re
 from time import perf_counter
 from typing import Any
 from uuid import uuid4
@@ -12,18 +13,22 @@ from mentor.storage import Storage
 MAX_OUTPUT_TOKENS = 25_000
 SUPPORTED_REASONING_EFFORTS = frozenset({"high", "xhigh", "max"})
 SUPPORTED_REASONING_MODES = frozenset({"standard", "pro"})
+SUPPORTED_RESEARCH_DEPTHS = frozenset({"auto", "normal", "deep", "exhaustive"})
 
 
 @dataclass(frozen=True)
 class EvaluationConfig:
     reasoning_effort: str = "high"
     reasoning_mode: str = "standard"
+    research_depth: str = "auto"
 
     def __post_init__(self) -> None:
         if self.reasoning_effort not in SUPPORTED_REASONING_EFFORTS:
             raise ValueError("Reasoning effort must be high, xhigh, or max.")
         if self.reasoning_mode not in SUPPORTED_REASONING_MODES:
             raise ValueError("Reasoning mode must be standard or pro.")
+        if self.research_depth not in SUPPORTED_RESEARCH_DEPTHS:
+            raise ValueError("Research depth must be auto, normal, deep, or exhaustive.")
 
     def request_value(self) -> dict[str, str]:
         value = {"effort": self.reasoning_effort}
@@ -57,6 +62,13 @@ class ResponseDiagnostics:
     status: str
     reasoning_effort: str
     reasoning_mode: str
+    requested_research_depth: str
+    effective_research_depth: str
+    file_search_calls: int
+    file_search_queries: list[str]
+    returned_evidence_count: int
+    cited_evidence_count: int
+    file_search_cost_status: str
     latency_ms: int
     input_tokens: int | None
     cached_input_tokens: int | None
@@ -95,10 +107,10 @@ class ChatService:
         question: str,
         evaluation: EvaluationConfig = DEFAULT_EVALUATION_CONFIG,
     ) -> Answer:
-        user_item, request = self._request(thread_id, question, evaluation)
+        user_item, request, effective_depth = self._request(thread_id, question, evaluation)
         started_at = perf_counter()
         response = self.client.responses.create(**request)
-        return self._finalize(thread_id, user_item, response, evaluation, started_at)
+        return self._finalize(thread_id, user_item, response, evaluation, effective_depth, started_at)
 
     def stream_reply(
         self,
@@ -106,14 +118,16 @@ class ChatService:
         question: str,
         evaluation: EvaluationConfig = DEFAULT_EVALUATION_CONFIG,
     ):
-        user_item, request = self._request(thread_id, question, evaluation)
+        user_item, request, effective_depth = self._request(thread_id, question, evaluation)
         started_at = perf_counter()
         stream = self.client.responses.create(**request, stream=True)
         for event in stream:
             if event.type == "response.output_text.delta":
                 yield StreamEvent("delta", event.delta)
             elif event.type in {"response.completed", "response.incomplete"}:
-                answer = self._finalize(thread_id, user_item, event.response, evaluation, started_at)
+                answer = self._finalize(
+                    thread_id, user_item, event.response, evaluation, effective_depth, started_at
+                )
                 if answer.incomplete_reason:
                     yield StreamEvent(
                         "incomplete",
@@ -127,15 +141,16 @@ class ChatService:
 
     def _request(
         self, thread_id: int, question: str, evaluation: EvaluationConfig
-    ) -> tuple[dict, dict]:
+    ) -> tuple[dict, dict, str]:
         question = _question(question)
         vector_store_id = self.storage.vector_store_id()
         if vector_store_id is None:
             raise RuntimeError("Import the Jacob transcripts before starting a chat.")
         user_item = {"role": "user", "content": [{"type": "input_text", "text": question}]}
+        effective_depth = _effective_research_depth(question, evaluation.research_depth)
         return user_item, {
             "model": self.model,
-            "instructions": MENTOR_INSTRUCTIONS,
+            "instructions": f"{MENTOR_INSTRUCTIONS}\n\n{_research_instruction(effective_depth)}",
             "input": [
                 *(_input_item(item) for item in self.storage.thread_items(thread_id)),
                 user_item,
@@ -145,7 +160,7 @@ class ChatService:
             "reasoning": evaluation.request_value(),
             "max_output_tokens": MAX_OUTPUT_TOKENS,
             "store": False,
-        }
+        }, effective_depth
 
     def _finalize(
         self,
@@ -153,19 +168,39 @@ class ChatService:
         user_item: dict,
         response: Any,
         evaluation: EvaluationConfig,
+        effective_depth: str,
         started_at: float,
     ) -> Answer:
         output = [_as_dict(item) for item in response.output]
-        self.storage.append_thread_items(thread_id, [user_item, *output])
-        diagnostics = _diagnostics(response, self.model, evaluation, started_at)
+        raw_positions = self.storage.append_thread_items(thread_id, [user_item, *output])
+        answer = _answer(output, incomplete_reason=_incomplete_reason(response))
+        diagnostics = _diagnostics(
+            response, self.model, evaluation, effective_depth, output, answer, started_at
+        )
         self.storage.record_response_diagnostics(
             thread_id, diagnostics.response_id, diagnostics.__dict__
         )
-        return _answer(
-            output,
+        answer = Answer(
+            text=answer.text,
+            citations=answer.citations,
+            evidence=answer.evidence,
             diagnostics=diagnostics,
-            incomplete_reason=_incomplete_reason(response),
+            incomplete_reason=answer.incomplete_reason,
         )
+        self.storage.record_display_turn(
+            thread_id,
+            user_text=user_item["content"][0]["text"],
+            answer_markdown=answer.text,
+            citations=[citation.__dict__ for citation in answer.citations],
+            evidence=[evidence.__dict__ for evidence in answer.evidence],
+            diagnostics=diagnostics.__dict__,
+            response_id=diagnostics.response_id,
+            status=diagnostics.status,
+            incomplete_reason=answer.incomplete_reason,
+            raw_start_position=None if raw_positions is None else raw_positions[0],
+            raw_end_position=None if raw_positions is None else raw_positions[1],
+        )
+        return answer
 
 
 def _question(question: str) -> str:
@@ -239,7 +274,13 @@ def _incomplete_reason(response: Any) -> str | None:
 
 
 def _diagnostics(
-    response: Any, model: str, evaluation: EvaluationConfig, started_at: float
+    response: Any,
+    model: str,
+    evaluation: EvaluationConfig,
+    effective_depth: str,
+    output: list[dict],
+    answer: Answer,
+    started_at: float,
 ) -> ResponseDiagnostics:
     usage = _field(response, "usage")
     input_details = _field(usage, "input_tokens_details")
@@ -249,6 +290,7 @@ def _diagnostics(
     cache_write_tokens = _int_or_none(_field(input_details, "cache_write_tokens")) or 0
     output_tokens = _int_or_none(_field(usage, "output_tokens"))
     response_model = str(_field(response, "model") or model)
+    file_search_calls, file_search_queries = _file_search_details(output)
     estimate = _estimate_text_cost(
         response_model, input_tokens, cached_input_tokens, cache_write_tokens, output_tokens
     )
@@ -258,6 +300,13 @@ def _diagnostics(
         status=str(_field(response, "status") or "completed"),
         reasoning_effort=evaluation.reasoning_effort,
         reasoning_mode=evaluation.reasoning_mode,
+        requested_research_depth=evaluation.research_depth,
+        effective_research_depth=effective_depth,
+        file_search_calls=file_search_calls,
+        file_search_queries=file_search_queries,
+        returned_evidence_count=len(answer.evidence),
+        cited_evidence_count=len(answer.citations),
+        file_search_cost_status="unknown",
         latency_ms=round((perf_counter() - started_at) * 1_000),
         input_tokens=input_tokens,
         cached_input_tokens=cached_input_tokens,
@@ -295,3 +344,37 @@ def _field(value: Any, name: str) -> Any:
 
 def _int_or_none(value: Any) -> int | None:
     return int(value) if isinstance(value, int | float) else None
+
+
+def _effective_research_depth(question: str, requested_depth: str) -> str:
+    if requested_depth != "auto":
+        return requested_depth
+    normalized = question.casefold()
+    if re.search(r"\b(all|every|everything|complete|exhaustive)\b|exact list|full mapping|compare all", normalized):
+        return "exhaustive"
+    if re.search(r"\b(verify|verification|compare|comparison|relationship|why)\b", normalized):
+        return "deep"
+    return "normal"
+
+
+def _research_instruction(depth: str) -> str:
+    if depth == "normal":
+        policy = "Use one focused native File Search when fresh evidence is needed; continue only if evidence is insufficient."
+    elif depth == "deep":
+        policy = "Use multiple model-chosen native File Search passes when useful, varying queries or source angles."
+    else:
+        policy = (
+            "Research a candidate answer, then use a complementary native File Search pass to find omissions, exceptions, "
+            "alternate timeframes, or related lessons before claiming completeness. Do not exceed four passes."
+        )
+    return f"Research depth: {depth.title()}. {policy} This depth controls research only; it does not change reasoning effort or mode."
+
+
+def _file_search_details(output: list[dict]) -> tuple[int, list[str]]:
+    searches = [item for item in output if item.get("type") == "file_search_call"]
+    return len(searches), [
+        query
+        for item in searches
+        for query in item.get("queries") or []
+        if isinstance(query, str)
+    ]

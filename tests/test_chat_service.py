@@ -30,6 +30,7 @@ def test_reply_persists_continuation_state_and_extracts_evidence(tmp_path):
             },
             {
                 "type": "file_search_call",
+                "queries": ["Jacob patience"],
                 "results": [
                     {
                         "file_id": "file_2025",
@@ -70,6 +71,47 @@ def test_reply_persists_continuation_state_and_extracts_evidence(tmp_path):
     assert storage.thread_items(thread_id) == [
         {"role": "user", "content": [{"type": "input_text", "text": "What does Jacob teach?"}]},
         *response.output,
+    ]
+    assert storage.display_turns(thread_id) == [
+        {
+            "turn_number": 1,
+            "user_text": "What does Jacob teach?",
+            "answer_markdown": "Jacob teaches patience.",
+            "citations": [{"file_id": "file_2025", "filename": "lesson.txt"}],
+            "evidence": [
+                {
+                    "file_id": "file_2025",
+                    "filename": "lesson.txt",
+                    "excerpt": "Jacob explains the setup here.",
+                    "year": "2025",
+                    "metadata": {"year": "2025", "relative_path": "2025/lesson.txt"},
+                }
+            ],
+            "diagnostics": {
+                "response_id": storage.response_diagnostics(thread_id)[0]["response_id"],
+                "model": "gpt-5.6-sol",
+                "status": "completed",
+                "reasoning_effort": "high",
+                "reasoning_mode": "standard",
+                "requested_research_depth": "auto",
+                "effective_research_depth": "normal",
+                "file_search_calls": 1,
+                "file_search_queries": ["Jacob patience"],
+                "returned_evidence_count": 1,
+                "cited_evidence_count": 1,
+                "file_search_cost_status": "unknown",
+                "latency_ms": storage.response_diagnostics(thread_id)[0]["latency_ms"],
+                "input_tokens": None,
+                "cached_input_tokens": None,
+                "output_tokens": None,
+                "reasoning_tokens": None,
+                "total_tokens": None,
+                "estimated_text_cost_usd": None,
+            },
+            "response_id": storage.response_diagnostics(thread_id)[0]["response_id"],
+            "status": "completed",
+            "incomplete_reason": None,
+        }
     ]
     request = responses.calls[0]
     assert request["store"] is False
@@ -188,6 +230,9 @@ def test_stream_reply_marks_an_output_limit_response_incomplete_and_records_diag
     assert events[-1].answer.text == "Partial answer."
     assert storage.thread_items(thread_id)[-1] == response.output[0]
     assert storage.response_diagnostics(thread_id)[0]["status"] == "incomplete"
+    assert storage.display_turns(thread_id)[0]["answer_markdown"] == "Partial answer."
+    assert storage.display_turns(thread_id)[0]["status"] == "incomplete"
+    assert storage.display_turns(thread_id)[0]["incomplete_reason"] == "max_output_tokens"
 
 
 def test_evaluation_configuration_validates_and_reaches_the_responses_request(tmp_path):
@@ -205,6 +250,70 @@ def test_evaluation_configuration_validates_and_reaches_the_responses_request(tm
         EvaluationConfig("low", "standard")
     with pytest.raises(ValueError, match="Reasoning mode"):
         EvaluationConfig("high", "fast")
+
+
+def test_research_depth_is_independent_of_reasoning_and_persists_requested_and_effective_values(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    storage.set_vector_store("vs_jacob")
+    thread_id = storage.create_thread("Question")
+    responses = FakeResponses(SimpleNamespace(output=[]))
+    service = ChatService(storage, SimpleNamespace(responses=responses))
+
+    service.reply(thread_id, "What are ALL the timeframe alignments?", EvaluationConfig("high", "standard", "auto"))
+    service.reply(thread_id, "What is SMT?", EvaluationConfig("xhigh", "pro", "deep"))
+
+    assert "Research depth: Exhaustive" in responses.calls[0]["instructions"]
+    assert responses.calls[0]["reasoning"] == {"effort": "high"}
+    assert "Research depth: Deep" in responses.calls[1]["instructions"]
+    assert responses.calls[1]["reasoning"] == {"effort": "xhigh", "mode": "pro"}
+    assert [
+        (row["requested_research_depth"], row["effective_research_depth"])
+        for row in storage.response_diagnostics(thread_id)
+    ] == [("auto", "exhaustive"), ("deep", "deep")]
+    with pytest.raises(ValueError, match="Research depth"):
+        EvaluationConfig("high", "standard", "fast")
+
+
+def test_diagnostics_retains_multiple_native_file_search_queries_and_truthful_cost_status(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    storage.set_vector_store("vs_jacob")
+    thread_id = storage.create_thread("Question")
+    response = SimpleNamespace(
+        output=[
+            {
+                "type": "file_search_call",
+                "queries": ["SMT 2025", "SMT 2026"],
+                "results": [{"file_id": "file_1", "filename": "one.txt", "text": "One", "attributes": {}}],
+            },
+            {
+                "type": "file_search_call",
+                "queries": ["SMT exceptions"],
+                "results": [{"file_id": "file_2", "filename": "two.txt", "text": "Two", "attributes": {}}],
+            },
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": "Answer",
+                        "annotations": [{"type": "file_citation", "file_id": "file_2", "filename": "two.txt"}],
+                    }
+                ],
+            },
+        ]
+    )
+
+    ChatService(storage, SimpleNamespace(responses=FakeResponses(response))).reply(thread_id, "Question")
+
+    diagnostics = storage.display_turns(thread_id)[0]["diagnostics"]
+    assert diagnostics["file_search_calls"] == 2
+    assert diagnostics["file_search_queries"] == ["SMT 2025", "SMT 2026", "SMT exceptions"]
+    assert diagnostics["returned_evidence_count"] == 2
+    assert diagnostics["cited_evidence_count"] == 1
+    assert diagnostics["file_search_cost_status"] == "unknown"
 
 
 def test_reply_replays_complete_state_without_response_only_status_fields(tmp_path):

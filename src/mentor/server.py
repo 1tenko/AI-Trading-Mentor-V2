@@ -51,11 +51,32 @@ class _Handler(BaseHTTPRequestHandler):
                 {"threads": [thread.__dict__ for thread in self.storage.threads()]},
             )
             return
+        match = re.fullmatch(r"/api/threads/(\d+)", path)
+        if match:
+            thread = self.storage.thread(int(match.group(1)))
+            if thread is None:
+                self._send_json(HTTPStatus.NOT_FOUND, {"error": "Conversation not found."})
+                return
+            self._send_json(
+                HTTPStatus.OK,
+                {"id": thread.id, "title": thread.title, "turns": self.storage.display_turns(thread.id)},
+            )
+            return
         match = re.fullmatch(r"/api/sources/([^/]+)", path)
         if match and FILE_ID.fullmatch(unquote(match.group(1))):
             self._source(unquote(match.group(1)))
             return
         self._send_json(HTTPStatus.NOT_FOUND, {"error": "Not found."})
+
+    def do_DELETE(self) -> None:  # noqa: N802
+        match = re.fullmatch(r"/api/threads/(\d+)", urlparse(self.path).path)
+        if match is None:
+            self._send_json(HTTPStatus.NOT_FOUND, {"error": "Not found."})
+            return
+        if not self.storage.delete_thread(int(match.group(1))):
+            self._send_json(HTTPStatus.NOT_FOUND, {"error": "Conversation not found."})
+            return
+        self._send_json(HTTPStatus.OK, {"deleted": True})
 
     def do_POST(self) -> None:  # noqa: N802
         path = urlparse(self.path).path
@@ -179,6 +200,7 @@ def _evaluation(value: object) -> EvaluationConfig:
         raise ValueError("Evaluation settings must be an object.")
     effort = value.get("reasoning_effort", "high")
     mode = value.get("reasoning_mode", "standard")
-    if not isinstance(effort, str) or not isinstance(mode, str):
+    research_depth = value.get("research_depth", "auto")
+    if not isinstance(effort, str) or not isinstance(mode, str) or not isinstance(research_depth, str):
         raise ValueError("Evaluation settings must be text.")
-    return EvaluationConfig(effort, mode)
+    return EvaluationConfig(effort, mode, research_depth)

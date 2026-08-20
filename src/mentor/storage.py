@@ -188,6 +188,13 @@ class Storage:
             ).fetchone()
         return row is not None
 
+    def thread(self, thread_id: int) -> Thread | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT id, title FROM threads WHERE id = ?", (thread_id,)
+            ).fetchone()
+        return None if row is None else Thread(*row)
+
     def append_thread_items(self, thread_id: int, items: list[dict]) -> tuple[int, int] | None:
         if not items:
             return None
