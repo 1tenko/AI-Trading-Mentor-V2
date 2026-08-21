@@ -189,9 +189,75 @@ even where filenames, lesson titles, or timestamps are duplicated.
 ## 8. Derived-record model and provenance
 
 Every derived record has a stable record ID, candidate/published snapshot ID,
-record schema version, record type, content, related concept identifiers,
-supporting anchor IDs, dependencies, validation state, lifecycle state, and
-compiler provenance (model, prompt version, run ID, timestamps).
+record schema version, one typed semantic family, related concept identifiers,
+supporting anchor IDs, dependencies, validation/evidence state, lifecycle state,
+and compiler provenance (model, prompt version, run ID, timestamps).
+
+The record is not an unconstrained `content` blob. Its payload is exactly one
+of the small typed families below. A family may contain bounded canonical text
+for a statement or label, but not a long AI-written essay. Shared fields are
+explicit and machine-checkable; optional extensions use typed facets (for
+example an alias, example, exception, invalidation, or strategy implication)
+with a facet type, compact value, related record IDs, and anchor IDs. A new
+facet does not require a new table for every concept, but it must still conform
+to the record schema and validation rules.
+
+### 8.1 Typed semantic families
+
+**Claim** represents one bounded proposition or teaching candidate:
+
+- canonical statement;
+- subject/concept identity;
+- scope and context;
+- conditions or `applies_when` facets;
+- qualifiers/modality and polarity;
+- evidence state and derived kind;
+- temporal/year/course scope;
+- supporting anchor IDs; and
+- validation state and concise qualification.
+
+**Relationship** represents an explicit connection:
+
+- source concept/record ID;
+- relationship type;
+- target concept/record ID;
+- conditions, exceptions, and qualifiers;
+- supporting anchor IDs; and
+- derived kind and evidence state.
+
+**Procedure/sequence/hierarchy** represents ordered structure rather than
+prose:
+
+- ordered step/item IDs or compact typed items;
+- optional prerequisites;
+- branches and conditions where required;
+- scope; and
+- supporting anchor IDs.
+
+**Evolution** represents a comparison across source sets:
+
+- earlier scope/source-set ID;
+- later scope/source-set ID;
+- evolution classification;
+- evidence state;
+- supporting and competing anchor IDs; and
+- concise qualification.
+
+**Conflict/unresolved** represents uncertainty that must remain visible:
+
+- competing claim/record IDs;
+- relevant scopes and conditions;
+- reconciliation state;
+- evidence basis through anchor IDs and dependency IDs; and
+- unresolved questions where applicable.
+
+These families are generic and support aliases, examples, exceptions,
+invalidations, and strategy implications through typed facets and relationships.
+They do not encode Jacob-specific concepts. A strategy implication is
+`source_extracted_claim` only when the active raw source explicitly teaches the
+implication. If it is reasoned from Jacob material, it is
+`cross_source_synthesis` and must remain labelled as Source synthesis/inference.
+It must never become an extracted fact merely because it sounds reasonable.
 
 Its `derived_kind` is exactly one of:
 
@@ -208,7 +274,7 @@ example `depends_on`, `applies_when`, `exception_to`, `refines`,
 `contrasts_with`, `anticipates`, and `uses_internal_structure`), extensible by
 schema version, and not tailored to any named Jacob concept.
 
-### 8.1 Product provenance remains separate
+### 8.2 Product provenance remains separate
 
 Assimilation provenance is not final-answer provenance:
 
@@ -276,9 +342,18 @@ independent validation.
 Clustering starts from validated derived records and anchored raw context. It
 creates concepts and relations only when their inputs are explicit. A synthesis
 record stores its input record IDs, all transitive raw anchor IDs needed for
-inspection, the reconciliation rationale, and qualification level. It may state
-that teachings are related or appear to differ; it cannot relabel that result as
-raw Direct teaching.
+inspection, a concise **auditable justification**, and qualification level. The
+justification is a short evidence-based explanation such as “These teachings
+apply to different cycle contexts, so they are compatible.” It may state that
+teachings are related or appear to differ; it cannot relabel that result as raw
+Direct teaching.
+
+Persistent derived records must never store or expose hidden chain-of-thought,
+model scratchpads, long private reasoning traces, encrypted reasoning converted
+into prose, or internal deliberation logs. They store only the conclusion,
+concise auditable justification, raw anchor basis, qualification, and the
+reconciliation/evolution outcome. Numeric model confidence is not a schema
+field; use the defined evidence/qualification vocabulary instead.
 
 ## 10. Evolution, absence, and conflict discipline
 
@@ -294,7 +369,7 @@ sets. Its classification is one of:
 - `no_supported_classification`.
 
 Each classification includes its supporting anchors, observed-year coverage,
-competing evidence, and confidence/qualification. Later material is not assumed
+   competing evidence, and evidence state/qualification. Later material is not assumed
 to be new, better, or a replacement for earlier material.
 
 ### 10.2 Negative-claim vocabulary
@@ -429,6 +504,14 @@ a bounded orientation object:
 - source-anchor IDs and source areas to verify; and
 - snapshot/version identity.
 
+Orientation is deliberately bounded. The server must deduplicate results by
+record ID and concept identity, enforce a strict per-turn record and token
+budget, return concise typed records rather than raw transcript dumps, and omit
+the wholesale concept graph. The exact numeric budget is selected and measured
+during implementation planning/evaluation; the design requires the budget and
+deduplication behavior, not a prematurely fixed number. Raw source text belongs
+in raw verification, never in the orientation payload.
+
 It does not return a raw-source citation, does not fabricate a file citation,
 and does not present itself as a Jacob transcript. The Responses API supports
 built-in tools and application-defined function calls; the function boundary is
@@ -445,15 +528,21 @@ replay.
 ## 14. Query-time Mentor policy
 
 1. Resolve one published snapshot pair at the start of the turn.
-2. For broad, comparative, multi-concept, evolutionary, or synthesis questions,
-   the model may call derived orientation to identify concepts, caveats, and
-   likely raw-source areas.
-3. For substantive factual claims, Direct source teaching, corrections, source
+2. When a valid published derived snapshot exists, broad, comparative,
+   evolutionary, multi-concept, relationship-heavy, and exhaustive questions
+   **must normally consult assimilated orientation before broad raw-source
+   research**, unless the model has a concrete reason the derived layer is
+   irrelevant. This includes questions such as “teach me everything about X,”
+   “compare X and Y,” “how do A, B, and C work together,” “what changed between
+   years,” “what concepts affect X,” and “how does Jacob's system fit together?”
+3. Narrow direct-source questions do not require orientation. Definitions,
+   exact source locations, and timestamp requests may go directly to raw search.
+4. For substantive factual claims, Direct source teaching, corrections, source
    comparisons, exhaustive assertions, or exact-source/timestamp requests, the
    model must verify against the active raw store using native File Search.
-4. The model produces the answer with Phase 2 provenance labels and native raw
+5. The model produces the answer with Phase 2 provenance labels and native raw
    citations where Direct source teaching is claimed.
-5. The UI keeps raw cited sources, raw retrieved passages, and derived
+6. The UI keeps raw cited sources, raw retrieved passages, and derived
    orientation/audit information visibly distinct.
 
 Specific rules:
@@ -471,10 +560,16 @@ Specific rules:
   answer; the record is flagged for correction/staleness, not defended.
 - If a required raw verification fails, the Mentor says the source does not
   establish the claim rather than citing a derived artifact.
+- Orientation is not forced into trivial questions solely to increase calls.
+- The Phase 3 evaluation records whether broad questions actually invoked
+  orientation and which records informed them; a Phase 3 answer that merely
+  reproduces Phase 2 raw-search behavior does not demonstrate assimilation.
 
 The current research-depth controls continue to govern future turns only.
-Exhaustive requests retain complementary raw-search passes; derived orientation
-can suggest omissions but cannot prove completeness.
+After orientation, exhaustive requests still require complementary raw-search
+passes, substantive claims still require raw verification and native raw
+citations, and raw disagreement overrides compiled knowledge. Derived
+orientation can suggest omissions but cannot prove completeness.
 
 ## 15. Assimilation Inspector
 
@@ -611,7 +706,8 @@ Run against the real Jacob corpus with results kept local/private:
 5. **Baseline comparison:** run the accepted Phase 2 Mentor and the Phase 3
    Mentor on the same representative set. Record correctness, completeness,
    source discipline, conceptual connection, year distinctions, correction
-   behavior, raw-search calls/passages, token use, latency, and estimated cost.
+   behavior, orientation calls/record IDs, raw-search calls/passages, token use,
+   latency, and estimated cost.
 6. **Adversarial set:** include fake Jacob claims, incompatible passages,
    refined-year cases, obscure details, exhaustive requests, exact timestamps,
    and prompts mixing direct teaching with AI inference.
