@@ -4,8 +4,9 @@ The binding design is
 [2026-08-20-trading-mentor-phase-2-design.md](../docs/superpowers/specs/2026-08-20-trading-mentor-phase-2-design.md).
 The detailed proposed execution plan is [plan.md](plan.md).
 
-**Status:** Tasks 1–8 complete on feature/phase-2-unified-mentor. Task 9 awaits
-Theo's human evaluation; do not begin Phase 3.
+**Status:** Tasks 1–8 and final technical hardening are complete on
+feature/phase-2-unified-mentor. Task 9 awaits Theo's human evaluation; do not
+begin Phase 3.
 
 ## conversation-lifecycle
 
@@ -92,6 +93,9 @@ Theo's human evaluation; do not begin Phase 3.
 ### Final checkpoint — Await Theo's Phase 2 decision
 
 - [x] All deterministic and browser checks pass.
+- [x] Native replay compaction, prompt-cache diagnostics, File Search result
+  budgets, evidence disclosure, and table overflow have passed technical and
+  controlled paid verification; see `docs/phase-2-evaluation.md`.
 - [x] The branch is committed and pushed.
 - [ ] Theo has made the human acceptance decision.
 - [ ] Stop: do not merge to main or begin Phase 3.

@@ -4,7 +4,13 @@ from types import SimpleNamespace
 
 import pytest
 
-from mentor.chat_service import ChatService, EvaluationConfig, _effective_research_depth
+from mentor.chat_service import (
+    ChatService,
+    EvaluationConfig,
+    FILE_SEARCH_RESULT_BUDGETS,
+    _input_item,
+    _effective_research_depth,
+)
 from mentor.prompts import MENTOR_INSTRUCTIONS
 from mentor.storage import Storage
 
@@ -101,14 +107,17 @@ def test_reply_persists_continuation_state_and_extracts_evidence(tmp_path):
                 "file_search_queries": ["Jacob patience"],
                 "returned_evidence_count": 1,
                 "cited_evidence_count": 1,
-                "file_search_cost_status": "unknown",
+                "file_search_cost_status": "known per-call charge; vector storage and other platform charges excluded",
                 "latency_ms": storage.response_diagnostics(thread_id)[0]["latency_ms"],
                 "input_tokens": None,
                 "cached_input_tokens": None,
+                "cache_write_tokens": None,
                 "output_tokens": None,
                 "reasoning_tokens": None,
                 "total_tokens": None,
                 "estimated_text_cost_usd": None,
+                "known_file_search_call_cost_usd": 0.0025,
+                "native_compaction_applied": False,
             },
             "response_id": storage.response_diagnostics(thread_id)[0]["response_id"],
             "status": "completed",
@@ -121,9 +130,12 @@ def test_reply_persists_continuation_state_and_extracts_evidence(tmp_path):
         "reasoning.encrypted_content",
         "file_search_call.results",
     ]
-    assert request["tools"] == [{"type": "file_search", "vector_store_ids": ["vs_jacob"]}]
+    assert request["tools"] == [
+        {"type": "file_search", "vector_store_ids": ["vs_jacob"], "max_num_results": 8}
+    ]
     assert request["max_output_tokens"] == 25_000
     assert request["reasoning"] == {"effort": "high"}
+    assert request["context_management"] == [{"type": "compaction", "compact_threshold": 50_000}]
 
 
 def test_reply_replays_prior_response_items_and_rejects_blank_questions(tmp_path):
@@ -315,7 +327,8 @@ def test_diagnostics_retains_multiple_native_file_search_queries_and_truthful_co
     assert diagnostics["file_search_queries"] == ["SMT 2025", "SMT 2026", "SMT exceptions"]
     assert diagnostics["returned_evidence_count"] == 2
     assert diagnostics["cited_evidence_count"] == 1
-    assert diagnostics["file_search_cost_status"] == "unknown"
+    assert diagnostics["file_search_cost_status"] == "known per-call charge; vector storage and other platform charges excluded"
+    assert diagnostics["known_file_search_call_cost_usd"] == 0.005
 
 
 def test_reply_replays_complete_state_without_response_only_status_fields(tmp_path):
@@ -375,3 +388,76 @@ def test_semantic_regression_fixtures_preserve_phase_1_research_and_provenance_p
     ] == [fixture["effective_depth"] for fixture in fixtures]
     assert "Direct source teaching requires" in MENTOR_INSTRUCTIONS
     assert "complementary File Search query" in MENTOR_INSTRUCTIONS
+
+
+def test_auto_research_depth_distinguishes_definitions_research_comparisons_and_exhaustive_requests():
+    assert _effective_research_depth("What is TPD?", "auto") == "normal"
+    assert _effective_research_depth("Research this again and verify it.", "auto") == "deep"
+    assert _effective_research_depth("What are the differences between 2025 and 2026 teachings?", "auto") == "deep"
+    assert _effective_research_depth("Tell me everything Jacob teaches about SMT.", "auto") == "exhaustive"
+
+
+def test_request_uses_a_smaller_native_result_budget_only_for_normal_research(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    storage.set_vector_store("vs_jacob")
+    thread_id = storage.create_thread("Question")
+    responses = FakeResponses(SimpleNamespace(output=[]))
+    service = ChatService(storage, SimpleNamespace(responses=responses))
+
+    service.reply(thread_id, "What is TPD?")
+    service.reply(thread_id, "Compare the 2025 and 2026 teachings.")
+    service.reply(thread_id, "What are all the TPD alignments?")
+
+    assert responses.calls[0]["tools"][0]["max_num_results"] == FILE_SEARCH_RESULT_BUDGETS["normal"]
+    assert responses.calls[1]["tools"][0]["max_num_results"] == FILE_SEARCH_RESULT_BUDGETS["deep"]
+    assert responses.calls[2]["tools"][0]["max_num_results"] == FILE_SEARCH_RESULT_BUDGETS["exhaustive"]
+
+
+def test_replay_omits_server_only_compaction_fields():
+    assert _input_item({"type": "compaction", "created_by": "server", "status": "completed"}) == {
+        "type": "compaction"
+    }
+
+
+def test_native_context_management_replaces_only_model_replay_when_openai_returns_a_compaction_item(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    storage.set_vector_store("vs_jacob")
+    thread_id = storage.create_thread("Question")
+    storage.append_thread_items(
+        thread_id,
+        [
+            {"role": "user", "content": [{"type": "input_text", "text": "Original question"}]},
+            {
+                "type": "file_search_call",
+                "results": [{"file_id": "file_1", "filename": "large.txt", "text": "x" * 450_000}],
+            },
+        ],
+    )
+    response = SimpleNamespace(
+        output=[
+            {"type": "compaction", "id": "cmp_1", "encrypted_content": "opaque-state"},
+            {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Follow-up."}]},
+        ],
+        usage=SimpleNamespace(
+            input_tokens=3_000,
+            output_tokens=100,
+            total_tokens=3_100,
+            input_tokens_details=SimpleNamespace(cached_tokens=2_000, cache_write_tokens=500),
+            output_tokens_details=SimpleNamespace(reasoning_tokens=50),
+        ),
+    )
+    responses = FakeResponses(response)
+
+    answer = ChatService(storage, SimpleNamespace(responses=responses)).reply(thread_id, "Where did that come from?")
+
+    assert responses.calls[0]["context_management"] == [{"type": "compaction", "compact_threshold": 50_000}]
+    assert any(item.get("type") == "file_search_call" for item in responses.calls[0]["input"])
+    assert responses.calls[0]["input"][-1]["content"][0]["text"] == "Where did that come from?"
+    assert answer.diagnostics.cache_write_tokens == 500
+    assert answer.diagnostics.native_compaction_applied is True
+    assert storage.thread_items(thread_id)[1]["type"] == "file_search_call"
+    replay_items = storage.replay_items(thread_id)
+    assert any(item.get("type") == "compaction" for item in replay_items)
+    assert not any(item.get("type") == "file_search_call" for item in replay_items)

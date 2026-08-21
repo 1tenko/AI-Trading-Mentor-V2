@@ -54,6 +54,12 @@ class Storage:
                     item_json TEXT NOT NULL,
                     PRIMARY KEY(thread_id, position)
                 );
+                CREATE TABLE IF NOT EXISTS thread_replay_items (
+                    thread_id INTEGER NOT NULL REFERENCES threads(id),
+                    position INTEGER NOT NULL,
+                    item_json TEXT NOT NULL,
+                    PRIMARY KEY(thread_id, position)
+                );
                 CREATE TABLE IF NOT EXISTS response_diagnostics (
                     response_id TEXT PRIMARY KEY,
                     thread_id INTEGER NOT NULL REFERENCES threads(id),
@@ -227,6 +233,43 @@ class Storage:
             ).fetchall()
         return [json.loads(row[0]) for row in rows]
 
+    def replay_items(self, thread_id: int) -> list[dict]:
+        """Return the model-only replay state, falling back to complete raw history."""
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT item_json FROM thread_replay_items WHERE thread_id = ? ORDER BY position",
+                (thread_id,),
+            ).fetchall()
+        return self.thread_items(thread_id) if not rows else [json.loads(row[0]) for row in rows]
+
+    def replace_replay_items(self, thread_id: int, items: list[dict]) -> None:
+        """Atomically replace only the server-owned model replay state."""
+        with self._connect() as connection:
+            connection.execute("DELETE FROM thread_replay_items WHERE thread_id = ?", (thread_id,))
+            connection.executemany(
+                "INSERT INTO thread_replay_items(thread_id, position, item_json) VALUES (?, ?, ?)",
+                [(thread_id, position, json.dumps(item)) for position, item in enumerate(items)],
+            )
+
+    def append_replay_items(self, thread_id: int, items: list[dict]) -> None:
+        if not items:
+            return
+        with self._connect() as connection:
+            exists = connection.execute(
+                "SELECT 1 FROM thread_replay_items WHERE thread_id = ? LIMIT 1", (thread_id,)
+            ).fetchone()
+            if exists is None:
+                return
+            row = connection.execute(
+                "SELECT COALESCE(MAX(position), -1) FROM thread_replay_items WHERE thread_id = ?",
+                (thread_id,),
+            ).fetchone()
+            start = int(row[0]) + 1
+            connection.executemany(
+                "INSERT INTO thread_replay_items(thread_id, position, item_json) VALUES (?, ?, ?)",
+                [(thread_id, start + index, json.dumps(item)) for index, item in enumerate(items)],
+            )
+
     def record_response_diagnostics(
         self, thread_id: int, response_id: str, diagnostic: dict
     ) -> None:
@@ -324,6 +367,7 @@ class Storage:
                 return False
             connection.execute("DELETE FROM display_turns WHERE thread_id = ?", (thread_id,))
             connection.execute("DELETE FROM response_diagnostics WHERE thread_id = ?", (thread_id,))
+            connection.execute("DELETE FROM thread_replay_items WHERE thread_id = ?", (thread_id,))
             connection.execute("DELETE FROM thread_items WHERE thread_id = ?", (thread_id,))
             connection.execute("DELETE FROM threads WHERE id = ?", (thread_id,))
         return True

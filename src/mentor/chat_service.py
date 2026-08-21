@@ -11,6 +11,9 @@ from mentor.storage import Storage
 
 
 MAX_OUTPUT_TOKENS = 25_000
+COMPACTION_TOKEN_THRESHOLD = 50_000
+FILE_SEARCH_RESULT_BUDGETS = {"normal": 8, "deep": 20, "exhaustive": 20}
+FILE_SEARCH_CALL_COST_USD = 0.0025
 SUPPORTED_REASONING_EFFORTS = frozenset({"high", "xhigh", "max"})
 SUPPORTED_REASONING_MODES = frozenset({"standard", "pro"})
 SUPPORTED_RESEARCH_DEPTHS = frozenset({"auto", "normal", "deep", "exhaustive"})
@@ -72,10 +75,13 @@ class ResponseDiagnostics:
     latency_ms: int
     input_tokens: int | None
     cached_input_tokens: int | None
+    cache_write_tokens: int | None
     output_tokens: int | None
     reasoning_tokens: int | None
     total_tokens: int | None
     estimated_text_cost_usd: float | None
+    known_file_search_call_cost_usd: float
+    native_compaction_applied: bool
 
 
 @dataclass(frozen=True)
@@ -148,16 +154,22 @@ class ChatService:
             raise RuntimeError("Import the Jacob transcripts before starting a chat.")
         user_item = {"role": "user", "content": [{"type": "input_text", "text": question}]}
         effective_depth = _effective_research_depth(question, evaluation.research_depth)
+        replay_items = self.storage.replay_items(thread_id)
         return user_item, {
             "model": self.model,
             "instructions": f"{MENTOR_INSTRUCTIONS}\n\n{_research_instruction(effective_depth)}",
             "input": [
-                *(_input_item(item) for item in self.storage.thread_items(thread_id)),
+                *(_input_item(item) for item in replay_items),
                 user_item,
             ],
-            "tools": [{"type": "file_search", "vector_store_ids": [vector_store_id]}],
+            "tools": [{
+                "type": "file_search",
+                "vector_store_ids": [vector_store_id],
+                "max_num_results": FILE_SEARCH_RESULT_BUDGETS[effective_depth],
+            }],
             "include": ["reasoning.encrypted_content", "file_search_call.results"],
             "reasoning": evaluation.request_value(),
+            "context_management": [{"type": "compaction", "compact_threshold": COMPACTION_TOKEN_THRESHOLD}],
             "max_output_tokens": MAX_OUTPUT_TOKENS,
             "store": False,
         }, effective_depth
@@ -173,9 +185,19 @@ class ChatService:
     ) -> Answer:
         output = [_as_dict(item) for item in response.output]
         raw_positions = self.storage.append_thread_items(thread_id, [user_item, *output])
+        compaction_index = next((index for index, item in enumerate(output) if item.get("type") == "compaction"), None)
+        if compaction_index is None:
+            self.storage.append_replay_items(thread_id, [user_item, *output])
+        else:
+            raw_items = self.storage.thread_items(thread_id)
+            self.storage.replace_replay_items(
+                thread_id,
+                [item for item in raw_items if item.get("role") == "user"] + output[compaction_index:],
+            )
         answer = _answer(output, incomplete_reason=_incomplete_reason(response))
         diagnostics = _diagnostics(
-            response, self.model, evaluation, effective_depth, output, answer, started_at
+            response, self.model, evaluation, effective_depth, output, answer, started_at,
+            native_compaction_applied=compaction_index is not None,
         )
         self.storage.record_response_diagnostics(
             thread_id, diagnostics.response_id, diagnostics.__dict__
@@ -220,7 +242,7 @@ def _as_dict(item: Any) -> dict:
 
 def _input_item(item: dict) -> dict:
     """Keep full API output locally but omit fields the input endpoint rejects."""
-    return {key: value for key, value in item.items() if key != "status"}
+    return {key: value for key, value in item.items() if key not in {"status", "created_by"}}
 
 
 def _answer(
@@ -281,18 +303,19 @@ def _diagnostics(
     output: list[dict],
     answer: Answer,
     started_at: float,
+    native_compaction_applied: bool,
 ) -> ResponseDiagnostics:
     usage = _field(response, "usage")
     input_details = _field(usage, "input_tokens_details")
     output_details = _field(usage, "output_tokens_details")
     input_tokens = _int_or_none(_field(usage, "input_tokens"))
     cached_input_tokens = _int_or_none(_field(input_details, "cached_tokens"))
-    cache_write_tokens = _int_or_none(_field(input_details, "cache_write_tokens")) or 0
+    cache_write_tokens = _int_or_none(_field(input_details, "cache_write_tokens"))
     output_tokens = _int_or_none(_field(usage, "output_tokens"))
     response_model = str(_field(response, "model") or model)
     file_search_calls, file_search_queries = _file_search_details(output)
     estimate = _estimate_text_cost(
-        response_model, input_tokens, cached_input_tokens, cache_write_tokens, output_tokens
+        response_model, input_tokens, cached_input_tokens, cache_write_tokens or 0, output_tokens
     )
     return ResponseDiagnostics(
         response_id=str(_field(response, "id") or f"local-{uuid4()}"),
@@ -306,14 +329,17 @@ def _diagnostics(
         file_search_queries=file_search_queries,
         returned_evidence_count=len(answer.evidence),
         cited_evidence_count=len(answer.citations),
-        file_search_cost_status="unknown",
+        file_search_cost_status="known per-call charge; vector storage and other platform charges excluded",
         latency_ms=round((perf_counter() - started_at) * 1_000),
         input_tokens=input_tokens,
         cached_input_tokens=cached_input_tokens,
+        cache_write_tokens=cache_write_tokens,
         output_tokens=output_tokens,
         reasoning_tokens=_int_or_none(_field(output_details, "reasoning_tokens")),
         total_tokens=_int_or_none(_field(usage, "total_tokens")),
         estimated_text_cost_usd=estimate,
+        known_file_search_call_cost_usd=round(file_search_calls * FILE_SEARCH_CALL_COST_USD, 6),
+        native_compaction_applied=native_compaction_applied,
     )
 
 
@@ -352,7 +378,7 @@ def _effective_research_depth(question: str, requested_depth: str) -> str:
     normalized = question.casefold()
     if re.search(r"\b(all|every|everything|complete|exhaustive)\b|exact list|full mapping|compare all", normalized):
         return "exhaustive"
-    if re.search(r"\b(verify|verification|compare|comparison|relationship|why)\b", normalized):
+    if re.search(r"\b(verify|verification|compare|comparison|difference|differences|different|relationship|why)\b", normalized):
         return "deep"
     return "normal"
 

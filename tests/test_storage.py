@@ -163,11 +163,15 @@ def test_storage_deletes_only_thread_owned_state_in_one_transaction(tmp_path):
         incomplete_reason=None,
     )
     storage.record_response_diagnostics(thread_id, "resp_1", {"response_id": "resp_1"})
+    storage.replace_replay_items(
+        thread_id, [{"type": "compaction", "encrypted_content": "server-only replay state"}]
+    )
 
     assert storage.delete_thread(thread_id) is True
     assert storage.delete_thread(thread_id) is False
     assert storage.has_thread(thread_id) is False
     assert storage.thread_items(thread_id) == []
+    assert storage.replay_items(thread_id) == []
     assert storage.display_turns(thread_id) == []
     assert storage.response_diagnostics(thread_id) == []
     assert storage.vector_store_id() == "vs_jacob"

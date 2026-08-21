@@ -156,6 +156,15 @@ def test_server_serves_the_persistent_chat_controls(tmp_path):
         assert b"turn.answer_markdown" in script
         assert b"File Search/platform cost" in script
         assert b"Number.isFinite(diagnostics.latency_ms)" in script
+        assert b"Show ${remaining} additional research result" in script
+        assert b"formatEvidenceTimestamp" in script
+        assert b"markdown-table-scroll" in script
+        assert b"Applied for future model replay" in script
+        status, _, stylesheet = request(server, "GET", "/app.css")
+        assert b".markdown-table-scroll" in stylesheet
+        assert b"overflow-wrap: normal" in stylesheet
+        assert b".markdown-table-scroll { margin: 1rem 0; max-width: 100%; overflow-x: auto; width: 100%; }" in stylesheet
+        assert b"#threads { min-width: 0;" in stylesheet
     finally:
         server.shutdown()
         worker.join()

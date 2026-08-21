@@ -1,6 +1,7 @@
 # Phase 2 Human Evaluation
 
-**Status:** Prepared for Theo's evaluation. This worksheet does not mark Phase 2 passed.
+**Status:** Technical hardening complete; prepared for Theo's evaluation. This
+worksheet does not mark Phase 2 passed.
 
 Run the deterministic checks first:
 
@@ -42,11 +43,49 @@ For every Mentor turn, verify:
 - cited evidence is shown first, while all retained evidence can be expanded;
 - displayed model, effort/mode, and requested/effective depth are that turn's
   historical settings;
-- text-token estimates explicitly exclude File Search/platform charges, which
-  remain marked unknown where OpenAI did not return them;
+- text-token estimates separately show cached input and cache-write tokens;
+- File Search shows its known $0.0025-per-call fee separately from text-token
+  cost; vector-storage and other platform charges remain explicitly excluded;
 - Markdown lists and tables render normally; no in-app `NaN.` text appears;
 - the browser console has no errors and no request exposes an API key or
   encrypted reasoning content.
+
+## Technical hardening record — 2026-08-21
+
+This is an engineering record, not Theo's acceptance decision.
+
+- Root cause of the rising same-thread input cost: the Phase 1 replay sent all
+  retained raw Responses output back to the API. In the measured thread, native
+  File Search result payloads accounted for 466,921 of 534,239 stored bytes
+  (87.4%). The API reports whole-request token usage, so the byte split is a
+  local attribution, while the reported input-token totals are exact API data.
+- The failed manual `responses.compact` attempt was replaced with native
+  Responses context management at a 50,000-token threshold. Raw local history
+  and browser display history remain unchanged; only encrypted model replay is
+  replaced by OpenAI's opaque compaction item. The replay sanitizer removes the
+  server-only `created_by` field before the next request.
+- A controlled paid sequence produced native compaction on a Deep year
+  comparison (32,745 input tokens, 3 File Search calls, 60 results, 7
+  citations). Its following narrow turn replayed successfully at 24,241 input
+  tokens. The comparable pre-hardening narrow follow-up had 134,822 input
+  tokens. Model output varies, so this is an observed comparison, not a cost
+  guarantee.
+- Prompt caching remains OpenAI's automatic implicit behavior. Diagnostics now
+  retain cached-input and cache-write tokens; no cache key or breakpoint was
+  added because the measured cache writes did not establish a net benefit.
+- Native File Search result limits are 8 for Normal and 20 for Deep or
+  Exhaustive. A controlled Normal comparison retained cited, grounded teaching
+  with 16 results while reducing input from 34,614 to 15,294 tokens versus the
+  20-result run.
+- Auto depth now classifies “difference(s)” questions as Deep. This fixes the
+  classifier mismatch that previously allowed a multi-search Deep response to
+  be recorded as Normal.
+
+Automated verification after this hardening: `32 passed` from
+`python -m pytest -q`, JavaScript syntax check passed, and desktop/mobile
+browser checks confirmed no console errors, a left sidebar, collapsed evidence
+with cited results first, and horizontally scrollable tables without page-level
+overflow.
 
 ## Decision
 

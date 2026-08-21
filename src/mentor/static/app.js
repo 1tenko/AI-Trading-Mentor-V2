@@ -40,6 +40,12 @@ function showMessage(label, text) {
 
 function renderMarkdown(target, text) {
   target.innerHTML = DOMPurify.sanitize(marked.parse(text, { breaks: true, gfm: true }), { USE_PROFILES: { html: true } });
+  target.querySelectorAll("table").forEach((table) => {
+    const scroll = document.createElement("div");
+    scroll.className = "markdown-table-scroll";
+    table.replaceWith(scroll);
+    scroll.append(table);
+  });
   target.querySelectorAll("a").forEach((link) => {
     link.target = "_blank";
     link.rel = "noopener noreferrer";
@@ -57,28 +63,93 @@ function showEvidence(evidence, citations) {
   summary.textContent = `${cited.size} cited · ${evidence.length} retrieved evidence ${evidence.length === 1 ? "result" : "results"}`;
   const content = document.createElement("div");
   content.className = "evidence-content";
+  const citedItems = [];
+  const additionalItems = [];
   const seen = new Set();
   items.forEach((item) => {
     const key = `${item.file_id}:${item.excerpt}`;
     if (seen.has(key)) return;
     seen.add(key);
-    const entry = document.createElement("div");
-    entry.className = "evidence-item";
-    const link = document.createElement("a");
-    link.href = `/api/sources/${encodeURIComponent(item.file_id)}`;
-    link.target = "_blank";
-    link.rel = "noopener noreferrer";
-    link.textContent = `Open full transcript: ${item.filename}${item.year ? ` (${item.year})` : ""}`;
-    const excerpt = document.createElement("span");
-    excerpt.className = "evidence-excerpt";
-    excerpt.textContent = item.excerpt || "No retrieved excerpt was returned for this citation.";
-    const metadata = document.createElement("small");
-    metadata.textContent = item.metadata?.relative_path || "";
-    entry.append(link, excerpt, metadata);
-    content.append(entry);
+    (cited.has(item.file_id) ? citedItems : additionalItems).push(item);
   });
+  citedItems.forEach((item) => content.append(evidenceItem(item)));
+  if (additionalItems.length) {
+    const additional = document.createElement("div");
+    additional.className = "evidence-additional";
+    additional.hidden = true;
+    additionalItems.forEach((item) => additional.append(evidenceItem(item)));
+    const remaining = additionalItems.length;
+    const toggle = document.createElement("button");
+    toggle.type = "button";
+    toggle.textContent = `Show ${remaining} additional research result${remaining === 1 ? "" : "s"}`;
+    toggle.addEventListener("click", () => {
+      additional.hidden = !additional.hidden;
+      toggle.textContent = additional.hidden
+        ? `Show ${remaining} additional research result${remaining === 1 ? "" : "s"}`
+        : "Hide additional research results";
+    });
+    content.append(toggle, additional);
+  }
   block.append(summary, content);
   messages.append(block);
+}
+
+function evidenceItem(item) {
+  const entry = document.createElement("div");
+  entry.className = "evidence-item";
+  const heading = document.createElement("strong");
+  heading.textContent = formatEvidenceDate(item) || item.filename || "Source";
+  const timestamp = formatEvidenceTimestamp(item.excerpt || "");
+  const excerpt = document.createElement("span");
+  excerpt.className = "evidence-excerpt";
+  excerpt.textContent = shortOriginalExcerpt(item.excerpt || "");
+  const link = document.createElement("a");
+  link.href = `/api/sources/${encodeURIComponent(item.file_id)}`;
+  link.target = "_blank";
+  link.rel = "noopener noreferrer";
+  link.textContent = "Open full transcript";
+  entry.append(heading);
+  if (timestamp) {
+    const time = document.createElement("small");
+    time.textContent = timestamp;
+    entry.append(time);
+  }
+  entry.append(excerpt, link);
+  return entry;
+}
+
+function formatEvidenceTimestamp(excerpt) {
+  const match = excerpt.match(/\[(\d+(?:\.\d+)?)\s*(?:-->|→)\s*(\d+(?:\.\d+)?)\]/);
+  return match ? `${formatSeconds(Number(match[1]))}–${formatSeconds(Number(match[2]))}` : "";
+}
+
+function formatSeconds(value) {
+  const seconds = Math.max(0, Math.floor(value));
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  const remainder = seconds % 60;
+  return hours
+    ? `${hours}:${String(minutes).padStart(2, "0")}:${String(remainder).padStart(2, "0")}`
+    : `${minutes}:${String(remainder).padStart(2, "0")}`;
+}
+
+function formatEvidenceDate(item) {
+  const path = item.metadata?.relative_path || "";
+  const match = path.match(/\b(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{1,2})(st|nd|rd|th)?\b/i);
+  if (!match || !item.year) return "";
+  const month = `${match[1][0].toUpperCase()}${match[1].slice(1).toLowerCase()}`;
+  return `${month} ${match[2]}${match[3] || ordinalSuffix(Number(match[2]))} (${item.year})`;
+}
+
+function ordinalSuffix(day) {
+  if (day % 100 >= 11 && day % 100 <= 13) return "th";
+  return ({ 1: "st", 2: "nd", 3: "rd" })[day % 10] || "th";
+}
+
+function shortOriginalExcerpt(excerpt) {
+  const withoutTimestamp = excerpt.replace(/^\s*\[\d+(?:\.\d+)?\s*(?:-->|→)\s*\d+(?:\.\d+)?\]\s*/, "").trim();
+  const limit = 700;
+  return withoutTimestamp.length > limit ? `${withoutTimestamp.slice(0, limit)}…` : withoutTimestamp || "No retrieved excerpt was returned for this citation.";
 }
 
 function showDiagnostics(diagnostics) {
@@ -99,8 +170,14 @@ function showDiagnostics(diagnostics) {
     ["Latency", latency],
     ["Tokens", `${diagnostics.input_tokens ?? "—"} input · ${diagnostics.output_tokens ?? "—"} output · ${diagnostics.reasoning_tokens ?? "—"} reasoning`],
     ["Text-token estimate", diagnostics.estimated_text_cost_usd == null ? "Unavailable" : `$${diagnostics.estimated_text_cost_usd.toFixed(4)} (excludes File Search fees)`],
-    ["File Search/platform cost", "Unknown; OpenAI does not return it in this response."],
+    ["Cached input", diagnostics.cached_input_tokens == null ? "Unavailable" : diagnostics.cached_input_tokens.toLocaleString()],
+    ["Cache write", diagnostics.cache_write_tokens == null ? "Unavailable" : diagnostics.cache_write_tokens.toLocaleString()],
+    ["File Search calls", `${diagnostics.file_search_calls || 0} · ${diagnostics.known_file_search_call_cost_usd == null ? "cost unavailable" : `$${diagnostics.known_file_search_call_cost_usd.toFixed(4)} known call cost`}`],
+    ["File Search/platform cost", diagnostics.file_search_cost_status || "Unknown"],
   ];
+  rows.push(["Native compaction", diagnostics.native_compaction_applied
+    ? "Applied for future model replay; included in this response usage."
+    : "Not applied on this turn"]);
   const block = document.createElement("details");
   block.className = "diagnostics";
   const summary = document.createElement("summary");
