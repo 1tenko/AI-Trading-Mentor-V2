@@ -16,6 +16,41 @@ MAX_OUTPUT_TOKENS = 25_000
 COMPACTION_TOKEN_THRESHOLD = 50_000
 FILE_SEARCH_RESULT_BUDGETS = {"normal": 8, "deep": 20, "exhaustive": 20}
 FILE_SEARCH_CALL_COST_USD = 0.0025
+DIRECT_SOURCE_CLAIM = re.compile(
+    r"(?:\*{1,2})?Direct source teaching"
+    r"(?:\*{1,2})?\s*(?::|[-\u2013\u2014]|\n)\s*\S",
+    re.IGNORECASE,
+)
+EXACT_SOURCE_REQUEST = re.compile(
+    r"\bwhere\s+(?:exactly\s+)?(?:does|did|is)\b|\b(?:what|which)\s+(?:video|timestamp)\b"
+    r"|\bgive me\b.*\b(?:video|timestamp)\b|\bexact source\b",
+    re.IGNORECASE,
+)
+CLOCK_TIME = re.compile(
+    r"(?<!\d)(\d{1,2}):(\d{2})(?:\s*[-\u2013\u2014]\s*(\d{1,2}):(\d{2}))?(?!\d)"
+)
+EVIDENCE_TIME_RANGE = re.compile(r"\[(\d+(?:\.\d+)?)\s*(?:-->|\u2192)\s*(\d+(?:\.\d+)?)\]")
+CITATION_REPAIR_INSTRUCTION = """Citation repair: the immediately preceding draft contains
+Direct source teaching claims but no native File Search citations. Reissue the same substantive
+answer with the same uncertainty. Attach native File Search citations to relevant Direct source
+teaching claims and, where reasonably possible, materially source-based synthesis. Use the
+existing File Search context or one focused File Search if necessary. Do not add, alter, or
+relabel claims merely to manufacture citations. For an exact timestamp request, give a timestamp
+only when a retrieved passage from the cited source supports it; otherwise state that it cannot be
+verified precisely."""
+CITATION_WARNING = (
+    "\n\n> **Citation warning:** Native source citations could not be attached to this "
+    "source-derived answer. Treat its Direct source teaching labels as unverified and inspect "
+    "the retrieved research results below."
+)
+EXACT_SOURCE_WARNING = (
+    "> **Source-verification warning:** The mentor could not verify an exact timestamp against a "
+    "retrieved passage from the cited source. No exact timestamp is being presented."
+)
+EXACT_TIMESTAMP_REPAIR_INSTRUCTION = (
+    "For this exact timestamp request, you must perform one new focused native File Search before "
+    "answering, even if the draft included other retrieved passages."
+)
 SUPPORTED_REASONING_EFFORTS = frozenset({"high", "xhigh", "max"})
 SUPPORTED_REASONING_MODES = frozenset({"standard", "pro"})
 SUPPORTED_RESEARCH_DEPTHS = frozenset({"auto", "normal", "deep", "exhaustive"})
@@ -119,7 +154,19 @@ class ChatService:
         user_item, request, effective_depth = self._request(thread_id, question, evaluation)
         started_at = perf_counter()
         response = self.client.responses.create(**request)
-        return self._finalize(thread_id, user_item, response, evaluation, effective_depth, started_at)
+        response, evidence_output, draft_response = self._citation_repaired_response(
+            request, response, user_item["content"][0]["text"]
+        )
+        return self._finalize(
+            thread_id,
+            user_item,
+            response,
+            evaluation,
+            effective_depth,
+            started_at,
+            evidence_output=evidence_output,
+            draft_response=draft_response,
+        )
 
     def stream_reply(
         self,
@@ -135,8 +182,18 @@ class ChatService:
                 if event.type == "response.output_text.delta":
                     yield StreamEvent("delta", event.delta)
                 elif event.type in {"response.completed", "response.incomplete"}:
+                    response, evidence_output, draft_response = self._citation_repaired_response(
+                        request, event.response, user_item["content"][0]["text"]
+                    )
                     answer = self._finalize(
-                        thread_id, user_item, event.response, evaluation, effective_depth, started_at
+                        thread_id,
+                        user_item,
+                        response,
+                        evaluation,
+                        effective_depth,
+                        started_at,
+                        evidence_output=evidence_output,
+                        draft_response=draft_response,
                     )
                     if answer.incomplete_reason:
                         yield StreamEvent(
@@ -157,6 +214,35 @@ class ChatService:
             return
         LOGGER.warning("OpenAI stream ended without a terminal response event")
         yield StreamEvent("error", error="The mentor stream ended before returning a usable response. Try again.")
+
+    def _citation_repaired_response(
+        self, request: dict, response: Any, question: str
+    ) -> tuple[Any, list[dict], Any | None]:
+        draft_output = [_as_dict(item) for item in response.output]
+        draft = _answer(draft_output)
+        needs_citation_repair = _has_direct_source_claim(draft.text) and not draft.citations
+        needs_timestamp_repair = _has_unsupported_exact_timestamp(question, draft)
+        if _field(response, "status") != "completed" or not (needs_citation_repair or needs_timestamp_repair):
+            return response, draft_output, None
+        repair_instructions = f"{request['instructions']}\n\n{CITATION_REPAIR_INSTRUCTION}"
+        if needs_timestamp_repair:
+            repair_instructions = f"{repair_instructions}\n\n{EXACT_TIMESTAMP_REPAIR_INSTRUCTION}"
+        repair_request = {
+            **request,
+            "instructions": repair_instructions,
+            "input": [
+                *request["input"],
+                *(_input_item(item) for item in draft_output),
+                {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "Please repair the citations now."}],
+                },
+            ],
+        }
+        if needs_timestamp_repair:
+            repair_request["tool_choice"] = {"type": "file_search"}
+        repaired = self.client.responses.create(**repair_request)
+        return repaired, [*draft_output, *(_as_dict(item) for item in repaired.output)], response
 
     def _request(
         self, thread_id: int, question: str, evaluation: EvaluationConfig
@@ -195,6 +281,8 @@ class ChatService:
         evaluation: EvaluationConfig,
         effective_depth: str,
         started_at: float,
+        evidence_output: list[dict] | None = None,
+        draft_response: Any | None = None,
     ) -> Answer:
         output = [_as_dict(item) for item in response.output]
         raw_positions = self.storage.append_thread_items(thread_id, [user_item, *output])
@@ -206,10 +294,38 @@ class ChatService:
                 thread_id,
                 output[compaction_index:],
             )
-        answer = _answer(output, incomplete_reason=_incomplete_reason(response))
+        answer = _answer(
+            output,
+            evidence_output=evidence_output,
+            incomplete_reason=_incomplete_reason(response),
+        )
+        question = user_item["content"][0]["text"]
+        if draft_response is not None and _has_unsupported_exact_timestamp(question, answer):
+            answer = Answer(
+                text=EXACT_SOURCE_WARNING,
+                citations=answer.citations,
+                evidence=answer.evidence,
+                diagnostics=answer.diagnostics,
+                incomplete_reason=answer.incomplete_reason,
+            )
+        elif draft_response is not None and not answer.citations:
+            answer = Answer(
+                text=f"{answer.text}{CITATION_WARNING}",
+                citations=answer.citations,
+                evidence=answer.evidence,
+                diagnostics=answer.diagnostics,
+                incomplete_reason=answer.incomplete_reason,
+            )
         diagnostics = _diagnostics(
-            response, self.model, evaluation, effective_depth, output, answer, started_at,
+            response,
+            self.model,
+            evaluation,
+            effective_depth,
+            evidence_output or output,
+            answer,
+            started_at,
             native_compaction_applied=compaction_index is not None,
+            draft_response=draft_response,
         )
         self.storage.record_response_diagnostics(
             thread_id, diagnostics.response_id, diagnostics.__dict__
@@ -260,12 +376,13 @@ def _input_item(item: dict) -> dict:
 def _answer(
     output: list[dict],
     diagnostics: ResponseDiagnostics | None = None,
+    evidence_output: list[dict] | None = None,
     incomplete_reason: str | None = None,
 ) -> Answer:
     text_parts: list[str] = []
     citations: list[Citation] = []
     evidence: list[Evidence] = []
-    for item in output:
+    for item in evidence_output or output:
         if item.get("type") == "file_search_call":
             for result in item.get("results") or []:
                 attributes = result.get("attributes") or {}
@@ -278,6 +395,7 @@ def _answer(
                         metadata={str(key): str(value) for key, value in attributes.items()},
                     )
                 )
+    for item in output:
         if item.get("type") != "message" or item.get("role") != "assistant":
             continue
         for content in item.get("content") or []:
@@ -301,6 +419,33 @@ def _answer(
     )
 
 
+def _has_direct_source_claim(text: str) -> bool:
+    return bool(DIRECT_SOURCE_CLAIM.search(text))
+
+
+def _has_unsupported_exact_timestamp(question: str, answer: Answer) -> bool:
+    if not EXACT_SOURCE_REQUEST.search(question):
+        return False
+    timestamps = []
+    for match in CLOCK_TIME.finditer(answer.text):
+        start = int(match.group(1)) * 60 + int(match.group(2))
+        end = start if match.group(3) is None else int(match.group(3)) * 60 + int(match.group(4))
+        timestamps.append((start, end))
+    if not timestamps:
+        return False
+    cited_file_ids = {citation.file_id for citation in answer.citations}
+    ranges = [
+        (float(match.group(1)), float(match.group(2)))
+        for evidence in answer.evidence
+        if evidence.file_id in cited_file_ids
+        for match in EVIDENCE_TIME_RANGE.finditer(evidence.excerpt)
+    ]
+    return any(
+        not any(start >= evidence_start and end <= evidence_end for evidence_start, evidence_end in ranges)
+        for start, end in timestamps
+    )
+
+
 def _incomplete_reason(response: Any) -> str | None:
     if _field(response, "status") != "incomplete":
         return None
@@ -316,14 +461,13 @@ def _diagnostics(
     answer: Answer,
     started_at: float,
     native_compaction_applied: bool,
+    draft_response: Any | None = None,
 ) -> ResponseDiagnostics:
-    usage = _field(response, "usage")
-    input_details = _field(usage, "input_tokens_details")
-    output_details = _field(usage, "output_tokens_details")
-    input_tokens = _int_or_none(_field(usage, "input_tokens"))
-    cached_input_tokens = _int_or_none(_field(input_details, "cached_tokens"))
-    cache_write_tokens = _int_or_none(_field(input_details, "cache_write_tokens"))
-    output_tokens = _int_or_none(_field(usage, "output_tokens"))
+    responses = [response] if draft_response is None else [draft_response, response]
+    input_tokens = _usage_total(responses, "input_tokens")
+    cached_input_tokens = _usage_total(responses, "cached_tokens", "input_tokens_details")
+    cache_write_tokens = _usage_total(responses, "cache_write_tokens", "input_tokens_details")
+    output_tokens = _usage_total(responses, "output_tokens")
     response_model = str(_field(response, "model") or model)
     file_search_calls, file_search_queries = _file_search_details(output)
     estimate = _estimate_text_cost(
@@ -347,12 +491,21 @@ def _diagnostics(
         cached_input_tokens=cached_input_tokens,
         cache_write_tokens=cache_write_tokens,
         output_tokens=output_tokens,
-        reasoning_tokens=_int_or_none(_field(output_details, "reasoning_tokens")),
-        total_tokens=_int_or_none(_field(usage, "total_tokens")),
+        reasoning_tokens=_usage_total(responses, "reasoning_tokens", "output_tokens_details"),
+        total_tokens=_usage_total(responses, "total_tokens"),
         estimated_text_cost_usd=estimate,
         known_file_search_call_cost_usd=round(file_search_calls * FILE_SEARCH_CALL_COST_USD, 6),
         native_compaction_applied=native_compaction_applied,
     )
+
+
+def _usage_total(responses: list[Any], field: str, parent: str | None = None) -> int | None:
+    values = [
+        _int_or_none(_field(_field(response, "usage") if parent is None else _field(_field(response, "usage"), parent), field))
+        for response in responses
+    ]
+    known = [value for value in values if value is not None]
+    return sum(known) if known else None
 
 
 def _estimate_text_cost(

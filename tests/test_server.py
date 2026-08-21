@@ -200,6 +200,9 @@ def test_server_serves_the_persistent_chat_controls(tmp_path):
         assert b"File Search/platform cost" in script
         assert b"Number.isFinite(diagnostics.latency_ms)" in script
         assert b"Show ${remaining} additional research result" in script
+        assert b"Cited source" in script
+        assert b"Retrieved passages from this source:" in script
+        assert b"Additional research results" in script
         assert b"formatEvidenceTimestamp" in script
         assert b"markdown-table-scroll" in script
         assert b"Applied for future model replay" in script

@@ -25,6 +25,42 @@ class FakeResponses:
         return self.response
 
 
+class SequenceResponses:
+    def __init__(self, *responses):
+        self.responses = list(responses)
+        self.calls = []
+
+    def create(self, **kwargs):
+        self.calls.append(kwargs)
+        return self.responses.pop(0)
+
+
+def source_response(text, annotations, *, status="completed", usage=None):
+    return SimpleNamespace(
+        status=status,
+        usage=usage,
+        output=[
+            {
+                "type": "file_search_call",
+                "queries": ["Jacob source"],
+                "results": [
+                    {
+                        "file_id": "file_jacob",
+                        "filename": "lesson.txt",
+                        "text": "[730.0 --> 756.0] Jacob's original words.",
+                        "attributes": {"year": "2026", "relative_path": "2026/January 20th.txt"},
+                    }
+                ],
+            },
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": text, "annotations": annotations}],
+            },
+        ],
+    )
+
+
 def test_reply_persists_continuation_state_and_extracts_evidence(tmp_path):
     storage = Storage(tmp_path / "mentor.sqlite3")
     storage.initialize()
@@ -136,6 +172,190 @@ def test_reply_persists_continuation_state_and_extracts_evidence(tmp_path):
     assert request["max_output_tokens"] == 25_000
     assert request["reasoning"] == {"effort": "high"}
     assert request["context_management"] == [{"type": "compaction", "compact_threshold": 50_000}]
+
+
+def test_direct_source_answer_with_native_citations_does_not_retry(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    storage.set_vector_store("vs_jacob")
+    thread_id = storage.create_thread("Question")
+    responses = SequenceResponses(
+        source_response(
+            "Direct source teaching: Jacob teaches this.",
+            [{"type": "file_citation", "file_id": "file_jacob", "filename": "lesson.txt"}],
+        )
+    )
+
+    answer = ChatService(storage, SimpleNamespace(responses=responses)).reply(thread_id, "What does Jacob teach?")
+
+    assert len(responses.calls) == 1
+    assert [citation.file_id for citation in answer.citations] == ["file_jacob"]
+
+
+def test_direct_source_answer_without_citations_is_repaired_before_persistence(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    storage.set_vector_store("vs_jacob")
+    thread_id = storage.create_thread("Question")
+    draft = source_response("**Direct source teaching – 2025:** Jacob teaches this.", [])
+    repaired = source_response(
+        "**Direct source teaching – 2025:** Jacob teaches this.",
+        [{"type": "file_citation", "file_id": "file_jacob", "filename": "lesson.txt"}],
+    )
+    responses = SequenceResponses(draft, repaired)
+
+    answer = ChatService(storage, SimpleNamespace(responses=responses)).reply(thread_id, "What does Jacob teach?")
+
+    assert len(responses.calls) == 2
+    assert "Citation repair" in responses.calls[1]["instructions"]
+    assert any(item.get("type") == "file_search_call" for item in responses.calls[1]["input"])
+    assert answer.text == repaired.output[-1]["content"][0]["text"]
+    assert [citation.file_id for citation in answer.citations] == ["file_jacob"]
+    assert storage.display_turns(thread_id)[0]["answer_markdown"] == answer.text
+    assert storage.thread_items(thread_id)[-1] == repaired.output[-1]
+    assert draft.output[-1] not in storage.thread_items(thread_id)
+
+
+def test_stream_replaces_an_uncited_direct_source_draft_with_the_repaired_answer(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    storage.set_vector_store("vs_jacob")
+    thread_id = storage.create_thread("Question")
+    draft = source_response("Direct source teaching: Jacob teaches this.", [])
+    repaired = source_response(
+        "Direct source teaching: Jacob teaches this.",
+        [{"type": "file_citation", "file_id": "file_jacob", "filename": "lesson.txt"}],
+    )
+    responses = SequenceResponses(
+        [
+            SimpleNamespace(type="response.output_text.delta", delta="Direct source teaching: Jacob teaches this."),
+            SimpleNamespace(type="response.completed", response=draft),
+        ],
+        repaired,
+    )
+
+    events = list(ChatService(storage, SimpleNamespace(responses=responses)).stream_reply(thread_id, "What does Jacob teach?"))
+
+    assert [event.type for event in events] == ["delta", "complete"]
+    assert len(responses.calls) == 2
+    assert events[-1].answer.citations[0].file_id == "file_jacob"
+    assert draft.output[-1] not in storage.thread_items(thread_id)
+
+
+def test_direct_source_answer_warns_when_one_repair_still_has_no_citations(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    storage.set_vector_store("vs_jacob")
+    thread_id = storage.create_thread("Question")
+    responses = SequenceResponses(
+        source_response("Direct source teaching: Jacob teaches this.", []),
+        source_response("Direct source teaching: Jacob teaches this.", []),
+    )
+
+    answer = ChatService(storage, SimpleNamespace(responses=responses)).reply(thread_id, "What does Jacob teach?")
+
+    assert len(responses.calls) == 2
+    assert answer.citations == []
+    assert "Citation warning" in answer.text
+    assert "could not be attached" in answer.text
+
+
+def test_direct_source_label_inside_a_table_cell_is_repaired(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    storage.set_vector_store("vs_jacob")
+    thread_id = storage.create_thread("Question")
+    text = "| Topic | **Direct source teaching:** Jacob teaches this. |"
+    responses = SequenceResponses(
+        source_response(text, []),
+        source_response(
+            text,
+            [{"type": "file_citation", "file_id": "file_jacob", "filename": "lesson.txt"}],
+        ),
+    )
+
+    ChatService(storage, SimpleNamespace(responses=responses)).reply(thread_id, "What does Jacob teach?")
+
+    assert len(responses.calls) == 2
+
+
+def test_ai_hypothesis_without_citations_is_not_retried(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    storage.set_vector_store("vs_jacob")
+    thread_id = storage.create_thread("Question")
+    responses = SequenceResponses(source_response("AI hypothesis: This may be useful.", []))
+
+    answer = ChatService(storage, SimpleNamespace(responses=responses)).reply(thread_id, "What might work?")
+
+    assert len(responses.calls) == 1
+    assert answer.text == "AI hypothesis: This may be useful."
+
+
+def test_exact_source_timestamp_is_repaired_when_no_retrieved_passage_supports_it(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    storage.set_vector_store("vs_jacob")
+    thread_id = storage.create_thread("Question")
+    citation = [{"type": "file_citation", "file_id": "file_jacob", "filename": "lesson.txt"}]
+    draft = source_response("Direct source teaching: Jacob says this at 12:10–12:36.", citation)
+    draft.output[0]["results"][0]["text"] = "[609.0 --> 616.0] An unrelated passage."
+    repaired = source_response("Direct source teaching: Jacob says this at 12:10–12:36.", citation)
+    responses = SequenceResponses(draft, repaired)
+
+    answer = ChatService(storage, SimpleNamespace(responses=responses)).reply(
+        thread_id,
+        "Where exactly does Jacob say this? Give me the video and timestamp.",
+    )
+
+    assert len(responses.calls) == 2
+    assert "must perform one new focused native file search" in responses.calls[1]["instructions"].casefold()
+    assert responses.calls[1]["tool_choice"] == {"type": "file_search"}
+    assert answer.text == "Direct source teaching: Jacob says this at 12:10–12:36."
+
+
+def test_exact_source_timestamp_is_withheld_after_one_unsupported_repair(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    storage.set_vector_store("vs_jacob")
+    thread_id = storage.create_thread("Question")
+    citation = [{"type": "file_citation", "file_id": "file_jacob", "filename": "lesson.txt"}]
+    draft = source_response("Direct source teaching: Jacob says this at 12:10–12:36.", citation)
+    repaired = source_response("Direct source teaching: Jacob says this at 12:10–12:36.", citation)
+    for response in (draft, repaired):
+        response.output[0]["results"][0]["text"] = "[609.0 --> 616.0] An unrelated passage."
+    responses = SequenceResponses(draft, repaired)
+
+    answer = ChatService(storage, SimpleNamespace(responses=responses)).reply(
+        thread_id,
+        "Where exactly does Jacob say this? Give me the video and timestamp.",
+    )
+
+    assert len(responses.calls) == 2
+    assert "Source-verification warning" in answer.text
+    assert "12:10" not in answer.text
+
+
+def test_exact_source_timestamp_can_use_a_later_range_in_one_retrieved_passage(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    storage.set_vector_store("vs_jacob")
+    thread_id = storage.create_thread("Question")
+    citation = [{"type": "file_citation", "file_id": "file_jacob", "filename": "lesson.txt"}]
+    response = source_response("Direct source teaching: Jacob says this at 12:10–12:36.", citation)
+    response.output[0]["results"][0]["text"] = (
+        "[609.0 --> 616.0] An unrelated passage.\n"
+        "[730.0 --> 756.0] The supporting passage."
+    )
+    responses = SequenceResponses(response)
+
+    answer = ChatService(storage, SimpleNamespace(responses=responses)).reply(
+        thread_id,
+        "Where exactly does Jacob say this? Give me the video and timestamp.",
+    )
+
+    assert len(responses.calls) == 1
+    assert answer.text == "Direct source teaching: Jacob says this at 12:10–12:36."
 
 
 def test_reply_replays_prior_response_items_and_rejects_blank_questions(tmp_path):

@@ -95,6 +95,14 @@ It documents the stale-server blank-response diagnosis, native-compaction
 continuity proof, retryable-stream behavior, and the measured Terra/Sol
 evaluation. It does not change the production default or introduce routing.
 
+## Source-citation integrity — 2026-08-21
+
+The final technical provenance fix is recorded in
+[phase-2-citation-integrity.md](phase-2-citation-integrity.md). It adds the
+native-citation repair safeguard, corrects cited-source versus retrieved-passage
+semantics, and records a controlled paid three-turn continuation. It does not
+pass Phase 2; Theo's browser decision remains required.
+
 ## Decision
 
 Record one outcome outside Git if it contains private conversation content:

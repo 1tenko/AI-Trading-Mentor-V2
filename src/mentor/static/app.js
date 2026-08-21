@@ -54,25 +54,26 @@ function renderMarkdown(target, text) {
 
 function showEvidence(evidence, citations) {
   const cited = new Set(citations.map((citation) => citation.file_id));
-  const items = [...evidence].sort((left, right) => Number(cited.has(right.file_id)) - Number(cited.has(left.file_id)));
-  if (!items.length && citations[0]) items.push({ ...citations[0], excerpt: "", metadata: {} });
-  if (!items.length) return;
-  const block = document.createElement("details");
-  block.className = "evidence";
-  const summary = document.createElement("summary");
-  summary.textContent = `${cited.size} cited · ${evidence.length} retrieved evidence ${evidence.length === 1 ? "result" : "results"}`;
-  const content = document.createElement("div");
-  content.className = "evidence-content";
-  const citedItems = [];
-  const additionalItems = [];
+  const items = [];
   const seen = new Set();
-  items.forEach((item) => {
+  evidence.forEach((item) => {
     const key = `${item.file_id}:${item.excerpt}`;
     if (seen.has(key)) return;
     seen.add(key);
-    (cited.has(item.file_id) ? citedItems : additionalItems).push(item);
+    items.push(item);
   });
-  citedItems.forEach((item) => content.append(evidenceItem(item)));
+  if (!items.length && !citations.length) return;
+  const block = document.createElement("details");
+  block.className = "evidence";
+  const summary = document.createElement("summary");
+  summary.textContent = `${citations.length} cited source${citations.length === 1 ? "" : "s"} · ${items.length} retrieved passage${items.length === 1 ? "" : "s"}`;
+  const content = document.createElement("div");
+  content.className = "evidence-content";
+  citations.forEach((citation) => {
+    const passages = items.filter((item) => item.file_id === citation.file_id);
+    content.append(citedSource(citation, passages));
+  });
+  const additionalItems = items.filter((item) => !cited.has(item.file_id));
   if (additionalItems.length) {
     const additional = document.createElement("div");
     additional.className = "evidence-additional";
@@ -88,10 +89,34 @@ function showEvidence(evidence, citations) {
         ? `Show ${remaining} additional research result${remaining === 1 ? "" : "s"}`
         : "Hide additional research results";
     });
-    content.append(toggle, additional);
+    const label = document.createElement("strong");
+    label.textContent = "Additional research results";
+    content.append(label, toggle, additional);
   }
   block.append(summary, content);
   messages.append(block);
+}
+
+function citedSource(citation, passages) {
+  const entry = document.createElement("section");
+  entry.className = "evidence-item";
+  const heading = document.createElement("strong");
+  heading.textContent = formatEvidenceDate(passages[0] || {}) || citation.filename || "Source";
+  const badge = document.createElement("small");
+  badge.textContent = "Cited source";
+  entry.append(heading, badge);
+  if (passages.length) {
+    const label = document.createElement("span");
+    label.textContent = "Retrieved passages from this source:";
+    entry.append(label);
+    passages.forEach((passage) => entry.append(evidencePassage(passage)));
+  } else {
+    const empty = document.createElement("span");
+    empty.textContent = "No retrieved passages were returned for this cited source.";
+    entry.append(empty);
+  }
+  entry.append(sourceLink(citation.file_id));
+  return entry;
 }
 
 function evidenceItem(item) {
@@ -99,23 +124,35 @@ function evidenceItem(item) {
   entry.className = "evidence-item";
   const heading = document.createElement("strong");
   heading.textContent = formatEvidenceDate(item) || item.filename || "Source";
+  const label = document.createElement("small");
+  label.textContent = "Retrieved passage";
+  entry.append(heading, label, evidencePassage(item), sourceLink(item.file_id));
+  return entry;
+}
+
+function evidencePassage(item) {
+  const passage = document.createElement("div");
+  passage.className = "evidence-passage";
   const timestamp = formatEvidenceTimestamp(item.excerpt || "");
   const excerpt = document.createElement("span");
   excerpt.className = "evidence-excerpt";
   excerpt.textContent = shortOriginalExcerpt(item.excerpt || "");
-  const link = document.createElement("a");
-  link.href = `/api/sources/${encodeURIComponent(item.file_id)}`;
-  link.target = "_blank";
-  link.rel = "noopener noreferrer";
-  link.textContent = "Open full transcript";
-  entry.append(heading);
   if (timestamp) {
     const time = document.createElement("small");
     time.textContent = timestamp;
-    entry.append(time);
+    passage.append(time);
   }
-  entry.append(excerpt, link);
-  return entry;
+  passage.append(excerpt);
+  return passage;
+}
+
+function sourceLink(fileId) {
+  const link = document.createElement("a");
+  link.href = `/api/sources/${encodeURIComponent(fileId)}`;
+  link.target = "_blank";
+  link.rel = "noopener noreferrer";
+  link.textContent = "Open full transcript";
+  return link;
 }
 
 function formatEvidenceTimestamp(excerpt) {
@@ -357,6 +394,7 @@ async function sendMessage(text, showUser = true) {
           }
           if (event.type === "complete" || event.type === "incomplete") {
             terminal = true;
+            renderMarkdown(mentor.content, event.answer.text);
             showEvidence(event.answer.evidence, event.answer.citations);
             showDiagnostics(event.answer.diagnostics);
             if (event.type === "incomplete") showIncomplete(event.answer, mentor);
