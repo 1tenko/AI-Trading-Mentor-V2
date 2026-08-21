@@ -108,7 +108,9 @@ before the next phase starts:
 
 1. Intelligence proof — Jacob teaching quality in private browser chat.
 2. Base unified mentor — polished conversational foundation.
-3. Extensible knowledge library — user-managed sources and source scopes.
+3. Extensible Knowledge Foundation + Jacob Corpus Assimilation — a generic,
+   source-managed knowledge foundation and the first derived, source-linked
+   assimilation of Jacob 2025–2026. Additional sources remain future work.
 4. Trader profile and editable long-term memory.
 5. Strategy Lab — structured data import and deterministic analysis.
 6. Versioned Strategy Projects.
@@ -116,6 +118,8 @@ before the next phase starts:
 8. Mindset and development sources.
 9. Evals, hardening, and productization.
 
-The current implementation boundary is defined only by the Phase 1 design:
-[`docs/superpowers/specs/2026-08-19-trading-mentor-phase-1-design.md`](docs/superpowers/specs/2026-08-19-trading-mentor-phase-1-design.md).
-Later phases are product direction, not permission to implement them now.
+Phase 1 and Phase 2 passed their human acceptance gates. The current approved
+implementation boundary is Phase 3 and is defined by
+[`docs/superpowers/specs/2026-08-21-trading-mentor-phase-3-design.md`](docs/superpowers/specs/2026-08-21-trading-mentor-phase-3-design.md).
+Later phases and additional sources are product direction, not permission to
+implement them now.

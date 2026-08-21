@@ -1,103 +1,122 @@
-# Phase 2 Task Checklist
+# Phase 3 Task Checklist
 
-The binding design is
-[2026-08-20-trading-mentor-phase-2-design.md](../docs/superpowers/specs/2026-08-20-trading-mentor-phase-2-design.md).
-The detailed proposed execution plan is [plan.md](plan.md).
+Binding design: [2026-08-21-trading-mentor-phase-3-design.md](../docs/superpowers/specs/2026-08-21-trading-mentor-phase-3-design.md).
+Authoritative task detail: [plan.md](plan.md).
 
-**Status:** Phase 2 passed Theo's final human acceptance evaluation on
-2026-08-21. The accepted implementation remains on
-feature/phase-2-unified-mentor; do not begin Phase 3 or merge to main without
-separate approval.
+**Status:** Planning complete; implementation requires separate Theo approval.
+Stay on feature/phase-3-knowledge-assimilation. Do not begin Phase 4.
 
-## conversation-lifecycle
+## knowledge-library
 
-- [x] **Task 1 — Idempotent display-turn migration and deletion primitive**
-  - Acceptance: legacy Phase 1 threads backfill safely; one transaction deletes
-    all thread-owned state and preserves sources/vector-store settings.
-  - Verify: focused storage migration/deletion tests; full pytest.
-  - Depends on: none.
+- [ ] **Task 1 — Generic library identity and additive migration**
+  - Depends on: none. Verify: focused migration tests; full pytest.
+- [ ] **Task 2 — Idempotent Jacob registry migration and change detection**
+  - Depends on: Task 1. Verify: importer/registry tests; full pytest.
 
-- [x] **Task 2 — Persist browser-safe display turns for new responses**
-  - Acceptance: every completed/incomplete turn has Markdown, evidence,
-    diagnostics, historical configuration, and raw replay positions; encrypted
-    reasoning remains server-only.
-  - Verify: API-shaped chat-service fixtures; full pytest.
-  - Depends on: Task 1.
+### Checkpoint A — Library safety
 
-- [x] **Task 3 — Safe restore and permanent-delete HTTP API**
-  - Acceptance: timeline GET is browser-safe and side-effect free; DELETE is
-    local-only, transactional, and preserves sources.
-  - Verify: HTTP restore/delete/security tests; full pytest.
-  - Depends on: Tasks 1–2.
+- [ ] Phase 2 conversations/citations remain readable; Jacob backfill is
+  idempotent; full pytest passes.
 
-### Checkpoint A — Conversation storage and API contract
+## source-anchors
 
-- [x] A migrated Phase 1 thread restores through the safe timeline route.
-- [x] Deletion persists after reread/reload and shared source state survives.
-- [x] Encrypted reasoning state never appears in browser JSON.
-- [x] Full pytest passes.
+- [ ] **Task 3 — Durable anchor model and deterministic validation**
+  - Depends on: Checkpoint A. Verify: anchor drift/offset/timestamp/name tests;
+    full pytest.
 
-## mentor-orchestration
+## compilation-lifecycle
 
-- [x] **Task 4 — Unified turn composition and research-depth policy**
-  - Acceptance: one Jacob capability seam; Auto/Normal/Deep/Exhaustive remains
-    independent from reasoning effort/mode; no future capability is built.
-  - Verify: request/policy/provenance fixtures; full pytest.
-  - Depends on: Checkpoint A.
+- [ ] **Task 4 — Compilation runs and immutable candidate snapshots**
+  - Depends on: Task 3. Verify: lifecycle transition/isolation tests; full pytest.
 
-- [x] **Task 5 — Compact evidence and truthful usage diagnostics**
-  - Acceptance: retain all native evidence and research counts; retain accurate
-    historical configuration; do not invent unavailable platform cost.
-  - Verify: multi-search and missing-usage fixtures; full pytest.
-  - Depends on: Task 4.
+## source-extraction
 
-### Checkpoint B — Mentor policy and observability contract
+- [ ] **Task 5 — Typed derived-record schema and persistence**
+  - Depends on: Task 4. Verify: family/facet/provenance tests; full pytest.
+- [ ] **Task 6 — Mocked per-source extraction with versioned prompts**
+  - Depends on: Task 5. Verify: fake Responses fixtures only; full pytest.
+- [ ] **Task 7 — Deterministic and independent semantic claim validation**
+  - Depends on: Task 6. Verify: hash/range/semantic fixtures; full pytest.
 
-- [x] Phase 1 exhaustive-search safeguards remain intact.
-- [x] Auto/manual depth and reasoning controls are independently historical.
-- [x] Full pytest passes.
+### Checkpoint B — Mechanical compiler proof
 
-## chat-foundation-ui
+- [ ] All fixtures are synthetic/mocked; no OpenAI calls; full pytest passes.
 
-- [x] **Task 6 — Restored conversations, switching, titles, and delete UI**
-  - Acceptance: history restores through reload/switch; title is useful; delete
-    is confirmed, keyboard reachable, and permanent locally.
-  - Verify: full pytest plus two-chat browser restore/delete smoke flow.
-  - Depends on: Checkpoint B.
+## concept-synthesis
 
-- [x] **Task 7 — Research-depth control and compact disclosures**
-  - Acceptance: future-turn depth control; historical settings remain intact;
-    evidence/diagnostics are compact; NaN. is diagnosed before any fix.
-  - Verify: fixtures/static tests, full pytest, desktop/mobile browser smoke.
-  - Depends on: Task 6.
+- [ ] **Task 8 — Typed synthesis for concepts, relationships, and procedures**
+  - Depends on: Checkpoint B. Verify: structure/justification tests; full pytest.
+- [ ] **Task 9 — Evolution, negative-evidence, and conflict semantics**
+  - Depends on: Task 8. Verify: coverage/absence/conflict tests; full pytest.
 
-### Checkpoint C — Persistent-chat user flow
+## invalidation-publication
 
-- [x] New and restored turns show their own settings/evidence.
-- [x] Delete survives reload and leaves shared sources available.
-- [x] Static responsive chat remains intact; full pytest passes.
+- [ ] **Task 10 — Dependency DAG and selective stale propagation**
+  - Depends on: Task 9. Verify: cycle/closure/staleness tests; full pytest.
+- [ ] **Task 11 — Local candidate validation and atomic publication**
+  - Depends on: Task 10. Verify: failed-candidate/pointer-swap tests; full pytest.
 
-## phase-2-regression
+### Checkpoint C — Safe local publication
 
-- [x] **Task 8 — Deterministic Phase 2 regression suite**
-  - Acceptance: lifecycle, migration, replay, provenance, security, semantic
-    prompts, and resolved NaN. behavior are covered without paid API calls.
-  - Verify: full pytest, diff check, secret scan, local browser smoke.
-  - Depends on: Checkpoint C.
+- [ ] Synthetic publication is safe; no remote candidate store exists; full
+  pytest passes.
 
-- [x] **Task 9 — Explicit Phase 2 human quality checkpoint**
-  - Acceptance: a small private paid evaluation confirms persistent-chat,
-    normal/exhaustive research, evidence/diagnostics, and deletion behavior.
-  - Verify: Theo's browser evaluation and pass/fail decision.
-  - Depends on: Task 8.
+## derived-orientation-retrieval
 
-### Final checkpoint — Phase 2 accepted
+- [ ] **Task 12 — Vector-store adapter and guarded capability preflight**
+  - Depends on: Checkpoint C. Verify: fake adapter tests; disposable live
+    preflight only with Theo's explicit approval.
+- [ ] **Task 13 — Bounded published-snapshot orientation service**
+  - Depends on: Task 12. Verify: stale/wrong/duplicate/budget/raw-dump tests;
+    full pytest.
 
-- [x] All deterministic and browser checks pass.
-- [x] Native replay compaction, prompt-cache diagnostics, File Search result
-  budgets, evidence disclosure, table overflow, long-thread recovery, and the
-  controlled Terra/Sol comparison have passed technical and controlled paid
-  verification; see `docs/phase-2-evaluation.md`.
-- [x] The branch is committed and pushed.
-- [x] Theo completed the human acceptance decision: **Phase 2 passed**.
-- [x] Stop: do not merge to main or begin Phase 3.
+## mentor-knowledge-orchestration
+
+- [ ] **Task 14 — Mentor integration, diagnostics, and replay safety**
+  - Depends on: Task 13. Verify: citation/timestamp/compaction/streaming
+    fixtures; full pytest.
+
+### Checkpoint D — Mentor regression gate
+
+- [ ] Phase 2 behavior remains green; broad fixtures orient and narrow fixtures
+  do not force orientation; full pytest passes.
+
+## knowledge-inspection
+
+- [ ] **Task 15 — Read-only Knowledge Inspector API**
+  - Depends on: Checkpoint D. Verify: loopback/read-only/safe-JSON API tests;
+    full pytest.
+- [ ] **Task 16 — Minimal static Assimilation Inspector**
+  - Depends on: Task 15. Verify: full pytest and desktop/compact browser smoke.
+
+## phase-3-evaluation
+
+- [ ] **Task 17 — Deterministic regression suite and evaluation harness**
+  - Depends on: Task 16. Verify: full pytest, diff/secret checks, browser smoke;
+    no paid calls.
+- [ ] **Task 18 — Six-source pilot manifest and measured-cost protocol**
+  - Depends on: Task 17. Verify: manifest/evaluation tests; full pytest; no
+    pilot call.
+
+### Gate 1 — Paid six-source pilot (explicit Theo authorization)
+
+- [ ] Confirm preconditions and run only the reviewed six-source pilot.
+- [ ] Audit anchors, independent validation, synthesis/evolution/conflict,
+  derived retrieval/orientation, and Phase 2 baseline comparison.
+- [ ] Record measured cost forecast locally and STOP for Theo's pilot review.
+- [ ] **Task 19 — Record Gate 1 pilot decision**
+  - Depends on: Gate 1. Verify: Theo review; stage only non-private summary.
+
+### Gate 2 — Full Jacob assimilation (separate Theo approval)
+
+- [ ] **Task 20 — Full 150-source assimilation after separate approval**
+  - Depends on: Task 19 and explicit Theo approval. Verify:
+    coverage/anchor/validation/dependency audit; full pytest.
+
+### Gate 3 — Mentor evaluation and human acceptance
+
+- [ ] **Task 21 — Baseline-versus-assimilated Mentor evaluation**
+  - Depends on: Task 20 published full snapshot. Verify: paid evaluation, raw
+    citation inspection, and full pytest.
+- [ ] **Task 22 — Theo's final Phase 3 human acceptance**
+  - Depends on: Task 21. Verify: Theo's explicit pass/fail decision.

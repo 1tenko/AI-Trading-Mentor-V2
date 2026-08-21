@@ -1,453 +1,360 @@
-# Implementation Plan: Phase 2 Unified Trading Mentor Foundation
+# Implementation Plan: Phase 3 Knowledge Foundation + Jacob Assimilation
 
-**Status:** Proposed — requires Theo's approval before implementation.
+**Status:** Proposed. Theo must approve this plan before implementation begins.
 
-## Scope
+## Scope and boundary
 
-Implement only the approved Phase 2 design at
-[2026-08-20-trading-mentor-phase-2-design.md](../docs/superpowers/specs/2026-08-20-trading-mentor-phase-2-design.md).
+This plan implements only the approved Phase 3 design at [2026-08-21-trading-mentor-phase-3-design.md](../docs/superpowers/specs/2026-08-21-trading-mentor-phase-3-design.md) on feature/phase-3-knowledge-assimilation.
 
-The work makes the proven mentor a reliable personal chat application. It does
-not alter the Phase 1 intelligence architecture and does not begin Phase 3 or
-later capabilities.
+Phase 3 builds the generic Knowledge Library and assimilates Jacob 2025-2026 as its first corpus. It does not add another source, profile/memory, strategy feature, model routing, or Phase 4 work.
 
-## Phase 1 Closure and Branch
+Routine pytest is local and mocked: it must not contact OpenAI. No task may run a real Jacob compiler or create a real candidate store until the explicit live gates. Corpus files, SQLite runtime data, pilot outputs, API keys, and private evaluation records remain untracked.
 
-- Phase 1 human Intelligence Proof: **passed** by Theo.
-- Acceptance record: [phase-1-acceptance.md](../docs/phase-1-acceptance.md).
-- Implementation branch: feature/phase-2-unified-mentor.
-- Base contract: local replay state, GPT-5.6 Sol, Responses API, store=false,
-  native File Search, raw Jacob source authority, and loopback-only serving.
+## Existing seam and implementation constraints
 
-## Verified Integration Constraints
+The application is a small Python 3.12+ / stdlib SQLite / openai>=2,<3 system with a loopback server, static UI, a single current Jacob source registry, native raw File Search, citation repair, and opaque context-compaction replay. Phase 3 extends these seams with dataclasses, SQLite tables, and focused modules. It does not add an ORM, graph database, schema framework, custom embeddings/ranking, or frontend framework.
 
-- GPT-5.6 Sol remains OpenAI's frontier model. It supports high, xhigh, and
-  max reasoning effort; Pro is an independent reasoning mode. The plan retains
-  the existing evaluated controls instead of automatically escalating them.
-  [OpenAI model guidance](https://developers.openai.com/api/docs/guides/latest-model)
-- When local code manages conversation state with store=false, OpenAI documents
-  preserving previous user inputs and every response output item, including
-  encrypted reasoning items, for later turns. This remains the raw replay
-  record; it must never be returned to the browser.
-  [OpenAI model guidance](https://developers.openai.com/api/docs/guides/latest-model)
-- Native File Search results are absent by default unless
-  file_search_call.results is requested through include. The response item
-  contains the model's File Search queries, and the tool supports a
-  max_num_results setting. Phase 2 retains all returned results without custom
-  ranking.
-  [OpenAI File Search guide](https://developers.openai.com/api/docs/guides/tools-file-search)
+OpenAI Vector Store Search supports queries, file-attribute filters, one to fifty results, and file identity/chunks/attributes/score. [OpenAI Vector Store Search](https://developers.openai.com/api/reference/python/resources/vector_stores/methods/search)
 
-## Architecture Decisions
+Attachment/detachment are separate; detaching a vector-store file does not delete the File. The guarded preflight must prove current SDK behavior for same-File candidate attachment, filters, batches/status, search, and detachment. If it conflicts with the approved architecture, execution stops and reports it. [Create vector-store file](https://developers.openai.com/api/reference/python/resources/vector_stores/subresources/files/methods/create) [Delete vector-store file](https://developers.openai.com/api/reference/python/resources/vector_stores/subresources/files/methods/delete)
 
-1. **Dual local records:** retain raw thread_items for stateless replay and add
-   a browser-safe display-turn projection. Do not make the browser parse or
-   receive encrypted reasoning state.
-2. **Physical local deletion:** delete a thread and all thread-owned rows in
-   one SQLite transaction. Never touch sources, source registry settings, local
-   transcripts, OpenAI Files, or the shared vector store.
-3. **Minimal unified boundary:** add one private request-composition seam for
-   an active Jacob-source capability. It supplies request policy/context only;
-   it does not create a capability registry, future tool, or another bot.
-4. **Two independent axes:** research depth controls source-research policy;
-   reasoning effort/mode controls GPT-5.6 configuration. Auto depth resolves
-   via transparent local intent rules and is recorded. No automatic effort or
-   Pro escalation occurs.
-5. **Static frontend retained:** the existing static UI can satisfy the
-   approved flows. No framework or dependency is planned.
+Responses supports built-in File Search and application-defined functions. The Mentor remains a direct Responses call so native raw citations survive. [Responses create](https://developers.openai.com/api/reference/cli/resources/responses/methods/create)
 
-## Dependency Graph
+## Interface contract
 
-    Task 1: migrate storage + atomic deletion primitive
-      -> Task 2: persist safe display turns and historical configuration
-          -> Task 3: safe restore/delete HTTP API
-              -> Checkpoint A
-                  -> Task 4: unified turn composition + research depth
-                      -> Task 5: evidence and diagnostics aggregation
-                          -> Checkpoint B
-                              -> Task 6: restored conversation UI
-                                  -> Task 7: controls and compact disclosure UI
-                                      -> Checkpoint C
-                                          -> Task 8: deterministic regressions
-                                              -> Task 9: explicit human quality checkpoint
+| Interface | Producer / consumer | Required contract |
+|---|---|---|
+| Collection, Source, SourceRevision | library, importer, anchors | Stable source identity; immutable SHA-256 revision; filename is metadata. |
+| CorpusSnapshot, CompilationRun | lifecycle, publication, diagnostics | Candidate/published state, revision fingerprint, remote IDs, versions, metrics, status. |
+| SourceAnchor | extraction, validation, Inspector | IDs, full hash, normalized range, timestamp when present, span fingerprint, locator version. |
+| DerivedRecord | compiler, storage, retrieval | Typed family, derived kind, evidence/validation/lifecycle state, anchors, dependencies, typed payload, concise qualification. |
+| Claim / Relationship / ProcedureSequenceHierarchy / Evolution / ConflictUnresolved | synthesis, Inspector | Small typed family payloads and typed facets; no arbitrary essay blob. |
+| OrientationService | Responses function, Mentor | Current published derived store only; local validation, dedupe, hard record/token budget, concise typed output. |
+| KnowledgeContext | Mentor, diagnostics, Inspector | Orientation use, snapshot/record IDs/count, budget result; no raw dump or hidden reasoning. |
 
-Tasks are deliberately sequential because the shared storage and API contracts
-must settle before static UI work begins. No parallel implementation is planned.
+Source-extracted remains derived. Direct source teaching still requires active raw verification and native raw citation. Persistent records store only conclusion, concise auditable justification, anchor basis, qualification, and outcome: never hidden reasoning, scratchpads, encrypted-reasoning prose, or arbitrary numeric confidence.
 
-## Task List
+Normal requests resolve one published raw/derived pair at start. Candidate, archived, and stale IDs are rejected. Publication swaps the snapshot and both remote store IDs in one SQLite transaction. Broad/comparative/evolutionary/multi-concept/relationship-heavy/exhaustive questions normally orient before broad raw search; narrow and exact-source questions may go raw-first. Raw evidence always overrides orientation.
 
-### Module: conversation-lifecycle
+## Dependency graph
 
-## Task 1: Add an idempotent display-turn migration and deletion primitive
+    knowledge-library (1-2)
+      -> source-anchors (3)
+      -> compilation-lifecycle (4)
+      -> source-extraction (5-7)
+      -> concept-synthesis (8-9)
+      -> invalidation-publication (10-11)
+      -> derived-orientation-retrieval (12-13)
+      -> mentor-knowledge-orchestration (14)
+      -> knowledge-inspection (15-16)
+      -> phase-3-evaluation (17-22)
 
-**Purpose:** Extend SQLite with the minimum display-turn structure needed to
-restore Phase 1 conversations, backfill legacy threads without losing raw replay
-items, and provide one atomic local deletion operation.
+Tasks are sequential through shared storage contracts. The Inspector follows the stable read API. Paid work sits outside routine autonomous tasks.
 
+## Task list
+
+### Task 1 — Generic library identity and additive migration
+
+**Module:** knowledge-library
+**Purpose:** Add Collection, Source, and immutable SourceRevision values and idempotent SQLite tables beside Phase 2 sources.
 **Dependencies:** None.
+**Files/components:** src/mentor/knowledge.py; src/mentor/storage.py; tests/test_knowledge.py; tests/test_storage.py.
+**Consumes/produces:** Phase-2-shaped sources -> typed library rows and revision-aware storage.
+**Failing-test-first:** Write legacy-database migration tests before tables/methods.
+**Acceptance criteria:** Initialization preserves threads, display turns, diagnostics, source linkage, and settings; source ID is stable; revision identity includes SHA-256; no corpus bytes enter fixtures.
+**Verification:** Focused knowledge/storage tests, then full pytest.
+**Commit boundary:** feat(knowledge-library): add revision-aware source model.
+### Task 2 — Idempotent Jacob registry migration and change detection
 
-**Files/components likely affected:**
-
-- src/mentor/storage.py
-- tests/test_storage.py
-- tests/fixtures/phase1_thread_state.json
-
-**Acceptance criteria:**
-
-- [ ] Initializing a Phase 1-shaped database creates/backfills display turns
-  idempotently while retaining the original chronological raw item sequence.
-- [ ] A display turn identifies its user content, answer Markdown, evidence,
-  diagnostics/configuration, completion state, and raw replay-item positions.
-- [ ] One storage deletion operation removes every thread-owned row
-  transactionally while source registry rows and vector-store settings survive.
-
-**Automated verification:**
-
-- [ ] Focused storage tests cover fresh initialization, legacy migration rerun,
-  transaction rollback/failure behavior, and source/settings survival.
-- [ ] Full suite: .\.venv\Scripts\python -m pytest -q.
-
-**Browser verification:** None; this is a local storage contract.
-
-**Estimated scope:** Medium.
-
-## Task 2: Persist new turns as safe display projections without changing replay
-
-**Purpose:** Make each new completed or incomplete response write both its
-existing raw replay state and a safe display projection containing the actual
-historical configuration that produced it.
-
+**Module:** knowledge-library
+**Purpose:** Backfill one Jacob collection without destructive import changes.
 **Dependencies:** Task 1.
+**Files/components:** src/mentor/source_registry.py; src/mentor/import_jacob.py; src/mentor/storage.py; tests/test_source_registry.py; tests/test_import_jacob.py.
+**Consumes/produces:** Transcript discovery/current registry -> current revisions and visible pending replacement/removal state.
+**Failing-test-first:** Write unchanged/replaced/removed/duplicate-looking-name fixture tests.
+**Acceptance criteria:** Byte-identical records preserve file/store linkage; changed bytes create pending revision; unreadable input is visible; rerun is idempotent.
+**Verification:** Focused importer/registry tests and full pytest.
+**Commit boundary:** feat(knowledge-library): migrate Jacob registry to revisions.
+### Checkpoint A — Library safety
 
-**Files/components likely affected:**
+- [ ] Phase 2 conversations and citation links remain readable.
+- [ ] Backfill is idempotent and does not create/delete remote resources.
+- [ ] Full pytest passes before anchors.
 
-- src/mentor/chat_service.py
-- src/mentor/storage.py
-- tests/test_chat_service.py
 
-**Acceptance criteria:**
+### Task 3 — Durable anchor model and deterministic validation
 
-- [ ] A streamed completed or incomplete response stores a matching display
-  turn with citations, all returned evidence, diagnostics, and exact historical
-  model/reasoning/research settings.
-- [ ] Replay input remains the complete raw output sequence required by the
-  Responses API, including encrypted reasoning items when present.
-- [ ] No browser-facing representation includes encrypted reasoning content or
-  opaque raw response items.
-
-**Automated verification:**
-
-- [ ] API-shaped fixtures assert display projection, incomplete handling, and
-  unchanged raw replay input.
-- [ ] Full suite: .\.venv\Scripts\python -m pytest -q.
-
-**Browser verification:** None; HTTP exposure follows Task 3.
-
-**Estimated scope:** Medium.
-
-## Task 3: Expose safe thread restoration and permanent-delete routes
-
-**Purpose:** Add the smallest loopback API surface for loading a thread's safe
-timeline and permanently deleting one local conversation.
-
-**Dependencies:** Tasks 1–2.
-
-**Files/components likely affected:**
-
-- src/mentor/server.py
-- src/mentor/storage.py
-- tests/test_server.py
-
-**Acceptance criteria:**
-
-- [ ] GET /api/threads/{id} returns chronological display turns only and never
-  contacts OpenAI or reveals raw/encrypted replay state.
-- [ ] DELETE /api/threads/{id} uses the storage transaction, returns a clear
-  success/not-found result, and does not affect sources or vector-store state.
-- [ ] Existing list/create/message/source routes and loopback-only binding
-  continue to behave as before.
-
-**Automated verification:**
-
-- [ ] HTTP tests cover restore, malformed/missing IDs, delete persistence, and
-  absence of encrypted reasoning/API keys in JSON.
-- [ ] Full suite: .\.venv\Scripts\python -m pytest -q.
-
-**Browser verification:** Request one existing thread endpoint from the local
-browser and confirm it returns no raw reasoning content.
-
-**Estimated scope:** Medium.
-
-### Checkpoint A: Conversation storage and API contract
-
-- [ ] All tests pass.
-- [ ] A representative Phase 1 thread migrates and can be read through the
-  safe timeline route.
-- [ ] Deleting a representative thread removes it after reread/reload while
-  the Jacob source registry and vector-store setting remain intact.
-- [ ] No browser route exposes encrypted reasoning state.
-
-### Module: mentor-orchestration
-
-## Task 4: Add minimal unified turn composition and research-depth policy
-
-**Purpose:** Separate current Jacob source-research policy from future
-capability attachment without implementing a generic registry or any future
-capability. Add Auto, Normal, Deep, and Exhaustive depth handling independently
-of existing reasoning controls.
-
+**Module:** source-anchors
+**Purpose:** Make raw evidence locations revision-specific and drift-detectable.
 **Dependencies:** Checkpoint A.
+**Files/components:** src/mentor/anchors.py; src/mentor/knowledge.py; tests/test_anchors.py; tests/fixtures/anchor_transcript.txt.
+**Consumes/produces:** SourceRevision plus transcript -> SourceAnchor and deterministic validation.
+**Failing-test-first:** Test valid anchor, changed revision/span, invalid offset, timestamp drift, and duplicate-looking names.
+**Acceptance criteria:** Validation checks all IDs, full hash, normalized offsets, timestamp when present, span fingerprint, and locator version; no OCR/video path.
+**Verification:** Focused anchor tests and full pytest.
+**Commit boundary:** feat(source-anchors): validate revision-specific evidence.
+### Task 4 — Compilation runs and immutable candidate snapshots
 
-**Files/components likely affected:**
+**Module:** compilation-lifecycle
+**Purpose:** Separate candidate construction from the sole published snapshot.
+**Dependencies:** Task 3.
+**Files/components:** src/mentor/compilation.py; src/mentor/storage.py; src/mentor/knowledge.py; tests/test_compilation.py.
+**Consumes/produces:** Selected revisions -> CompilationRun, CorpusSnapshot, fingerprint, transitions, and zero-cost metric rows.
+**Failing-test-first:** Test invalid transitions, failed-run isolation, and current-pointer lookup.
+**Acceptance criteria:** Candidate does not alter published pointer; only build -> validate -> publish/fail transitions exist; run records model/prompt/schema and source/record/call/token/latency/cost/remote/failure metrics.
+**Verification:** Focused lifecycle tests and full pytest.
+**Commit boundary:** feat(compilation-lifecycle): add immutable snapshots.
+### Task 5 — Typed derived-record schema and persistence
 
-- src/mentor/chat_service.py
-- src/mentor/prompts.py
-- tests/test_chat_service.py
-
-**Acceptance criteria:**
-
-- [ ] One server-owned turn-composition path builds the existing Jacob
-  instructions, native File Search tool, include fields, and research-depth
-  policy; no user-facing bot or future capability is created.
-- [ ] Auto deterministically resolves to Normal, Deep, or Exhaustive from
-  transparent intent criteria; an explicit manual depth cannot be downgraded.
-- [ ] Research depth is stored separately from reasoning effort/mode and does
-  not automatically raise effort or enable Pro.
-
-**Automated verification:**
-
-- [ ] Fixtures assert policy resolution, request composition, preserved native
-  File Search configuration, and unchanged provenance/exhaustive safeguards.
-- [ ] Full suite: .\.venv\Scripts\python -m pytest -q.
-
-**Browser verification:** None; UI control follows Task 7.
-
-**Estimated scope:** Medium.
-
-## Task 5: Retain compact evidence and truthful usage diagnostics
-
-**Purpose:** Record the native research details needed for compact display:
-returned evidence count, cited count, File Search calls/queries/results, and
-known response usage—without inventing total platform cost.
-
+**Module:** source-extraction
+**Purpose:** Store small composable semantic records, never record_type plus unconstrained JSON.
 **Dependencies:** Task 4.
+**Files/components:** src/mentor/derived_records.py; src/mentor/storage.py; src/mentor/knowledge.py; tests/test_derived_records.py.
+**Consumes/produces:** Anchors/snapshot -> shared envelope plus Claim, Relationship, ProcedureSequenceHierarchy, Evolution, ConflictUnresolved, and typed facets.
+**Failing-test-first:** Reject unknown family, free-form payload, missing anchor/dependency, invalid state, and numeric confidence.
+**Acceptance criteria:** Every record has family, kind, states, anchors, dependencies, qualification; strategy implications default to synthesis unless explicitly raw taught; private reasoning is rejected.
+**Verification:** Focused typed-record tests and full pytest.
+**Commit boundary:** feat(source-extraction): add typed derived records.
+### Task 6 — Mocked per-source extraction with versioned prompts
 
-**Files/components likely affected:**
+**Module:** source-extraction
+**Purpose:** Produce bounded candidate records from one revision without self-approval or routine paid calls.
+**Dependencies:** Task 5.
+**Files/components:** src/mentor/compiler.py; src/mentor/compiler_prompts.py; src/mentor/derived_records.py; tests/test_compiler.py; tests/fixtures/compiler_responses.json.
+**Consumes/produces:** One revision -> versioned extraction request and parsed candidate records through an injectable fake Responses client.
+**Failing-test-first:** Test zero candidates, malformed family, missing anchors, and attempted self-validation.
+**Acceptance criteria:** Extraction is per-source; Sol is live-mode only; prompt/schema versions persist; pytest has no credential/network path.
+**Verification:** Focused compiler tests and full pytest.
+**Commit boundary:** feat(source-extraction): add mocked candidate extraction.
+### Task 7 — Deterministic and independent semantic claim validation
 
-- src/mentor/chat_service.py
-- src/mentor/storage.py
-- tests/test_chat_service.py
-
-**Acceptance criteria:**
-
-- [ ] Each display turn retains all returned source evidence and enough
-  aggregate metadata to show research/citation counts.
-- [ ] Historical diagnostics retain requested/effective depth, model,
-  effort/mode, status, latency, available tokens, and clearly labelled
-  text-token estimate.
-- [ ] Unknown File Search/platform charges remain unknown; no custom ranking,
-  summarization, or quote rewriting is introduced.
-
-**Automated verification:**
-
-- [ ] Fixtures cover multiple File Search calls, absent usage fields, and
-  historical diagnostics fidelity.
-- [ ] Full suite: .\.venv\Scripts\python -m pytest -q.
-
-**Browser verification:** Inspect the safe timeline JSON for counts and all
-evidence records; verify no raw reasoning item is present.
-
-**Estimated scope:** Medium.
-
-### Checkpoint B: Unified mentor policy and observability contract
-
-- [ ] All tests pass.
-- [ ] The existing Phase 1 exhaustive-query policy still requires a
-  complementary omission/falsification search.
-- [ ] Auto/manual depth, effort, and mode are independently persisted.
-- [ ] Evidence and usage metadata are complete enough for the approved UI but
-  do not expose reasoning state or misstate costs.
-
-### Module: chat-foundation-ui
-
-## Task 6: Restore conversations, switching, reload, titles, and delete flow
-
-**Purpose:** Use the safe timeline API in the existing static chat page so
-saved conversations faithfully reappear and can be deleted through a restrained
-confirmed action.
-
-**Dependencies:** Checkpoint B.
-
-**Files/components likely affected:**
-
-- src/mentor/static/index.html
-- src/mentor/static/app.js
-- src/mentor/static/app.css
-
-**Acceptance criteria:**
-
-- [ ] Selecting a saved thread and reloading the page render historical Theo
-  and Mentor messages, Markdown, citations/evidence, diagnostics, and
-  incomplete state in chronological order.
-- [ ] Sidebar titles use the persisted first meaningful question and switch
-  reliably without clearing historical content.
-- [ ] A keyboard-accessible delete affordance confirms intent, removes the
-  conversation immediately on success, and leaves sources untouched.
-
-**Automated verification:**
-
-- [ ] Existing server tests continue to pass; add browser-safe route fixtures
-  needed by the static flow.
-- [ ] Full suite: .\.venv\Scripts\python -m pytest -q.
-
-**Browser verification:** Create two chats, add a follow-up to one, switch both
-ways, reload, delete one with confirmation, reload again, and verify the other
-still restores.
-
-**Estimated scope:** Medium.
-
-## Task 7: Add research-depth control and compact historical disclosures
-
-**Purpose:** Extend the static UI—not the intelligence architecture—with an
-advanced research-depth control, historical configuration display, compact
-evidence disclosure, and the approved NaN. diagnosis.
-
+**Module:** source-extraction
+**Purpose:** Ensure the extractor cannot certify its own claims.
 **Dependencies:** Task 6.
+**Files/components:** src/mentor/validation.py; src/mentor/compiler_prompts.py; src/mentor/anchors.py; tests/test_validation.py; tests/fixtures/validation_responses.json.
+**Consumes/produces:** Candidate claim plus actual raw spans -> deterministic and independent semantic outcome.
+**Failing-test-first:** Test bad hash/range and partial/unsupported/ambiguous results blocking source-extracted publication.
+**Acceptance criteria:** Independent prompt/context ignores extractor rationale; only affirmative keeps source-extracted; other outcomes are excluded or unresolved with audit data.
+**Verification:** Focused validation/compiler/anchor tests and full pytest.
+**Commit boundary:** feat(source-extraction): validate extracted claims independently.
+### Checkpoint B — Mechanical compiler proof
 
-**Files/components likely affected:**
+- [ ] Synthetic fixtures exercise all record families and validator outcomes.
+- [ ] No test contacted OpenAI or inspected a real transcript.
+- [ ] Full pytest passes before synthesis/invalidation.
 
-- src/mentor/static/index.html
-- src/mentor/static/app.js
-- src/mentor/static/app.css
-- tests/test_server.py
 
-**Acceptance criteria:**
+### Task 8 — Typed synthesis for concepts, relationships, and procedures
 
-- [ ] Auto/Normal/Deep/Exhaustive is sent only for future turns and does not
-  relabel historical turns; the existing effort/mode controls remain separate.
-- [ ] Evidence is collapsed by default with cited results first, a compact
-  researched/cited count, and an explicit way to reveal all retained evidence.
-- [ ] Live UI and a saved fixture determine whether NaN. is an application
-  defect; only a reproducible in-app defect receives a minimal code fix and
-  regression.
+**Module:** concept-synthesis
+**Purpose:** Assemble validated records without a monolithic canonical glossary.
+**Dependencies:** Checkpoint B.
+**Files/components:** src/mentor/synthesis.py; src/mentor/derived_records.py; src/mentor/compilation.py; tests/test_synthesis.py.
+**Consumes/produces:** Validated records -> bounded synthesis records with input IDs, transitive anchors, typed structure, and concise auditable justification.
+**Failing-test-first:** Test invalid-record exclusion, ordered branches/prerequisites, and raw-text dump rejection.
+**Acceptance criteria:** Relationships/procedures are structured; synthesis retains inputs/anchors/evidence state; no chain-of-thought or numeric confidence persists.
+**Verification:** Focused synthesis tests and full pytest.
+**Commit boundary:** feat(concept-synthesis): assemble typed knowledge records.
+### Task 9 — Evolution, negative-evidence, and conflict semantics
 
-**Automated verification:**
-
-- [ ] HTTP/static asset tests pass and fixture coverage protects any confirmed
-  NaN. rendering fix.
-- [ ] Full suite: .\.venv\Scripts\python -m pytest -q.
-
-**Browser verification:** At desktop and mobile widths, verify controls,
-streaming, Markdown tables, collapsed evidence/diagnostics, no console errors,
-and no horizontal sidebar-button pile.
-
-**Estimated scope:** Medium.
-
-### Checkpoint C: Persistent-chat user flow
-
-- [ ] All tests pass.
-- [ ] A new streamed answer and a restored historical answer display their own
-  distinct historical settings and evidence.
-- [ ] Browser deletion persists through reload without affecting a different
-  conversation or shared source access.
-- [ ] The UI remains a static, responsive personal chat—not a dashboard.
-
-### Module: phase-2-regression
-
-## Task 8: Complete deterministic Phase 2 regression coverage
-
-**Purpose:** Consolidate migration, lifecycle, provenance, security, and
-semantic behavior into small deterministic fixtures so routine tests do not
-make paid model requests.
-
-**Dependencies:** Checkpoint C.
-
-**Files/components likely affected:**
-
-- tests/test_storage.py
-- tests/test_chat_service.py
-- tests/test_server.py
-- tests/fixtures/
-
-**Acceptance criteria:**
-
-- [ ] Tests cover create/list/title/restore/reload/switch/delete, shared-source
-  survival, raw replay continuity, historical configuration fidelity, and
-  incomplete responses.
-- [ ] Tests retain the Phase 1 semantic fixtures: SMT, TPD, all
-  reversion-level alignments, exhaustive SMT teaching, false attribution, and
-  correction/follow-up.
-- [ ] Tests cover loopback-only routing, API-key secrecy, source restrictions,
-  provenance, Auto/manual depth, and the resolved NaN. finding.
-
-**Automated verification:**
-
-- [ ] Full suite: .\.venv\Scripts\python -m pytest -q.
-- [ ] Diff check and secret scan before the task commit.
-
-**Browser verification:** Run the defined smoke flow once against a local
-server; do not send paid model requests during ordinary regression runs.
-
-**Estimated scope:** Medium.
-
-## Task 9: Run the explicit Phase 2 human quality checkpoint
-
-**Purpose:** Prepare and run a small paid browser evaluation only after all
-deterministic checks pass. Theo, not the agent, decides whether Phase 2 passes.
-
+**Module:** concept-synthesis
+**Purpose:** Make year comparison and absence claims evidence-disciplined.
 **Dependencies:** Task 8.
+**Files/components:** src/mentor/synthesis.py; src/mentor/derived_records.py; tests/test_synthesis.py; tests/fixtures/synthesis_cases.json.
+**Consumes/produces:** Validated records plus coverage -> Evolution and ConflictUnresolved records with supporting/competing anchors.
+**Failing-test-first:** Reject unsupported never/new/removed/deprecated classifications; test compatible and unresolved conflicts.
+**Acceptance criteria:** Not-found never becomes factual absence; later is not assumed new; evolution stores earlier/later sets; conflict remains visible until conditionally reconciled.
+**Verification:** Focused synthesis tests and full pytest.
+**Commit boundary:** feat(concept-synthesis): model evolution and uncertainty.
+### Task 10 — Dependency DAG and selective stale propagation
 
-**Files/components likely affected:**
+**Module:** invalidation-publication
+**Purpose:** Track raw revision -> extracted -> synthesis -> higher synthesis dependencies.
+**Dependencies:** Task 9.
+**Files/components:** src/mentor/dependencies.py; src/mentor/storage.py; src/mentor/derived_records.py; tests/test_dependencies.py.
+**Consumes/produces:** Revisions/records -> DAG edges, reverse lookup, stale closure, and selective rebuild set.
+**Failing-test-first:** Test self-cycle, multi-record cycle, direct/transitive stale, unaffected branch, and stale retrieval rejection.
+**Acceptance criteria:** Cycles block candidate validation; changed revision marks every reverse-reachable record stale; rebuild set excludes unaffected branches.
+**Verification:** Focused dependency tests and full pytest.
+**Commit boundary:** feat(invalidation-publication): track derived dependencies.
+### Task 11 — Local candidate validation and atomic publication
 
-- docs/phase-2-evaluation.md
-- README.md
+**Module:** invalidation-publication
+**Purpose:** Swap a fully validated raw/derived snapshot pair atomically.
+**Dependencies:** Task 10.
+**Files/components:** src/mentor/compilation.py; src/mentor/storage.py; src/mentor/dependencies.py; tests/test_compilation.py; tests/test_storage.py.
+**Consumes/produces:** Validated candidate/store IDs -> current snapshot pointer and archived/stale predecessor.
+**Failing-test-first:** Test missing validation, failed candidate, read at swap boundary, and old/new store exclusion.
+**Acceptance criteria:** Normal request cannot resolve a candidate; one transaction swaps snapshot/raw/derived IDs; predecessor is history, never current retrieval.
+**Verification:** Focused lifecycle/dependency/storage tests and full pytest.
+**Commit boundary:** feat(invalidation-publication): publish snapshots atomically.
+### Checkpoint C — Safe local publication
 
-**Acceptance criteria:**
+- [ ] Synthetic revision change proves transitive stale propagation and selective rebuild closure.
+- [ ] Failed candidate cannot affect the current pair.
+- [ ] Full pytest passes. No remote candidate store exists yet.
 
-- [ ] The worksheet combines persistent-chat lifecycle checks with the compact
-  Phase 1 semantic regression prompts and records configuration/observability.
-- [ ] It explicitly checks normal versus exhaustive research behavior, restored
-  history fidelity, permanent deletion boundaries, and evidence/diagnostics UX.
-- [ ] Private full transcripts, runtime data, and API secrets remain outside
-  Git; Theo records the final pass/fail decision.
 
-**Automated verification:**
+### Task 12 — Vector-store adapter and guarded capability preflight
 
-- [ ] Full suite: .\.venv\Scripts\python -m pytest -q before the real run.
-- [ ] No paid API request is added to pytest or a routine browser smoke test.
+**Module:** derived-orientation-retrieval
+**Purpose:** Isolate remote store operations and turn API uncertainty into an explicit stop condition.
+**Dependencies:** Checkpoint C.
+**Files/components:** src/mentor/vector_stores.py; src/mentor/config.py; tests/test_vector_stores.py; docs/phase-3-api-preflight.md.
+**Consumes/produces:** OpenAI client plus snapshot artifacts -> fakeable create/attach/batch-status/search/detach adapter and preflight report.
+**Failing-test-first:** Test statuses, filters, search mapping, detach-without-delete, and same-file/multiple-store unsupported outcome with fakes.
+**Acceptance criteria:** No remote call in pytest; live preflight uses disposable non-corpus data only with Theo approval; contradiction stops work.
+**Verification:** Focused fake-adapter tests and full pytest; live preflight is a separate manual checkpoint.
+**Commit boundary:** feat(derived-orientation): isolate vector-store operations.
+### Task 13 — Bounded published-snapshot orientation service
 
-**Browser verification:** Theo performs the approved paid/local human
-checkpoint and decides Phase 2 pass/fail.
+**Module:** derived-orientation-retrieval
+**Purpose:** Retrieve compact derived orientation without raw citations or raw transcript text.
+**Dependencies:** Task 12.
+**Files/components:** src/mentor/orientation.py; src/mentor/vector_stores.py; src/mentor/derived_records.py; src/mentor/storage.py; tests/test_orientation.py.
+**Consumes/produces:** Published snapshot/question/scope -> OrientationResult with typed records, anchors/source areas, snapshot, count, and budget result.
+**Failing-test-first:** Test stale/wrong snapshot, duplicate record/concept, budget, invalid local record, and raw-dump rejection.
+**Acceptance criteria:** Searches only current derived store with current filters; deduplicates before hard budget; exposes truncation; never fabricates citations.
+**Verification:** Focused orientation tests and full pytest.
+**Commit boundary:** feat(derived-orientation): bound current snapshot context.
+### Task 14 — Mentor integration, diagnostics, and replay safety
 
-**Estimated scope:** Small.
+**Module:** mentor-knowledge-orchestration
+**Purpose:** Add server-owned orientation function/tool loop while preserving Phase 2 source safeguards.
+**Dependencies:** Task 13.
+**Files/components:** src/mentor/chat_service.py; src/mentor/prompts.py; src/mentor/orientation.py; src/mentor/storage.py; tests/test_chat_service.py.
+**Consumes/produces:** OrientationService -> bounded function output and KnowledgeContext audit: used, snapshot ID, record IDs/count, budget state, separate raw File Search metrics.
+**Failing-test-first:** Use Responses-shaped fixtures for broad orient-first, narrow raw-first, exact timestamp, tool failure, stale snapshot, citation repair, and compaction replay.
+**Acceptance criteria:** Broad categories orient when snapshot exists; narrow/exact need not; Direct teaching still raw verifies/cites; raw overrides orientation; full payload is excluded from replay/browser display.
+**Verification:** Chat/streaming/citation/compaction tests and full pytest.
+**Commit boundary:** feat(mentor-orchestration): add derived orientation safely.
+### Checkpoint D — Mentor regression gate
 
-### Final checkpoint: Await Theo's Phase 2 decision
+- [ ] Phase 2 citations, exact timestamps, repair, compaction, streaming, persistence, and loopback behavior remain green.
+- [ ] Broad fixtures orient; narrow fixtures do not add unnecessary calls.
+- [ ] Full pytest passes before Inspector work.
 
-- [ ] All deterministic tests and browser smoke checks pass.
-- [ ] The explicit paid quality checkpoint is complete.
-- [ ] The completed branch is committed and pushed.
-- [ ] Theo has made the human acceptance decision.
-- [ ] Stop. Do not start Phase 3, merge to main, or add future capabilities.
 
-## Migration and Data Risks
+### Task 15 — Read-only Knowledge Inspector API
 
-| Risk | Mitigation |
-|---|---|
-| Legacy thread grouping cannot associate all historical diagnostics | Preserve raw items; associate diagnostics in recorded response order; explicitly label genuinely absent fields unavailable. |
-| Partial deletion causes a deleted chat to reappear | Use one SQLite transaction, enabled foreign keys, explicit dependent-row deletes, and reread/reload tests. |
-| Browser-safe display data drifts from replay data | Persist both in one service finalization path and test exact historical configuration/evidence. |
-| Auto depth creates surprise cost or weak research | Use transparent deterministic baselines, manual override, stored effective depth, and actual native-search counts. |
-| Evidence disclosure hides critical sources | Keep all original returned results; show cited results first; expose explicit expand-all. |
-| A planned UI change becomes a framework migration | Stop and ask Theo; the static UI is the approved approach. |
+**Module:** knowledge-inspection
+**Purpose:** Expose inspectable Phase 3 state without source-management actions.
+**Dependencies:** Checkpoint D.
+**Files/components:** src/mentor/server.py; src/mentor/storage.py; src/mentor/knowledge.py; tests/test_server.py.
+**Consumes/produces:** Snapshots/records/anchors/dependencies/turn audit -> loopback browser-safe read-only JSON.
+**Failing-test-first:** Test current/pending/failed status, details, anchor metadata, orientation audit, missing ID, and non-loopback access.
+**Acceptance criteria:** Exposes coverage/failures, typed states, anchors, relations, evolution/conflicts, stale/dependencies, and turn record IDs; never raw corpus, hidden reasoning, secrets, or mutation routes.
+**Verification:** Focused server tests and full pytest.
+**Commit boundary:** feat(knowledge-inspection): expose read-only audit API.
+### Task 16 — Minimal static Assimilation Inspector
 
-## ADRs
+**Module:** knowledge-inspection
+**Purpose:** Let Theo inspect assimilation while the chat remains primary.
+**Dependencies:** Task 15.
+**Files/components:** src/mentor/static/index.html; src/mentor/static/app.js; src/mentor/static/style.css; tests/test_server.py.
+**Consumes/produces:** Inspector JSON -> secondary read-only snapshot/record/anchor/evolution/conflict/stale/turn-audit surface.
+**Failing-test-first:** Add static/API contract assertions before markup changes.
+**Acceptance criteria:** No upload/edit/delete/source-manager actions; raw/derived are distinct; desktop and compact UI have no console errors.
+**Verification:** Full pytest plus desktop and compact-width loopback browser smoke.
+**Commit boundary:** feat(knowledge-inspection): add read-only inspector UI.
+### Task 17 — Deterministic regression suite and evaluation harness
 
-No standalone ADR is created at planning time. The approved Phase 2 design is
-the binding decision record for dual records, physical deletion, independent
-research depth, the unified capability seam, and retention of the static UI.
-Creating duplicate ADR files now would add documentation without a new decision.
+**Module:** phase-3-evaluation
+**Purpose:** Prove structural invariants and prepare a local-only baseline/assimilated measurement schema.
+**Dependencies:** Task 16.
+**Files/components:** tests/test_phase3_regression.py; tests/fixtures/; src/mentor/evaluation.py; docs/phase-3-evaluation.md.
+**Consumes/produces:** Synthetic fixtures -> cross-module regression coverage and evaluation metric schema.
+**Failing-test-first:** Add cross-module regression cases before evaluation aggregation.
+**Acceptance criteria:** Covers migration, anchors, records, validation, synthesis, absence/conflict, DAG, publication, budgets, citations, replay, Inspector, and Phase 2 regression; tracks quality/citations/connections/evolution/correction/orientation/raw searches/passages/tokens/latency/cost.
+**Verification:** Full pytest, diff/secret checks, browser smoke.
+**Commit boundary:** test(phase-3): add deterministic assimilation regressions.
+### Task 18 — Six-source pilot manifest and measured-cost protocol
 
-## Approval Gate
+**Module:** phase-3-evaluation
+**Purpose:** Select the smallest representative real-corpus pilot without running it or guessing full-corpus cost.
+**Dependencies:** Task 17.
+**Files/components:** docs/phase-3-evaluation.md; .gitignore; src/mentor/evaluation.py; tests/test_evaluation.py.
+**Consumes/produces:** Migrated inventory -> ignored manifest of exactly six unique source-revision IDs and cost protocol.
+**Failing-test-first:** Test six-unique-source and structural-role validation first.
+**Acceptance criteria:** Six sources cover foundational teaching, detailed procedure, one concept across 2025/2026, exception/condition, synthesis/evolution material, and possible conflict/uncertainty; names come from inventory not product logic; protocol captures calls, records, audits, tokens, latency, cost, remote counts.
+**Verification:** Manifest/evaluation tests and full pytest. No pilot API call.
+**Commit boundary:** docs: define Phase 3 pilot measurement protocol.
+## Gate 1 — Paid six-source pilot
 
-Do not implement any task until Theo approves this plan and
-[todo.md](todo.md). On approval, work tasks in order, commit/push each
-significant coherent slice, and stop at Task 9 for Theo's human decision.
+**Requires:** Tasks 1-18 complete; deterministic/browser checks green; guarded disposable-data API preflight passed; reviewed six-source manifest; Theo's explicit paid-pilot approval.
+
+**Run:** Compile/validate only the six selected source revisions with GPT-5.6 Sol; build a pilot candidate; audit anchors/validation, relationships, one evolution result, and one unresolved/conflict case where evidence permits; test derived retrieval/orientation and a small Phase 2 baseline comparison.
+
+**Record locally:** revision IDs, compiler/prompt/schema versions, metrics, record counts/families, audit results, retrieval traces, comparison results, and measured full-corpus forecast. Never commit private raw outputs.
+
+**STOP:** Theo reviews semantic representation, evidence discipline, record volume, UX, and cost before full assimilation.
+
+
+### Task 19 — Record Gate 1 pilot decision
+
+**Module:** phase-3-evaluation
+**Purpose:** Preserve pilot pass/fail without granting automatic permission to scale.
+**Dependencies:** Gate 1.
+**Files/components:** docs/phase-3-evaluation.md; tasks/todo.md.
+**Consumes/produces:** Private pilot evidence -> concise non-private decision and explicit full-assimilation authorization state.
+**Failing-test-first:** Not applicable; this is human-gate documentation.
+**Acceptance criteria:** Failed/undecided blocks scaling; pass records measured forecast and still requires a separate Theo approval.
+**Verification:** Theo review and staged-private-data check.
+**Commit boundary:** docs: record Phase 3 pilot decision.
+## Gate 2 — Full Jacob assimilation
+
+Task 20 requires the separate Theo approval recorded by Task 19. A pilot pass is not enough.
+
+
+### Task 20 — Full 150-source assimilation after separate approval
+
+**Module:** phase-3-evaluation
+**Purpose:** Build and validate full candidate with the pilot-proven schema and measured budget.
+**Dependencies:** Task 19 plus explicit Theo approval.
+**Files/components:** src/mentor/compilation.py; src/mentor/vector_stores.py; src/mentor/evaluation.py; ignored local runtime/evaluation artifacts.
+**Consumes/produces:** Selected revisions -> full candidate, coverage/failure audit, stores, records, dependencies, actual metrics.
+**Failing-test-first:** Not applicable; deterministic error paths are already covered.
+**Acceptance criteria:** Every intended source is processed or visibly failed; structural/anchor/validation/dependency/coverage gates pass before publication; actual cost compares to pilot forecast.
+**Verification:** Paid local audit, sampled human anchor audit, full pytest.
+**Commit boundary:** Commit only source/docs/test changes; never corpus/database/private output.
+## Gate 3 — Mentor evaluation and final human acceptance
+
+Task 22 is the final Theo pass/fail decision. Automated or paid results are
+evidence, never a substitute.
+
+
+### Task 21 — Baseline-versus-assimilated Mentor evaluation
+
+**Module:** phase-3-evaluation
+**Purpose:** Determine whether the complete Mentor feels as though it studied Jacob while preserving raw authority.
+**Dependencies:** Task 20 published full snapshot.
+**Files/components:** docs/phase-3-evaluation.md; src/mentor/evaluation.py; tasks/todo.md; ignored local evaluation records.
+**Consumes/produces:** Phase 2 baseline plus full snapshot -> private metrics and concise safe report.
+**Failing-test-first:** Not applicable; deterministic instrumentation is Task 17.
+**Acceptance criteria:** Measures correctness, completeness, citations, conceptual links, evolution, correction, orientation/raw searches/passages, tokens, latency, cost; includes adversarial fake claims/conflicts/refined years/obscure/exhaustive/timestamp/mixed prompts.
+**Verification:** Paid evaluation, raw citation sampling, and full pytest.
+**Commit boundary:** docs: record Phase 3 evaluation results, after Theo approves what is safe to commit.
+
+### Task 22 — Theo's final Phase 3 human acceptance
+
+**Module:** phase-3-evaluation
+**Purpose:** Keep the final pass/fail decision human-owned.
+**Dependencies:** Task 21.
+**Files/components:** docs/phase-3-evaluation.md; tasks/todo.md.
+**Consumes/produces:** Live behavior and evaluation evidence -> Theo's pass/fail record only.
+**Failing-test-first:** Not applicable; mandatory human gate.
+**Acceptance criteria:** Acceptance confirms raw authority, inspectability,
+invalidation, broad-course understanding, citation discipline, and Phase 2
+compatibility. No Phase 4 begins automatically.
+**Verification:** Theo's explicit live decision.
+**Commit boundary:** docs: record Phase 3 human acceptance, if accepted.
+## ADR decision
+
+No standalone ADR is created in this planning commit. The approved Phase 3 design already records the durable decisions for immutable raw/derived store pairs, server-owned orientation, and source-extracted records remaining derived. If the guarded API preflight contradicts one, stop and create a focused ADR only with Theo's approval.
+
+## Plan self-review
+
+- [x] All ten approved module IDs are represented in dependency order.
+- [x] Every task has purpose, dependencies, files, interfaces, failing-test-first work where applicable, acceptance, verification, and commit boundary.
+- [x] Pilot, full corpus, and final Mentor evaluation are separate gates.
+- [x] Routine pytest is mocked/local, and strict Phase 3 boundaries remain.
