@@ -22,6 +22,16 @@ class StreamingFakeChatService:
         yield StreamEvent("complete", answer=Answer(text="A", citations=[], evidence=[]))
 
 
+class FailingStreamingFakeChatService:
+    def stream_reply(self, thread_id, question, evaluation):
+        yield StreamEvent("error", error="The mentor request failed. Try again.")
+
+
+class ExplodingStreamingFakeChatService:
+    def stream_reply(self, thread_id, question, evaluation):
+        raise RuntimeError("simulated server failure")
+
+
 def request(server, method, path, body=None):
     connection = http.client.HTTPConnection(*server.server_address)
     headers = {"Content-Type": "application/json"} if body is not None else {}
@@ -106,6 +116,39 @@ def test_server_streams_chat_events(tmp_path):
         worker.join()
 
 
+def test_server_streams_a_recoverable_error_event(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    thread_id = storage.create_thread("Plan")
+    server = create_server(storage, FailingStreamingFakeChatService(), port=0)
+    worker = threading.Thread(target=server.serve_forever)
+    worker.start()
+    try:
+        status, _, body = request(server, "POST", f"/api/threads/{thread_id}/messages", b'{"question":"Hello"}')
+        assert status == 200
+        assert b'"type": "error"' in body
+        assert b"The mentor request failed. Try again." in body
+    finally:
+        server.shutdown()
+        worker.join()
+
+
+def test_server_recovers_an_unexpected_streaming_exception(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    thread_id = storage.create_thread("Plan")
+    server = create_server(storage, ExplodingStreamingFakeChatService(), port=0)
+    worker = threading.Thread(target=server.serve_forever)
+    worker.start()
+    try:
+        status, _, body = request(server, "POST", f"/api/threads/{thread_id}/messages", b'{"question":"Hello"}')
+        assert status == 200
+        assert b'"type": "error"' in body
+    finally:
+        server.shutdown()
+        worker.join()
+
+
 def test_server_serves_local_markdown_dependencies(tmp_path):
     storage = Storage(tmp_path / "mentor.sqlite3")
     storage.initialize()
@@ -160,6 +203,8 @@ def test_server_serves_the_persistent_chat_controls(tmp_path):
         assert b"formatEvidenceTimestamp" in script
         assert b"markdown-table-scroll" in script
         assert b"Applied for future model replay" in script
+        assert b'event.type === "error"' in script
+        assert b"Mentor unavailable. You can retry." in script
         status, _, stylesheet = request(server, "GET", "/app.css")
         assert b".markdown-table-scroll" in stylesheet
         assert b"overflow-wrap: normal" in stylesheet

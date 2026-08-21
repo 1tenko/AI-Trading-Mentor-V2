@@ -94,8 +94,9 @@ begin Phase 3.
 
 - [x] All deterministic and browser checks pass.
 - [x] Native replay compaction, prompt-cache diagnostics, File Search result
-  budgets, evidence disclosure, and table overflow have passed technical and
-  controlled paid verification; see `docs/phase-2-evaluation.md`.
+  budgets, evidence disclosure, table overflow, long-thread recovery, and the
+  controlled Terra/Sol comparison have passed technical and controlled paid
+  verification; see `docs/phase-2-evaluation.md`.
 - [x] The branch is committed and pushed.
 - [ ] Theo has made the human acceptance decision.
 - [ ] Stop: do not merge to main or begin Phase 3.

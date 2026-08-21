@@ -1,6 +1,7 @@
 """Private loopback HTTP server for the Phase 1 browser chat."""
 
 import json
+import logging
 import re
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -8,9 +9,10 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlparse
 
-from mentor.chat_service import Answer, EvaluationConfig
+from mentor.chat_service import Answer, EvaluationConfig, StreamEvent
 from mentor.storage import Storage
 
+LOGGER = logging.getLogger(__name__)
 MAX_JSON_BYTES = 16_384
 FILE_ID = re.compile(r"^[A-Za-z0-9_-]+$")
 STATIC_ASSETS = {
@@ -129,14 +131,23 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("X-Frame-Options", "DENY")
         self.end_headers()
-        for event in self.chat_service.stream_reply(thread_id, question, evaluation):
-            body = {"type": event.type, "text": event.text}
-            if event.answer is not None:
-                body["answer"] = _answer_json(event.answer)
-            if event.incomplete_reason is not None:
-                body["incomplete_reason"] = event.incomplete_reason
-            self.wfile.write(f"data: {json.dumps(body)}\n\n".encode())
-            self.wfile.flush()
+        try:
+            for event in self.chat_service.stream_reply(thread_id, question, evaluation):
+                self._write_stream_event(event)
+        except Exception as error:
+            LOGGER.warning("Mentor SSE handler raised %s", type(error).__name__)
+            self._write_stream_event(StreamEvent("error", error="The mentor request failed. Try again."))
+
+    def _write_stream_event(self, event: Any) -> None:
+        body = {"type": event.type, "text": event.text}
+        if event.answer is not None:
+            body["answer"] = _answer_json(event.answer)
+        if event.incomplete_reason is not None:
+            body["incomplete_reason"] = event.incomplete_reason
+        if event.error:
+            body["error"] = event.error
+        self.wfile.write(f"data: {json.dumps(body)}\n\n".encode())
+        self.wfile.flush()
 
     def _json_body(self) -> dict:
         content_length = self.headers.get("Content-Length")

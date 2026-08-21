@@ -211,6 +211,17 @@ function showIncomplete(answer, mentor) {
   messages.append(block);
 }
 
+function showStreamError(mentor, message, retryText) {
+  mentor.heading.textContent = "Mentor — unavailable";
+  mentor.content.classList.remove("markdown");
+  mentor.content.replaceChildren(document.createTextNode(message));
+  const retry = document.createElement("button");
+  retry.type = "button";
+  retry.textContent = "Retry";
+  retry.addEventListener("click", () => sendMessage(retryText, false));
+  mentor.content.append(document.createElement("br"), retry);
+}
+
 function evaluation() {
   return { reasoning_effort: effort.value, reasoning_mode: mode.value, research_depth: researchDepth.value };
 }
@@ -335,6 +346,7 @@ async function sendMessage(text, showUser = true) {
       const decoder = new TextDecoder();
       let buffer = "";
       let answerText = "";
+      let terminal = false;
       while (true) {
         const chunk = await reader.read();
         if (chunk.done) break;
@@ -344,11 +356,25 @@ async function sendMessage(text, showUser = true) {
             renderMarkdown(mentor.content, answerText);
           }
           if (event.type === "complete" || event.type === "incomplete") {
+            terminal = true;
             showEvidence(event.answer.evidence, event.answer.citations);
             showDiagnostics(event.answer.diagnostics);
             if (event.type === "incomplete") showIncomplete(event.answer, mentor);
           }
+          if (event.type === "error") {
+            terminal = true;
+            showStreamError(mentor, event.error || "The mentor request failed. Try again.", text);
+          }
         });
+      }
+      if (!terminal) {
+        showStreamError(mentor, "The mentor stream ended before returning a usable response. Try again.", text);
+        status.textContent = "Mentor unavailable. You can retry.";
+        return;
+      }
+      if (mentor.heading.textContent === "Mentor — unavailable") {
+        status.textContent = "Mentor unavailable. You can retry.";
+        return;
       }
     } else {
       const answer = await response.json();

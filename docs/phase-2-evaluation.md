@@ -1,7 +1,8 @@
 # Phase 2 Human Evaluation
 
-**Status:** Technical hardening complete; prepared for Theo's evaluation. This
-worksheet does not mark Phase 2 passed.
+**Status:** Technical hardening, long-thread recovery, and model comparison are
+complete; prepared for Theo's evaluation. This worksheet does not mark Phase 2
+passed.
 
 Run the deterministic checks first:
 
@@ -86,6 +87,13 @@ Automated verification after this hardening: `32 passed` from
 browser checks confirmed no console errors, a left sidebar, collapsed evidence
 with cited results first, and horizontally scrollable tables without page-level
 overflow.
+
+## Long-thread recovery and model comparison — 2026-08-21
+
+The technical record is [phase-2-long-thread-and-model-evaluation.md](phase-2-long-thread-and-model-evaluation.md).
+It documents the stale-server blank-response diagnosis, native-compaction
+continuity proof, retryable-stream behavior, and the measured Terra/Sol
+evaluation. It does not change the production default or introduce routing.
 
 ## Decision
 

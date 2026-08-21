@@ -1,6 +1,7 @@
 """Grounded, stateless Responses API chat for the Phase 1 proof."""
 
 from dataclasses import dataclass
+import logging
 import re
 from time import perf_counter
 from typing import Any
@@ -10,6 +11,7 @@ from mentor.prompts import MENTOR_INSTRUCTIONS
 from mentor.storage import Storage
 
 
+LOGGER = logging.getLogger(__name__)
 MAX_OUTPUT_TOKENS = 25_000
 COMPACTION_TOKEN_THRESHOLD = 50_000
 FILE_SEARCH_RESULT_BUDGETS = {"normal": 8, "deep": 20, "exhaustive": 20}
@@ -99,6 +101,7 @@ class StreamEvent:
     text: str = ""
     answer: Answer | None = None
     incomplete_reason: str | None = None
+    error: str = ""
 
 
 class ChatService:
@@ -126,24 +129,34 @@ class ChatService:
     ):
         user_item, request, effective_depth = self._request(thread_id, question, evaluation)
         started_at = perf_counter()
-        stream = self.client.responses.create(**request, stream=True)
-        for event in stream:
-            if event.type == "response.output_text.delta":
-                yield StreamEvent("delta", event.delta)
-            elif event.type in {"response.completed", "response.incomplete"}:
-                answer = self._finalize(
-                    thread_id, user_item, event.response, evaluation, effective_depth, started_at
-                )
-                if answer.incomplete_reason:
-                    yield StreamEvent(
-                        "incomplete",
-                        answer=answer,
-                        incomplete_reason=answer.incomplete_reason,
+        try:
+            stream = self.client.responses.create(**request, stream=True)
+            for event in stream:
+                if event.type == "response.output_text.delta":
+                    yield StreamEvent("delta", event.delta)
+                elif event.type in {"response.completed", "response.incomplete"}:
+                    answer = self._finalize(
+                        thread_id, user_item, event.response, evaluation, effective_depth, started_at
                     )
-                else:
-                    yield StreamEvent("complete", answer=answer)
-                return
-        raise RuntimeError("OpenAI ended the response stream without a completed response.")
+                    if answer.incomplete_reason:
+                        yield StreamEvent(
+                            "incomplete",
+                            answer=answer,
+                            incomplete_reason=answer.incomplete_reason,
+                        )
+                    else:
+                        yield StreamEvent("complete", answer=answer)
+                    return
+                elif event.type in {"response.failed", "response.cancelled", "error"}:
+                    LOGGER.warning("OpenAI stream ended with %s", event.type)
+                    yield StreamEvent("error", error="The mentor request failed. Try again.")
+                    return
+        except Exception as error:
+            LOGGER.warning("OpenAI stream raised %s", type(error).__name__)
+            yield StreamEvent("error", error="The mentor request failed. Try again.")
+            return
+        LOGGER.warning("OpenAI stream ended without a terminal response event")
+        yield StreamEvent("error", error="The mentor stream ended before returning a usable response. Try again.")
 
     def _request(
         self, thread_id: int, question: str, evaluation: EvaluationConfig
@@ -189,10 +202,9 @@ class ChatService:
         if compaction_index is None:
             self.storage.append_replay_items(thread_id, [user_item, *output])
         else:
-            raw_items = self.storage.thread_items(thread_id)
             self.storage.replace_replay_items(
                 thread_id,
-                [item for item in raw_items if item.get("role") == "user"] + output[compaction_index:],
+                output[compaction_index:],
             )
         answer = _answer(output, incomplete_reason=_incomplete_reason(response))
         diagnostics = _diagnostics(

@@ -249,6 +249,26 @@ def test_stream_reply_marks_an_output_limit_response_incomplete_and_records_diag
     assert storage.display_turns(thread_id)[0]["incomplete_reason"] == "max_output_tokens"
 
 
+def test_stream_reply_reports_a_failed_response_without_persisting_a_turn(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    storage.set_vector_store("vs_jacob")
+    thread_id = storage.create_thread("Question")
+    failed_response = SimpleNamespace(
+        status="failed",
+        error=SimpleNamespace(message="context window exceeded"),
+    )
+    responses = FakeResponses([SimpleNamespace(type="response.failed", response=failed_response)])
+
+    events = list(ChatService(storage, SimpleNamespace(responses=responses)).stream_reply(thread_id, "Question"))
+
+    assert [(event.type, event.error) for event in events] == [
+        ("error", "The mentor request failed. Try again."),
+    ]
+    assert storage.thread_items(thread_id) == []
+    assert storage.display_turns(thread_id) == []
+
+
 def test_evaluation_configuration_validates_and_reaches_the_responses_request(tmp_path):
     storage = Storage(tmp_path / "mentor.sqlite3")
     storage.initialize()
@@ -458,6 +478,4 @@ def test_native_context_management_replaces_only_model_replay_when_openai_return
     assert answer.diagnostics.cache_write_tokens == 500
     assert answer.diagnostics.native_compaction_applied is True
     assert storage.thread_items(thread_id)[1]["type"] == "file_search_call"
-    replay_items = storage.replay_items(thread_id)
-    assert any(item.get("type") == "compaction" for item in replay_items)
-    assert not any(item.get("type") == "file_search_call" for item in replay_items)
+    assert storage.replay_items(thread_id) == response.output
