@@ -4,9 +4,10 @@ The binding design is
 [2026-08-20-trading-mentor-phase-2-design.md](../docs/superpowers/specs/2026-08-20-trading-mentor-phase-2-design.md).
 The detailed proposed execution plan is [plan.md](plan.md).
 
-**Status:** Tasks 1–8 and final technical hardening are complete on
-feature/phase-2-unified-mentor. Task 9 awaits Theo's human evaluation; do not
-begin Phase 3.
+**Status:** Phase 2 passed Theo's final human acceptance evaluation on
+2026-08-21. The accepted implementation remains on
+feature/phase-2-unified-mentor; do not begin Phase 3 or merge to main without
+separate approval.
 
 ## conversation-lifecycle
 
@@ -84,13 +85,13 @@ begin Phase 3.
   - Verify: full pytest, diff check, secret scan, local browser smoke.
   - Depends on: Checkpoint C.
 
-- [ ] **Task 9 — Explicit Phase 2 human quality checkpoint**
+- [x] **Task 9 — Explicit Phase 2 human quality checkpoint**
   - Acceptance: a small private paid evaluation confirms persistent-chat,
     normal/exhaustive research, evidence/diagnostics, and deletion behavior.
   - Verify: Theo's browser evaluation and pass/fail decision.
   - Depends on: Task 8.
 
-### Final checkpoint — Await Theo's Phase 2 decision
+### Final checkpoint — Phase 2 accepted
 
 - [x] All deterministic and browser checks pass.
 - [x] Native replay compaction, prompt-cache diagnostics, File Search result
@@ -98,5 +99,5 @@ begin Phase 3.
   controlled Terra/Sol comparison have passed technical and controlled paid
   verification; see `docs/phase-2-evaluation.md`.
 - [x] The branch is committed and pushed.
-- [ ] Theo has made the human acceptance decision.
-- [ ] Stop: do not merge to main or begin Phase 3.
+- [x] Theo completed the human acceptance decision: **Phase 2 passed**.
+- [x] Stop: do not merge to main or begin Phase 3.

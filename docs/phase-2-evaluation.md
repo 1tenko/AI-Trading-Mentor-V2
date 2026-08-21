@@ -1,8 +1,8 @@
 # Phase 2 Human Evaluation
 
-**Status:** Technical hardening, long-thread recovery, and model comparison are
-complete; prepared for Theo's evaluation. This worksheet does not mark Phase 2
-passed.
+**Status:** Passed by Theo's final human acceptance evaluation on 2026-08-21.
+This record does not authorize Phase 3, automatic model routing, or a merge to
+main.
 
 Run the deterministic checks first:
 
@@ -101,13 +101,30 @@ The final technical provenance fix is recorded in
 [phase-2-citation-integrity.md](phase-2-citation-integrity.md). It adds the
 native-citation repair safeguard, corrects cited-source versus retrieved-passage
 semantics, and records a controlled paid three-turn continuation. It does not
-pass Phase 2; Theo's browser decision remains required.
+pass Phase 2 by itself; its behavior was subsequently verified in Theo's final
+live acceptance evaluation.
+
+## Final human acceptance — 2026-08-21
+
+Theo accepted the Phase 2 foundation after personally verifying persistent
+conversation restoration/switching and reload persistence; local-only permanent
+deletion; historical Markdown, evidence, diagnostics, and settings; research
+depth controls; provenance; exhaustive source research; native long-thread
+compaction and continuation; recoverable stream failures; citations; exact
+source/timestamp verification; evidence semantics; timestamps; table behavior;
+and source-grounded corrections.
+
+The final live citation check completed an Auto-to-Deep 2025/2026 SMT comparison
+with five cited sources and cited Direct source teaching. Its same-conversation
+exact-source follow-up identified January 20th, retained a native citation, and
+kept the claim qualified to the supported wording. Private transcripts and
+runtime data are intentionally not recorded here.
 
 ## Decision
 
 Record one outcome outside Git if it contains private conversation content:
 
-- [ ] Pass — Phase 2 persistent-chat foundation is acceptable.
+- [x] Pass — Phase 2 persistent-chat foundation is acceptable.
 - [ ] Fail — record the prompt, settings, evidence, and observed gap.
 
-Theo alone makes this decision. A pass does not authorize Phase 3.
+Theo made this decision. A pass does not authorize Phase 3.
