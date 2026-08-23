@@ -8,7 +8,7 @@ Stay on feature/phase-3-knowledge-assimilation. Do not begin Phase 4.
 
 ## knowledge-library
 
-- [ ] **Task 1 — Generic library identity and additive migration**
+- [x] **Task 1 — Generic library identity and additive migration**
   - Depends on: none. Verify: focused migration tests; full pytest.
 - [ ] **Task 2 — Idempotent Jacob registry migration and change detection**
   - Depends on: Task 1. Verify: importer/registry tests; full pytest.
