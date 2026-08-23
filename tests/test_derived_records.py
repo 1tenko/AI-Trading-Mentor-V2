@@ -316,6 +316,52 @@ def test_evolution_and_conflict_reject_raw_evidence_private_text_and_unsupported
 
 
 @pytest.mark.parametrize(
+    ("field", "wording"),
+    [
+        ("qualification", "Jacob never taught this before 2026."),
+        ("current", "This was new in 2026 and absent before."),
+        ("previous", "The earlier teaching was removed in 2026."),
+    ],
+)
+def test_evolution_rejects_negative_claim_wording_without_structural_evidence(field, wording):
+    common = {
+        **_envelope(),
+        "anchors": ("anc_2025", "anc_2026", "anc_deprecation"),
+        "dependencies": (
+            RecordDependency("source_revision", "rev_2025"),
+            RecordDependency("source_revision", "rev_2026"),
+        ),
+        "subject": "synthetic concept",
+        "previous": "earlier teaching",
+        "current": "later teaching",
+        "earlier_source_set": ("rev_2025",),
+        "later_source_set": ("rev_2026",),
+        "classification": "no_supported_classification",
+        "negative_evidence_state": "not_found_in_observed_evidence",
+        "earlier_coverage_id": "coverage_2025",
+        "later_coverage_id": "coverage_2026",
+        "earlier_observed_years": (2025,),
+        "later_observed_years": (2026,),
+    }
+
+    with pytest.raises(ValueError, match="negative claim wording"):
+        Evolution.create(**(common | {field: wording}))
+
+    direct_deprecation = Evolution.create(
+        **(
+            common
+            | {
+                "qualification": "The earlier teaching was deprecated in later material.",
+                "classification": "deprecated_or_deemphasized",
+                "negative_evidence_state": "positive_teaching",
+                "deprecation_evidence_anchors": ("anc_deprecation",),
+            }
+        ),
+    )
+    assert direct_deprecation.classification == "deprecated_or_deemphasized"
+
+
+@pytest.mark.parametrize(
     "factory, message",
     [
         (lambda: create_record("unknown", **_envelope()), "unknown derived record family"),

@@ -252,7 +252,7 @@ def test_storage_has_no_result_accepting_path_for_forged_validation_results(tmp_
             **common,
             subject="one",
             previous="old",
-            current="new",
+            current="later",
             earlier_source_set=(revision.revision_id,),
             later_source_set=(revision.revision_id,),
             classification="no_supported_classification",

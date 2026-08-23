@@ -43,6 +43,7 @@ MAX_FACETS = 5
 MAX_FACET_VALUE_LENGTH = 160
 MAX_TERMS = 8
 MAX_TYPED_CONTENT_LENGTH = 240
+NEGATIVE_CLAIM_WORDS = frozenset({"never", "new", "absent", "removed", "deprecated"})
 
 
 @dataclass(frozen=True)
@@ -411,6 +412,7 @@ def _validate_family(record: DerivedRecord) -> None:
         if record.classification == "deprecated_or_deemphasized":
             if record.negative_evidence_state != "positive_teaching" or not record.deprecation_evidence_anchors:
                 raise ValueError("deprecated classifications require direct deprecation evidence")
+        _validate_evolution_negative_claim_wording(record)
         strings = (record.subject, record.previous, record.current)
     elif isinstance(record, ConflictUnresolved):
         if record.family != "conflict_unresolved" or record.derived_kind != record.kind or record.kind not in {"conflict", "unresolved"} or len(record.alternatives) < 2:
@@ -458,7 +460,7 @@ def _require_auditable_text(value: object, label: str, *, maximum: int | None = 
 
 
 def reject_private_or_raw_text(value: str, label: str) -> None:
-    tokens = frozenset(re.findall(r"[a-z0-9]+", unicodedata.normalize("NFKC", value).casefold()))
+    tokens = _normalized_tokens(value)
     if (
         "private" in tokens
         or "scratchpad" in tokens
@@ -473,6 +475,45 @@ def reject_private_or_raw_text(value: str, label: str) -> None:
         raise ValueError(f"{label} cannot contain private or raw source content")
     if "confidence" in tokens and any(token.isdigit() for token in tokens):
         raise ValueError(f"{label} cannot contain numeric confidence")
+
+
+def _validate_evolution_negative_claim_wording(record: Evolution) -> None:
+    wording = frozenset().union(
+        *(
+            _normalized_tokens(value)
+            for value in (
+                record.qualification,
+                record.subject,
+                record.previous,
+                record.current,
+                *(facet.value for facet in record.facets),
+            )
+        )
+    )
+    strong_words = wording & NEGATIVE_CLAIM_WORDS
+    if not strong_words:
+        return
+
+    authorized_words: frozenset[str] = frozenset()
+    if (
+        record.classification == "introduced"
+        and record.negative_evidence_state == "source_asserted_absence"
+    ):
+        authorized_words = frozenset({"never", "new", "absent"})
+    elif (
+        record.classification == "deprecated_or_deemphasized"
+        and record.negative_evidence_state == "positive_teaching"
+        and record.deprecation_evidence_anchors
+    ):
+        authorized_words = frozenset({"removed", "deprecated"})
+    if not strong_words <= authorized_words:
+        raise ValueError("evolution negative claim wording requires supporting classification and evidence")
+
+
+def _normalized_tokens(value: str) -> frozenset[str]:
+    normalized = unicodedata.normalize("NFKD", value).casefold()
+    normalized = "".join(character for character in normalized if not unicodedata.combining(character))
+    return frozenset(re.findall(r"[a-z0-9]+", normalized))
 
 
 def _require_identifier_tuple(values: object, label: str, *, allow_empty: bool = False) -> None:
