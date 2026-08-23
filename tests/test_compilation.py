@@ -1,5 +1,6 @@
 from dataclasses import replace
 from hashlib import sha256
+import sqlite3
 
 import pytest
 
@@ -48,6 +49,15 @@ def candidate(storage: Storage, run_id: str, revisions: list[SourceRevision]) ->
     return snapshot
 
 
+def current_pointer(storage: Storage) -> dict[str, str]:
+    with storage._connect() as connection:
+        rows = connection.execute(
+            "SELECT key, value FROM settings WHERE key IN "
+            "('current_snapshot_id', 'active_raw_store_id', 'active_derived_store_id')"
+        ).fetchall()
+    return {key: value for key, value in rows}
+
+
 def test_candidate_requires_validation_before_publication(tmp_path):
     storage = Storage(tmp_path / "mentor.sqlite3")
     storage.initialize()
@@ -57,6 +67,7 @@ def test_candidate_requires_validation_before_publication(tmp_path):
         storage.transition_snapshot(snapshot.snapshot_id, "published")
 
     assert storage.snapshot(snapshot.snapshot_id).status == "building"
+    assert storage.current_snapshot() is None
 
 
 def test_candidate_cannot_fail_before_validation(tmp_path):
@@ -167,3 +178,65 @@ def test_current_snapshot_lookup_and_metric_rows_are_deterministic(tmp_path):
             schema_version="schema-v1",
         )
     ]
+
+
+def test_publication_archives_the_previous_pair_and_resolves_only_the_new_pair(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    previous = candidate(storage, "run_previous", [revision_for(storage, "source_previous")])
+    storage.transition_snapshot(previous.snapshot_id, "validating")
+    storage.transition_snapshot(previous.snapshot_id, "published")
+    replacement = candidate(storage, "run_replacement", [revision_for(storage, "source_replacement")])
+    storage.transition_snapshot(replacement.snapshot_id, "validating")
+
+    storage.transition_snapshot(replacement.snapshot_id, "published")
+
+    assert storage.snapshot(previous.snapshot_id).status == "archived"
+    assert storage.current_snapshot() == storage.snapshot(replacement.snapshot_id)
+    assert current_pointer(storage) == {
+        "current_snapshot_id": replacement.snapshot_id,
+        "active_raw_store_id": replacement.raw_store_id,
+        "active_derived_store_id": replacement.derived_store_id,
+    }
+
+
+def test_failed_pointer_swap_keeps_the_previous_pair_readable(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    previous = candidate(storage, "run_boundary_previous", [revision_for(storage, "source_previous")])
+    storage.transition_snapshot(previous.snapshot_id, "validating")
+    storage.transition_snapshot(previous.snapshot_id, "published")
+    replacement = candidate(storage, "run_boundary_replacement", [revision_for(storage, "source_replacement")])
+    storage.transition_snapshot(replacement.snapshot_id, "validating")
+    before = current_pointer(storage)
+    with storage._connect() as connection:
+        connection.execute(
+            """
+            CREATE TRIGGER fail_raw_pointer_update
+            BEFORE UPDATE ON settings WHEN NEW.key = 'active_raw_store_id'
+            BEGIN
+                SELECT RAISE(ABORT, 'synthetic pointer failure');
+            END
+            """
+        )
+
+    with pytest.raises(sqlite3.IntegrityError, match="synthetic pointer failure"):
+        storage.transition_snapshot(replacement.snapshot_id, "published")
+
+    assert current_pointer(storage) == before
+    assert storage.current_snapshot() == storage.snapshot(previous.snapshot_id)
+    assert storage.snapshot(replacement.snapshot_id).status == "validating"
+
+
+def test_current_snapshot_rejects_mixed_snapshot_store_pointers(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    snapshot = candidate(storage, "run_mixed_pointers", [revision_for(storage, "source_mixed")])
+    storage.transition_snapshot(snapshot.snapshot_id, "validating")
+    storage.transition_snapshot(snapshot.snapshot_id, "published")
+    with storage._connect() as connection:
+        connection.execute(
+            "UPDATE settings SET value = 'raw_other' WHERE key = 'active_raw_store_id'"
+        )
+
+    assert storage.current_snapshot() is None

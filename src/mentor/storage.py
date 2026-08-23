@@ -64,10 +64,12 @@ class Thread:
 
 
 _SNAPSHOT_QUERY = """
-SELECT snapshot_id, run_id, selected_revision_ids_json, selected_revision_fingerprint,
+SELECT corpus_snapshots.snapshot_id, run_id, selected_revision_ids_json, selected_revision_fingerprint,
        raw_store_id, derived_store_id, model_version, prompt_version, schema_version,
-       status, created_at, validated_at, published_at, failed_at, failure_reason
+       CASE WHEN archived_snapshots.snapshot_id IS NULL THEN corpus_snapshots.status ELSE 'archived' END,
+       created_at, validated_at, published_at, failed_at, failure_reason
 FROM corpus_snapshots
+LEFT JOIN archived_snapshots ON archived_snapshots.snapshot_id = corpus_snapshots.snapshot_id
 """
 
 
@@ -194,6 +196,10 @@ class Storage:
                     published_at REAL,
                     failed_at REAL,
                     failure_reason TEXT
+                );
+                CREATE TABLE IF NOT EXISTS archived_snapshots (
+                    snapshot_id TEXT PRIMARY KEY REFERENCES corpus_snapshots(snapshot_id),
+                    archived_at REAL NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS compilation_metrics (
                     metric_id INTEGER PRIMARY KEY,
@@ -447,7 +453,9 @@ class Storage:
     ) -> CorpusSnapshot:
         transitioned_at = time.time() if transitioned_at is None else transitioned_at
         with self._connect() as connection:
-            row = connection.execute(_SNAPSHOT_QUERY + " WHERE snapshot_id = ?", (snapshot_id,)).fetchone()
+            row = connection.execute(
+                _SNAPSHOT_QUERY + " WHERE corpus_snapshots.snapshot_id = ?", (snapshot_id,)
+            ).fetchone()
             if row is None:
                 raise ValueError("unknown snapshot")
             snapshot = _snapshot_from_row(row)
@@ -504,6 +512,15 @@ class Storage:
                 ),
             )
             if status == "published":
+                previous = connection.execute(
+                    "SELECT value FROM settings WHERE key = 'current_snapshot_id'"
+                ).fetchone()
+                if previous is not None and previous[0] != snapshot_id:
+                    connection.execute(
+                        "INSERT INTO archived_snapshots(snapshot_id, archived_at) VALUES (?, ?) "
+                        "ON CONFLICT(snapshot_id) DO NOTHING",
+                        (previous[0], transitioned_at),
+                    )
                 for key, value in (
                     ("current_snapshot_id", snapshot_id),
                     ("active_raw_store_id", snapshot.raw_store_id),
@@ -518,16 +535,22 @@ class Storage:
 
     def snapshot(self, snapshot_id: str) -> CorpusSnapshot | None:
         with self._connect() as connection:
-            row = connection.execute(_SNAPSHOT_QUERY + " WHERE snapshot_id = ?", (snapshot_id,)).fetchone()
+            row = connection.execute(
+                _SNAPSHOT_QUERY + " WHERE corpus_snapshots.snapshot_id = ?", (snapshot_id,)
+            ).fetchone()
         return None if row is None else _snapshot_from_row(row)
 
     def current_snapshot(self) -> CorpusSnapshot | None:
         with self._connect() as connection:
             row = connection.execute(
                 _SNAPSHOT_QUERY
-                + " JOIN settings ON settings.key = 'current_snapshot_id'"
-                " AND settings.value = corpus_snapshots.snapshot_id"
-                " WHERE corpus_snapshots.status = 'published'"
+                + " JOIN settings AS current_pointer ON current_pointer.key = 'current_snapshot_id'"
+                " AND current_pointer.value = corpus_snapshots.snapshot_id"
+                " JOIN settings AS raw_pointer ON raw_pointer.key = 'active_raw_store_id'"
+                " AND raw_pointer.value = corpus_snapshots.raw_store_id"
+                " JOIN settings AS derived_pointer ON derived_pointer.key = 'active_derived_store_id'"
+                " AND derived_pointer.value = corpus_snapshots.derived_store_id"
+                " WHERE corpus_snapshots.status = 'published' AND archived_snapshots.snapshot_id IS NULL"
             ).fetchone()
         return None if row is None else _snapshot_from_row(row)
 
