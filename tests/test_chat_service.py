@@ -13,6 +13,12 @@ from mentor.chat_service import (
 )
 from mentor.prompts import MENTOR_INSTRUCTIONS
 from mentor.storage import Storage
+from mentor.orientation import (
+    OrientationBudget,
+    OrientationRecord,
+    OrientationResult,
+    OrientationSourceArea,
+)
 
 
 class FakeResponses:
@@ -33,6 +39,54 @@ class SequenceResponses:
     def create(self, **kwargs):
         self.calls.append(kwargs)
         return self.responses.pop(0)
+
+
+class FakeOrientation:
+    def __init__(self, result=None, error=None):
+        self.result = result
+        self.error = error
+        self.calls = []
+
+    def consult(self, question, **kwargs):
+        self.calls.append((question, kwargs))
+        if self.error is not None:
+            raise self.error
+        return self.result
+
+
+def published_snapshot():
+    return SimpleNamespace(
+        snapshot_id="snap_current",
+        schema_version="derived-schema-v1",
+        status="published",
+        raw_store_id="vs_raw_current",
+        derived_store_id="vs_derived_current",
+    )
+
+
+def orientation_result():
+    return OrientationResult(
+        snapshot_id="snap_current",
+        snapshot_schema_version="derived-schema-v1",
+        records=(
+            OrientationRecord(
+                record_id="rec_orientation",
+                concept_id="con_" + "a" * 64,
+                family="relationship",
+                derived_kind="cross_source_synthesis",
+                evidence_state="qualified",
+                qualification="Verify against the raw source.",
+                statement="Derived orientation cue that must not persist in replay.",
+                anchor_ids=("anc_orientation",),
+                source_area=OrientationSourceArea("collection_jacob", 2026, "timing"),
+            ),
+        ),
+        used_tokens=96,
+        budget=OrientationBudget(max_records=8, max_tokens=4_000),
+        truncated=False,
+        duplicate_result_count=0,
+        discarded_result_count=0,
+    )
 
 
 def source_response(text, annotations, *, status="completed", usage=None):
@@ -59,6 +113,209 @@ def source_response(text, annotations, *, status="completed", usage=None):
             },
         ],
     )
+
+
+def orientation_function_response(question):
+    return SimpleNamespace(
+        status="completed",
+        output=[
+            {
+                "type": "function_call",
+                "name": "consult_assimilated_knowledge",
+                "call_id": "call_orientation",
+                "arguments": json.dumps({"question": question}),
+            }
+        ],
+    )
+
+
+def test_broad_question_uses_a_server_owned_orientation_function_before_raw_search_and_persists_only_audit(
+    tmp_path, monkeypatch
+):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    storage.set_vector_store("vs_legacy")
+    monkeypatch.setattr(storage, "current_snapshot", published_snapshot)
+    response = source_response(
+        "Direct source teaching: The raw source controls this answer.",
+        [{"type": "file_citation", "file_id": "file_jacob", "filename": "lesson.txt"}],
+        usage=SimpleNamespace(
+            input_tokens=100,
+            output_tokens=20,
+            total_tokens=120,
+            input_tokens_details=SimpleNamespace(cached_tokens=5, cache_write_tokens=8),
+            output_tokens_details=SimpleNamespace(reasoning_tokens=9),
+        ),
+    )
+    orientation_call = orientation_function_response("Compare SMT and TPD across 2025 and 2026.")
+    orientation_call.usage = SimpleNamespace(
+        input_tokens=11,
+        output_tokens=7,
+        total_tokens=18,
+        input_tokens_details=SimpleNamespace(cached_tokens=2, cache_write_tokens=3),
+        output_tokens_details=SimpleNamespace(reasoning_tokens=4),
+    )
+    responses = SequenceResponses(
+        orientation_call,
+        response,
+    )
+    orientation = FakeOrientation(orientation_result())
+
+    answer = ChatService(
+        storage,
+        SimpleNamespace(responses=responses),
+        orientation_service=orientation,
+    ).reply(storage.create_thread("Compare"), "Compare SMT and TPD across 2025 and 2026.")
+
+    assert answer.text == "Direct source teaching: The raw source controls this answer."
+    assert len(responses.calls) == 2
+    assert responses.calls[0]["tool_choice"] == {
+        "type": "function",
+        "name": "consult_assimilated_knowledge",
+    }
+    assert any(tool["type"] == "file_search" for tool in responses.calls[0]["tools"])
+    assert all(tool["type"] != "function" for tool in responses.calls[1]["tools"])
+    assert responses.calls[1]["tools"] == [
+        {"type": "file_search", "vector_store_ids": ["vs_raw_current"], "max_num_results": 20}
+    ]
+    assert orientation.calls == [
+        ("Compare SMT and TPD across 2025 and 2026.", {"snapshot": published_snapshot()})
+    ]
+    function_output = responses.calls[1]["input"][-1]
+    assert function_output["type"] == "function_call_output"
+    assert json.loads(function_output["output"])["records"][0]["record_id"] == "rec_orientation"
+    diagnostics = storage.display_turns(1)[0]["diagnostics"]
+    assert diagnostics["knowledge_context"] == {
+        "status": "used",
+        "used": True,
+        "snapshot_id": "snap_current",
+        "snapshot_schema_version": "derived-schema-v1",
+        "record_ids": ["rec_orientation"],
+        "record_count": 1,
+        "budget": {"max_records": 8, "max_tokens": 4_000, "used_tokens": 96, "truncated": False},
+    }
+    assert (diagnostics["input_tokens"], diagnostics["output_tokens"], diagnostics["total_tokens"]) == (111, 27, 138)
+    assert (diagnostics["cached_input_tokens"], diagnostics["cache_write_tokens"], diagnostics["reasoning_tokens"]) == (7, 11, 13)
+    saved = json.dumps(storage.thread_items(1)) + json.dumps(storage.display_turns(1))
+    assert "Derived orientation cue that must not persist in replay." not in saved
+    assert "anc_orientation" not in saved
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "What does TPD stand for?",
+        "Where exactly does Jacob say this? Give me the video and timestamp.",
+    ],
+)
+def test_narrow_and_exact_questions_do_not_add_an_orientation_call(tmp_path, monkeypatch, question):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    storage.set_vector_store("vs_legacy")
+    monkeypatch.setattr(storage, "current_snapshot", published_snapshot)
+    responses = FakeResponses(
+        source_response(
+            "Direct source teaching: Raw File Search remains authoritative.",
+            [{"type": "file_citation", "file_id": "file_jacob", "filename": "lesson.txt"}],
+        )
+    )
+    orientation = FakeOrientation(error=AssertionError("narrow questions must not orient"))
+
+    ChatService(storage, SimpleNamespace(responses=responses), orientation_service=orientation).reply(
+        storage.create_thread("Question"), question
+    )
+
+    assert orientation.calls == []
+    assert len(responses.calls) == 1
+    assert "tool_choice" not in responses.calls[0]
+    assert all(tool["type"] != "function" for tool in responses.calls[0]["tools"])
+
+
+def test_broad_question_with_no_valid_published_snapshot_stays_on_the_legacy_raw_store(tmp_path, monkeypatch):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    storage.set_vector_store("vs_legacy")
+    monkeypatch.setattr(
+        storage,
+        "current_snapshot",
+        lambda: SimpleNamespace(status="archived", raw_store_id="vs_stale", derived_store_id="vs_stale_derived"),
+    )
+    responses = FakeResponses(source_response("Raw answer.", []))
+    orientation = FakeOrientation(error=AssertionError("stale snapshots must not orient"))
+
+    ChatService(storage, SimpleNamespace(responses=responses), orientation_service=orientation).reply(
+        storage.create_thread("Question"), "Compare the 2025 and 2026 teachings."
+    )
+
+    assert orientation.calls == []
+    assert responses.calls[0]["tools"] == [
+        {"type": "file_search", "vector_store_ids": ["vs_legacy"], "max_num_results": 20}
+    ]
+
+
+def test_orientation_tool_failure_is_auditable_and_recovers_with_raw_search(tmp_path, monkeypatch):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    storage.set_vector_store("vs_legacy")
+    monkeypatch.setattr(storage, "current_snapshot", published_snapshot)
+    responses = SequenceResponses(
+        orientation_function_response("How do SMT and TPD work together?"),
+        source_response(
+            "Direct source teaching: Raw File Search verified this.",
+            [{"type": "file_citation", "file_id": "file_jacob", "filename": "lesson.txt"}],
+        ),
+    )
+
+    answer = ChatService(
+        storage,
+        SimpleNamespace(responses=responses),
+        orientation_service=FakeOrientation(error=RuntimeError("remote derived lookup failed")),
+    ).reply(storage.create_thread("Question"), "How do SMT and TPD work together?")
+
+    assert answer.citations[0].file_id == "file_jacob"
+    assert len(responses.calls) == 2
+    function_output = json.loads(responses.calls[1]["input"][-1]["output"])
+    assert function_output == {"status": "unavailable", "message": "Derived orientation was unavailable; verify with raw File Search."}
+    diagnostics = storage.response_diagnostics(1)[0]["knowledge_context"]
+    assert diagnostics["status"] == "unavailable"
+    assert diagnostics["used"] is False
+    assert "remote derived lookup failed" not in json.dumps(diagnostics)
+
+
+def test_broad_streaming_preserves_native_compaction_without_replaying_orientation_payload(tmp_path, monkeypatch):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    storage.set_vector_store("vs_legacy")
+    monkeypatch.setattr(storage, "current_snapshot", published_snapshot)
+    final = SimpleNamespace(
+        status="completed",
+        output=[
+            {"type": "compaction", "id": "cmp_1", "encrypted_content": "opaque-state"},
+            {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Raw answer."}]},
+        ],
+    )
+    responses = SequenceResponses(
+        orientation_function_response("How does Jacob's system fit together?"),
+        [
+            SimpleNamespace(type="response.output_text.delta", delta="Raw answer."),
+            SimpleNamespace(type="response.completed", response=final),
+        ],
+    )
+
+    events = list(
+        ChatService(
+            storage,
+            SimpleNamespace(responses=responses),
+            orientation_service=FakeOrientation(orientation_result()),
+        ).stream_reply(storage.create_thread("Question"), "How does Jacob's system fit together?")
+    )
+
+    assert [event.type for event in events] == ["delta", "complete"]
+    assert responses.calls[1]["stream"] is True
+    assert storage.replay_items(1) == final.output
+    replay = json.dumps(storage.replay_items(1))
+    assert "Derived orientation cue that must not persist in replay." not in replay
+    assert "anc_orientation" not in replay
 
 
 def test_reply_persists_continuation_state_and_extracts_evidence(tmp_path):
@@ -154,6 +411,7 @@ def test_reply_persists_continuation_state_and_extracts_evidence(tmp_path):
                 "estimated_text_cost_usd": None,
                 "known_file_search_call_cost_usd": 0.0025,
                 "native_compaction_applied": False,
+                "knowledge_context": None,
             },
             "response_id": storage.response_diagnostics(thread_id)[0]["response_id"],
             "status": "completed",
@@ -601,6 +859,7 @@ def test_policy_reserves_direct_teaching_for_affirmative_source_claims():
     assert "all, every, exact, exhaustive" in MENTOR_INSTRUCTIONS
     assert "each material subquestion" in MENTOR_INSTRUCTIONS
     assert "each requested year independently" in MENTOR_INSTRUCTIONS
+    assert "raw source evidence\noverride any derived orientation" in MENTOR_INSTRUCTIONS
 
 
 def test_policy_requires_a_complementary_search_before_claiming_completeness():

@@ -74,6 +74,7 @@ class OrientationService:
         self,
         question: str,
         *,
+        snapshot: Any | None = None,
         collection_id: str | None = None,
         year: int | None = None,
         scope: str | None = None,
@@ -81,7 +82,7 @@ class OrientationService:
         _require_question(question)
         attributes = {"snapshot_id": "", "status": "published"}
         _add_scope(attributes, collection_id=collection_id, year=year, scope=scope)
-        snapshot = self._storage.current_snapshot()
+        snapshot = self._storage.current_snapshot() if snapshot is None else snapshot
         if snapshot is None or snapshot.status != "published" or not isinstance(snapshot.derived_store_id, str):
             return OrientationResult(None, None, (), 0, self._budget, False, 0, 0)
 
