@@ -317,6 +317,49 @@ def test_noncanonical_direct_record_is_ignored_without_breaking_snapshot_reads(t
     assert storage.derived_records(snapshot.snapshot_id) == [valid]
 
 
+def test_invalid_utf8_direct_records_do_not_break_valid_snapshot_reads(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    snapshot = snapshot_for(storage)
+    valid = claim(
+        snapshot_id=snapshot.snapshot_id,
+        dependencies=(RecordDependency("source_revision", snapshot.selected_revision_ids[0]),),
+    )
+    storage.store_derived_record(valid)
+
+    with storage._connect() as connection:
+        _stage_invalid_utf8_record_id(connection, snapshot)
+        _stage_direct_claim(connection, snapshot, "rec_bad_content", "signal", "states", "observation")
+        connection.execute("UPDATE derived_claims SET subject = CAST(X'80' AS TEXT) WHERE record_id = 'rec_bad_content'")
+        connection.execute("UPDATE derived_records SET finalized = 1 WHERE record_id = 'rec_bad_content'")
+        _stage_direct_claim(connection, snapshot, "rec_bad_facet", "signal", "states", "observation")
+        connection.execute(
+            "INSERT INTO derived_record_facets VALUES ('rec_bad_facet', 0, 'scope', CAST(X'80' AS TEXT))"
+        )
+        connection.execute("UPDATE derived_records SET finalized = 1 WHERE record_id = 'rec_bad_facet'")
+
+    assert storage.derived_records(snapshot.snapshot_id) == [valid]
+
+
+def _stage_invalid_utf8_record_id(connection, snapshot):
+    connection.execute(
+        """
+        INSERT INTO derived_records(
+            record_id, snapshot_id, family, derived_kind, evidence_state, validation_state,
+            lifecycle_state, qualification
+        ) VALUES (CAST(X'80' AS TEXT), ?, 'claim', 'statement', 'raw_taught', 'validated', 'active', 'Synthetic.')
+        """,
+        (snapshot.snapshot_id,),
+    )
+    connection.execute("INSERT INTO derived_record_anchors VALUES (CAST(X'80' AS TEXT), 0, 'anc_synthetic')")
+    connection.execute(
+        "INSERT INTO derived_record_dependencies VALUES (CAST(X'80' AS TEXT), 0, 'source_revision', ?)",
+        (snapshot.selected_revision_ids[0],),
+    )
+    connection.execute("INSERT INTO derived_claims VALUES (CAST(X'80' AS TEXT), 'signal', 'states', 'observation')")
+    connection.execute("UPDATE derived_records SET finalized = 1 WHERE record_id = CAST(X'80' AS TEXT)")
+
+
 def _stage_direct_claim(connection, snapshot, record_id, subject, predicate, object):
     connection.execute(
         """

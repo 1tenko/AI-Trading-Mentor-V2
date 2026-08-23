@@ -588,20 +588,25 @@ class Storage:
 
     def derived_records(self, snapshot_id: str) -> list[DerivedRecord]:
         with self._connect() as connection:
-            rows = connection.execute(
-                """
-                SELECT record_id, snapshot_id, family, derived_kind, evidence_state, validation_state, lifecycle_state, qualification
-                FROM derived_records WHERE snapshot_id = ? AND finalized = 1 ORDER BY record_id
-                """,
-                (snapshot_id,),
-            ).fetchall()
-            records = []
-            for row in rows:
-                try:
-                    records.append(self._derived_record_from_row(connection, row))
-                except (IndexError, TypeError, ValueError):
-                    continue
-            return records
+            text_factory = connection.text_factory
+            connection.text_factory = bytes
+            try:
+                rows = connection.execute(
+                    """
+                    SELECT record_id, snapshot_id, family, derived_kind, evidence_state, validation_state, lifecycle_state, qualification
+                    FROM derived_records WHERE snapshot_id = ? AND finalized = 1 ORDER BY record_id
+                    """,
+                    (snapshot_id,),
+                ).fetchall()
+                records = []
+                for row in rows:
+                    try:
+                        records.append(self._derived_record_from_row(connection, row))
+                    except (IndexError, TypeError, UnicodeError, ValueError):
+                        continue
+                return records
+            finally:
+                connection.text_factory = text_factory
 
     def _store_record_family(self, connection: sqlite3.Connection, record: DerivedRecord) -> None:
         if isinstance(record, Claim):
@@ -657,17 +662,19 @@ class Storage:
             )
 
     def _derived_record_from_row(self, connection: sqlite3.Connection, row: tuple) -> DerivedRecord:
-        record_id, snapshot_id, family, derived_kind, evidence_state, validation_state, lifecycle_state, qualification = row
+        record_id, snapshot_id, family, derived_kind, evidence_state, validation_state, lifecycle_state, qualification = (
+            _decode_sqlite_text(value) for value in row
+        )
         common = {
             "snapshot_id": snapshot_id,
             "anchors": tuple(
-                item[0]
+                _decode_sqlite_text(item[0])
                 for item in connection.execute(
                     "SELECT anchor_id FROM derived_record_anchors WHERE record_id = ? ORDER BY position", (record_id,)
                 )
             ),
             "dependencies": tuple(
-                RecordDependency(*item)
+                RecordDependency(*(_decode_sqlite_text(value) for value in item))
                 for item in connection.execute(
                     """
                     SELECT dependency_kind, dependency_id FROM derived_record_dependencies
@@ -681,7 +688,7 @@ class Storage:
             "qualification": qualification,
             "evidence_state": evidence_state,
             "facets": tuple(
-                Facet(*item)
+                Facet(*(_decode_sqlite_text(value) for value in item))
                 for item in connection.execute(
                     "SELECT facet_name, facet_value FROM derived_record_facets WHERE record_id = ? ORDER BY position", (record_id,)
                 )
@@ -691,6 +698,7 @@ class Storage:
             values = connection.execute(
                 "SELECT subject, predicate, object FROM derived_claims WHERE record_id = ?", (record_id,)
             ).fetchone()
+            values = tuple(_decode_sqlite_text(value) for value in values)
             record = Claim.create(
                 **common,
                 derived_kind=derived_kind,
@@ -702,13 +710,15 @@ class Storage:
             values = connection.execute(
                 "SELECT left_term, relation, right_term FROM derived_relationships WHERE record_id = ?", (record_id,)
             ).fetchone()
+            values = tuple(_decode_sqlite_text(value) for value in values)
             record = Relationship.create(**common, left=values[0], relation=values[1], right=values[2])
         elif family == "procedure_sequence_hierarchy":
             kind = connection.execute(
                 "SELECT structure_kind FROM derived_procedure_sequence_hierarchy WHERE record_id = ?", (record_id,)
-            ).fetchone()[0]
+            ).fetchone()
+            kind = _decode_sqlite_text(kind[0])
             terms = tuple(
-                item[0]
+                _decode_sqlite_text(item[0])
                 for item in connection.execute(
                     """
                     SELECT value FROM derived_record_terms
@@ -722,13 +732,15 @@ class Storage:
             values = connection.execute(
                 "SELECT subject, previous_value, current_value FROM derived_evolutions WHERE record_id = ?", (record_id,)
             ).fetchone()
+            values = tuple(_decode_sqlite_text(value) for value in values)
             record = Evolution.create(**common, subject=values[0], previous=values[1], current=values[2])
         elif family == "conflict_unresolved":
             kind, subject = connection.execute(
                 "SELECT issue_kind, subject FROM derived_conflict_unresolved WHERE record_id = ?", (record_id,)
             ).fetchone()
+            kind, subject = _decode_sqlite_text(kind), _decode_sqlite_text(subject)
             alternatives = tuple(
-                item[0]
+                _decode_sqlite_text(item[0])
                 for item in connection.execute(
                     """
                     SELECT value FROM derived_record_terms
@@ -1465,6 +1477,14 @@ def _snapshot_from_row(row: tuple) -> CorpusSnapshot:
         tuple(json.loads(row[2])),
         *row[3:],
     )
+
+
+def _decode_sqlite_text(value: object) -> str:
+    if isinstance(value, bytes):
+        return value.decode("utf-8")
+    if isinstance(value, str):
+        return value
+    raise TypeError("expected SQLite text")
 
 
 def _display_content(items: list[dict]) -> tuple[str, list[dict], list[dict]]:
