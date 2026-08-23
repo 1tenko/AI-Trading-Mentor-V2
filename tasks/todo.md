@@ -31,7 +31,7 @@ Stay on feature/phase-3-knowledge-assimilation. Do not begin Phase 4.
 
 ## source-extraction
 
-- [ ] **Task 5 — Typed derived-record schema and persistence**
+- [x] **Task 5 — Typed derived-record schema and persistence**
   - Depends on: Task 4. Verify: family/facet/provenance tests; full pytest.
 - [ ] **Task 6 — Mocked per-source extraction with versioned prompts**
   - Depends on: Task 5. Verify: fake Responses fixtures only; full pytest.
