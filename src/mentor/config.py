@@ -13,16 +13,29 @@ class ConfigError(RuntimeError):
 class Config:
     api_key: str
     model: str = "gpt-5.6-sol"
+    vector_store_preflight_approved: bool = False
+
+    def require_vector_store_preflight(self) -> None:
+        if not self.vector_store_preflight_approved:
+            raise ConfigError(
+                "PHASE3_VECTOR_STORE_PREFLIGHT=disposable-approved is required before a live preflight."
+            )
 
 
 def load_config(environment: Mapping[str, str], dotenv_path: Path) -> Config:
     """Read an API key from the environment, falling back to a local .env file."""
-    api_key = environment.get("OPENAI_API_KEY") or _read_dotenv(dotenv_path).get(
-        "OPENAI_API_KEY", ""
-    )
+    dotenv = _read_dotenv(dotenv_path)
+    api_key = environment.get("OPENAI_API_KEY") or dotenv.get("OPENAI_API_KEY", "")
     if not api_key.strip():
         raise ConfigError("OPENAI_API_KEY is required. Copy .env.example to .env first.")
-    return Config(api_key=api_key.strip())
+    return Config(
+        api_key=api_key.strip(),
+        vector_store_preflight_approved=(
+            environment.get("PHASE3_VECTOR_STORE_PREFLIGHT")
+            or dotenv.get("PHASE3_VECTOR_STORE_PREFLIGHT")
+        )
+        == "disposable-approved",
+    )
 
 
 def _read_dotenv(path: Path) -> dict[str, str]:
