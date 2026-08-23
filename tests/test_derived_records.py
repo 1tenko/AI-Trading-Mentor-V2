@@ -362,6 +362,46 @@ def test_evolution_rejects_negative_claim_wording_without_structural_evidence(fi
 
 
 @pytest.mark.parametrize(
+    ("field", "wording"),
+    [
+        ("qualification", "n.e.w"),
+        ("qualification", "n e w"),
+        ("current", "a-b-s-e-n-t"),
+        ("previous", "re_moved"),
+        ("qualification", "depre-cated"),
+        ("subject", "newly"),
+        ("current", "introduced"),
+        ("previous", "de-emphasized"),
+        ("facet", "not taught before 2026"),
+    ],
+)
+def test_evolution_rejects_separator_and_morphology_negative_wording(field, wording):
+    common = {
+        **_envelope(),
+        "anchors": ("anc_2025", "anc_2026"),
+        "dependencies": (
+            RecordDependency("source_revision", "rev_2025"),
+            RecordDependency("source_revision", "rev_2026"),
+        ),
+        "subject": "synthetic concept",
+        "previous": "earlier teaching",
+        "current": "later teaching",
+        "earlier_source_set": ("rev_2025",),
+        "later_source_set": ("rev_2026",),
+        "classification": "no_supported_classification",
+        "negative_evidence_state": "not_found_in_observed_evidence",
+        "earlier_coverage_id": "coverage_2025",
+        "later_coverage_id": "coverage_2026",
+        "earlier_observed_years": (2025,),
+        "later_observed_years": (2026,),
+    }
+    change = {"facets": (Facet("scope", wording),)} if field == "facet" else {field: wording}
+
+    with pytest.raises(ValueError, match="negative claim wording"):
+        Evolution.create(**(common | change))
+
+
+@pytest.mark.parametrize(
     "factory, message",
     [
         (lambda: create_record("unknown", **_envelope()), "unknown derived record family"),

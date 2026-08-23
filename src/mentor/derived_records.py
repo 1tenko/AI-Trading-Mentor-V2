@@ -43,7 +43,9 @@ MAX_FACETS = 5
 MAX_FACET_VALUE_LENGTH = 160
 MAX_TERMS = 8
 MAX_TYPED_CONTENT_LENGTH = 240
-NEGATIVE_CLAIM_WORDS = frozenset({"never", "new", "absent", "removed", "deprecated"})
+EVOLUTION_WORDING_FAMILIES = frozenset(
+    {"introduction", "absence", "removal", "deprecation"}
+)
 
 
 @dataclass(frozen=True)
@@ -478,42 +480,77 @@ def reject_private_or_raw_text(value: str, label: str) -> None:
 
 
 def _validate_evolution_negative_claim_wording(record: Evolution) -> None:
-    wording = frozenset().union(
-        *(
-            _normalized_tokens(value)
-            for value in (
-                record.qualification,
-                record.subject,
-                record.previous,
-                record.current,
-                *(facet.value for facet in record.facets),
-            )
+    if is_forbidden_negative_wording(record):
+        raise ValueError("evolution negative claim wording requires supporting classification and evidence")
+
+
+def is_forbidden_negative_wording(record: Evolution) -> bool:
+    wording_families = _evolution_wording_families(
+        (
+            record.qualification,
+            record.subject,
+            record.previous,
+            record.current,
+            *(facet.value for facet in record.facets),
         )
     )
-    strong_words = wording & NEGATIVE_CLAIM_WORDS
-    if not strong_words:
-        return
+    if not wording_families:
+        return False
 
-    authorized_words: frozenset[str] = frozenset()
+    authorized_families: frozenset[str] = frozenset()
     if (
         record.classification == "introduced"
         and record.negative_evidence_state == "source_asserted_absence"
     ):
-        authorized_words = frozenset({"never", "new", "absent"})
+        authorized_families = frozenset({"introduction", "absence"})
     elif (
         record.classification == "deprecated_or_deemphasized"
         and record.negative_evidence_state == "positive_teaching"
         and record.deprecation_evidence_anchors
     ):
-        authorized_words = frozenset({"removed", "deprecated"})
-    if not strong_words <= authorized_words:
-        raise ValueError("evolution negative claim wording requires supporting classification and evidence")
+        authorized_families = frozenset({"removal", "deprecation"})
+    return not wording_families <= authorized_families
+
+
+def _evolution_wording_families(values: tuple[str, ...]) -> frozenset[str]:
+    tokens: list[str] = []
+    compact_terms: set[str] = set()
+    for value in values:
+        normalized = _normalized_text(value)
+        value_tokens = re.findall(r"[a-z0-9]+", normalized)
+        tokens.extend(value_tokens)
+        compact_terms.update(
+            re.sub(r"[^a-z0-9]+", "", match.group(0))
+            for match in re.finditer(r"[a-z0-9]+(?:\s*(?:[^\w\s]|_)\s*[a-z0-9]+)+", normalized)
+        )
+        for start in range(len(value_tokens)):
+            for end in range(start + 2, min(start + 16, len(value_tokens)) + 1):
+                compact_terms.add("".join(value_tokens[start:end]))
+
+    terms = set(tokens) | compact_terms
+    families = set()
+    if any(term == "never" or term == "new" or term.startswith("newly") or term.startswith("introduc") for term in terms):
+        families.add("introduction")
+    if (
+        any(term == "never" or term.startswith("absen") for term in terms)
+        or "nottaught" in terms
+        or any(first == "not" and second.startswith("taught") for first, second in zip(tokens, tokens[1:]))
+    ):
+        families.add("absence")
+    if any(term.startswith("remov") for term in terms):
+        families.add("removal")
+    if any(term.startswith("deprecat") or term.startswith("deemphas") for term in terms):
+        families.add("deprecation")
+    return frozenset(families & EVOLUTION_WORDING_FAMILIES)
 
 
 def _normalized_tokens(value: str) -> frozenset[str]:
+    return frozenset(re.findall(r"[a-z0-9]+", _normalized_text(value)))
+
+
+def _normalized_text(value: str) -> str:
     normalized = unicodedata.normalize("NFKD", value).casefold()
-    normalized = "".join(character for character in normalized if not unicodedata.combining(character))
-    return frozenset(re.findall(r"[a-z0-9]+", normalized))
+    return "".join(character for character in normalized if not unicodedata.combining(character))
 
 
 def _require_identifier_tuple(values: object, label: str, *, allow_empty: bool = False) -> None:
