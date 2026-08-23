@@ -44,7 +44,7 @@ Stay on feature/phase-3-knowledge-assimilation. Do not begin Phase 4.
 
 ## concept-synthesis
 
-- [ ] **Task 8 — Typed synthesis for concepts, relationships, and procedures**
+- [x] **Task 8 — Typed synthesis for concepts, relationships, and procedures**
   - Depends on: Checkpoint B. Verify: structure/justification tests; full pytest.
 - [ ] **Task 9 — Evolution, negative-evidence, and conflict semantics**
   - Depends on: Task 8. Verify: coverage/absence/conflict tests; full pytest.
