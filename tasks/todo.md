@@ -81,42 +81,52 @@ Stay on feature/phase-3-knowledge-assimilation. Do not begin Phase 4.
 - [ ] Phase 2 behavior remains green; broad fixtures orient and narrow fixtures
   do not force orientation; full pytest passes.
 
+## candidate-compilation-orchestration
+
+- [ ] **Task 15 — End-to-end candidate compilation orchestrator**
+  - Depends on: Checkpoint D. Verify: fake-service candidate success/failure,
+    stale-record, bounded-artifact, unpublished-state, and metric-aggregation
+    tests; full pytest; no network calls.
+
 ## knowledge-inspection
 
-- [ ] **Task 15 — Read-only Knowledge Inspector API**
-  - Depends on: Checkpoint D. Verify: loopback/read-only/safe-JSON API tests;
+- [ ] **Task 16 — Read-only Knowledge Inspector API**
+  - Depends on: Task 15. Verify: loopback/read-only/safe-JSON API tests;
     full pytest.
-- [ ] **Task 16 — Minimal static Assimilation Inspector**
-  - Depends on: Task 15. Verify: full pytest and desktop/compact browser smoke.
+- [ ] **Task 17 — Minimal static Assimilation Inspector**
+  - Depends on: Task 16. Verify: full pytest and desktop/compact browser smoke.
 
 ## phase-3-evaluation
 
-- [ ] **Task 17 — Deterministic regression suite and evaluation harness**
-  - Depends on: Task 16. Verify: full pytest, diff/secret checks, browser smoke;
-    no paid calls.
-- [ ] **Task 18 — Six-source pilot manifest and measured-cost protocol**
-  - Depends on: Task 17. Verify: manifest/evaluation tests; full pytest; no
+- [ ] **Task 18 — Deterministic regression suite and isolated pilot harness**
+  - Depends on: Task 17. Verify: full pytest, production/pilot runtime and
+    pilot-store separation tests, diff/secret checks, browser smoke; no paid calls.
+- [ ] **Task 19 — Six-source pilot manifest and measured-cost protocol**
+  - Depends on: Task 18. Verify: manifest/evaluation tests; full pytest; no
     pilot call.
 
 ### Gate 1 — Paid six-source pilot (explicit Theo authorization)
 
 - [ ] Confirm preconditions and run only the reviewed six-source pilot.
 - [ ] Audit anchors, independent validation, synthesis/evolution/conflict,
-  derived retrieval/orientation, and Phase 2 baseline comparison.
+  isolated published runtime derived retrieval/orientation, raw verification,
+  Mentor tool loop, and Phase 2 baseline comparison.
+- [ ] Keep production runtime/current snapshot untouched; tag and track pilot
+  remote stores; retain pilot cleanup as an explicit non-automatic action.
 - [ ] Record measured cost forecast locally and STOP for Theo's pilot review.
-- [ ] **Task 19 — Record Gate 1 pilot decision**
+- [ ] **Task 20 — Record Gate 1 pilot decision**
   - Depends on: Gate 1. Verify: Theo review; stage only non-private summary.
 
 ### Gate 2 — Full Jacob assimilation (separate Theo approval)
 
-- [ ] **Task 20 — Full 150-source assimilation after separate approval**
-  - Depends on: Task 19 and explicit Theo approval. Verify:
+- [ ] **Task 21 — Full active Jacob corpus assimilation after separate approval**
+  - Depends on: Task 20 and explicit Theo approval. Verify:
     coverage/anchor/validation/dependency audit; full pytest.
 
 ### Gate 3 — Mentor evaluation and human acceptance
 
-- [ ] **Task 21 — Baseline-versus-assimilated Mentor evaluation**
-  - Depends on: Task 20 published full snapshot. Verify: paid evaluation, raw
+- [ ] **Task 22 — Baseline-versus-assimilated Mentor evaluation**
+  - Depends on: Task 21 published full snapshot. Verify: paid evaluation, raw
     citation inspection, and full pytest.
-- [ ] **Task 22 — Theo's final Phase 3 human acceptance**
-  - Depends on: Task 21. Verify: Theo's explicit pass/fail decision.
+- [ ] **Task 23 — Theo's final Phase 3 human acceptance**
+  - Depends on: Task 22. Verify: Theo's explicit pass/fail decision.

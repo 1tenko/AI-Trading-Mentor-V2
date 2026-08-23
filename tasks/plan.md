@@ -29,12 +29,16 @@ Responses supports built-in File Search and application-defined functions. The M
 | SourceAnchor | extraction, validation, Inspector | IDs, full hash, normalized range, timestamp when present, span fingerprint, locator version. |
 | DerivedRecord | compiler, storage, retrieval | Typed family, derived kind, evidence/validation/lifecycle state, anchors, dependencies, typed payload, concise qualification. |
 | Claim / Relationship / ProcedureSequenceHierarchy / Evolution / ConflictUnresolved | synthesis, Inspector | Small typed family payloads and typed facets; no arbitrary essay blob. |
+| Concept | synthesis, orientation, Inspector | Immutable-candidate concept ID, canonical label, aliases, scope, and valid supporting record/anchor references. |
+| CandidateCompiler | live gates, evaluation harness | Injectable staged runner that builds a fully validated, unpublished candidate and aggregates its metrics. |
 | OrientationService | Responses function, Mentor | Current published derived store only; local validation, dedupe, hard record/token budget, concise typed output. |
 | KnowledgeContext | Mentor, diagnostics, Inspector | Orientation use, snapshot/record IDs/count, budget result; no raw dump or hidden reasoning. |
 
 Source-extracted remains derived. Direct source teaching still requires active raw verification and native raw citation. Persistent records store only conclusion, concise auditable justification, anchor basis, qualification, and outcome: never hidden reasoning, scratchpads, encrypted-reasoning prose, or arbitrary numeric confidence.
 
 Normal requests resolve one published raw/derived pair at start. Candidate, archived, and stale IDs are rejected. Publication swaps the snapshot and both remote store IDs in one SQLite transaction. Broad/comparative/evolutionary/multi-concept/relationship-heavy/exhaustive questions normally orient before broad raw search; narrow and exact-source questions may go raw-first. Raw evidence always overrides orientation.
+
+A pilot is a separate runtime, never an alternate production current snapshot. Its ignored SQLite runtime copy has its own `current_snapshot_id`, is marked `pilot`, and may publish only its six-source candidate. Pilot raw and derived remote stores are tagged and recorded as pilot artifacts. The production runtime resolves only its own published pointer and rejects pilot store IDs; cleanup is explicit and never automatic.
 
 ## Dependency graph
 
@@ -46,8 +50,9 @@ Normal requests resolve one published raw/derived pair at start. Candidate, arch
       -> invalidation-publication (10-11)
       -> derived-orientation-retrieval (12-13)
       -> mentor-knowledge-orchestration (14)
-      -> knowledge-inspection (15-16)
-      -> phase-3-evaluation (17-22)
+      -> candidate-compilation-orchestration (15)
+      -> knowledge-inspection (16-17)
+      -> phase-3-evaluation (18-23)
 
 Tasks are sequential through shared storage contracts. The Inspector follows the stable read API. Paid work sits outside routine autonomous tasks.
 
@@ -147,12 +152,12 @@ Tasks are sequential through shared storage contracts. The Inspector follows the
 ### Task 8 — Typed synthesis for concepts, relationships, and procedures
 
 **Module:** concept-synthesis
-**Purpose:** Assemble validated records without a monolithic canonical glossary.
+**Purpose:** Assemble validated records around explicit, small concept identities without a monolithic canonical glossary.
 **Dependencies:** Checkpoint B.
 **Files/components:** src/mentor/synthesis.py; src/mentor/derived_records.py; src/mentor/compilation.py; tests/test_synthesis.py.
-**Consumes/produces:** Validated records -> bounded synthesis records with input IDs, transitive anchors, typed structure, and concise auditable justification.
-**Failing-test-first:** Test invalid-record exclusion, ordered branches/prerequisites, and raw-text dump rejection.
-**Acceptance criteria:** Relationships/procedures are structured; synthesis retains inputs/anchors/evidence state; no chain-of-thought or numeric confidence persists.
+**Consumes/produces:** Validated records -> immutable-candidate Concepts (ID, canonical label, aliases, optional scope, supporting record/anchor IDs) and bounded synthesis records with valid concept references, transitive anchors, typed structure, and concise auditable justification.
+**Failing-test-first:** Test invalid-record exclusion, ordered branches/prerequisites, raw-text dump rejection, repeated-reference clustering, alias resolution, and similarly named but distinct concepts.
+**Acceptance criteria:** Concept IDs are stable within an immutable candidate; aliases resolve only to their concept; published records refer only to valid concept IDs; relationships/procedures are structured; synthesis retains inputs/anchors/evidence state; no chain-of-thought or numeric confidence persists.
 **Verification:** Focused synthesis tests and full pytest.
 **Commit boundary:** feat(concept-synthesis): assemble typed knowledge records.
 ### Task 9 — Evolution, negative-evidence, and conflict semantics
@@ -214,7 +219,7 @@ Tasks are sequential through shared storage contracts. The Inspector follows the
 **Files/components:** src/mentor/orientation.py; src/mentor/vector_stores.py; src/mentor/derived_records.py; src/mentor/storage.py; tests/test_orientation.py.
 **Consumes/produces:** Published snapshot/question/scope -> OrientationResult with typed records, anchors/source areas, snapshot, count, and budget result.
 **Failing-test-first:** Test stale/wrong snapshot, duplicate record/concept, budget, invalid local record, and raw-dump rejection.
-**Acceptance criteria:** Searches only current derived store with current filters; deduplicates before hard budget; exposes truncation; never fabricates citations.
+**Acceptance criteria:** Searches only current derived store with current filters; deduplicates by validated concept identity before hard budget; exposes truncation; never fabricates citations.
 **Verification:** Focused orientation tests and full pytest.
 **Commit boundary:** feat(derived-orientation): bound current snapshot context.
 ### Task 14 — Mentor integration, diagnostics, and replay safety
@@ -235,44 +240,56 @@ Tasks are sequential through shared storage contracts. The Inspector follows the
 - [ ] Full pytest passes before Inspector work.
 
 
-### Task 15 — Read-only Knowledge Inspector API
+### Task 15 — End-to-end candidate compilation orchestrator
+
+**Module:** candidate-compilation-orchestration
+**Purpose:** Implement the production `CandidateCompiler.build(request)` interface that composes already-built stages into one complete, validated, unpublished candidate before any paid gate uses it.
+**Dependencies:** Checkpoint D.
+**Files/components:** src/mentor/candidate_compiler.py; src/mentor/compilation.py; src/mentor/compiler.py; src/mentor/validation.py; src/mentor/synthesis.py; src/mentor/dependencies.py; src/mentor/vector_stores.py; src/mentor/orientation.py; src/mentor/evaluation.py; tests/test_candidate_compiler.py.
+**Consumes/produces:** Selected SourceRevisions plus injectable extraction/validation/synthesis/vector-store services and an explicit artifact scope -> a candidate with validated records, dependency graph, bounded typed orientation artifacts, candidate raw/derived store IDs, readiness status, pilot/production artifact tags, and aggregated metrics. `build` never publishes; the existing explicit publication path remains the only pointer swap.
+**Failing-test-first:** Test successful synthetic candidate; visible extraction failure; validation failure blocking affected records/candidate readiness; remote attachment/readiness failure marking the candidate failed; stale-record exclusion; bounded typed orientation artifact rendering without raw transcript dumps; unpublished candidate isolation; and cross-stage metric aggregation.
+**Acceptance criteria:** The runner performs revision selection -> extraction -> deterministic anchor validation -> independent semantic validation -> concept/relationship/evolution/conflict synthesis -> dependency graph -> structural/coverage gates -> bounded orientation rendering -> raw and derived candidate-store construction -> remote readiness verification. Pilot artifact scope tags and tracks both remote stores. All Responses/compiler stages and vector-store operations are injectable/fakeable; pytest makes no network call. A candidate remains unpublished until the existing explicit publication operation succeeds.
+**Verification:** Focused fake-service end-to-end tests and full pytest; inspect test fixtures to confirm they contain no real corpus text.
+**Commit boundary:** feat(candidate-compiler): compose validated candidate builds.
+
+### Task 16 — Read-only Knowledge Inspector API
 
 **Module:** knowledge-inspection
 **Purpose:** Expose inspectable Phase 3 state without source-management actions.
-**Dependencies:** Checkpoint D.
+**Dependencies:** Task 15.
 **Files/components:** src/mentor/server.py; src/mentor/storage.py; src/mentor/knowledge.py; tests/test_server.py.
 **Consumes/produces:** Snapshots/records/anchors/dependencies/turn audit -> loopback browser-safe read-only JSON.
 **Failing-test-first:** Test current/pending/failed status, details, anchor metadata, orientation audit, missing ID, and non-loopback access.
 **Acceptance criteria:** Exposes coverage/failures, typed states, anchors, relations, evolution/conflicts, stale/dependencies, and turn record IDs; never raw corpus, hidden reasoning, secrets, or mutation routes.
 **Verification:** Focused server tests and full pytest.
 **Commit boundary:** feat(knowledge-inspection): expose read-only audit API.
-### Task 16 — Minimal static Assimilation Inspector
+### Task 17 — Minimal static Assimilation Inspector
 
 **Module:** knowledge-inspection
 **Purpose:** Let Theo inspect assimilation while the chat remains primary.
-**Dependencies:** Task 15.
+**Dependencies:** Task 16.
 **Files/components:** src/mentor/static/index.html; src/mentor/static/app.js; src/mentor/static/style.css; tests/test_server.py.
 **Consumes/produces:** Inspector JSON -> secondary read-only snapshot/record/anchor/evolution/conflict/stale/turn-audit surface.
 **Failing-test-first:** Add static/API contract assertions before markup changes.
 **Acceptance criteria:** No upload/edit/delete/source-manager actions; raw/derived are distinct; desktop and compact UI have no console errors.
 **Verification:** Full pytest plus desktop and compact-width loopback browser smoke.
 **Commit boundary:** feat(knowledge-inspection): add read-only inspector UI.
-### Task 17 — Deterministic regression suite and evaluation harness
+### Task 18 — Deterministic regression suite and isolated pilot harness
 
 **Module:** phase-3-evaluation
-**Purpose:** Prove structural invariants and prepare a local-only baseline/assimilated measurement schema.
-**Dependencies:** Task 16.
-**Files/components:** tests/test_phase3_regression.py; tests/fixtures/; src/mentor/evaluation.py; docs/phase-3-evaluation.md.
-**Consumes/produces:** Synthetic fixtures -> cross-module regression coverage and evaluation metric schema.
-**Failing-test-first:** Add cross-module regression cases before evaluation aggregation.
-**Acceptance criteria:** Covers migration, anchors, records, validation, synthesis, absence/conflict, DAG, publication, budgets, citations, replay, Inspector, and Phase 2 regression; tracks quality/citations/connections/evolution/correction/orientation/raw searches/passages/tokens/latency/cost.
+**Purpose:** Prove structural invariants and implement the local-only evaluation harness, including a strictly isolated pilot runtime.
+**Dependencies:** Task 17.
+**Files/components:** tests/test_phase3_regression.py; tests/test_evaluation.py; tests/fixtures/; src/mentor/evaluation.py; src/mentor/config.py; src/mentor/server.py; docs/phase-3-evaluation.md.
+**Consumes/produces:** Synthetic fixtures -> cross-module regression coverage, evaluation metric schema, and `PilotRuntime.create`/launch contract that uses an ignored per-run SQLite copy.
+**Failing-test-first:** Add cross-module regression cases and production-versus-pilot runtime separation cases before evaluation aggregation.
+**Acceptance criteria:** Covers migration, anchors, records, validation, synthesis, alias/concept identity, absence/conflict, DAG, publication, candidate orchestration, budgets, citations, replay, Inspector, and Phase 2 regression; tracks quality/citations/connections/evolution/correction/orientation/raw searches/passages/tokens/latency/cost. Tests prove pilot publication changes only the copied pilot `current_snapshot_id`, production cannot resolve pilot-tagged store IDs, and pilot/private paths remain ignored.
 **Verification:** Full pytest, diff/secret checks, browser smoke.
 **Commit boundary:** test(phase-3): add deterministic assimilation regressions.
-### Task 18 — Six-source pilot manifest and measured-cost protocol
+### Task 19 — Six-source pilot manifest and measured-cost protocol
 
 **Module:** phase-3-evaluation
 **Purpose:** Select the smallest representative real-corpus pilot without running it or guessing full-corpus cost.
-**Dependencies:** Task 17.
+**Dependencies:** Task 18.
 **Files/components:** docs/phase-3-evaluation.md; .gitignore; src/mentor/evaluation.py; tests/test_evaluation.py.
 **Consumes/produces:** Migrated inventory -> ignored manifest of exactly six unique source-revision IDs and cost protocol.
 **Failing-test-first:** Test six-unique-source and structural-role validation first.
@@ -281,16 +298,18 @@ Tasks are sequential through shared storage contracts. The Inspector follows the
 **Commit boundary:** docs: define Phase 3 pilot measurement protocol.
 ## Gate 1 — Paid six-source pilot
 
-**Requires:** Tasks 1-18 complete; deterministic/browser checks green; guarded disposable-data API preflight passed; reviewed six-source manifest; Theo's explicit paid-pilot approval.
+**Requires:** Tasks 1-19 complete; deterministic/browser checks green; guarded disposable-data API preflight passed; reviewed six-source manifest; Theo's explicit paid-pilot approval.
 
-**Run:** Compile/validate only the six selected source revisions with GPT-5.6 Sol; build a pilot candidate; audit anchors/validation, relationships, one evolution result, and one unresolved/conflict case where evidence permits; test derived retrieval/orientation and a small Phase 2 baseline comparison.
+**Isolated runtime:** `PilotRuntime.create` takes a transactionally consistent copy of the production SQLite runtime into an ignored per-run directory, marks that database `pilot`, and launches the ordinary loopback server/Mentor against that runtime only. The six-source candidate is built by `CandidateCompiler.build`, then published through the normal atomic path inside the pilot database only. Its raw and derived remote stores carry a pilot tag and are recorded as pilot artifacts. Production keeps its original database/current pointer, and its normal Mentor rejects pilot-tagged store IDs. The harness never copies pilot records, output, traces, or raw corpus material back to production; remote cleanup/detachment is an explicit later action, not an automatic gate step.
+
+**Run:** Compile/validate only the six selected source revisions with GPT-5.6 Sol through the existing candidate compiler; audit anchors/validation, relationships, one evolution result, and one unresolved/conflict case where evidence permits; use the isolated published pilot runtime for real derived retrieval/orientation, raw verification, Mentor tool-loop, and a small Phase 2 baseline comparison.
 
 **Record locally:** revision IDs, compiler/prompt/schema versions, metrics, record counts/families, audit results, retrieval traces, comparison results, and measured full-corpus forecast. Never commit private raw outputs.
 
 **STOP:** Theo reviews semantic representation, evidence discipline, record volume, UX, and cost before full assimilation.
 
 
-### Task 19 — Record Gate 1 pilot decision
+### Task 20 — Record Gate 1 pilot decision
 
 **Module:** phase-3-evaluation
 **Purpose:** Preserve pilot pass/fail without granting automatic permission to scale.
@@ -303,18 +322,18 @@ Tasks are sequential through shared storage contracts. The Inspector follows the
 **Commit boundary:** docs: record Phase 3 pilot decision.
 ## Gate 2 — Full Jacob assimilation
 
-Task 20 requires the separate Theo approval recorded by Task 19. A pilot pass is not enough.
+Task 21 requires the separate Theo approval recorded by Task 20. A pilot pass is not enough.
 
 
-### Task 20 — Full 150-source assimilation after separate approval
+### Task 21 — Full active Jacob corpus assimilation after separate approval
 
 **Module:** phase-3-evaluation
-**Purpose:** Build and validate full candidate with the pilot-proven schema and measured budget.
-**Dependencies:** Task 19 plus explicit Theo approval.
-**Files/components:** src/mentor/compilation.py; src/mentor/vector_stores.py; src/mentor/evaluation.py; ignored local runtime/evaluation artifacts.
+**Purpose:** Build and validate the full active Jacob corpus candidate (currently 150 intended sources) with the pilot-proven schema and measured budget.
+**Dependencies:** Task 20 plus explicit Theo approval.
+**Files/components:** src/mentor/candidate_compiler.py; src/mentor/compilation.py; src/mentor/vector_stores.py; src/mentor/evaluation.py; ignored local runtime/evaluation artifacts.
 **Consumes/produces:** Selected revisions -> full candidate, coverage/failure audit, stores, records, dependencies, actual metrics.
 **Failing-test-first:** Not applicable; deterministic error paths are already covered.
-**Acceptance criteria:** Every intended source is processed or visibly failed; structural/anchor/validation/dependency/coverage gates pass before publication; actual cost compares to pilot forecast.
+**Acceptance criteria:** The active inventory determines the source count; every intended source is processed or visibly failed; structural/anchor/validation/dependency/coverage gates pass before publication; actual cost compares to pilot forecast.
 **Verification:** Paid local audit, sampled human anchor audit, full pytest.
 **Commit boundary:** Commit only source/docs/test changes; never corpus/database/private output.
 ## Gate 3 — Mentor evaluation and final human acceptance
@@ -323,23 +342,23 @@ Task 22 is the final Theo pass/fail decision. Automated or paid results are
 evidence, never a substitute.
 
 
-### Task 21 — Baseline-versus-assimilated Mentor evaluation
+### Task 22 — Baseline-versus-assimilated Mentor evaluation
 
 **Module:** phase-3-evaluation
 **Purpose:** Determine whether the complete Mentor feels as though it studied Jacob while preserving raw authority.
-**Dependencies:** Task 20 published full snapshot.
+**Dependencies:** Task 21 published full snapshot.
 **Files/components:** docs/phase-3-evaluation.md; src/mentor/evaluation.py; tasks/todo.md; ignored local evaluation records.
 **Consumes/produces:** Phase 2 baseline plus full snapshot -> private metrics and concise safe report.
-**Failing-test-first:** Not applicable; deterministic instrumentation is Task 17.
+**Failing-test-first:** Not applicable; deterministic instrumentation is Task 18.
 **Acceptance criteria:** Measures correctness, completeness, citations, conceptual links, evolution, correction, orientation/raw searches/passages, tokens, latency, cost; includes adversarial fake claims/conflicts/refined years/obscure/exhaustive/timestamp/mixed prompts.
 **Verification:** Paid evaluation, raw citation sampling, and full pytest.
 **Commit boundary:** docs: record Phase 3 evaluation results, after Theo approves what is safe to commit.
 
-### Task 22 — Theo's final Phase 3 human acceptance
+### Task 23 — Theo's final Phase 3 human acceptance
 
 **Module:** phase-3-evaluation
 **Purpose:** Keep the final pass/fail decision human-owned.
-**Dependencies:** Task 21.
+**Dependencies:** Task 22.
 **Files/components:** docs/phase-3-evaluation.md; tasks/todo.md.
 **Consumes/produces:** Live behavior and evaluation evidence -> Theo's pass/fail record only.
 **Failing-test-first:** Not applicable; mandatory human gate.
@@ -356,5 +375,5 @@ No standalone ADR is created in this planning commit. The approved Phase 3 desig
 
 - [x] All ten approved module IDs are represented in dependency order.
 - [x] Every task has purpose, dependencies, files, interfaces, failing-test-first work where applicable, acceptance, verification, and commit boundary.
-- [x] Pilot, full corpus, and final Mentor evaluation are separate gates.
+- [x] Candidate orchestration is implemented and deterministically proven before the isolated pilot; pilot, full active corpus, and final Mentor evaluation are separate gates.
 - [x] Routine pytest is mocked/local, and strict Phase 3 boundaries remain.
