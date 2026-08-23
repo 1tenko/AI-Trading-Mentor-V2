@@ -195,6 +195,11 @@ def test_published_snapshot_rejects_invalidation_without_changing_current_retrie
         (RecordDependency("source_revision", revision.revision_id),),
     )
     storage.store_derived_record(record)
+    storage.record_candidate_gate(
+        snapshot.snapshot_id,
+        (SourceProcessingResult(revision.revision_id, "processed", 1),),
+        checked_at=1_700_000_003.0,
+    )
     storage.transition_snapshot(snapshot.snapshot_id, "validating")
     storage.transition_snapshot(snapshot.snapshot_id, "published")
 

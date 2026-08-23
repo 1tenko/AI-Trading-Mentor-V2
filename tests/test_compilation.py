@@ -298,6 +298,16 @@ def test_candidate_gate_accepts_processed_zero_records_but_rejects_duplicate_act
         (SourceProcessingResult(first.revision_id, "processed", 0),),
         checked_at=1_700_000_002.0,
     ) == CandidateGateResult(zero.snapshot_id, "passed", 1_700_000_002.0, None)
+    with storage._connect() as connection:
+        gate_shape = connection.execute(
+            "SELECT structural_version, record_count, record_fingerprint FROM candidate_gates WHERE snapshot_id = ?",
+            (zero.snapshot_id,),
+        ).fetchone()
+    assert gate_shape == (
+        "record-structure-v1",
+        0,
+        sha256(b"").hexdigest(),
+    )
 
     source = storage.library_source(first.source_id)
     duplicate = SourceRevision.create(
@@ -324,11 +334,37 @@ def test_candidate_gate_accepts_processed_zero_records_but_rejects_duplicate_act
         duplicate_snapshot.snapshot_id,
         "failed",
         1_700_000_004.0,
-        "candidate selects duplicate active revisions for one source",
+        "candidate selects duplicate revisions for one source",
     )
     storage.transition_snapshot(duplicate_snapshot.snapshot_id, "validating")
     with pytest.raises(ValueError, match="passing candidate gate"):
         storage.transition_snapshot(duplicate_snapshot.snapshot_id, "published")
+
+    superseded = SourceRevision.create(
+        source=source,
+        content_sha256=sha256(b"superseded revision").hexdigest(),
+        byte_size=1,
+        local_locator="C:/synthetic/superseded.txt",
+        observed_at=1_700_000_005.0,
+        lifecycle_state="superseded",
+    )
+    storage.store_source_revision(superseded)
+    mixed_lifecycle = candidate(
+        storage, "run_gate_mixed_lifecycle", [first, superseded], record_gate=False
+    )
+    assert storage.record_candidate_gate(
+        mixed_lifecycle.snapshot_id,
+        (
+            SourceProcessingResult(first.revision_id, "processed", 0),
+            SourceProcessingResult(superseded.revision_id, "processed", 0),
+        ),
+        checked_at=1_700_000_006.0,
+    ) == CandidateGateResult(
+        mixed_lifecycle.snapshot_id,
+        "failed",
+        1_700_000_006.0,
+        "candidate selects duplicate revisions for one source",
+    )
 
 
 @pytest.mark.parametrize("state", ("validating", "failed", "published", "archived"))
@@ -409,11 +445,96 @@ def test_sqlite_seal_blocks_completion_of_a_building_stage_after_publication(tmp
             """,
             (snapshot.snapshot_id,),
         )
-    storage.transition_snapshot(snapshot.snapshot_id, "validating")
-    storage.transition_snapshot(snapshot.snapshot_id, "published")
+    with storage._connect() as connection:
+        connection.execute(
+            "UPDATE corpus_snapshots SET status = 'published' WHERE snapshot_id = ?",
+            (snapshot.snapshot_id,),
+        )
 
     with storage._connect() as connection:
         with pytest.raises(sqlite3.IntegrityError, match="building candidate"):
             connection.execute(
                 "INSERT INTO derived_record_anchors(record_id, position, anchor_id) VALUES ('rec_staged', 0, 'anc_staged')"
             )
+
+
+def test_sqlite_seal_blocks_moving_a_published_stage_to_a_building_snapshot(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    published_revision = revision_for(storage, "source_move_published")
+    published = candidate(storage, "run_move_published", [published_revision])
+    with storage._connect() as connection:
+        connection.execute(
+            """
+            INSERT INTO derived_records(
+                record_id, snapshot_id, family, derived_kind, evidence_state,
+                validation_state, lifecycle_state, qualification
+            ) VALUES ('rec_movable', ?, 'claim', 'statement', 'raw_taught', 'validated', 'candidate', 'Synthetic stage.')
+            """,
+            (published.snapshot_id,),
+        )
+    with storage._connect() as connection:
+        connection.execute(
+            "UPDATE corpus_snapshots SET status = 'published' WHERE snapshot_id = ?",
+            (published.snapshot_id,),
+        )
+    building = candidate(storage, "run_move_building", [revision_for(storage, "source_move_building")])
+
+    with storage._connect() as connection:
+        with pytest.raises(sqlite3.IntegrityError, match="building candidate"):
+            connection.execute(
+                "UPDATE derived_records SET snapshot_id = ? WHERE record_id = 'rec_movable'",
+                (building.snapshot_id,),
+            )
+
+
+def test_candidate_gate_rejects_unfinished_staged_records(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    revision = revision_for(storage, "source_unfinished")
+    snapshot = candidate(storage, "run_unfinished", [revision], record_gate=False)
+    with storage._connect() as connection:
+        connection.execute(
+            """
+            INSERT INTO derived_records(
+                record_id, snapshot_id, family, derived_kind, evidence_state,
+                validation_state, lifecycle_state, qualification
+            ) VALUES ('rec_unfinished', ?, 'claim', 'statement', 'raw_taught', 'validated', 'candidate', 'Synthetic stage.')
+            """,
+            (snapshot.snapshot_id,),
+        )
+
+    assert storage.record_candidate_gate(
+        snapshot.snapshot_id,
+        (SourceProcessingResult(revision.revision_id, "processed", 0),),
+        checked_at=1_700_000_007.0,
+    ) == CandidateGateResult(
+        snapshot.snapshot_id,
+        "failed",
+        1_700_000_007.0,
+        "candidate records must be finalized and validated",
+    )
+
+
+def test_publication_rejects_content_added_after_a_passing_gate(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    revision = revision_for(storage, "source_gate_drift")
+    snapshot = candidate(storage, "run_gate_drift", [revision])
+    storage.store_derived_record(
+        Claim.create(
+            snapshot_id=snapshot.snapshot_id,
+            anchors=("anc_gate_drift",),
+            dependencies=(RecordDependency("source_revision", revision.revision_id),),
+            validation_state="validated",
+            lifecycle_state="candidate",
+            qualification="Synthetic post-gate record.",
+            subject="gate",
+            predicate="binds",
+            object="records",
+        )
+    )
+    storage.transition_snapshot(snapshot.snapshot_id, "validating")
+
+    with pytest.raises(ValueError, match="candidate gate no longer matches candidate content"):
+        storage.transition_snapshot(snapshot.snapshot_id, "published")

@@ -5,6 +5,7 @@ import sqlite3
 import time
 from dataclasses import replace
 from dataclasses import dataclass
+from hashlib import sha256
 from pathlib import Path
 from typing import Mapping
 
@@ -71,6 +72,8 @@ SELECT corpus_snapshots.snapshot_id, run_id, selected_revision_ids_json, selecte
 FROM corpus_snapshots
 LEFT JOIN archived_snapshots ON archived_snapshots.snapshot_id = corpus_snapshots.snapshot_id
 """
+
+_CANDIDATE_GATE_STRUCTURE_VERSION = "record-structure-v1"
 
 
 class Storage:
@@ -212,7 +215,10 @@ class Storage:
                     snapshot_id TEXT PRIMARY KEY REFERENCES corpus_snapshots(snapshot_id),
                     status TEXT NOT NULL CHECK(status IN ('passed', 'failed')),
                     checked_at REAL NOT NULL,
-                    failure_reason TEXT
+                    failure_reason TEXT,
+                    structural_version TEXT NOT NULL,
+                    record_count INTEGER NOT NULL CHECK(record_count >= 0),
+                    record_fingerprint TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS compilation_metrics (
                     metric_id INTEGER PRIMARY KEY,
@@ -373,6 +379,14 @@ class Storage:
             ):
                 if column not in conflict_columns:
                     connection.execute(f"ALTER TABLE derived_conflict_unresolved ADD COLUMN {column} {definition}")
+            gate_columns = {row[1] for row in connection.execute("PRAGMA table_info(candidate_gates)")}
+            for column, definition in (
+                ("structural_version", "TEXT"),
+                ("record_count", "INTEGER"),
+                ("record_fingerprint", "TEXT"),
+            ):
+                if column not in gate_columns:
+                    connection.execute(f"ALTER TABLE candidate_gates ADD COLUMN {column} {definition}")
             self._create_derived_record_triggers(connection)
             connection.execute("UPDATE derived_records SET finalized = 1 WHERE finalized = 0")
             self._backfill_display_turns(connection)
@@ -665,7 +679,10 @@ class Storage:
             status, selected_revision_ids = self._snapshot_state(connection, snapshot_id)
             if status != "building":
                 raise ValueError("candidate gates require a building candidate")
-            failure_reason = self._candidate_gate_failure(connection, selected_revision_ids, results)
+            structure_version, record_count, record_fingerprint, structural_failure = self._candidate_gate_structure(
+                connection, snapshot_id
+            )
+            failure_reason = self._candidate_gate_failure(connection, selected_revision_ids, results) or structural_failure
             connection.execute("DELETE FROM snapshot_source_coverage WHERE snapshot_id = ?", (snapshot_id,))
             connection.executemany(
                 """
@@ -677,14 +694,27 @@ class Storage:
             status = "failed" if failure_reason else "passed"
             connection.execute(
                 """
-                INSERT INTO candidate_gates(snapshot_id, status, checked_at, failure_reason)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO candidate_gates(
+                    snapshot_id, status, checked_at, failure_reason,
+                    structural_version, record_count, record_fingerprint
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(snapshot_id) DO UPDATE SET
                     status = excluded.status,
                     checked_at = excluded.checked_at,
-                    failure_reason = excluded.failure_reason
+                    failure_reason = excluded.failure_reason,
+                    structural_version = excluded.structural_version,
+                    record_count = excluded.record_count,
+                    record_fingerprint = excluded.record_fingerprint
                 """,
-                (snapshot_id, status, checked_at, failure_reason),
+                (
+                    snapshot_id,
+                    status,
+                    checked_at,
+                    failure_reason,
+                    structure_version,
+                    record_count,
+                    record_fingerprint,
+                ),
             )
         return CandidateGateResult(snapshot_id, status, checked_at, failure_reason)
 
@@ -722,21 +752,51 @@ class Storage:
             return "coverage includes a failed revision"
         placeholders = ",".join("?" for _ in selected_revision_ids)
         duplicate = connection.execute(
-            "SELECT source_id FROM source_revisions WHERE lifecycle_state = 'active' AND revision_id IN "
+            "SELECT source_id FROM source_revisions WHERE revision_id IN "
             f"({placeholders}) GROUP BY source_id HAVING COUNT(*) > 1",
             tuple(sorted(selected_revision_ids)),
         ).fetchone()
         if duplicate is not None:
-            return "candidate selects duplicate active revisions for one source"
+            return "candidate selects duplicate revisions for one source"
         return None
 
-    @staticmethod
-    def _require_passing_candidate_gate(connection: sqlite3.Connection, snapshot_id: str) -> None:
+    def _candidate_gate_structure(
+        self, connection: sqlite3.Connection, snapshot_id: str
+    ) -> tuple[str, int, str, str | None]:
+        rows = connection.execute(
+            """
+            SELECT record_id, finalized, validation_state
+            FROM derived_records WHERE snapshot_id = ? ORDER BY record_id
+            """,
+            (snapshot_id,),
+        ).fetchall()
+        record_ids = tuple(row[0] for row in rows)
+        fingerprint = sha256("\n".join(record_ids).encode()).hexdigest()
+        if any(finalized != 1 or validation_state != "validated" for _, finalized, validation_state in rows):
+            return _CANDIDATE_GATE_STRUCTURE_VERSION, len(rows), fingerprint, "candidate records must be finalized and validated"
+        if connection.execute(
+            "SELECT 1 FROM derived_record_staleness WHERE snapshot_id = ? LIMIT 1", (snapshot_id,)
+        ).fetchone():
+            return _CANDIDATE_GATE_STRUCTURE_VERSION, len(rows), fingerprint, "candidate records must not be stale"
+        try:
+            self._dependency_graph(connection, snapshot_id).assert_acyclic()
+        except ValueError:
+            return _CANDIDATE_GATE_STRUCTURE_VERSION, len(rows), fingerprint, "candidate records must be snapshot-owned"
+        return _CANDIDATE_GATE_STRUCTURE_VERSION, len(rows), fingerprint, None
+
+    def _require_passing_candidate_gate(self, connection: sqlite3.Connection, snapshot_id: str) -> None:
         row = connection.execute(
-            "SELECT status FROM candidate_gates WHERE snapshot_id = ?", (snapshot_id,)
+            """
+            SELECT status, structural_version, record_count, record_fingerprint
+            FROM candidate_gates WHERE snapshot_id = ?
+            """,
+            (snapshot_id,),
         ).fetchone()
         if row is None or row[0] != "passed":
             raise ValueError("published snapshots require a passing candidate gate")
+        version, count, fingerprint, failure = self._candidate_gate_structure(connection, snapshot_id)
+        if failure or (version, count, fingerprint) != row[1:]:
+            raise ValueError("candidate gate no longer matches candidate content")
 
     def store_derived_record(self, record: DerivedRecord) -> None:
         validate_record(record)
@@ -1362,12 +1422,18 @@ class Storage:
             CREATE TRIGGER IF NOT EXISTS derived_records_updates_require_building_snapshot
             BEFORE UPDATE ON derived_records
             WHEN NOT EXISTS(
-                SELECT 1 FROM corpus_snapshots
-                LEFT JOIN archived_snapshots USING(snapshot_id)
-                WHERE corpus_snapshots.snapshot_id = NEW.snapshot_id
-                  AND corpus_snapshots.status = 'building'
-                  AND archived_snapshots.snapshot_id IS NULL
-            )
+                    SELECT 1 FROM corpus_snapshots
+                    LEFT JOIN archived_snapshots USING(snapshot_id)
+                    WHERE corpus_snapshots.snapshot_id = NEW.snapshot_id
+                      AND corpus_snapshots.status = 'building'
+                      AND archived_snapshots.snapshot_id IS NULL
+                ) OR NOT EXISTS(
+                    SELECT 1 FROM corpus_snapshots
+                    LEFT JOIN archived_snapshots USING(snapshot_id)
+                    WHERE corpus_snapshots.snapshot_id = OLD.snapshot_id
+                      AND corpus_snapshots.status = 'building'
+                      AND archived_snapshots.snapshot_id IS NULL
+                )
             BEGIN
                 SELECT RAISE(ABORT, 'derived records require a building candidate');
             END;
