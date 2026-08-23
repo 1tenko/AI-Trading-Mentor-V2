@@ -113,12 +113,36 @@ def test_conflict_inputs_must_be_validated_candidate_records_and_remain_visible(
         alternatives=("first", "second"),
         competing_record_ids=(first.record_id, second.record_id),
         reconciliation_state="unresolved",
+        relevant_scopes=("synthetic scope",),
+        unresolved_questions=("Which synthetic condition applies?",),
     )
 
     candidate = SynthesisCandidate.from_records(snapshot_id=SNAPSHOT_ID, records=(first, second, conflict))
 
     assert conflict.record_id in candidate.record_ids
     assert conflict.competing_record_ids == (first.record_id, second.record_id)
+    missing_anchor_conflict = ConflictUnresolved.create(
+        snapshot_id=SNAPSHOT_ID,
+        anchors=("anc_first",),
+        dependencies=(
+            RecordDependency("source_revision", "rev_synthetic"),
+            RecordDependency("derived_record", first.record_id),
+            RecordDependency("derived_record", second.record_id),
+        ),
+        validation_state="validated",
+        lifecycle_state="candidate",
+        qualification="The synthetic contexts conflict without a supported reconciliation.",
+        kind="unresolved",
+        subject="synthetic question",
+        alternatives=("first", "second"),
+        competing_record_ids=(first.record_id, second.record_id),
+        reconciliation_state="unresolved",
+        relevant_scopes=("synthetic scope",),
+        unresolved_questions=("Which synthetic condition applies?",),
+    )
+    with pytest.raises(ValueError, match="competing record anchors"):
+        SynthesisCandidate.from_records(snapshot_id=SNAPSHOT_ID, records=(first, second, missing_anchor_conflict))
+
     unknown_conflict = ConflictUnresolved.create(
         snapshot_id=SNAPSHOT_ID,
         anchors=("anc_first", "anc_second"),
@@ -135,6 +159,8 @@ def test_conflict_inputs_must_be_validated_candidate_records_and_remain_visible(
         alternatives=("first", "unknown"),
         competing_record_ids=(first.record_id, "rec_unknown"),
         reconciliation_state="unresolved",
+        relevant_scopes=("synthetic scope",),
+        unresolved_questions=("Which synthetic condition applies?",),
     )
 
     with pytest.raises(ValueError, match="competing record"):
@@ -524,14 +550,12 @@ def test_procedure_rejects_private_text_in_conditions_and_branches():
             ),
         )
 
-    private_condition = procedure(
-        dependencies=(RecordDependency("source_revision", "rev_synthetic"),),
-        terms=("Observe", "Enter"),
-        conditions=("Private reasoning: hidden analysis.",),
-    )
-    private_candidate = SynthesisCandidate.from_records(snapshot_id=SNAPSHOT_ID, records=(private_condition,))
     with pytest.raises(ValueError, match="private"):
-        private_candidate.synthesize_procedure(private_condition.record_id)
+        procedure(
+            dependencies=(RecordDependency("source_revision", "rev_synthetic"),),
+            terms=("Observe", "Enter"),
+            conditions=("Private reasoning: hidden analysis.",),
+        )
 
 
 def test_hints_keep_same_label_relationship_roles_in_distinct_scopes():
@@ -617,11 +641,9 @@ def test_procedure_conditions_require_an_allowed_structured_source_and_reject_no
         "Scratch pad: hidden details.",
         "Transcript excerpt: exact speaker words.",
     ):
-        private_record = procedure(
-            dependencies=(RecordDependency("source_revision", "rev_synthetic"),),
-            terms=("Observe", "Enter"),
-            conditions=(private_condition,),
-        )
-        private_candidate = SynthesisCandidate.from_records(snapshot_id=SNAPSHOT_ID, records=(private_record,))
         with pytest.raises(ValueError, match="private|raw"):
-            private_candidate.synthesize_procedure(private_record.record_id)
+            procedure(
+                dependencies=(RecordDependency("source_revision", "rev_synthetic"),),
+                terms=("Observe", "Enter"),
+                conditions=(private_condition,),
+            )

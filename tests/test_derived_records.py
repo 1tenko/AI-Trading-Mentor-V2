@@ -1,5 +1,6 @@
 from dataclasses import replace
 from hashlib import sha256
+import json
 
 import sqlite3
 
@@ -15,8 +16,10 @@ from mentor.derived_records import (
     RecordDependency,
     Relationship,
     create_record,
+    is_legacy_record,
 )
 from mentor.knowledge import Collection, Source, SourceRevision
+from mentor.synthesis import SynthesisCandidate
 from mentor.storage import Storage
 
 
@@ -66,6 +69,10 @@ def test_typed_families_have_a_complete_shared_envelope():
             later_source_set=("rev_synthetic",),
             classification="no_supported_classification",
             negative_evidence_state="unresolved",
+            earlier_coverage_id="coverage_synthetic_earlier",
+            later_coverage_id="coverage_synthetic_later",
+            earlier_observed_years=(2025,),
+            later_observed_years=(2026,),
         ),
         ConflictUnresolved.create(
             **conflict_common,
@@ -74,6 +81,8 @@ def test_typed_families_have_a_complete_shared_envelope():
             alternatives=("option a", "option b"),
             competing_record_ids=("rec_option_a", "rec_option_b"),
             reconciliation_state="unresolved",
+            relevant_scopes=("synthetic scope",),
+            unresolved_questions=("Which synthetic condition applies?",),
         ),
     )
 
@@ -121,6 +130,10 @@ def test_evolution_requires_explicit_coverage_and_rejects_unsupported_change_cla
         classification="refined",
         negative_evidence_state="positive_teaching",
         competing_anchors=("anc_competing",),
+        earlier_coverage_id="coverage_2025",
+        later_coverage_id="coverage_2026",
+        earlier_observed_years=(2025,),
+        later_observed_years=(2026,),
     )
 
     assert refined.earlier_source_set == ("rev_2025_a", "rev_2025_b")
@@ -140,6 +153,10 @@ def test_evolution_requires_explicit_coverage_and_rejects_unsupported_change_cla
             later_source_set=("rev_2026_a",),
             classification="introduced",
             negative_evidence_state="not_found_in_observed_evidence",
+            earlier_coverage_id="coverage_2025",
+            later_coverage_id="coverage_2026",
+            earlier_observed_years=(2025,),
+            later_observed_years=(2026,),
         )
     with pytest.raises(ValueError, match="evolution source set"):
         Evolution.create(
@@ -151,6 +168,10 @@ def test_evolution_requires_explicit_coverage_and_rejects_unsupported_change_cla
             later_source_set=("rev_2026_a",),
             classification="no_supported_classification",
             negative_evidence_state="unresolved",
+            earlier_coverage_id="coverage_2025",
+            later_coverage_id="coverage_2026",
+            earlier_observed_years=(2025,),
+            later_observed_years=(2026,),
         )
     with pytest.raises(ValueError, match="source revision dependencies"):
         Evolution.create(
@@ -162,6 +183,10 @@ def test_evolution_requires_explicit_coverage_and_rejects_unsupported_change_cla
             later_source_set=("rev_2026_a",),
             classification="no_supported_classification",
             negative_evidence_state="unresolved",
+            earlier_coverage_id="coverage_2025",
+            later_coverage_id="coverage_2026",
+            earlier_observed_years=(2025,),
+            later_observed_years=(2026,),
         )
 
 
@@ -183,6 +208,8 @@ def test_conflict_records_keep_competing_inputs_visible_until_conditionally_reco
         competing_record_ids=("rec_option_a", "rec_option_b"),
         reconciliation_state="compatible_under_conditions",
         facets=(Facet("condition", "Different synthetic contexts."),),
+        relevant_scopes=("synthetic scope",),
+        conditions=("Different synthetic contexts.",),
     )
     unresolved = ConflictUnresolved.create(
         **common,
@@ -191,6 +218,8 @@ def test_conflict_records_keep_competing_inputs_visible_until_conditionally_reco
         alternatives=("option a", "option b"),
         competing_record_ids=("rec_option_a", "rec_option_b"),
         reconciliation_state="unresolved",
+        relevant_scopes=("synthetic scope",),
+        unresolved_questions=("Which synthetic condition applies?",),
     )
 
     assert compatible.competing_record_ids == ("rec_option_a", "rec_option_b")
@@ -204,7 +233,86 @@ def test_conflict_records_keep_competing_inputs_visible_until_conditionally_reco
             alternatives=("option a", "option b"),
             competing_record_ids=("rec_option_a", "rec_option_b"),
             reconciliation_state="compatible_under_conditions",
+            relevant_scopes=("synthetic scope",),
         )
+
+
+def test_evolution_and_conflict_reject_raw_evidence_private_text_and_unsupported_classifications():
+    evolution_common = {
+        **_envelope(),
+        "anchors": ("anc_2025", "anc_2026", "anc_deprecation"),
+        "dependencies": (
+            RecordDependency("source_revision", "rev_2025"),
+            RecordDependency("source_revision", "rev_2026"),
+        ),
+        "subject": "synthetic concept",
+        "previous": "earlier teaching",
+        "current": "later teaching",
+        "earlier_source_set": ("rev_2025",),
+        "later_source_set": ("rev_2026",),
+        "earlier_coverage_id": "coverage_2025",
+        "later_coverage_id": "coverage_2026",
+        "earlier_observed_years": (2025,),
+        "later_observed_years": (2026,),
+    }
+    conflict_common = {
+        **_envelope(),
+        "dependencies": (
+            RecordDependency("source_revision", "rev_synthetic"),
+            RecordDependency("derived_record", "rec_a"),
+            RecordDependency("derived_record", "rec_b"),
+        ),
+        "kind": "conflict",
+        "subject": "synthetic question",
+        "alternatives": ("option a", "option b"),
+        "competing_record_ids": ("rec_a", "rec_b"),
+        "reconciliation_state": "genuinely_contradictory",
+        "relevant_scopes": ("synthetic scope",),
+    }
+
+    for private_text in (
+        "My private analysis: hidden details.",
+        "Scratch pad: hidden details.",
+            "Transcript excerpt: exact speaker words.",
+    ):
+        with pytest.raises(ValueError, match="private|raw"):
+            Evolution.create(
+                **(evolution_common | {"qualification": private_text}),
+                classification="no_supported_classification",
+                negative_evidence_state="unresolved",
+            )
+        with pytest.raises(ValueError, match="private|raw"):
+            ConflictUnresolved.create(**conflict_common, conditions=(private_text,))
+
+    with pytest.raises(ValueError, match="source synthesis"):
+        Evolution.create(
+            **evolution_common,
+            evidence_state="raw_taught",
+            classification="no_supported_classification",
+            negative_evidence_state="unresolved",
+        )
+    with pytest.raises(ValueError, match="source synthesis"):
+        ConflictUnresolved.create(**conflict_common, evidence_state="raw_taught")
+    with pytest.raises(ValueError, match="positive or coverage evidence"):
+        Evolution.create(
+            **evolution_common,
+            classification="refined",
+            negative_evidence_state="unresolved",
+        )
+    with pytest.raises(ValueError, match="direct deprecation evidence"):
+        Evolution.create(
+            **evolution_common,
+            classification="deprecated_or_deemphasized",
+            negative_evidence_state="source_asserted_absence",
+        )
+
+    deprecated = Evolution.create(
+        **evolution_common,
+        classification="deprecated_or_deemphasized",
+        negative_evidence_state="positive_teaching",
+        deprecation_evidence_anchors=("anc_deprecation",),
+    )
+    assert deprecated.deprecation_evidence_anchors == ("anc_deprecation",)
 
 
 @pytest.mark.parametrize(
@@ -286,6 +394,10 @@ def test_storage_round_trips_each_typed_family(tmp_path):
             later_source_set=(snapshot.selected_revision_ids[0],),
             classification="no_supported_classification",
             negative_evidence_state="unresolved",
+            earlier_coverage_id="coverage_synthetic_earlier",
+            later_coverage_id="coverage_synthetic_later",
+            earlier_observed_years=(2025,),
+            later_observed_years=(2026,),
         ),
         ConflictUnresolved.create(
             **conflict_common,
@@ -294,6 +406,7 @@ def test_storage_round_trips_each_typed_family(tmp_path):
             alternatives=("option a", "option b"),
             competing_record_ids=("rec_option_a", "rec_option_b"),
             reconciliation_state="genuinely_contradictory",
+            relevant_scopes=("synthetic scope",),
         ),
     ]
 
@@ -301,6 +414,165 @@ def test_storage_round_trips_each_typed_family(tmp_path):
         storage.store_derived_record(record)
 
     assert storage.derived_records(snapshot.snapshot_id) == sorted(records, key=lambda record: record.record_id)
+
+
+def test_storage_round_trips_explicit_conflict_context_fields(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    snapshot = snapshot_for(storage)
+    conflict = ConflictUnresolved.create(
+        snapshot_id=snapshot.snapshot_id,
+        anchors=("anc_synthetic",),
+        dependencies=(
+            RecordDependency("source_revision", snapshot.selected_revision_ids[0]),
+            RecordDependency("derived_record", "rec_a"),
+            RecordDependency("derived_record", "rec_b"),
+        ),
+        validation_state="validated",
+        lifecycle_state="active",
+        qualification="Synthetic unresolved conflict.",
+        kind="unresolved",
+        subject="synthetic question",
+        alternatives=("option a", "option b"),
+        competing_record_ids=("rec_a", "rec_b"),
+        reconciliation_state="unresolved",
+        relevant_scopes=("synthetic scope",),
+        conditions=("Synthetic condition.",),
+        unresolved_questions=("Which option applies?",),
+    )
+
+    storage.store_derived_record(conflict)
+
+    assert storage.derived_records(snapshot.snapshot_id) == [conflict]
+
+
+def test_storage_migrates_a_genuine_old_evolution_row_without_changing_its_identity(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    snapshot = snapshot_for(storage)
+    legacy_values = {
+        "record_id": "",
+        "snapshot_id": snapshot.snapshot_id,
+        "family": "evolution",
+        "derived_kind": "change",
+        "evidence_state": "raw_taught",
+        "validation_state": "validated",
+        "lifecycle_state": "active",
+        "anchors": ["anc_synthetic"],
+        "dependencies": [{"kind": "source_revision", "identifier": snapshot.selected_revision_ids[0]}],
+        "qualification": "Synthetic legacy support.",
+        "facets": [],
+        "subject": "definition",
+        "previous": "earlier",
+        "current": "later",
+    }
+    legacy_id = f"rec_{sha256(json.dumps(legacy_values, sort_keys=True, separators=(',', ':')).encode()).hexdigest()}"
+
+    with storage._connect() as connection:
+        connection.execute("DROP TRIGGER derived_records_require_staging")
+        connection.execute("DROP TRIGGER derived_records_require_children")
+        connection.execute("DROP TRIGGER derived_records_lock_finalized_rows")
+        connection.execute("DROP TABLE derived_evolutions")
+        connection.execute(
+            """
+            CREATE TABLE derived_evolutions (
+                record_id TEXT PRIMARY KEY REFERENCES derived_records(record_id),
+                subject TEXT NOT NULL,
+                previous_value TEXT NOT NULL,
+                current_value TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO derived_records(
+                record_id, snapshot_id, family, derived_kind, evidence_state, validation_state,
+                lifecycle_state, qualification, finalized
+            ) VALUES (?, ?, 'evolution', 'change', 'raw_taught', 'validated', 'active', 'Synthetic legacy support.', 0)
+            """,
+            (legacy_id, snapshot.snapshot_id),
+        )
+        connection.execute("INSERT INTO derived_record_anchors VALUES (?, 0, 'anc_synthetic')", (legacy_id,))
+        connection.execute(
+            "INSERT INTO derived_record_dependencies VALUES (?, 0, 'source_revision', ?)",
+            (legacy_id, snapshot.selected_revision_ids[0]),
+        )
+        connection.execute("INSERT INTO derived_evolutions VALUES (?, 'definition', 'earlier', 'later')", (legacy_id,))
+
+    storage.initialize()
+    [loaded] = storage.derived_records(snapshot.snapshot_id)
+
+    assert loaded.record_id == legacy_id
+    assert is_legacy_record(loaded)
+    assert SynthesisCandidate.from_records(snapshot_id=snapshot.snapshot_id, records=(loaded,)).record_ids == ()
+
+
+def test_storage_reads_first_task9_conflict_rows_without_rewriting_their_identity(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    snapshot = snapshot_for(storage)
+    legacy_values = {
+        "record_id": "",
+        "snapshot_id": snapshot.snapshot_id,
+        "family": "conflict_unresolved",
+        "derived_kind": "unresolved",
+        "evidence_state": "cross_source_synthesis",
+        "validation_state": "validated",
+        "lifecycle_state": "active",
+        "anchors": ["anc_synthetic"],
+        "dependencies": [
+            {"kind": "source_revision", "identifier": snapshot.selected_revision_ids[0]},
+            {"kind": "derived_record", "identifier": "rec_a"},
+            {"kind": "derived_record", "identifier": "rec_b"},
+        ],
+        "qualification": "Synthetic legacy conflict.",
+        "facets": [],
+        "kind": "unresolved",
+        "subject": "question",
+        "alternatives": ["option a", "option b"],
+        "competing_record_ids": ["rec_a", "rec_b"],
+        "reconciliation_state": "unresolved",
+    }
+    legacy_id = f"rec_{sha256(json.dumps(legacy_values, sort_keys=True, separators=(',', ':')).encode()).hexdigest()}"
+
+    with storage._connect() as connection:
+        connection.execute(
+            """
+            INSERT INTO derived_records(
+                record_id, snapshot_id, family, derived_kind, evidence_state, validation_state,
+                lifecycle_state, qualification
+            ) VALUES (?, ?, 'conflict_unresolved', 'unresolved', 'cross_source_synthesis', 'validated', 'active',
+                      'Synthetic legacy conflict.')
+            """,
+            (legacy_id, snapshot.snapshot_id),
+        )
+        connection.execute("INSERT INTO derived_record_anchors VALUES (?, 0, 'anc_synthetic')", (legacy_id,))
+        connection.executemany(
+            "INSERT INTO derived_record_dependencies VALUES (?, ?, ?, ?)",
+            [
+                (legacy_id, 0, "source_revision", snapshot.selected_revision_ids[0]),
+                (legacy_id, 1, "derived_record", "rec_a"),
+                (legacy_id, 2, "derived_record", "rec_b"),
+            ],
+        )
+        connection.execute(
+            """
+            INSERT INTO derived_conflict_unresolved(
+                record_id, issue_kind, subject, competing_record_ids_json, reconciliation_state
+            ) VALUES (?, 'unresolved', 'question', '[\"rec_a\", \"rec_b\"]', 'unresolved')
+            """,
+            (legacy_id,),
+        )
+        connection.executemany(
+            "INSERT INTO derived_record_terms VALUES (?, 'alternative', ?, ?)",
+            [(legacy_id, 0, "option a"), (legacy_id, 1, "option b")],
+        )
+
+    storage.initialize()
+    [loaded] = storage.derived_records(snapshot.snapshot_id)
+
+    assert loaded.record_id == legacy_id
+    assert is_legacy_record(loaded)
 
 
 def test_storage_revalidates_tampered_record_data_at_its_boundary(tmp_path):

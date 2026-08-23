@@ -3,8 +3,6 @@
 from dataclasses import dataclass
 from hashlib import sha256
 import json
-import re
-import unicodedata
 from typing import Sequence
 
 from mentor.derived_records import (
@@ -14,6 +12,8 @@ from mentor.derived_records import (
     Evolution,
     ProcedureSequenceHierarchy,
     Relationship,
+    is_legacy_record,
+    reject_private_or_raw_text,
     validate_record,
 )
 
@@ -159,14 +159,20 @@ class SynthesisCandidate:
             validate_record(record)
             if record.snapshot_id != snapshot_id:
                 raise ValueError("record snapshot_id does not match candidate")
-            if record.validation_state == "validated":
+            if record.validation_state == "validated" and not is_legacy_record(record):
                 valid_records.append(record)
         record_map = {record.record_id: record for record in valid_records}
         if len(record_map) != len(valid_records):
             raise ValueError("duplicate validated record")
         for record in valid_records:
-            if isinstance(record, ConflictUnresolved) and not set(record.competing_record_ids) <= set(record_map):
-                raise ValueError("conflict requires valid competing record inputs")
+            if isinstance(record, ConflictUnresolved):
+                if not set(record.competing_record_ids) <= set(record_map):
+                    raise ValueError("conflict requires valid competing record inputs")
+                required_anchors = {
+                    anchor for record_id in record.competing_record_ids for anchor in record_map[record_id].anchors
+                }
+                if not required_anchors <= set(record.anchors):
+                    raise ValueError("conflict anchors must include competing record anchors")
         ordered_records = tuple(sorted(record_map.values(), key=lambda record: record.record_id))
         concepts, occurrences = _cluster_concepts(snapshot_id, ordered_records, hints)
         ordered_concepts = tuple(sorted(concepts, key=lambda concept: concept.concept_id))
@@ -680,21 +686,7 @@ def _validate_justification(justification: object) -> None:
 
 
 def _reject_private_text(value: str, label: str) -> None:
-    tokens = frozenset(re.findall(r"[a-z0-9]+", unicodedata.normalize("NFKC", value).casefold()))
-    if (
-        "private" in tokens
-        or "scratchpad" in tokens
-        or "transcript" in tokens
-        or "excerpt" in tokens
-        or "verbatim" in tokens
-        or {"scratch", "pad"} <= tokens
-        or {"chain", "thought"} <= tokens
-        or {"hidden", "analysis"} <= tokens
-        or {"internal", "deliberation"} <= tokens
-    ):
-        raise ValueError(f"{label} cannot contain private or raw source content")
-    if "confidence" in tokens and any(token.isdigit() for token in tokens):
-        raise ValueError(f"{label} cannot contain numeric confidence")
+    reject_private_or_raw_text(value, label)
 
 
 def _concept_id(snapshot_id: str, label_key: str, scope: str | None) -> str:

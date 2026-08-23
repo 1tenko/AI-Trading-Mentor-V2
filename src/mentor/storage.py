@@ -272,14 +272,22 @@ class Storage:
                     later_source_set_json TEXT NOT NULL DEFAULT '[]',
                     classification TEXT NOT NULL DEFAULT 'no_supported_classification',
                     negative_evidence_state TEXT NOT NULL DEFAULT 'unresolved',
-                    competing_anchor_ids_json TEXT NOT NULL DEFAULT '[]'
+                    competing_anchor_ids_json TEXT NOT NULL DEFAULT '[]',
+                    earlier_coverage_id TEXT NOT NULL DEFAULT '',
+                    later_coverage_id TEXT NOT NULL DEFAULT '',
+                    earlier_observed_years_json TEXT NOT NULL DEFAULT '[]',
+                    later_observed_years_json TEXT NOT NULL DEFAULT '[]',
+                    deprecation_evidence_anchor_ids_json TEXT NOT NULL DEFAULT '[]'
                 );
                 CREATE TABLE IF NOT EXISTS derived_conflict_unresolved (
                     record_id TEXT PRIMARY KEY REFERENCES derived_records(record_id),
                     issue_kind TEXT NOT NULL CHECK(issue_kind IN ('conflict', 'unresolved')),
                     subject TEXT NOT NULL,
                     competing_record_ids_json TEXT NOT NULL DEFAULT '[]',
-                    reconciliation_state TEXT NOT NULL DEFAULT 'unresolved'
+                    reconciliation_state TEXT NOT NULL DEFAULT 'unresolved',
+                    relevant_scopes_json TEXT NOT NULL DEFAULT '[]',
+                    conditions_json TEXT NOT NULL DEFAULT '[]',
+                    unresolved_questions_json TEXT NOT NULL DEFAULT '[]'
                 );
                 CREATE TABLE IF NOT EXISTS derived_record_terms (
                     record_id TEXT NOT NULL REFERENCES derived_records(record_id),
@@ -321,6 +329,11 @@ class Storage:
                 ("classification", "TEXT NOT NULL DEFAULT 'no_supported_classification'"),
                 ("negative_evidence_state", "TEXT NOT NULL DEFAULT 'unresolved'"),
                 ("competing_anchor_ids_json", "TEXT NOT NULL DEFAULT '[]'"),
+                ("earlier_coverage_id", "TEXT NOT NULL DEFAULT ''"),
+                ("later_coverage_id", "TEXT NOT NULL DEFAULT ''"),
+                ("earlier_observed_years_json", "TEXT NOT NULL DEFAULT '[]'"),
+                ("later_observed_years_json", "TEXT NOT NULL DEFAULT '[]'"),
+                ("deprecation_evidence_anchor_ids_json", "TEXT NOT NULL DEFAULT '[]'"),
             ):
                 if column not in evolution_columns:
                     connection.execute(f"ALTER TABLE derived_evolutions ADD COLUMN {column} {definition}")
@@ -328,6 +341,9 @@ class Storage:
             for column, definition in (
                 ("competing_record_ids_json", "TEXT NOT NULL DEFAULT '[]'"),
                 ("reconciliation_state", "TEXT NOT NULL DEFAULT 'unresolved'"),
+                ("relevant_scopes_json", "TEXT NOT NULL DEFAULT '[]'"),
+                ("conditions_json", "TEXT NOT NULL DEFAULT '[]'"),
+                ("unresolved_questions_json", "TEXT NOT NULL DEFAULT '[]'"),
             ):
                 if column not in conflict_columns:
                     connection.execute(f"ALTER TABLE derived_conflict_unresolved ADD COLUMN {column} {definition}")
@@ -758,8 +774,10 @@ class Storage:
                 """
                 INSERT INTO derived_evolutions(
                     record_id, subject, previous_value, current_value, earlier_source_set_json,
-                    later_source_set_json, classification, negative_evidence_state, competing_anchor_ids_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING
+                    later_source_set_json, classification, negative_evidence_state, competing_anchor_ids_json,
+                    earlier_coverage_id, later_coverage_id, earlier_observed_years_json,
+                    later_observed_years_json, deprecation_evidence_anchor_ids_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING
                 """,
                 (
                     record.record_id,
@@ -771,6 +789,11 @@ class Storage:
                     record.classification,
                     record.negative_evidence_state,
                     json.dumps(record.competing_anchors),
+                    record.earlier_coverage_id,
+                    record.later_coverage_id,
+                    json.dumps(record.earlier_observed_years),
+                    json.dumps(record.later_observed_years),
+                    json.dumps(record.deprecation_evidence_anchors),
                 ),
             )
         elif isinstance(record, ConflictUnresolved):
@@ -778,7 +801,8 @@ class Storage:
                 """
                 INSERT INTO derived_conflict_unresolved(
                     record_id, issue_kind, subject, competing_record_ids_json, reconciliation_state
-                ) VALUES (?, ?, ?, ?, ?) ON CONFLICT DO NOTHING
+                    , relevant_scopes_json, conditions_json, unresolved_questions_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING
                 """,
                 (
                     record.record_id,
@@ -786,6 +810,9 @@ class Storage:
                     record.subject,
                     json.dumps(record.competing_record_ids),
                     record.reconciliation_state,
+                    json.dumps(record.relevant_scopes),
+                    json.dumps(record.conditions),
+                    json.dumps(record.unresolved_questions),
                 ),
             )
             connection.executemany(
@@ -875,36 +902,63 @@ class Storage:
             values = connection.execute(
                 """
                 SELECT subject, previous_value, current_value, earlier_source_set_json, later_source_set_json,
-                       classification, negative_evidence_state, competing_anchor_ids_json
+                       classification, negative_evidence_state, competing_anchor_ids_json, earlier_coverage_id,
+                       later_coverage_id, earlier_observed_years_json, later_observed_years_json,
+                       deprecation_evidence_anchor_ids_json
                 FROM derived_evolutions WHERE record_id = ?
                 """,
                 (record_id,),
             ).fetchone()
             values = tuple(_decode_sqlite_text(value) for value in values)
-            record = Evolution.create(
-                **common,
-                subject=values[0],
-                previous=values[1],
-                current=values[2],
-                earlier_source_set=tuple(json.loads(values[3])),
-                later_source_set=tuple(json.loads(values[4])),
-                classification=values[5],
-                negative_evidence_state=values[6],
-                competing_anchors=tuple(json.loads(values[7])),
-            )
+            if not any(json.loads(values[index]) for index in (10, 11, 12)) and not values[8] and not values[9]:
+                record = Evolution(
+                    record_id=record_id,
+                    family="evolution",
+                    derived_kind=derived_kind,
+                    **common,
+                    subject=values[0],
+                    previous=values[1],
+                    current=values[2],
+                    earlier_source_set=tuple(json.loads(values[3])),
+                    later_source_set=tuple(json.loads(values[4])),
+                    classification=values[5],
+                    negative_evidence_state=values[6],
+                    competing_anchors=tuple(json.loads(values[7])),
+                )
+            else:
+                record = Evolution.create(
+                    **common,
+                    subject=values[0],
+                    previous=values[1],
+                    current=values[2],
+                    earlier_source_set=tuple(json.loads(values[3])),
+                    later_source_set=tuple(json.loads(values[4])),
+                    classification=values[5],
+                    negative_evidence_state=values[6],
+                    competing_anchors=tuple(json.loads(values[7])),
+                    earlier_coverage_id=values[8],
+                    later_coverage_id=values[9],
+                    earlier_observed_years=tuple(json.loads(values[10])),
+                    later_observed_years=tuple(json.loads(values[11])),
+                    deprecation_evidence_anchors=tuple(json.loads(values[12])),
+                )
         elif family == "conflict_unresolved":
-            kind, subject, competing_record_ids_json, reconciliation_state = connection.execute(
+            kind, subject, competing_record_ids_json, reconciliation_state, relevant_scopes_json, conditions_json, unresolved_questions_json = connection.execute(
                 """
-                SELECT issue_kind, subject, competing_record_ids_json, reconciliation_state
+                SELECT issue_kind, subject, competing_record_ids_json, reconciliation_state, relevant_scopes_json,
+                       conditions_json, unresolved_questions_json
                 FROM derived_conflict_unresolved WHERE record_id = ?
                 """,
                 (record_id,),
             ).fetchone()
-            kind, subject, competing_record_ids_json, reconciliation_state = (
+            kind, subject, competing_record_ids_json, reconciliation_state, relevant_scopes_json, conditions_json, unresolved_questions_json = (
                 _decode_sqlite_text(kind),
                 _decode_sqlite_text(subject),
                 _decode_sqlite_text(competing_record_ids_json),
                 _decode_sqlite_text(reconciliation_state),
+                _decode_sqlite_text(relevant_scopes_json),
+                _decode_sqlite_text(conditions_json),
+                _decode_sqlite_text(unresolved_questions_json),
             )
             alternatives = tuple(
                 _decode_sqlite_text(item[0])
@@ -916,14 +970,30 @@ class Storage:
                     (record_id,),
                 )
             )
-            record = ConflictUnresolved.create(
-                **common,
-                kind=kind,
-                subject=subject,
-                alternatives=alternatives,
-                competing_record_ids=tuple(json.loads(competing_record_ids_json)),
-                reconciliation_state=reconciliation_state,
-            )
+            if not any(json.loads(value) for value in (relevant_scopes_json, conditions_json, unresolved_questions_json)):
+                record = ConflictUnresolved(
+                    record_id=record_id,
+                    family="conflict_unresolved",
+                    derived_kind=derived_kind,
+                    **common,
+                    kind=kind,
+                    subject=subject,
+                    alternatives=alternatives,
+                    competing_record_ids=tuple(json.loads(competing_record_ids_json)),
+                    reconciliation_state=reconciliation_state,
+                )
+            else:
+                record = ConflictUnresolved.create(
+                    **common,
+                    kind=kind,
+                    subject=subject,
+                    alternatives=alternatives,
+                    competing_record_ids=tuple(json.loads(competing_record_ids_json)),
+                    reconciliation_state=reconciliation_state,
+                    relevant_scopes=tuple(json.loads(relevant_scopes_json)),
+                    conditions=tuple(json.loads(conditions_json)),
+                    unresolved_questions=tuple(json.loads(unresolved_questions_json)),
+                )
         else:
             raise ValueError("unknown derived record family")
         if record.record_id != record_id:

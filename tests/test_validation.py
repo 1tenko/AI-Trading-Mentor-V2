@@ -257,6 +257,10 @@ def test_storage_has_no_result_accepting_path_for_forged_validation_results(tmp_
             later_source_set=(revision.revision_id,),
             classification="no_supported_classification",
             negative_evidence_state="unresolved",
+            earlier_coverage_id="coverage_synthetic_earlier",
+            later_coverage_id="coverage_synthetic_later",
+            earlier_observed_years=(2025,),
+            later_observed_years=(2026,),
         ),
         "conflict": ConflictUnresolved.create(
             **conflict_common,
@@ -265,6 +269,7 @@ def test_storage_has_no_result_accepting_path_for_forged_validation_results(tmp_
             alternatives=("first", "second"),
             competing_record_ids=("rec_first", "rec_second"),
             reconciliation_state="genuinely_contradictory",
+            relevant_scopes=("synthetic scope",),
         ),
     }[family]
     forged = ValidationResult(

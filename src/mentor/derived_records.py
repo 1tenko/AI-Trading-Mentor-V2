@@ -3,6 +3,8 @@
 from dataclasses import asdict, dataclass, replace
 from hashlib import sha256
 import json
+import re
+import unicodedata
 
 
 FAMILIES = frozenset(
@@ -166,6 +168,11 @@ class Evolution(DerivedRecord):
     classification: str = "no_supported_classification"
     negative_evidence_state: str = "unresolved"
     competing_anchors: tuple[str, ...] = ()
+    earlier_coverage_id: str = ""
+    later_coverage_id: str = ""
+    earlier_observed_years: tuple[int, ...] = ()
+    later_observed_years: tuple[int, ...] = ()
+    deprecation_evidence_anchors: tuple[str, ...] = ()
 
     @classmethod
     def create(
@@ -178,7 +185,12 @@ class Evolution(DerivedRecord):
         later_source_set: tuple[str, ...],
         classification: str,
         negative_evidence_state: str,
+        earlier_coverage_id: str,
+        later_coverage_id: str,
+        earlier_observed_years: tuple[int, ...],
+        later_observed_years: tuple[int, ...],
         competing_anchors: tuple[str, ...] = (),
+        deprecation_evidence_anchors: tuple[str, ...] = (),
         **common: object,
     ) -> "Evolution":
         return _new(
@@ -192,7 +204,12 @@ class Evolution(DerivedRecord):
             classification=classification,
             negative_evidence_state=negative_evidence_state,
             competing_anchors=competing_anchors,
-            **_common(common, "change"),
+            earlier_coverage_id=earlier_coverage_id,
+            later_coverage_id=later_coverage_id,
+            earlier_observed_years=earlier_observed_years,
+            later_observed_years=later_observed_years,
+            deprecation_evidence_anchors=deprecation_evidence_anchors,
+            **_synthesis_common(common, "change"),
         )
 
 
@@ -203,6 +220,9 @@ class ConflictUnresolved(DerivedRecord):
     alternatives: tuple[str, ...] = ()
     competing_record_ids: tuple[str, ...] = ()
     reconciliation_state: str = "unresolved"
+    relevant_scopes: tuple[str, ...] = ()
+    conditions: tuple[str, ...] = ()
+    unresolved_questions: tuple[str, ...] = ()
 
     @classmethod
     def create(
@@ -213,6 +233,9 @@ class ConflictUnresolved(DerivedRecord):
         alternatives: tuple[str, ...],
         competing_record_ids: tuple[str, ...],
         reconciliation_state: str,
+        relevant_scopes: tuple[str, ...],
+        conditions: tuple[str, ...] = (),
+        unresolved_questions: tuple[str, ...] = (),
         **common: object,
     ) -> "ConflictUnresolved":
         if kind not in {"conflict", "unresolved"} or len(alternatives) < 2:
@@ -227,7 +250,10 @@ class ConflictUnresolved(DerivedRecord):
             alternatives=alternatives,
             competing_record_ids=competing_record_ids,
             reconciliation_state=reconciliation_state,
-            **_common(common, kind),
+            relevant_scopes=relevant_scopes,
+            conditions=conditions,
+            unresolved_questions=unresolved_questions,
+            **_synthesis_common(common, kind),
         )
 
 
@@ -248,7 +274,7 @@ def validate_record(record: DerivedRecord) -> None:
         raise ValueError("invalid lifecycle_state")
     _require_text(record.snapshot_id, "snapshot_id")
     _require_text(record.derived_kind, "derived_kind")
-    _require_text(record.qualification, "qualification")
+    _require_auditable_text(record.qualification, "qualification")
     if len(record.qualification) > 280:
         raise ValueError("qualification must be concise")
     if not isinstance(record.anchors, tuple) or not record.anchors or any(not isinstance(anchor, str) or not anchor for anchor in record.anchors):
@@ -262,7 +288,7 @@ def validate_record(record: DerivedRecord) -> None:
     _validate_compiler_provenance(record.compiler_provenance)
     _validate_facets(record.facets)
     _validate_family(record)
-    if record.record_id != _record_id(record):
+    if record.record_id != _record_id(record) and not is_legacy_record(record):
         raise ValueError("record identity is not canonical")
 
 
@@ -280,6 +306,13 @@ def _common(values: dict[str, object], default_kind: str) -> dict[str, object]:
     return {"derived_kind": derived_kind, "evidence_state": evidence_state, **values}
 
 
+def _synthesis_common(values: dict[str, object], default_kind: str) -> dict[str, object]:
+    common = _common(values, default_kind)
+    if common["evidence_state"] != "cross_source_synthesis":
+        raise ValueError("evolution and conflict records must remain source synthesis or unresolved")
+    return common
+
+
 def _default_evidence_state(derived_kind: str) -> str:
     return "cross_source_synthesis" if derived_kind in {"strategy_implication", "change", "conflict", "unresolved"} else "raw_taught"
 
@@ -289,9 +322,9 @@ def _validate_compiler_provenance(provenance: object) -> None:
         return
     if not isinstance(provenance, CompilerProvenance):
         raise ValueError("invalid compiler provenance")
-    _require_text(provenance.model_version, "compiler model version")
-    _require_text(provenance.prompt_version, "compiler prompt version")
-    _require_text(provenance.schema_version, "compiler schema version")
+    _require_auditable_text(provenance.model_version, "compiler model version")
+    _require_auditable_text(provenance.prompt_version, "compiler prompt version")
+    _require_auditable_text(provenance.schema_version, "compiler schema version")
 
 
 def _validate_facets(facets: object) -> None:
@@ -312,7 +345,7 @@ def _validate_facets(facets: object) -> None:
         if facet.name in names:
             raise ValueError("duplicate facet name")
         names.add(facet.name)
-        _require_text(facet.value, "facet value", maximum=MAX_FACET_VALUE_LENGTH)
+        _require_auditable_text(facet.value, "facet value", maximum=MAX_FACET_VALUE_LENGTH)
 
 
 def _validate_family(record: DerivedRecord) -> None:
@@ -332,8 +365,19 @@ def _validate_family(record: DerivedRecord) -> None:
     elif isinstance(record, Evolution):
         if record.family != "evolution" or record.derived_kind != "change":
             raise ValueError("invalid evolution record")
+        if is_legacy_record(record):
+            strings = (record.subject, record.previous, record.current)
+            for value in strings:
+                _require_auditable_text(value, "typed record value", maximum=MAX_TYPED_CONTENT_LENGTH)
+            return
+        if record.evidence_state != "cross_source_synthesis":
+            raise ValueError("evolution records must remain source synthesis or unresolved")
         _require_identifier_tuple(record.earlier_source_set, "earlier evolution source set")
         _require_identifier_tuple(record.later_source_set, "later evolution source set")
+        _require_text(record.earlier_coverage_id, "earlier coverage ID", maximum=MAX_TYPED_CONTENT_LENGTH)
+        _require_text(record.later_coverage_id, "later coverage ID", maximum=MAX_TYPED_CONTENT_LENGTH)
+        _require_year_tuple(record.earlier_observed_years, "earlier observed years")
+        _require_year_tuple(record.later_observed_years, "later observed years")
         source_revision_dependencies = {
             dependency.identifier for dependency in record.dependencies if dependency.kind == "source_revision"
         }
@@ -344,10 +388,15 @@ def _validate_family(record: DerivedRecord) -> None:
         if record.negative_evidence_state not in NEGATIVE_EVIDENCE_STATES:
             raise ValueError("invalid negative evidence state")
         if (
-            record.classification in {"introduced", "deprecated_or_deemphasized"}
+            record.classification == "introduced"
             and record.negative_evidence_state != "source_asserted_absence"
         ):
-            raise ValueError("introduced or deprecated classifications require source asserted absence")
+            raise ValueError("introduced classifications require source asserted absence")
+        if (
+            record.classification in {"repeated", "refined", "expanded", "reframed"}
+            and record.negative_evidence_state not in {"positive_teaching", "coverage_supported_synthesis"}
+        ):
+            raise ValueError("supported evolution classifications require positive or coverage evidence")
         if (
             record.negative_evidence_state == "not_found_in_observed_evidence"
             and record.classification not in {"no_supported_classification", "uncertain_chronology"}
@@ -356,10 +405,23 @@ def _validate_family(record: DerivedRecord) -> None:
         _require_identifier_tuple(record.competing_anchors, "competing anchor", allow_empty=True)
         if not set(record.competing_anchors) <= set(record.anchors):
             raise ValueError("competing anchors must be supporting anchors")
+        _require_identifier_tuple(record.deprecation_evidence_anchors, "deprecation evidence anchor", allow_empty=True)
+        if not set(record.deprecation_evidence_anchors) <= set(record.anchors):
+            raise ValueError("deprecation evidence anchors must be supporting anchors")
+        if record.classification == "deprecated_or_deemphasized":
+            if record.negative_evidence_state != "positive_teaching" or not record.deprecation_evidence_anchors:
+                raise ValueError("deprecated classifications require direct deprecation evidence")
         strings = (record.subject, record.previous, record.current)
     elif isinstance(record, ConflictUnresolved):
         if record.family != "conflict_unresolved" or record.derived_kind != record.kind or record.kind not in {"conflict", "unresolved"} or len(record.alternatives) < 2:
             raise ValueError("invalid conflict or unresolved record")
+        if is_legacy_record(record):
+            strings = (record.subject, *record.alternatives)
+            for value in strings:
+                _require_auditable_text(value, "typed record value", maximum=MAX_TYPED_CONTENT_LENGTH)
+            return
+        if record.evidence_state != "cross_source_synthesis":
+            raise ValueError("conflict records must remain source synthesis or unresolved")
         _require_identifier_tuple(record.competing_record_ids, "competing record")
         if not set(record.competing_record_ids) <= {
             dependency.identifier for dependency in record.dependencies if dependency.kind == "derived_record"
@@ -369,15 +431,18 @@ def _validate_family(record: DerivedRecord) -> None:
             raise ValueError("invalid conflict reconciliation state")
         if record.kind == "unresolved" and record.reconciliation_state != "unresolved":
             raise ValueError("unresolved records must remain unresolved")
-        if record.reconciliation_state == "compatible_under_conditions" and not any(
-            facet.name == "condition" for facet in record.facets
-        ):
-            raise ValueError("compatible conflicts require a condition facet")
+        _require_prose_tuple(record.relevant_scopes, "relevant scope")
+        _require_prose_tuple(record.conditions, "condition", allow_empty=True)
+        _require_prose_tuple(record.unresolved_questions, "unresolved question", allow_empty=True)
+        if record.reconciliation_state == "compatible_under_conditions" and not record.conditions:
+            raise ValueError("compatible conflicts require an explicit condition")
+        if record.kind == "unresolved" and not record.unresolved_questions:
+            raise ValueError("unresolved conflicts require an unresolved question")
         strings = (record.subject, *record.alternatives)
     else:
         raise ValueError("unknown derived record family")
     for value in strings:
-        _require_text(value, "typed record value", maximum=MAX_TYPED_CONTENT_LENGTH)
+        _require_auditable_text(value, "typed record value", maximum=MAX_TYPED_CONTENT_LENGTH)
 
 
 def _require_text(value: object, label: str, *, maximum: int | None = None) -> None:
@@ -387,6 +452,29 @@ def _require_text(value: object, label: str, *, maximum: int | None = None) -> N
         raise ValueError(f"{label} exceeds its maximum length")
 
 
+def _require_auditable_text(value: object, label: str, *, maximum: int | None = None) -> None:
+    _require_text(value, label, maximum=maximum)
+    reject_private_or_raw_text(value, label)
+
+
+def reject_private_or_raw_text(value: str, label: str) -> None:
+    tokens = frozenset(re.findall(r"[a-z0-9]+", unicodedata.normalize("NFKC", value).casefold()))
+    if (
+        "private" in tokens
+        or "scratchpad" in tokens
+        or "transcript" in tokens
+        or "excerpt" in tokens
+        or "verbatim" in tokens
+        or {"scratch", "pad"} <= tokens
+        or {"chain", "thought"} <= tokens
+        or {"hidden", "analysis"} <= tokens
+        or {"internal", "deliberation"} <= tokens
+    ):
+        raise ValueError(f"{label} cannot contain private or raw source content")
+    if "confidence" in tokens and any(token.isdigit() for token in tokens):
+        raise ValueError(f"{label} cannot contain numeric confidence")
+
+
 def _require_identifier_tuple(values: object, label: str, *, allow_empty: bool = False) -> None:
     if not isinstance(values, tuple) or (not allow_empty and not values) or len(set(values)) != len(values):
         raise ValueError(f"{label} IDs must be non-empty and unique")
@@ -394,9 +482,110 @@ def _require_identifier_tuple(values: object, label: str, *, allow_empty: bool =
         _require_text(value, f"{label} ID", maximum=MAX_TYPED_CONTENT_LENGTH)
 
 
+def _require_prose_tuple(values: object, label: str, *, allow_empty: bool = False) -> None:
+    if not isinstance(values, tuple) or (not allow_empty and not values) or len(set(values)) != len(values):
+        raise ValueError(f"{label} values must be non-empty and unique")
+    for value in values:
+        _require_auditable_text(value, label, maximum=MAX_TYPED_CONTENT_LENGTH)
+
+
+def _require_year_tuple(values: object, label: str) -> None:
+    if not isinstance(values, tuple) or not values or len(set(values)) != len(values):
+        raise ValueError(f"{label} must be a non-empty unique tuple")
+    if any(isinstance(year, bool) or not isinstance(year, int) or year < 1 or year > 9999 for year in values):
+        raise ValueError(f"{label} must contain calendar years")
+
+
+def is_legacy_record(record: DerivedRecord) -> bool:
+    if isinstance(record, Evolution):
+        return (
+            not record.earlier_source_set
+            and not record.later_source_set
+            and not record.competing_anchors
+            and not record.earlier_coverage_id
+            and not record.later_coverage_id
+            and not record.earlier_observed_years
+            and not record.later_observed_years
+            and not record.deprecation_evidence_anchors
+            and record.record_id == _legacy_record_id(record)
+        ) or (
+            not record.earlier_coverage_id
+            and not record.later_coverage_id
+            and not record.earlier_observed_years
+            and not record.later_observed_years
+            and not record.deprecation_evidence_anchors
+            and record.record_id == _first_task9_record_id(record)
+        )
+    if isinstance(record, ConflictUnresolved):
+        return (
+            not record.competing_record_ids
+            and not record.relevant_scopes
+            and not record.conditions
+            and not record.unresolved_questions
+            and record.record_id == _legacy_record_id(record)
+        ) or (
+            not record.relevant_scopes
+            and not record.conditions
+            and not record.unresolved_questions
+            and record.record_id == _first_task9_record_id(record)
+        )
+    return False
+
+
 def _record_id(record: DerivedRecord) -> str:
     values = asdict(record)
     values["record_id"] = ""
+    if values["compiler_provenance"] is None:
+        del values["compiler_provenance"]
+    return f"rec_{sha256(json.dumps(values, sort_keys=True, separators=(',', ':')).encode()).hexdigest()}"
+
+
+def _legacy_record_id(record: DerivedRecord) -> str:
+    values = asdict(record)
+    values["record_id"] = ""
+    if isinstance(record, Evolution):
+        for name in (
+            "earlier_source_set",
+            "later_source_set",
+            "classification",
+            "negative_evidence_state",
+            "competing_anchors",
+            "earlier_coverage_id",
+            "later_coverage_id",
+            "earlier_observed_years",
+            "later_observed_years",
+            "deprecation_evidence_anchors",
+        ):
+            values.pop(name)
+    elif isinstance(record, ConflictUnresolved):
+        for name in (
+            "competing_record_ids",
+            "reconciliation_state",
+            "relevant_scopes",
+            "conditions",
+            "unresolved_questions",
+        ):
+            values.pop(name)
+    if values["compiler_provenance"] is None:
+        del values["compiler_provenance"]
+    return f"rec_{sha256(json.dumps(values, sort_keys=True, separators=(',', ':')).encode()).hexdigest()}"
+
+
+def _first_task9_record_id(record: DerivedRecord) -> str:
+    values = asdict(record)
+    values["record_id"] = ""
+    if isinstance(record, Evolution):
+        for name in (
+            "earlier_coverage_id",
+            "later_coverage_id",
+            "earlier_observed_years",
+            "later_observed_years",
+            "deprecation_evidence_anchors",
+        ):
+            values.pop(name)
+    elif isinstance(record, ConflictUnresolved):
+        for name in ("relevant_scopes", "conditions", "unresolved_questions"):
+            values.pop(name)
     if values["compiler_provenance"] is None:
         del values["compiler_provenance"]
     return f"rec_{sha256(json.dumps(values, sort_keys=True, separators=(',', ':')).encode()).hexdigest()}"
