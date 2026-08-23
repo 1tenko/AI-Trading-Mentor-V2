@@ -2,9 +2,12 @@
 
 import json
 import sqlite3
+import time
+from dataclasses import replace
 from dataclasses import dataclass
 from pathlib import Path
 
+from mentor.compilation import CompilationMetric, CompilationRun, CorpusSnapshot
 from mentor.knowledge import Collection, Source as LibrarySource, SourceRevision
 
 
@@ -42,6 +45,14 @@ class SourceChange:
 class Thread:
     id: int
     title: str
+
+
+_SNAPSHOT_QUERY = """
+SELECT snapshot_id, run_id, selected_revision_ids_json, selected_revision_fingerprint,
+       raw_store_id, derived_store_id, model_version, prompt_version, schema_version,
+       status, created_at, validated_at, published_at, failed_at, failure_reason
+FROM corpus_snapshots
+"""
 
 
 class Storage:
@@ -141,12 +152,289 @@ class Storage:
                     local_locator TEXT NOT NULL,
                     observed_at REAL NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS compilation_runs (
+                    run_id TEXT PRIMARY KEY,
+                    model_version TEXT NOT NULL,
+                    prompt_version TEXT NOT NULL,
+                    schema_version TEXT NOT NULL,
+                    started_at REAL NOT NULL,
+                    status TEXT NOT NULL CHECK(status IN ('building', 'validating', 'failed', 'published')),
+                    completed_at REAL,
+                    failure_reason TEXT
+                );
+                CREATE TABLE IF NOT EXISTS corpus_snapshots (
+                    snapshot_id TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL UNIQUE REFERENCES compilation_runs(run_id),
+                    selected_revision_ids_json TEXT NOT NULL,
+                    selected_revision_fingerprint TEXT NOT NULL,
+                    raw_store_id TEXT,
+                    derived_store_id TEXT,
+                    model_version TEXT NOT NULL,
+                    prompt_version TEXT NOT NULL,
+                    schema_version TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK(status IN ('building', 'validating', 'failed', 'published')),
+                    created_at REAL NOT NULL,
+                    validated_at REAL,
+                    published_at REAL,
+                    failed_at REAL,
+                    failure_reason TEXT
+                );
+                CREATE TABLE IF NOT EXISTS compilation_metrics (
+                    metric_id INTEGER PRIMARY KEY,
+                    run_id TEXT NOT NULL REFERENCES compilation_runs(run_id),
+                    stage TEXT NOT NULL,
+                    model_version TEXT NOT NULL,
+                    prompt_version TEXT NOT NULL,
+                    schema_version TEXT NOT NULL,
+                    source_count INTEGER NOT NULL CHECK(source_count >= 0),
+                    record_count INTEGER NOT NULL CHECK(record_count >= 0),
+                    call_count INTEGER NOT NULL CHECK(call_count >= 0),
+                    input_tokens INTEGER NOT NULL CHECK(input_tokens >= 0),
+                    output_tokens INTEGER NOT NULL CHECK(output_tokens >= 0),
+                    latency_ms INTEGER NOT NULL CHECK(latency_ms >= 0),
+                    cost_usd REAL NOT NULL CHECK(cost_usd >= 0),
+                    remote_calls INTEGER NOT NULL CHECK(remote_calls >= 0),
+                    failure_count INTEGER NOT NULL CHECK(failure_count >= 0)
+                );
                 """
             )
             columns = {row[1] for row in connection.execute("PRAGMA table_info(sources)")}
             if "modified_at" not in columns:
                 connection.execute("ALTER TABLE sources ADD COLUMN modified_at REAL")
             self._backfill_display_turns(connection)
+
+    def create_compilation_candidate(self, run: CompilationRun, snapshot: CorpusSnapshot) -> None:
+        if run.status != "building" or snapshot.status != "building":
+            raise ValueError("new compilation candidates must be building")
+        if snapshot.run_id != run.run_id:
+            raise ValueError("snapshot run_id does not match compilation run")
+        if (
+            snapshot.model_version,
+            snapshot.prompt_version,
+            snapshot.schema_version,
+        ) != (run.model_version, run.prompt_version, run.schema_version):
+            raise ValueError("snapshot versions do not match compilation run")
+        with self._connect() as connection:
+            known_revisions = {
+                row[0]
+                for row in connection.execute(
+                    "SELECT revision_id FROM source_revisions WHERE revision_id IN "
+                    f"({','.join('?' for _ in snapshot.selected_revision_ids)})",
+                    snapshot.selected_revision_ids,
+                )
+            }
+            if known_revisions != set(snapshot.selected_revision_ids):
+                raise ValueError("snapshot contains an unknown source revision")
+            connection.execute(
+                """
+                INSERT INTO compilation_runs(
+                    run_id, model_version, prompt_version, schema_version, started_at, status,
+                    completed_at, failure_reason
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    run.run_id,
+                    run.model_version,
+                    run.prompt_version,
+                    run.schema_version,
+                    run.started_at,
+                    run.status,
+                    run.completed_at,
+                    run.failure_reason,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO corpus_snapshots(
+                    snapshot_id, run_id, selected_revision_ids_json, selected_revision_fingerprint,
+                    raw_store_id, derived_store_id, model_version, prompt_version, schema_version,
+                    status, created_at, validated_at, published_at, failed_at, failure_reason
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    snapshot.snapshot_id,
+                    snapshot.run_id,
+                    json.dumps(snapshot.selected_revision_ids),
+                    snapshot.selected_revision_fingerprint,
+                    snapshot.raw_store_id,
+                    snapshot.derived_store_id,
+                    snapshot.model_version,
+                    snapshot.prompt_version,
+                    snapshot.schema_version,
+                    snapshot.status,
+                    snapshot.created_at,
+                    snapshot.validated_at,
+                    snapshot.published_at,
+                    snapshot.failed_at,
+                    snapshot.failure_reason,
+                ),
+            )
+
+    def transition_snapshot(
+        self,
+        snapshot_id: str,
+        status: str,
+        *,
+        failure_reason: str | None = None,
+        transitioned_at: float | None = None,
+    ) -> CorpusSnapshot:
+        transitioned_at = time.time() if transitioned_at is None else transitioned_at
+        with self._connect() as connection:
+            row = connection.execute(_SNAPSHOT_QUERY + " WHERE snapshot_id = ?", (snapshot_id,)).fetchone()
+            if row is None:
+                raise ValueError("unknown snapshot")
+            snapshot = _snapshot_from_row(row)
+            allowed = {
+                "building": {"validating", "failed"},
+                "validating": {"published", "failed"},
+                "failed": set(),
+                "published": set(),
+            }
+            if status not in allowed[snapshot.status]:
+                raise ValueError(f"cannot transition snapshot from {snapshot.status} to {status}")
+            if status == "failed" and not failure_reason:
+                raise ValueError("failed snapshots require a failure_reason")
+            if status == "published" and (not snapshot.raw_store_id or not snapshot.derived_store_id):
+                raise ValueError("published snapshots require raw and derived store IDs")
+
+            connection.execute(
+                """
+                UPDATE corpus_snapshots
+                SET status = ?, validated_at = ?, published_at = ?, failed_at = ?, failure_reason = ?
+                WHERE snapshot_id = ?
+                """,
+                (
+                    status,
+                    transitioned_at if status == "validating" else snapshot.validated_at,
+                    transitioned_at if status == "published" else snapshot.published_at,
+                    transitioned_at if status == "failed" else snapshot.failed_at,
+                    failure_reason,
+                    snapshot_id,
+                ),
+            )
+            connection.execute(
+                """
+                UPDATE compilation_runs
+                SET status = ?, completed_at = ?, failure_reason = ?
+                WHERE run_id = ?
+                """,
+                (
+                    status,
+                    transitioned_at if status in {"published", "failed"} else None,
+                    failure_reason,
+                    snapshot.run_id,
+                ),
+            )
+            if status == "published":
+                for key, value in (
+                    ("current_snapshot_id", snapshot_id),
+                    ("active_raw_store_id", snapshot.raw_store_id),
+                    ("active_derived_store_id", snapshot.derived_store_id),
+                ):
+                    connection.execute(
+                        "INSERT INTO settings(key, value) VALUES (?, ?) "
+                        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                        (key, value),
+                    )
+        return self.snapshot(snapshot_id)
+
+    def snapshot(self, snapshot_id: str) -> CorpusSnapshot | None:
+        with self._connect() as connection:
+            row = connection.execute(_SNAPSHOT_QUERY + " WHERE snapshot_id = ?", (snapshot_id,)).fetchone()
+        return None if row is None else _snapshot_from_row(row)
+
+    def current_snapshot(self) -> CorpusSnapshot | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                _SNAPSHOT_QUERY
+                + " JOIN settings ON settings.key = 'current_snapshot_id'"
+                " AND settings.value = corpus_snapshots.snapshot_id"
+                " WHERE corpus_snapshots.status = 'published'"
+            ).fetchone()
+        return None if row is None else _snapshot_from_row(row)
+
+    def compilation_run(self, run_id: str) -> CompilationRun | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT run_id, model_version, prompt_version, schema_version, started_at, status,
+                       completed_at, failure_reason
+                FROM compilation_runs WHERE run_id = ?
+                """,
+                (run_id,),
+            ).fetchone()
+        return None if row is None else CompilationRun(*row)
+
+    def record_compilation_metric(self, run_id: str, metric: CompilationMetric) -> CompilationMetric:
+        values = (
+            metric.source_count,
+            metric.record_count,
+            metric.call_count,
+            metric.input_tokens,
+            metric.output_tokens,
+            metric.latency_ms,
+            metric.cost_usd,
+            metric.remote_calls,
+            metric.failure_count,
+        )
+        if any(value < 0 for value in values):
+            raise ValueError("compilation metrics cannot be negative")
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT model_version, prompt_version, schema_version FROM compilation_runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError("unknown compilation run")
+            versions = tuple(row)
+            supplied_versions = (metric.model_version, metric.prompt_version, metric.schema_version)
+            if any(value is not None for value in supplied_versions) and supplied_versions != versions:
+                raise ValueError("metric versions do not match compilation run")
+            metric = replace(
+                metric,
+                model_version=versions[0],
+                prompt_version=versions[1],
+                schema_version=versions[2],
+            )
+            connection.execute(
+                """
+                INSERT INTO compilation_metrics(
+                    run_id, stage, model_version, prompt_version, schema_version, source_count,
+                    record_count, call_count, input_tokens, output_tokens, latency_ms, cost_usd,
+                    remote_calls, failure_count
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    run_id,
+                    metric.stage,
+                    metric.model_version,
+                    metric.prompt_version,
+                    metric.schema_version,
+                    metric.source_count,
+                    metric.record_count,
+                    metric.call_count,
+                    metric.input_tokens,
+                    metric.output_tokens,
+                    metric.latency_ms,
+                    metric.cost_usd,
+                    metric.remote_calls,
+                    metric.failure_count,
+                ),
+            )
+        return metric
+
+    def compilation_metrics(self, run_id: str) -> list[CompilationMetric]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT stage, source_count, record_count, call_count, input_tokens, output_tokens,
+                       latency_ms, cost_usd, remote_calls, failure_count, model_version,
+                       prompt_version, schema_version
+                FROM compilation_metrics WHERE run_id = ? ORDER BY metric_id
+                """,
+                (run_id,),
+            ).fetchall()
+        return [CompilationMetric(*row) for row in rows]
 
     def store_collection(self, collection: Collection) -> None:
         with self._connect() as connection:
@@ -712,6 +1000,15 @@ def _user_text(item: dict) -> str | None:
 def _compact_title(text: str) -> str:
     compact = " ".join(text.split())
     return f"{compact[:55]}…" if len(compact) > 56 else compact
+
+
+def _snapshot_from_row(row: tuple) -> CorpusSnapshot:
+    return CorpusSnapshot(
+        row[0],
+        row[1],
+        tuple(json.loads(row[2])),
+        *row[3:],
+    )
 
 
 def _display_content(items: list[dict]) -> tuple[str, list[dict], list[dict]]:
