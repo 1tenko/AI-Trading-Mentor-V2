@@ -8,6 +8,17 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from mentor.compilation import CompilationMetric, CompilationRun, CorpusSnapshot
+from mentor.derived_records import (
+    Claim,
+    ConflictUnresolved,
+    DerivedRecord,
+    Evolution,
+    Facet,
+    ProcedureSequenceHierarchy,
+    RecordDependency,
+    Relationship,
+    validate_record,
+)
 from mentor.knowledge import Collection, Source as LibrarySource, SourceRevision
 
 
@@ -195,6 +206,72 @@ class Storage:
                     cost_usd REAL NOT NULL CHECK(cost_usd >= 0),
                     remote_calls INTEGER NOT NULL CHECK(remote_calls >= 0),
                     failure_count INTEGER NOT NULL CHECK(failure_count >= 0)
+                );
+                CREATE TABLE IF NOT EXISTS derived_records (
+                    record_id TEXT PRIMARY KEY,
+                    snapshot_id TEXT NOT NULL REFERENCES corpus_snapshots(snapshot_id),
+                    family TEXT NOT NULL CHECK(family IN (
+                        'claim', 'relationship', 'procedure_sequence_hierarchy', 'evolution', 'conflict_unresolved'
+                    )),
+                    derived_kind TEXT NOT NULL,
+                    evidence_state TEXT NOT NULL CHECK(evidence_state IN ('raw_taught', 'cross_source_synthesis')),
+                    validation_state TEXT NOT NULL CHECK(validation_state IN ('pending', 'validated', 'rejected')),
+                    lifecycle_state TEXT NOT NULL CHECK(lifecycle_state IN ('candidate', 'active', 'superseded', 'retired')),
+                    qualification TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS derived_record_anchors (
+                    record_id TEXT NOT NULL REFERENCES derived_records(record_id),
+                    position INTEGER NOT NULL,
+                    anchor_id TEXT NOT NULL,
+                    PRIMARY KEY(record_id, position)
+                );
+                CREATE TABLE IF NOT EXISTS derived_record_dependencies (
+                    record_id TEXT NOT NULL REFERENCES derived_records(record_id),
+                    position INTEGER NOT NULL,
+                    dependency_kind TEXT NOT NULL CHECK(dependency_kind IN ('source_revision', 'derived_record')),
+                    dependency_id TEXT NOT NULL,
+                    PRIMARY KEY(record_id, position)
+                );
+                CREATE TABLE IF NOT EXISTS derived_record_facets (
+                    record_id TEXT NOT NULL REFERENCES derived_records(record_id),
+                    position INTEGER NOT NULL,
+                    facet_name TEXT NOT NULL CHECK(facet_name IN ('scope', 'condition', 'exception', 'outcome', 'timeframe')),
+                    facet_value TEXT NOT NULL,
+                    PRIMARY KEY(record_id, position)
+                );
+                CREATE TABLE IF NOT EXISTS derived_claims (
+                    record_id TEXT PRIMARY KEY REFERENCES derived_records(record_id),
+                    subject TEXT NOT NULL,
+                    predicate TEXT NOT NULL,
+                    object TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS derived_relationships (
+                    record_id TEXT PRIMARY KEY REFERENCES derived_records(record_id),
+                    left_term TEXT NOT NULL,
+                    relation TEXT NOT NULL,
+                    right_term TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS derived_procedure_sequence_hierarchy (
+                    record_id TEXT PRIMARY KEY REFERENCES derived_records(record_id),
+                    structure_kind TEXT NOT NULL CHECK(structure_kind IN ('procedure', 'sequence', 'hierarchy'))
+                );
+                CREATE TABLE IF NOT EXISTS derived_evolutions (
+                    record_id TEXT PRIMARY KEY REFERENCES derived_records(record_id),
+                    subject TEXT NOT NULL,
+                    previous_value TEXT NOT NULL,
+                    current_value TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS derived_conflict_unresolved (
+                    record_id TEXT PRIMARY KEY REFERENCES derived_records(record_id),
+                    issue_kind TEXT NOT NULL CHECK(issue_kind IN ('conflict', 'unresolved')),
+                    subject TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS derived_record_terms (
+                    record_id TEXT NOT NULL REFERENCES derived_records(record_id),
+                    term_role TEXT NOT NULL CHECK(term_role IN ('procedure_term', 'alternative')),
+                    position INTEGER NOT NULL,
+                    value TEXT NOT NULL,
+                    PRIMARY KEY(record_id, term_role, position)
                 );
                 """
             )
@@ -447,6 +524,204 @@ class Storage:
                 (run_id,),
             ).fetchall()
         return [CompilationMetric(*row) for row in rows]
+
+    def store_derived_record(self, record: DerivedRecord) -> None:
+        validate_record(record)
+        with self._connect() as connection:
+            if connection.execute("SELECT 1 FROM corpus_snapshots WHERE snapshot_id = ?", (record.snapshot_id,)).fetchone() is None:
+                raise ValueError("derived record references an unknown snapshot")
+            connection.execute(
+                """
+                INSERT INTO derived_records(
+                    record_id, snapshot_id, family, derived_kind, evidence_state, validation_state, lifecycle_state, qualification
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(record_id) DO NOTHING
+                """,
+                (
+                    record.record_id,
+                    record.snapshot_id,
+                    record.family,
+                    record.derived_kind,
+                    record.evidence_state,
+                    record.validation_state,
+                    record.lifecycle_state,
+                    record.qualification,
+                ),
+            )
+            connection.executemany(
+                "INSERT INTO derived_record_anchors(record_id, position, anchor_id) VALUES (?, ?, ?) ON CONFLICT DO NOTHING",
+                [(record.record_id, position, anchor) for position, anchor in enumerate(record.anchors)],
+            )
+            connection.executemany(
+                """
+                INSERT INTO derived_record_dependencies(record_id, position, dependency_kind, dependency_id)
+                VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING
+                """,
+                [
+                    (record.record_id, position, dependency.kind, dependency.identifier)
+                    for position, dependency in enumerate(record.dependencies)
+                ],
+            )
+            connection.executemany(
+                """
+                INSERT INTO derived_record_facets(record_id, position, facet_name, facet_value)
+                VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING
+                """,
+                [(record.record_id, position, facet.name, facet.value) for position, facet in enumerate(record.facets)],
+            )
+            self._store_record_family(connection, record)
+
+    def derived_records(self, snapshot_id: str) -> list[DerivedRecord]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT record_id, snapshot_id, family, derived_kind, evidence_state, validation_state, lifecycle_state, qualification
+                FROM derived_records WHERE snapshot_id = ? ORDER BY record_id
+                """,
+                (snapshot_id,),
+            ).fetchall()
+            return [self._derived_record_from_row(connection, row) for row in rows]
+
+    def _store_record_family(self, connection: sqlite3.Connection, record: DerivedRecord) -> None:
+        if isinstance(record, Claim):
+            connection.execute(
+                "INSERT INTO derived_claims(record_id, subject, predicate, object) VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING",
+                (record.record_id, record.subject, record.predicate, record.object),
+            )
+        elif isinstance(record, Relationship):
+            connection.execute(
+                """
+                INSERT INTO derived_relationships(record_id, left_term, relation, right_term)
+                VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING
+                """,
+                (record.record_id, record.left, record.relation, record.right),
+            )
+        elif isinstance(record, ProcedureSequenceHierarchy):
+            connection.execute(
+                """
+                INSERT INTO derived_procedure_sequence_hierarchy(record_id, structure_kind)
+                VALUES (?, ?) ON CONFLICT DO NOTHING
+                """,
+                (record.record_id, record.kind),
+            )
+            connection.executemany(
+                """
+                INSERT INTO derived_record_terms(record_id, term_role, position, value)
+                VALUES (?, 'procedure_term', ?, ?) ON CONFLICT DO NOTHING
+                """,
+                [(record.record_id, position, term) for position, term in enumerate(record.terms)],
+            )
+        elif isinstance(record, Evolution):
+            connection.execute(
+                """
+                INSERT INTO derived_evolutions(record_id, subject, previous_value, current_value)
+                VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING
+                """,
+                (record.record_id, record.subject, record.previous, record.current),
+            )
+        elif isinstance(record, ConflictUnresolved):
+            connection.execute(
+                """
+                INSERT INTO derived_conflict_unresolved(record_id, issue_kind, subject)
+                VALUES (?, ?, ?) ON CONFLICT DO NOTHING
+                """,
+                (record.record_id, record.kind, record.subject),
+            )
+            connection.executemany(
+                """
+                INSERT INTO derived_record_terms(record_id, term_role, position, value)
+                VALUES (?, 'alternative', ?, ?) ON CONFLICT DO NOTHING
+                """,
+                [(record.record_id, position, alternative) for position, alternative in enumerate(record.alternatives)],
+            )
+
+    def _derived_record_from_row(self, connection: sqlite3.Connection, row: tuple) -> DerivedRecord:
+        record_id, snapshot_id, family, derived_kind, evidence_state, validation_state, lifecycle_state, qualification = row
+        common = {
+            "snapshot_id": snapshot_id,
+            "anchors": tuple(
+                item[0]
+                for item in connection.execute(
+                    "SELECT anchor_id FROM derived_record_anchors WHERE record_id = ? ORDER BY position", (record_id,)
+                )
+            ),
+            "dependencies": tuple(
+                RecordDependency(*item)
+                for item in connection.execute(
+                    """
+                    SELECT dependency_kind, dependency_id FROM derived_record_dependencies
+                    WHERE record_id = ? ORDER BY position
+                    """,
+                    (record_id,),
+                )
+            ),
+            "validation_state": validation_state,
+            "lifecycle_state": lifecycle_state,
+            "qualification": qualification,
+            "evidence_state": evidence_state,
+            "facets": tuple(
+                Facet(*item)
+                for item in connection.execute(
+                    "SELECT facet_name, facet_value FROM derived_record_facets WHERE record_id = ? ORDER BY position", (record_id,)
+                )
+            ),
+        }
+        if family == "claim":
+            values = connection.execute(
+                "SELECT subject, predicate, object FROM derived_claims WHERE record_id = ?", (record_id,)
+            ).fetchone()
+            record = Claim.create(
+                **common,
+                derived_kind=derived_kind,
+                subject=values[0],
+                predicate=values[1],
+                object=values[2],
+            )
+        elif family == "relationship":
+            values = connection.execute(
+                "SELECT left_term, relation, right_term FROM derived_relationships WHERE record_id = ?", (record_id,)
+            ).fetchone()
+            record = Relationship.create(**common, left=values[0], relation=values[1], right=values[2])
+        elif family == "procedure_sequence_hierarchy":
+            kind = connection.execute(
+                "SELECT structure_kind FROM derived_procedure_sequence_hierarchy WHERE record_id = ?", (record_id,)
+            ).fetchone()[0]
+            terms = tuple(
+                item[0]
+                for item in connection.execute(
+                    """
+                    SELECT value FROM derived_record_terms
+                    WHERE record_id = ? AND term_role = 'procedure_term' ORDER BY position
+                    """,
+                    (record_id,),
+                )
+            )
+            record = ProcedureSequenceHierarchy.create(**common, kind=kind, terms=terms)
+        elif family == "evolution":
+            values = connection.execute(
+                "SELECT subject, previous_value, current_value FROM derived_evolutions WHERE record_id = ?", (record_id,)
+            ).fetchone()
+            record = Evolution.create(**common, subject=values[0], previous=values[1], current=values[2])
+        elif family == "conflict_unresolved":
+            kind, subject = connection.execute(
+                "SELECT issue_kind, subject FROM derived_conflict_unresolved WHERE record_id = ?", (record_id,)
+            ).fetchone()
+            alternatives = tuple(
+                item[0]
+                for item in connection.execute(
+                    """
+                    SELECT value FROM derived_record_terms
+                    WHERE record_id = ? AND term_role = 'alternative' ORDER BY position
+                    """,
+                    (record_id,),
+                )
+            )
+            record = ConflictUnresolved.create(**common, kind=kind, subject=subject, alternatives=alternatives)
+        else:
+            raise ValueError("unknown derived record family")
+        if record.record_id != record_id:
+            raise ValueError("stored derived record identity is not canonical")
+        return record
 
     def store_collection(self, collection: Collection) -> None:
         with self._connect() as connection:
