@@ -81,6 +81,8 @@ class SourceRevision:
         remote_vector_store_file_id: str | None = None,
     ) -> "SourceRevision":
         content_sha256 = content_sha256.lower()
+        if len(content_sha256) != 64 or any(character not in "0123456789abcdef" for character in content_sha256):
+            raise ValueError("content_sha256 must be a SHA-256 hex digest")
         return cls(
             revision_id=f"rev_{source_id}_{content_sha256}",
             source_id=source_id,

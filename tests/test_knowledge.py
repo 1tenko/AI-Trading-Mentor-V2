@@ -53,3 +53,16 @@ def test_source_revision_identity_contains_its_sha256_and_cannot_change():
     assert revision.content_sha256 in revision.revision_id
     with pytest.raises(FrozenInstanceError):
         revision.lifecycle_state = "superseded"
+
+
+@pytest.mark.parametrize("content_sha256", ["", "a" * 63, "g" * 64])
+def test_source_revision_rejects_values_that_are_not_sha256_hex_digests(content_sha256):
+    with pytest.raises(ValueError, match="SHA-256"):
+        SourceRevision.create(
+            source_id="src_synthetic",
+            content_sha256=content_sha256,
+            byte_size=42,
+            local_locator="C:/synthetic/opening-range.txt",
+            observed_at=1_700_000_000.0,
+            lifecycle_state="active",
+        )

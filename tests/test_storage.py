@@ -213,45 +213,20 @@ def test_storage_rolls_back_a_thread_delete_if_any_owned_row_cannot_be_removed(t
 
 
 def test_storage_adds_library_tables_to_a_populated_legacy_database_without_changing_phase_two_state(tmp_path):
-    storage = Storage(tmp_path / "mentor.sqlite3")
-    storage.initialize()
-    storage.set_vector_store("vs_legacy")
-    storage.register_source(
-        relative_path="2026/synthetic-lesson.txt",
-        filename="synthetic-lesson.txt",
-        year=2026,
-        local_path="C:/synthetic/2026/synthetic-lesson.txt",
-        modified_at=1_700_000_000.0,
-        file_id="file_legacy",
-        vector_store_file_id="vsf_legacy",
-    )
-    thread_id = storage.create_thread("Legacy question")
-    storage.append_thread_items(
-        thread_id,
-        [{"role": "user", "content": [{"type": "input_text", "text": "Question"}]}],
-    )
-    storage.record_display_turn(
-        thread_id,
-        user_text="Question",
-        answer_markdown="Answer",
-        citations=[{"file_id": "file_legacy", "filename": "synthetic-lesson.txt"}],
-        evidence=[],
-        diagnostics={"response_id": "resp_legacy"},
-        response_id="resp_legacy",
-        status="completed",
-        incomplete_reason=None,
-    )
-    storage.record_response_diagnostics(thread_id, "resp_legacy", {"response_id": "resp_legacy"})
+    database_path = tmp_path / "mentor.sqlite3"
+    _create_populated_phase_two_database(database_path)
+    storage = Storage(database_path)
 
     storage.initialize()
 
     assert storage.vector_store_id() == "vs_legacy"
     assert storage.source_for_file("file_legacy").relative_path == "2026/synthetic-lesson.txt"
-    assert storage.thread_items(thread_id)[0]["content"][0]["text"] == "Question"
-    assert storage.display_turns(thread_id)[0]["citations"] == [
+    assert storage.thread_items(1)[0]["content"][0]["text"] == "Question"
+    assert storage.replay_items(1) == [{"type": "reasoning", "encrypted_content": "legacy replay"}]
+    assert storage.display_turns(1)[0]["citations"] == [
         {"file_id": "file_legacy", "filename": "synthetic-lesson.txt"}
     ]
-    assert storage.response_diagnostics(thread_id) == [{"response_id": "resp_legacy"}]
+    assert storage.response_diagnostics(1) == [{"response_id": "resp_legacy"}]
     with sqlite3.connect(storage.database_path) as connection:
         tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
     assert {"collections", "library_sources", "source_revisions"} <= tables
@@ -259,6 +234,91 @@ def test_storage_adds_library_tables_to_a_populated_legacy_database_without_chan
     storage.initialize()
     with sqlite3.connect(storage.database_path) as connection:
         assert connection.execute("SELECT COUNT(*) FROM collections").fetchone()[0] == 0
+
+
+def _create_populated_phase_two_database(database_path):
+    with sqlite3.connect(database_path) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            CREATE TABLE sources (
+                relative_path TEXT PRIMARY KEY,
+                filename TEXT NOT NULL,
+                year INTEGER NOT NULL CHECK(year IN (2025, 2026)),
+                local_path TEXT NOT NULL,
+                modified_at REAL NOT NULL,
+                file_id TEXT NOT NULL,
+                vector_store_file_id TEXT NOT NULL
+            );
+            CREATE TABLE threads (id INTEGER PRIMARY KEY, title TEXT NOT NULL);
+            CREATE TABLE thread_items (
+                thread_id INTEGER NOT NULL REFERENCES threads(id),
+                position INTEGER NOT NULL,
+                item_json TEXT NOT NULL,
+                PRIMARY KEY(thread_id, position)
+            );
+            CREATE TABLE thread_replay_items (
+                thread_id INTEGER NOT NULL REFERENCES threads(id),
+                position INTEGER NOT NULL,
+                item_json TEXT NOT NULL,
+                PRIMARY KEY(thread_id, position)
+            );
+            CREATE TABLE response_diagnostics (
+                response_id TEXT PRIMARY KEY,
+                thread_id INTEGER NOT NULL REFERENCES threads(id),
+                diagnostic_json TEXT NOT NULL
+            );
+            CREATE TABLE display_turns (
+                thread_id INTEGER NOT NULL REFERENCES threads(id),
+                turn_number INTEGER NOT NULL,
+                user_text TEXT NOT NULL,
+                answer_markdown TEXT NOT NULL,
+                citations_json TEXT NOT NULL,
+                evidence_json TEXT NOT NULL,
+                diagnostic_json TEXT,
+                response_id TEXT,
+                status TEXT NOT NULL,
+                incomplete_reason TEXT,
+                raw_start_position INTEGER,
+                raw_end_position INTEGER,
+                PRIMARY KEY(thread_id, turn_number)
+            );
+            """
+        )
+        connection.execute("INSERT INTO settings VALUES ('vector_store_id', 'vs_legacy')")
+        connection.execute(
+            "INSERT INTO sources VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                "2026/synthetic-lesson.txt",
+                "synthetic-lesson.txt",
+                2026,
+                "C:/synthetic/2026/synthetic-lesson.txt",
+                1_700_000_000.0,
+                "file_legacy",
+                "vsf_legacy",
+            ),
+        )
+        connection.execute("INSERT INTO threads VALUES (1, 'Legacy question')")
+        connection.execute(
+            "INSERT INTO thread_items VALUES (1, 0, ?)",
+            ('{"role":"user","content":[{"type":"input_text","text":"Question"}]}',),
+        )
+        connection.execute(
+            "INSERT INTO thread_replay_items VALUES (1, 0, ?)",
+            ('{"type":"reasoning","encrypted_content":"legacy replay"}',),
+        )
+        connection.execute(
+            "INSERT INTO response_diagnostics VALUES ('resp_legacy', 1, ?)",
+            ('{"response_id":"resp_legacy"}',),
+        )
+        connection.execute(
+            "INSERT INTO display_turns VALUES (1, 1, 'Question', 'Answer', ?, '[]', ?, "
+            "'resp_legacy', 'completed', NULL, 0, 0)",
+            (
+                '[{"file_id":"file_legacy","filename":"synthetic-lesson.txt"}]',
+                '{"response_id":"resp_legacy"}',
+            ),
+        )
 
 
 def test_storage_persists_an_immutable_library_source_revision_idempotently(tmp_path):
