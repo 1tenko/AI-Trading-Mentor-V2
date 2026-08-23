@@ -10,6 +10,7 @@ from typing import Mapping
 
 from mentor.anchors import SourceAnchor
 from mentor.compilation import CompilationMetric, CompilationRun, CorpusSnapshot
+from mentor.dependencies import DependencyEdge, DependencyGraph, DependencyNode
 from mentor.derived_records import (
     Claim,
     CompilerProvenance,
@@ -240,6 +241,12 @@ class Storage:
                     dependency_id TEXT NOT NULL,
                     PRIMARY KEY(record_id, position)
                 );
+                CREATE TABLE IF NOT EXISTS derived_record_staleness (
+                    snapshot_id TEXT NOT NULL REFERENCES corpus_snapshots(snapshot_id),
+                    record_id TEXT NOT NULL REFERENCES derived_records(record_id),
+                    revision_id TEXT NOT NULL REFERENCES source_revisions(revision_id),
+                    PRIMARY KEY(snapshot_id, record_id, revision_id)
+                );
                 CREATE TABLE IF NOT EXISTS derived_record_facets (
                     record_id TEXT NOT NULL REFERENCES derived_records(record_id),
                     position INTEGER NOT NULL,
@@ -454,6 +461,12 @@ class Storage:
                 raise ValueError(f"cannot transition snapshot from {snapshot.status} to {status}")
             if status == "failed" and not failure_reason:
                 raise ValueError("failed snapshots require a failure_reason")
+            if status == "validating":
+                self._dependency_graph(connection, snapshot_id).assert_acyclic()
+            if status in {"validating", "published"} and connection.execute(
+                "SELECT 1 FROM derived_record_staleness WHERE snapshot_id = ? LIMIT 1", (snapshot_id,)
+            ).fetchone():
+                raise ValueError("stale derived records cannot pass candidate validation")
             if status == "published" and (not snapshot.raw_store_id or not snapshot.derived_store_id):
                 raise ValueError("published snapshots require raw and derived store IDs")
             if status == "published" and connection.execute(
@@ -728,14 +741,89 @@ class Storage:
                 (snapshot_id,),
             ).fetchall()
 
-    def derived_records(self, snapshot_id: str) -> list[DerivedRecord]:
+    def dependency_graph(self, snapshot_id: str) -> DependencyGraph:
         with self._connect() as connection:
+            if connection.execute("SELECT 1 FROM corpus_snapshots WHERE snapshot_id = ?", (snapshot_id,)).fetchone() is None:
+                raise ValueError("unknown snapshot")
+            return self._dependency_graph(connection, snapshot_id)
+
+    def _dependency_graph(self, connection: sqlite3.Connection, snapshot_id: str) -> DependencyGraph:
+        snapshot_row = connection.execute(
+            "SELECT selected_revision_ids_json FROM corpus_snapshots WHERE snapshot_id = ?", (snapshot_id,)
+        ).fetchone()
+        if snapshot_row is None:
+            raise ValueError("unknown snapshot")
+        selected_revision_ids = set(json.loads(snapshot_row[0]))
+        candidate_record_ids = {
+            row[0]
+            for row in connection.execute(
+                "SELECT record_id FROM derived_records WHERE snapshot_id = ? AND finalized = 1", (snapshot_id,)
+            )
+        }
+        rows = connection.execute(
+            """
+            SELECT dependency_kind, dependency_id, record_id
+            FROM derived_record_dependencies
+            WHERE record_id IN (
+                SELECT record_id FROM derived_records WHERE snapshot_id = ? AND finalized = 1
+            )
+            ORDER BY dependency_kind, dependency_id, record_id
+            """,
+            (snapshot_id,),
+        ).fetchall()
+        for kind, identifier, _record_id in rows:
+            if kind == "source_revision" and identifier not in selected_revision_ids:
+                raise ValueError("derived record dependency is outside the candidate raw snapshot")
+            if kind == "derived_record" and identifier not in candidate_record_ids:
+                raise ValueError("derived record dependency is outside the candidate snapshot")
+        return DependencyGraph(
+            DependencyEdge(DependencyNode(kind, identifier), DependencyNode("derived_record", record_id))
+            for kind, identifier, record_id in rows
+        )
+
+    def mark_stale_for_revisions(self, snapshot_id: str, revision_ids: tuple[str, ...]) -> tuple[str, ...]:
+        if not revision_ids or any(not isinstance(revision_id, str) or not revision_id for revision_id in revision_ids):
+            raise ValueError("revision IDs must be non-empty")
+        with self._connect() as connection:
+            if connection.execute("SELECT 1 FROM corpus_snapshots WHERE snapshot_id = ?", (snapshot_id,)).fetchone() is None:
+                raise ValueError("unknown snapshot")
+            graph = self._dependency_graph(connection, snapshot_id)
+            stale_by_revision = {revision_id: graph.stale_record_ids((revision_id,)) for revision_id in revision_ids}
+            stale_ids = tuple(sorted({record_id for record_ids in stale_by_revision.values() for record_id in record_ids}))
+            connection.executemany(
+                """
+                INSERT INTO derived_record_staleness(snapshot_id, record_id, revision_id)
+                VALUES (?, ?, ?) ON CONFLICT DO NOTHING
+                """,
+                [
+                    (snapshot_id, record_id, revision_id)
+                    for revision_id, record_ids in stale_by_revision.items()
+                    for record_id in record_ids
+                ],
+            )
+        return stale_ids
+
+    def stale_record_ids(self, snapshot_id: str) -> tuple[str, ...]:
+        with self._connect() as connection:
+            return tuple(
+                row[0]
+                for row in connection.execute(
+                    "SELECT DISTINCT record_id FROM derived_record_staleness WHERE snapshot_id = ? ORDER BY record_id",
+                    (snapshot_id,),
+                )
+            )
+
+    def rebuild_record_ids(self, snapshot_id: str, revision_ids: tuple[str, ...]) -> tuple[str, ...]:
+        return self.dependency_graph(snapshot_id).rebuild_record_ids(revision_ids)
+
+    def derived_records(self, snapshot_id: str, *, include_stale: bool = False) -> list[DerivedRecord]:
+        with self._connect() as connection:
+            stale_filter = "" if include_stale else " AND NOT EXISTS (SELECT 1 FROM derived_record_staleness stale WHERE stale.snapshot_id = derived_records.snapshot_id AND stale.record_id = derived_records.record_id)"
             rows = connection.execute(
                 """
                 SELECT record_id, snapshot_id, family, derived_kind, evidence_state, validation_state, lifecycle_state, qualification,
                        compiler_model_version, compiler_prompt_version, compiler_schema_version
-                FROM derived_records WHERE snapshot_id = ? AND finalized = 1 ORDER BY record_id
-                """,
+                FROM derived_records WHERE snapshot_id = ? AND finalized = 1""" + stale_filter + " ORDER BY record_id",
                 (snapshot_id,),
             ).fetchall()
             return [self._derived_record_from_row(connection, row) for row in rows]
