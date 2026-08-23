@@ -26,7 +26,7 @@ Stay on feature/phase-3-knowledge-assimilation. Do not begin Phase 4.
 
 ## compilation-lifecycle
 
-- [ ] **Task 4 — Compilation runs and immutable candidate snapshots**
+- [x] **Task 4 — Compilation runs and immutable candidate snapshots**
   - Depends on: Task 3. Verify: lifecycle transition/isolation tests; full pytest.
 
 ## source-extraction
