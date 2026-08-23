@@ -11,6 +11,31 @@ FAMILIES = frozenset(
 EVIDENCE_STATES = frozenset({"raw_taught", "cross_source_synthesis"})
 VALIDATION_STATES = frozenset({"pending", "validated", "rejected"})
 LIFECYCLE_STATES = frozenset({"candidate", "active", "superseded", "retired"})
+EVOLUTION_CLASSIFICATIONS = frozenset(
+    {
+        "introduced",
+        "repeated",
+        "refined",
+        "expanded",
+        "reframed",
+        "deprecated_or_deemphasized",
+        "apparently_contradictory",
+        "uncertain_chronology",
+        "no_supported_classification",
+    }
+)
+NEGATIVE_EVIDENCE_STATES = frozenset(
+    {
+        "positive_teaching",
+        "not_found_in_observed_evidence",
+        "source_asserted_absence",
+        "coverage_supported_synthesis",
+        "unresolved",
+    }
+)
+RECONCILIATION_STATES = frozenset(
+    {"compatible_under_conditions", "unresolved", "genuinely_contradictory"}
+)
 FACET_NAMES = frozenset({"scope", "condition", "exception", "outcome", "timeframe"})
 MAX_FACETS = 5
 MAX_FACET_VALUE_LENGTH = 160
@@ -136,15 +161,37 @@ class Evolution(DerivedRecord):
     subject: str = ""
     previous: str = ""
     current: str = ""
+    earlier_source_set: tuple[str, ...] = ()
+    later_source_set: tuple[str, ...] = ()
+    classification: str = "no_supported_classification"
+    negative_evidence_state: str = "unresolved"
+    competing_anchors: tuple[str, ...] = ()
 
     @classmethod
-    def create(cls, *, subject: str, previous: str, current: str, **common: object) -> "Evolution":
+    def create(
+        cls,
+        *,
+        subject: str,
+        previous: str,
+        current: str,
+        earlier_source_set: tuple[str, ...],
+        later_source_set: tuple[str, ...],
+        classification: str,
+        negative_evidence_state: str,
+        competing_anchors: tuple[str, ...] = (),
+        **common: object,
+    ) -> "Evolution":
         return _new(
             cls,
             family="evolution",
             subject=subject,
             previous=previous,
             current=current,
+            earlier_source_set=earlier_source_set,
+            later_source_set=later_source_set,
+            classification=classification,
+            negative_evidence_state=negative_evidence_state,
+            competing_anchors=competing_anchors,
             **_common(common, "change"),
         )
 
@@ -154,10 +201,19 @@ class ConflictUnresolved(DerivedRecord):
     kind: str = ""
     subject: str = ""
     alternatives: tuple[str, ...] = ()
+    competing_record_ids: tuple[str, ...] = ()
+    reconciliation_state: str = "unresolved"
 
     @classmethod
     def create(
-        cls, *, kind: str, subject: str, alternatives: tuple[str, ...], **common: object
+        cls,
+        *,
+        kind: str,
+        subject: str,
+        alternatives: tuple[str, ...],
+        competing_record_ids: tuple[str, ...],
+        reconciliation_state: str,
+        **common: object,
     ) -> "ConflictUnresolved":
         if kind not in {"conflict", "unresolved"} or len(alternatives) < 2:
             raise ValueError("invalid conflict or unresolved record")
@@ -169,6 +225,8 @@ class ConflictUnresolved(DerivedRecord):
             kind=kind,
             subject=subject,
             alternatives=alternatives,
+            competing_record_ids=competing_record_ids,
+            reconciliation_state=reconciliation_state,
             **_common(common, kind),
         )
 
@@ -223,7 +281,7 @@ def _common(values: dict[str, object], default_kind: str) -> dict[str, object]:
 
 
 def _default_evidence_state(derived_kind: str) -> str:
-    return "cross_source_synthesis" if derived_kind == "strategy_implication" else "raw_taught"
+    return "cross_source_synthesis" if derived_kind in {"strategy_implication", "change", "conflict", "unresolved"} else "raw_taught"
 
 
 def _validate_compiler_provenance(provenance: object) -> None:
@@ -274,10 +332,47 @@ def _validate_family(record: DerivedRecord) -> None:
     elif isinstance(record, Evolution):
         if record.family != "evolution" or record.derived_kind != "change":
             raise ValueError("invalid evolution record")
+        _require_identifier_tuple(record.earlier_source_set, "earlier evolution source set")
+        _require_identifier_tuple(record.later_source_set, "later evolution source set")
+        source_revision_dependencies = {
+            dependency.identifier for dependency in record.dependencies if dependency.kind == "source_revision"
+        }
+        if not set(record.earlier_source_set + record.later_source_set) <= source_revision_dependencies:
+            raise ValueError("evolution source sets must be source revision dependencies")
+        if record.classification not in EVOLUTION_CLASSIFICATIONS:
+            raise ValueError("invalid evolution classification")
+        if record.negative_evidence_state not in NEGATIVE_EVIDENCE_STATES:
+            raise ValueError("invalid negative evidence state")
+        if (
+            record.classification in {"introduced", "deprecated_or_deemphasized"}
+            and record.negative_evidence_state != "source_asserted_absence"
+        ):
+            raise ValueError("introduced or deprecated classifications require source asserted absence")
+        if (
+            record.negative_evidence_state == "not_found_in_observed_evidence"
+            and record.classification not in {"no_supported_classification", "uncertain_chronology"}
+        ):
+            raise ValueError("not-found evidence cannot support an evolution classification")
+        _require_identifier_tuple(record.competing_anchors, "competing anchor", allow_empty=True)
+        if not set(record.competing_anchors) <= set(record.anchors):
+            raise ValueError("competing anchors must be supporting anchors")
         strings = (record.subject, record.previous, record.current)
     elif isinstance(record, ConflictUnresolved):
         if record.family != "conflict_unresolved" or record.derived_kind != record.kind or record.kind not in {"conflict", "unresolved"} or len(record.alternatives) < 2:
             raise ValueError("invalid conflict or unresolved record")
+        _require_identifier_tuple(record.competing_record_ids, "competing record")
+        if not set(record.competing_record_ids) <= {
+            dependency.identifier for dependency in record.dependencies if dependency.kind == "derived_record"
+        }:
+            raise ValueError("competing records must be derived dependencies")
+        if record.reconciliation_state not in RECONCILIATION_STATES:
+            raise ValueError("invalid conflict reconciliation state")
+        if record.kind == "unresolved" and record.reconciliation_state != "unresolved":
+            raise ValueError("unresolved records must remain unresolved")
+        if record.reconciliation_state == "compatible_under_conditions" and not any(
+            facet.name == "condition" for facet in record.facets
+        ):
+            raise ValueError("compatible conflicts require a condition facet")
         strings = (record.subject, *record.alternatives)
     else:
         raise ValueError("unknown derived record family")
@@ -290,6 +385,13 @@ def _require_text(value: object, label: str, *, maximum: int | None = None) -> N
         raise ValueError(f"{label} must be non-empty text")
     if maximum is not None and len(value) > maximum:
         raise ValueError(f"{label} exceeds its maximum length")
+
+
+def _require_identifier_tuple(values: object, label: str, *, allow_empty: bool = False) -> None:
+    if not isinstance(values, tuple) or (not allow_empty and not values) or len(set(values)) != len(values):
+        raise ValueError(f"{label} IDs must be non-empty and unique")
+    for value in values:
+        _require_text(value, f"{label} ID", maximum=MAX_TYPED_CONTENT_LENGTH)
 
 
 def _record_id(record: DerivedRecord) -> str:

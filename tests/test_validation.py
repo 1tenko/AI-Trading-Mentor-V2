@@ -237,13 +237,34 @@ def test_storage_has_no_result_accepting_path_for_forged_validation_results(tmp_
         "lifecycle_state": "candidate",
         "qualification": "Synthetic.",
     }
+    conflict_common = common | {
+        "dependencies": (
+            RecordDependency("source_revision", revision.revision_id),
+            RecordDependency("derived_record", "rec_first"),
+            RecordDependency("derived_record", "rec_second"),
+        )
+    }
     record = {
         "claim": candidate,
         "relationship": Relationship.create(**common, left="one", relation="supports", right="two"),
         "procedure": ProcedureSequenceHierarchy.create(**common, kind="procedure", terms=("one", "two")),
-        "evolution": Evolution.create(**common, subject="one", previous="old", current="new"),
+        "evolution": Evolution.create(
+            **common,
+            subject="one",
+            previous="old",
+            current="new",
+            earlier_source_set=(revision.revision_id,),
+            later_source_set=(revision.revision_id,),
+            classification="no_supported_classification",
+            negative_evidence_state="unresolved",
+        ),
         "conflict": ConflictUnresolved.create(
-            **common, kind="conflict", subject="one", alternatives=("first", "second")
+            **conflict_common,
+            kind="conflict",
+            subject="one",
+            alternatives=("first", "second"),
+            competing_record_ids=("rec_first", "rec_second"),
+            reconciliation_state="genuinely_contradictory",
         ),
     }[family]
     forged = ValidationResult(

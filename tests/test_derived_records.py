@@ -45,13 +45,36 @@ def test_typed_families_have_a_complete_shared_envelope():
         "lifecycle_state": "active",
         "qualification": "Only under the stated synthetic condition.",
     }
+    conflict_common = common | {
+        "dependencies": (
+            RecordDependency("source_revision", "rev_synthetic"),
+            RecordDependency("derived_record", "rec_option_a"),
+            RecordDependency("derived_record", "rec_option_b"),
+        )
+    }
 
     records = (
         claim(),
         Relationship.create(**common, left="signal", relation="supports", right="observation"),
         ProcedureSequenceHierarchy.create(**common, kind="sequence", terms=("first", "then")),
-        Evolution.create(**common, subject="definition", previous="earlier", current="later"),
-        ConflictUnresolved.create(**common, kind="unresolved", subject="question", alternatives=("option a", "option b")),
+        Evolution.create(
+            **common,
+            subject="definition",
+            previous="earlier",
+            current="later",
+            earlier_source_set=("rev_synthetic",),
+            later_source_set=("rev_synthetic",),
+            classification="no_supported_classification",
+            negative_evidence_state="unresolved",
+        ),
+        ConflictUnresolved.create(
+            **conflict_common,
+            kind="unresolved",
+            subject="question",
+            alternatives=("option a", "option b"),
+            competing_record_ids=("rec_option_a", "rec_option_b"),
+            reconciliation_state="unresolved",
+        ),
     )
 
     assert {record.family for record in records} == {
@@ -65,7 +88,7 @@ def test_typed_families_have_a_complete_shared_envelope():
         assert record.record_id.startswith("rec_")
         assert record.snapshot_id == "snap_synthetic"
         assert record.anchors == ("anc_synthetic",)
-        assert record.dependencies == (RecordDependency("source_revision", "rev_synthetic"),)
+        assert record.dependencies[0] == RecordDependency("source_revision", "rev_synthetic")
         assert record.qualification == "Only under the stated synthetic condition."
 
 
@@ -75,6 +98,113 @@ def test_strategy_implications_default_to_cross_source_synthesis_unless_raw_taug
 
     assert inferred.evidence_state == "cross_source_synthesis"
     assert raw_taught.evidence_state == "raw_taught"
+
+
+def test_evolution_requires_explicit_coverage_and_rejects_unsupported_change_claims():
+    common = {
+        **_envelope(),
+        "anchors": ("anc_synthetic", "anc_competing"),
+        "dependencies": (
+            RecordDependency("source_revision", "rev_2025_a"),
+            RecordDependency("source_revision", "rev_2025_b"),
+            RecordDependency("source_revision", "rev_2026_a"),
+        ),
+    }
+
+    refined = Evolution.create(
+        **common,
+        subject="synthetic concept",
+        previous="earlier qualified teaching",
+        current="later qualified teaching",
+        earlier_source_set=("rev_2025_a", "rev_2025_b"),
+        later_source_set=("rev_2026_a",),
+        classification="refined",
+        negative_evidence_state="positive_teaching",
+        competing_anchors=("anc_competing",),
+    )
+
+    assert refined.earlier_source_set == ("rev_2025_a", "rev_2025_b")
+    assert refined.later_source_set == ("rev_2026_a",)
+    assert refined.classification == "refined"
+    assert refined.negative_evidence_state == "positive_teaching"
+    assert refined.competing_anchors == ("anc_competing",)
+    assert refined.evidence_state == "cross_source_synthesis"
+
+    with pytest.raises(ValueError, match="source asserted absence"):
+        Evolution.create(
+            **common,
+            subject="synthetic concept",
+            previous="not observed earlier",
+            current="later teaching",
+            earlier_source_set=("rev_2025_a",),
+            later_source_set=("rev_2026_a",),
+            classification="introduced",
+            negative_evidence_state="not_found_in_observed_evidence",
+        )
+    with pytest.raises(ValueError, match="evolution source set"):
+        Evolution.create(
+            **common,
+            subject="synthetic concept",
+            previous="earlier teaching",
+            current="later teaching",
+            earlier_source_set=(),
+            later_source_set=("rev_2026_a",),
+            classification="no_supported_classification",
+            negative_evidence_state="unresolved",
+        )
+    with pytest.raises(ValueError, match="source revision dependencies"):
+        Evolution.create(
+            **common,
+            subject="synthetic concept",
+            previous="earlier teaching",
+            current="later teaching",
+            earlier_source_set=("rev_untracked",),
+            later_source_set=("rev_2026_a",),
+            classification="no_supported_classification",
+            negative_evidence_state="unresolved",
+        )
+
+
+def test_conflict_records_keep_competing_inputs_visible_until_conditionally_reconciled():
+    common = {
+        **_envelope(),
+        "dependencies": (
+            RecordDependency("source_revision", "rev_synthetic"),
+            RecordDependency("derived_record", "rec_option_a"),
+            RecordDependency("derived_record", "rec_option_b"),
+        ),
+    }
+
+    compatible = ConflictUnresolved.create(
+        **common,
+        kind="conflict",
+        subject="synthetic condition",
+        alternatives=("option a", "option b"),
+        competing_record_ids=("rec_option_a", "rec_option_b"),
+        reconciliation_state="compatible_under_conditions",
+        facets=(Facet("condition", "Different synthetic contexts."),),
+    )
+    unresolved = ConflictUnresolved.create(
+        **common,
+        kind="unresolved",
+        subject="synthetic condition",
+        alternatives=("option a", "option b"),
+        competing_record_ids=("rec_option_a", "rec_option_b"),
+        reconciliation_state="unresolved",
+    )
+
+    assert compatible.competing_record_ids == ("rec_option_a", "rec_option_b")
+    assert compatible.reconciliation_state == "compatible_under_conditions"
+    assert unresolved.reconciliation_state == "unresolved"
+    with pytest.raises(ValueError, match="condition"):
+        ConflictUnresolved.create(
+            **common,
+            kind="conflict",
+            subject="synthetic condition",
+            alternatives=("option a", "option b"),
+            competing_record_ids=("rec_option_a", "rec_option_b"),
+            reconciliation_state="compatible_under_conditions",
+        )
 
 
 @pytest.mark.parametrize(
@@ -136,12 +266,35 @@ def test_storage_round_trips_each_typed_family(tmp_path):
         "lifecycle_state": "active",
         "qualification": "Only under the stated synthetic condition.",
     }
+    conflict_common = common | {
+        "dependencies": (
+            RecordDependency("source_revision", snapshot.selected_revision_ids[0]),
+            RecordDependency("derived_record", "rec_option_a"),
+            RecordDependency("derived_record", "rec_option_b"),
+        )
+    }
     records = [
         claim(**common),
         Relationship.create(**common, left="signal", relation="supports", right="observation"),
         ProcedureSequenceHierarchy.create(**common, kind="procedure", terms=("observe", "act")),
-        Evolution.create(**common, subject="definition", previous="earlier", current="later"),
-        ConflictUnresolved.create(**common, kind="conflict", subject="question", alternatives=("option a", "option b")),
+        Evolution.create(
+            **common,
+            subject="definition",
+            previous="earlier",
+            current="later",
+            earlier_source_set=(snapshot.selected_revision_ids[0],),
+            later_source_set=(snapshot.selected_revision_ids[0],),
+            classification="no_supported_classification",
+            negative_evidence_state="unresolved",
+        ),
+        ConflictUnresolved.create(
+            **conflict_common,
+            kind="conflict",
+            subject="question",
+            alternatives=("option a", "option b"),
+            competing_record_ids=("rec_option_a", "rec_option_b"),
+            reconciliation_state="genuinely_contradictory",
+        ),
     ]
 
     for record in records:

@@ -164,6 +164,9 @@ class SynthesisCandidate:
         record_map = {record.record_id: record for record in valid_records}
         if len(record_map) != len(valid_records):
             raise ValueError("duplicate validated record")
+        for record in valid_records:
+            if isinstance(record, ConflictUnresolved) and not set(record.competing_record_ids) <= set(record_map):
+                raise ValueError("conflict requires valid competing record inputs")
         ordered_records = tuple(sorted(record_map.values(), key=lambda record: record.record_id))
         concepts, occurrences = _cluster_concepts(snapshot_id, ordered_records, hints)
         ordered_concepts = tuple(sorted(concepts, key=lambda concept: concept.concept_id))

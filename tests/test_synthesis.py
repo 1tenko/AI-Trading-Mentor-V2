@@ -2,7 +2,14 @@ from dataclasses import replace
 
 import pytest
 
-from mentor.derived_records import Facet, ProcedureSequenceHierarchy, Relationship, Claim, RecordDependency
+from mentor.derived_records import (
+    Claim,
+    ConflictUnresolved,
+    Facet,
+    ProcedureSequenceHierarchy,
+    RecordDependency,
+    Relationship,
+)
 from mentor.synthesis import ConceptHint, ProcedureBranch, SynthesisCandidate
 
 
@@ -85,6 +92,53 @@ def test_candidate_excludes_invalid_records_and_requires_valid_concept_support()
             records=(validated, pending),
             hints=(ConceptHint(pending.record_id, "pending"),),
         )
+
+
+def test_conflict_inputs_must_be_validated_candidate_records_and_remain_visible():
+    first = claim(subject="first")
+    second = claim(subject="second")
+    conflict = ConflictUnresolved.create(
+        snapshot_id=SNAPSHOT_ID,
+        anchors=("anc_first", "anc_second"),
+        dependencies=(
+            RecordDependency("source_revision", "rev_synthetic"),
+            RecordDependency("derived_record", first.record_id),
+            RecordDependency("derived_record", second.record_id),
+        ),
+        validation_state="validated",
+        lifecycle_state="candidate",
+        qualification="The synthetic contexts conflict without a supported reconciliation.",
+        kind="unresolved",
+        subject="synthetic question",
+        alternatives=("first", "second"),
+        competing_record_ids=(first.record_id, second.record_id),
+        reconciliation_state="unresolved",
+    )
+
+    candidate = SynthesisCandidate.from_records(snapshot_id=SNAPSHOT_ID, records=(first, second, conflict))
+
+    assert conflict.record_id in candidate.record_ids
+    assert conflict.competing_record_ids == (first.record_id, second.record_id)
+    unknown_conflict = ConflictUnresolved.create(
+        snapshot_id=SNAPSHOT_ID,
+        anchors=("anc_first", "anc_second"),
+        dependencies=(
+            RecordDependency("source_revision", "rev_synthetic"),
+            RecordDependency("derived_record", first.record_id),
+            RecordDependency("derived_record", "rec_unknown"),
+        ),
+        validation_state="validated",
+        lifecycle_state="candidate",
+        qualification="The synthetic contexts need more evidence.",
+        kind="unresolved",
+        subject="synthetic question",
+        alternatives=("first", "unknown"),
+        competing_record_ids=(first.record_id, "rec_unknown"),
+        reconciliation_state="unresolved",
+    )
+
+    with pytest.raises(ValueError, match="competing record"):
+        SynthesisCandidate.from_records(snapshot_id=SNAPSHOT_ID, records=(first, second, unknown_conflict))
 
 
 def test_candidate_requires_each_concept_anchor_to_belong_to_its_valid_supporting_record():

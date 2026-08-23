@@ -267,12 +267,19 @@ class Storage:
                     record_id TEXT PRIMARY KEY REFERENCES derived_records(record_id),
                     subject TEXT NOT NULL,
                     previous_value TEXT NOT NULL,
-                    current_value TEXT NOT NULL
+                    current_value TEXT NOT NULL,
+                    earlier_source_set_json TEXT NOT NULL DEFAULT '[]',
+                    later_source_set_json TEXT NOT NULL DEFAULT '[]',
+                    classification TEXT NOT NULL DEFAULT 'no_supported_classification',
+                    negative_evidence_state TEXT NOT NULL DEFAULT 'unresolved',
+                    competing_anchor_ids_json TEXT NOT NULL DEFAULT '[]'
                 );
                 CREATE TABLE IF NOT EXISTS derived_conflict_unresolved (
                     record_id TEXT PRIMARY KEY REFERENCES derived_records(record_id),
                     issue_kind TEXT NOT NULL CHECK(issue_kind IN ('conflict', 'unresolved')),
-                    subject TEXT NOT NULL
+                    subject TEXT NOT NULL,
+                    competing_record_ids_json TEXT NOT NULL DEFAULT '[]',
+                    reconciliation_state TEXT NOT NULL DEFAULT 'unresolved'
                 );
                 CREATE TABLE IF NOT EXISTS derived_record_terms (
                     record_id TEXT NOT NULL REFERENCES derived_records(record_id),
@@ -307,6 +314,23 @@ class Storage:
             for column in ("compiler_model_version", "compiler_prompt_version", "compiler_schema_version"):
                 if column not in derived_columns:
                     connection.execute(f"ALTER TABLE derived_records ADD COLUMN {column} TEXT")
+            evolution_columns = {row[1] for row in connection.execute("PRAGMA table_info(derived_evolutions)")}
+            for column, definition in (
+                ("earlier_source_set_json", "TEXT NOT NULL DEFAULT '[]'"),
+                ("later_source_set_json", "TEXT NOT NULL DEFAULT '[]'"),
+                ("classification", "TEXT NOT NULL DEFAULT 'no_supported_classification'"),
+                ("negative_evidence_state", "TEXT NOT NULL DEFAULT 'unresolved'"),
+                ("competing_anchor_ids_json", "TEXT NOT NULL DEFAULT '[]'"),
+            ):
+                if column not in evolution_columns:
+                    connection.execute(f"ALTER TABLE derived_evolutions ADD COLUMN {column} {definition}")
+            conflict_columns = {row[1] for row in connection.execute("PRAGMA table_info(derived_conflict_unresolved)")}
+            for column, definition in (
+                ("competing_record_ids_json", "TEXT NOT NULL DEFAULT '[]'"),
+                ("reconciliation_state", "TEXT NOT NULL DEFAULT 'unresolved'"),
+            ):
+                if column not in conflict_columns:
+                    connection.execute(f"ALTER TABLE derived_conflict_unresolved ADD COLUMN {column} {definition}")
             self._create_derived_record_triggers(connection)
             connection.execute("UPDATE derived_records SET finalized = 1 WHERE finalized = 0")
             self._backfill_display_turns(connection)
@@ -732,18 +756,37 @@ class Storage:
         elif isinstance(record, Evolution):
             connection.execute(
                 """
-                INSERT INTO derived_evolutions(record_id, subject, previous_value, current_value)
-                VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING
+                INSERT INTO derived_evolutions(
+                    record_id, subject, previous_value, current_value, earlier_source_set_json,
+                    later_source_set_json, classification, negative_evidence_state, competing_anchor_ids_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING
                 """,
-                (record.record_id, record.subject, record.previous, record.current),
+                (
+                    record.record_id,
+                    record.subject,
+                    record.previous,
+                    record.current,
+                    json.dumps(record.earlier_source_set),
+                    json.dumps(record.later_source_set),
+                    record.classification,
+                    record.negative_evidence_state,
+                    json.dumps(record.competing_anchors),
+                ),
             )
         elif isinstance(record, ConflictUnresolved):
             connection.execute(
                 """
-                INSERT INTO derived_conflict_unresolved(record_id, issue_kind, subject)
-                VALUES (?, ?, ?) ON CONFLICT DO NOTHING
+                INSERT INTO derived_conflict_unresolved(
+                    record_id, issue_kind, subject, competing_record_ids_json, reconciliation_state
+                ) VALUES (?, ?, ?, ?, ?) ON CONFLICT DO NOTHING
                 """,
-                (record.record_id, record.kind, record.subject),
+                (
+                    record.record_id,
+                    record.kind,
+                    record.subject,
+                    json.dumps(record.competing_record_ids),
+                    record.reconciliation_state,
+                ),
             )
             connection.executemany(
                 """
@@ -830,15 +873,39 @@ class Storage:
             record = ProcedureSequenceHierarchy.create(**common, kind=kind, terms=terms)
         elif family == "evolution":
             values = connection.execute(
-                "SELECT subject, previous_value, current_value FROM derived_evolutions WHERE record_id = ?", (record_id,)
+                """
+                SELECT subject, previous_value, current_value, earlier_source_set_json, later_source_set_json,
+                       classification, negative_evidence_state, competing_anchor_ids_json
+                FROM derived_evolutions WHERE record_id = ?
+                """,
+                (record_id,),
             ).fetchone()
             values = tuple(_decode_sqlite_text(value) for value in values)
-            record = Evolution.create(**common, subject=values[0], previous=values[1], current=values[2])
+            record = Evolution.create(
+                **common,
+                subject=values[0],
+                previous=values[1],
+                current=values[2],
+                earlier_source_set=tuple(json.loads(values[3])),
+                later_source_set=tuple(json.loads(values[4])),
+                classification=values[5],
+                negative_evidence_state=values[6],
+                competing_anchors=tuple(json.loads(values[7])),
+            )
         elif family == "conflict_unresolved":
-            kind, subject = connection.execute(
-                "SELECT issue_kind, subject FROM derived_conflict_unresolved WHERE record_id = ?", (record_id,)
+            kind, subject, competing_record_ids_json, reconciliation_state = connection.execute(
+                """
+                SELECT issue_kind, subject, competing_record_ids_json, reconciliation_state
+                FROM derived_conflict_unresolved WHERE record_id = ?
+                """,
+                (record_id,),
             ).fetchone()
-            kind, subject = _decode_sqlite_text(kind), _decode_sqlite_text(subject)
+            kind, subject, competing_record_ids_json, reconciliation_state = (
+                _decode_sqlite_text(kind),
+                _decode_sqlite_text(subject),
+                _decode_sqlite_text(competing_record_ids_json),
+                _decode_sqlite_text(reconciliation_state),
+            )
             alternatives = tuple(
                 _decode_sqlite_text(item[0])
                 for item in connection.execute(
@@ -849,7 +916,14 @@ class Storage:
                     (record_id,),
                 )
             )
-            record = ConflictUnresolved.create(**common, kind=kind, subject=subject, alternatives=alternatives)
+            record = ConflictUnresolved.create(
+                **common,
+                kind=kind,
+                subject=subject,
+                alternatives=alternatives,
+                competing_record_ids=tuple(json.loads(competing_record_ids_json)),
+                reconciliation_state=reconciliation_state,
+            )
         else:
             raise ValueError("unknown derived record family")
         if record.record_id != record_id:
