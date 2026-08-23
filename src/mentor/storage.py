@@ -19,6 +19,26 @@ class Source:
 
 
 @dataclass(frozen=True)
+class LegacySource:
+    relative_path: str
+    filename: str
+    year: int
+    local_path: str
+    modified_at: float
+    file_id: str
+    vector_store_file_id: str
+
+
+@dataclass(frozen=True)
+class SourceChange:
+    source_id: str
+    lifecycle_state: str
+    revision_id: str | None
+    local_locator: str
+    observed_at: float
+
+
+@dataclass(frozen=True)
 class Thread:
     id: int
     title: str
@@ -114,6 +134,13 @@ class Storage:
                     remote_vector_store_file_id TEXT,
                     UNIQUE(source_id, content_sha256)
                 );
+                CREATE TABLE IF NOT EXISTS source_changes (
+                    source_id TEXT PRIMARY KEY REFERENCES library_sources(source_id),
+                    lifecycle_state TEXT NOT NULL,
+                    revision_id TEXT REFERENCES source_revisions(revision_id),
+                    local_locator TEXT NOT NULL,
+                    observed_at REAL NOT NULL
+                );
                 """
             )
             columns = {row[1] for row in connection.execute("PRAGMA table_info(sources)")}
@@ -180,6 +207,20 @@ class Storage:
             ).fetchone()
         return None if row is None else LibrarySource(*row)
 
+    def library_source_for_identity(
+        self, collection_id: str, identity_key: str
+    ) -> LibrarySource | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT source_id, collection_id, identity_key, source_type, author, course,
+                       lesson_title, year, original_filename, local_provenance
+                FROM library_sources WHERE collection_id = ? AND identity_key = ?
+                """,
+                (collection_id, identity_key),
+            ).fetchone()
+        return None if row is None else LibrarySource(*row)
+
     def store_source_revision(self, revision: SourceRevision) -> None:
         with self._connect() as connection:
             connection.execute(
@@ -214,6 +255,58 @@ class Storage:
                 (revision_id,),
             ).fetchone()
         return None if row is None else SourceRevision(*row)
+
+    def source_revisions(self, source_id: str) -> list[SourceRevision]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT revision_id, source_id, content_sha256, byte_size, local_locator,
+                       observed_at, lifecycle_state, remote_file_id, remote_vector_store_file_id
+                FROM source_revisions WHERE source_id = ? ORDER BY rowid
+                """,
+                (source_id,),
+            ).fetchall()
+        return [SourceRevision(*row) for row in rows]
+
+    def store_source_change(self, change: SourceChange) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO source_changes(
+                    source_id, lifecycle_state, revision_id, local_locator, observed_at
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(source_id) DO UPDATE SET
+                    lifecycle_state = excluded.lifecycle_state,
+                    revision_id = excluded.revision_id,
+                    local_locator = excluded.local_locator,
+                    observed_at = excluded.observed_at
+                WHERE source_changes.lifecycle_state IS NOT excluded.lifecycle_state
+                   OR source_changes.revision_id IS NOT excluded.revision_id
+                   OR source_changes.local_locator IS NOT excluded.local_locator
+                """,
+                (
+                    change.source_id,
+                    change.lifecycle_state,
+                    change.revision_id,
+                    change.local_locator,
+                    change.observed_at,
+                ),
+            )
+
+    def source_change(self, source_id: str) -> SourceChange | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT source_id, lifecycle_state, revision_id, local_locator, observed_at
+                FROM source_changes WHERE source_id = ?
+                """,
+                (source_id,),
+            ).fetchone()
+        return None if row is None else SourceChange(*row)
+
+    def clear_source_change(self, source_id: str) -> None:
+        with self._connect() as connection:
+            connection.execute("DELETE FROM source_changes WHERE source_id = ?", (source_id,))
 
     def set_vector_store(self, vector_store_id: str) -> None:
         with self._connect() as connection:
@@ -259,6 +352,17 @@ class Storage:
                     vector_store_file_id,
                 ),
             )
+
+    def legacy_sources(self) -> list[LegacySource]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT relative_path, filename, year, local_path, modified_at, file_id,
+                       vector_store_file_id
+                FROM sources ORDER BY relative_path
+                """
+            ).fetchall()
+        return [LegacySource(*row) for row in rows]
 
     def has_source(self, relative_path: str) -> bool:
         with self._connect() as connection:

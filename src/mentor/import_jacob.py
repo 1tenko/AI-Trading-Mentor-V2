@@ -9,7 +9,7 @@ from typing import Any, Callable
 from openai import OpenAI
 
 from mentor.config import load_config
-from mentor.source_registry import discover_transcripts
+from mentor.source_registry import backfill_jacob_registry, discover_transcripts
 from mentor.storage import Storage
 
 
@@ -28,6 +28,7 @@ def import_transcripts(
     sleep: Callable[[float], None] = time.sleep,
 ) -> ImportResult:
     """Upload each unregistered raw transcript and wait for indexing."""
+    backfill_jacob_registry(transcript_root, storage)
     transcripts = discover_transcripts(transcript_root)
     vector_store_id = storage.vector_store_id()
     if vector_store_id is None:
@@ -67,6 +68,8 @@ def import_transcripts(
             vector_store_file_id=vector_file.id,
         )
         uploaded_count += 1
+
+    backfill_jacob_registry(transcript_root, storage)
 
     return ImportResult(
         vector_store_id=vector_store_id,

@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
 from mentor.import_jacob import import_transcripts
+from mentor.source_registry import JACOB_COLLECTION_ID
 from mentor.storage import Storage
 
 
@@ -51,4 +52,7 @@ def test_import_uploads_each_transcript_once_and_records_remote_ids(tmp_path):
     assert storage.vector_store_id() == "vs_jacob"
     assert storage.source_count() == 2
     assert storage.source_for_file("file_1").modified_at == (transcripts / "2025" / "old.txt").stat().st_mtime
+    source = storage.library_source_for_identity(JACOB_COLLECTION_ID, "legacy:file_1")
+    assert source is not None
+    assert storage.source_revisions(source.source_id)[0].remote_file_id == "file_1"
     assert [path.rsplit("\\", 1)[-1] for path in client.uploads] == ["old.txt", "new.txt"]
