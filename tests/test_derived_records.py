@@ -370,6 +370,9 @@ def test_evolution_rejects_negative_claim_wording_without_structural_evidence(fi
         ("previous", "re_moved"),
         ("qualification", "depre-cated"),
         ("subject", "newly"),
+        ("qualification", "newness in 2026"),
+        ("current", "newer in 2026"),
+        ("previous", "newest in 2026"),
         ("current", "introduced"),
         ("previous", "de-emphasized"),
         ("facet", "not taught before 2026"),
@@ -399,6 +402,34 @@ def test_evolution_rejects_separator_and_morphology_negative_wording(field, word
 
     with pytest.raises(ValueError, match="negative claim wording"):
         Evolution.create(**(common | change))
+
+
+def test_evolution_new_wording_guard_does_not_match_unrelated_new_prefixes():
+    record = Evolution.create(
+        **(
+            _envelope()
+            | {
+                "dependencies": (
+                    RecordDependency("source_revision", "rev_2025"),
+                    RecordDependency("source_revision", "rev_2026"),
+                ),
+                "qualification": "A newspaper analogy appears in the observed material.",
+                "subject": "synthetic concept",
+                "previous": "earlier teaching",
+                "current": "later teaching",
+                "earlier_source_set": ("rev_2025",),
+                "later_source_set": ("rev_2026",),
+                "classification": "no_supported_classification",
+                "negative_evidence_state": "not_found_in_observed_evidence",
+                "earlier_coverage_id": "coverage_2025",
+                "later_coverage_id": "coverage_2026",
+                "earlier_observed_years": (2025,),
+                "later_observed_years": (2026,),
+            }
+        )
+    )
+
+    assert record.qualification == "A newspaper analogy appears in the observed material."
 
 
 @pytest.mark.parametrize(

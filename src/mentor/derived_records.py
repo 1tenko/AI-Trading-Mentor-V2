@@ -529,7 +529,12 @@ def _evolution_wording_families(values: tuple[str, ...]) -> frozenset[str]:
 
     terms = set(tokens) | compact_terms
     families = set()
-    if any(term == "never" or term == "new" or term.startswith("newly") or term.startswith("introduc") for term in terms):
+    if any(
+        term == "never"
+        or term in {"new", "newly", "newness", "newer", "newest"}
+        or term.startswith("introduc")
+        for term in terms
+    ):
         families.add("introduction")
     if (
         any(term == "never" or term.startswith("absen") for term in terms)
