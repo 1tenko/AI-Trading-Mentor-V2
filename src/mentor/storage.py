@@ -10,6 +10,7 @@ from pathlib import Path
 from mentor.compilation import CompilationMetric, CompilationRun, CorpusSnapshot
 from mentor.derived_records import (
     Claim,
+    CompilerProvenance,
     ConflictUnresolved,
     DerivedRecord,
     Evolution,
@@ -218,6 +219,9 @@ class Storage:
                     validation_state TEXT NOT NULL CHECK(validation_state IN ('pending', 'validated', 'rejected')),
                     lifecycle_state TEXT NOT NULL CHECK(lifecycle_state IN ('candidate', 'active', 'superseded', 'retired')),
                     qualification TEXT NOT NULL,
+                    compiler_model_version TEXT,
+                    compiler_prompt_version TEXT,
+                    compiler_schema_version TEXT,
                     finalized INTEGER NOT NULL DEFAULT 0 CHECK(finalized IN (0, 1))
                 );
                 CREATE TABLE IF NOT EXISTS derived_record_anchors (
@@ -284,6 +288,9 @@ class Storage:
                 connection.execute(
                     "ALTER TABLE derived_records ADD COLUMN finalized INTEGER NOT NULL DEFAULT 0 CHECK(finalized IN (0, 1))"
                 )
+            for column in ("compiler_model_version", "compiler_prompt_version", "compiler_schema_version"):
+                if column not in derived_columns:
+                    connection.execute(f"ALTER TABLE derived_records ADD COLUMN {column} TEXT")
             self._create_derived_record_triggers(connection)
             connection.execute("UPDATE derived_records SET finalized = 1 WHERE finalized = 0")
             self._backfill_display_turns(connection)
@@ -545,8 +552,9 @@ class Storage:
             connection.execute(
                 """
                 INSERT INTO derived_records(
-                    record_id, snapshot_id, family, derived_kind, evidence_state, validation_state, lifecycle_state, qualification
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    record_id, snapshot_id, family, derived_kind, evidence_state, validation_state, lifecycle_state, qualification,
+                    compiler_model_version, compiler_prompt_version, compiler_schema_version
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(record_id) DO NOTHING
                 """,
                 (
@@ -558,6 +566,9 @@ class Storage:
                     record.validation_state,
                     record.lifecycle_state,
                     record.qualification,
+                    record.compiler_provenance.model_version if record.compiler_provenance else None,
+                    record.compiler_provenance.prompt_version if record.compiler_provenance else None,
+                    record.compiler_provenance.schema_version if record.compiler_provenance else None,
                 ),
             )
             connection.executemany(
@@ -590,7 +601,8 @@ class Storage:
         with self._connect() as connection:
             rows = connection.execute(
                 """
-                SELECT record_id, snapshot_id, family, derived_kind, evidence_state, validation_state, lifecycle_state, qualification
+                SELECT record_id, snapshot_id, family, derived_kind, evidence_state, validation_state, lifecycle_state, qualification,
+                       compiler_model_version, compiler_prompt_version, compiler_schema_version
                 FROM derived_records WHERE snapshot_id = ? AND finalized = 1 ORDER BY record_id
                 """,
                 (snapshot_id,),
@@ -652,8 +664,15 @@ class Storage:
 
     def _derived_record_from_row(self, connection: sqlite3.Connection, row: tuple) -> DerivedRecord:
         record_id, snapshot_id, family, derived_kind, evidence_state, validation_state, lifecycle_state, qualification = (
-            _decode_sqlite_text(value) for value in row
+            _decode_sqlite_text(value) for value in row[:8]
         )
+        provenance_values = row[8:]
+        if any(value is None for value in provenance_values):
+            if any(value is not None for value in provenance_values):
+                raise ValueError("stored compiler provenance is incomplete")
+            compiler_provenance = None
+        else:
+            compiler_provenance = CompilerProvenance(*(_decode_sqlite_text(value) for value in provenance_values))
         common = {
             "snapshot_id": snapshot_id,
             "anchors": tuple(
@@ -676,6 +695,7 @@ class Storage:
             "lifecycle_state": lifecycle_state,
             "qualification": qualification,
             "evidence_state": evidence_state,
+            "compiler_provenance": compiler_provenance,
             "facets": tuple(
                 Facet(*(_decode_sqlite_text(value) for value in item))
                 for item in connection.execute(
@@ -752,7 +772,8 @@ class Storage:
             record_id = raw_record_id.decode("utf-8")
             row = connection.execute(
                 """
-                SELECT record_id, snapshot_id, family, derived_kind, evidence_state, validation_state, lifecycle_state, qualification
+                SELECT record_id, snapshot_id, family, derived_kind, evidence_state, validation_state, lifecycle_state, qualification,
+                       compiler_model_version, compiler_prompt_version, compiler_schema_version
                 FROM derived_records WHERE record_id = ?
                 """,
                 (record_id,),

@@ -7,11 +7,14 @@ from typing import Any
 from mentor.compiler_prompts import (
     EXTRACTION_PROMPT_VERSION,
     EXTRACTION_SCHEMA_VERSION,
+    MAX_ANCHOR_ID_LENGTH,
+    MAX_ANCHORS_PER_CANDIDATE,
     MAX_CANDIDATES_PER_SOURCE,
     extraction_request,
 )
 from mentor.derived_records import (
     Claim,
+    CompilerProvenance,
     DerivedRecord,
     RecordDependency,
 )
@@ -33,16 +36,9 @@ _SELF_VALIDATION_FIELDS = frozenset(
 
 
 @dataclass(frozen=True)
-class ExtractionProvenance:
-    model_version: str
-    prompt_version: str
-    schema_version: str
-
-
-@dataclass(frozen=True)
 class ExtractionResult:
     revision_id: str
-    provenance: ExtractionProvenance
+    provenance: CompilerProvenance
     candidates: tuple[DerivedRecord, ...]
 
 
@@ -53,7 +49,7 @@ class SourceExtractor:
         if model == SOL_MODEL and not live_mode:
             raise ValueError("GPT-5.6 Sol requires explicit live mode")
         self._client = client
-        self._provenance = ExtractionProvenance(model, EXTRACTION_PROMPT_VERSION, EXTRACTION_SCHEMA_VERSION)
+        self._provenance = CompilerProvenance(model, EXTRACTION_PROMPT_VERSION, EXTRACTION_SCHEMA_VERSION)
 
     def extract(
         self, *, revision: SourceRevision, snapshot_id: str, transcript: str
@@ -62,7 +58,10 @@ class SourceExtractor:
             **extraction_request(revision=revision, transcript=transcript, model=self._provenance.model_version)
         )
         candidates = _parse_candidates(
-            _response_output_text(response), revision=revision, snapshot_id=snapshot_id
+            _response_output_text(response),
+            revision=revision,
+            snapshot_id=snapshot_id,
+            provenance=self._provenance,
         )
         return ExtractionResult(revision.revision_id, self._provenance, candidates)
 
@@ -74,7 +73,9 @@ def _response_output_text(response: Any) -> str:
     return output_text
 
 
-def _parse_candidates(output_text: str, *, revision: SourceRevision, snapshot_id: str) -> tuple[DerivedRecord, ...]:
+def _parse_candidates(
+    output_text: str, *, revision: SourceRevision, snapshot_id: str, provenance: CompilerProvenance
+) -> tuple[DerivedRecord, ...]:
     try:
         response = json.loads(output_text)
     except json.JSONDecodeError as error:
@@ -84,13 +85,13 @@ def _parse_candidates(output_text: str, *, revision: SourceRevision, snapshot_id
     if len(response["candidates"]) > MAX_CANDIDATES_PER_SOURCE:
         raise ValueError("too many source candidates")
     return tuple(
-        _candidate_from_payload(payload, revision=revision, snapshot_id=snapshot_id)
+        _candidate_from_payload(payload, revision=revision, snapshot_id=snapshot_id, provenance=provenance)
         for payload in response["candidates"]
     )
 
 
 def _candidate_from_payload(
-    payload: object, *, revision: SourceRevision, snapshot_id: str
+    payload: object, *, revision: SourceRevision, snapshot_id: str, provenance: CompilerProvenance
 ) -> DerivedRecord:
     if not isinstance(payload, dict):
         raise ValueError("candidate must be an object")
@@ -109,6 +110,7 @@ def _candidate_from_payload(
         "validation_state": "pending",
         "lifecycle_state": "candidate",
         "qualification": payload.get("qualification"),
+        "compiler_provenance": provenance,
     }
     _allow_fields(payload, {"family", "anchors", "qualification", "subject", "predicate", "object", "derived_kind"})
     return Claim.create(
@@ -128,4 +130,8 @@ def _allow_fields(payload: dict[str, object], allowed: set[str]) -> None:
 def _anchors(value: object) -> tuple[str, ...]:
     if not isinstance(value, list):
         return ()
+    if len(value) > MAX_ANCHORS_PER_CANDIDATE:
+        raise ValueError("too many candidate anchors")
+    if any(not isinstance(anchor, str) or not anchor or len(anchor) > MAX_ANCHOR_ID_LENGTH for anchor in value):
+        raise ValueError("invalid candidate anchor")
     return tuple(value)

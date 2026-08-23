@@ -6,6 +6,8 @@ from mentor.knowledge import SourceRevision
 EXTRACTION_PROMPT_VERSION = "source-extraction-v1"
 EXTRACTION_SCHEMA_VERSION = "source-extraction-schema-v1"
 MAX_CANDIDATES_PER_SOURCE = 12
+MAX_ANCHORS_PER_CANDIDATE = 8
+MAX_ANCHOR_ID_LENGTH = 128
 
 EXTRACTION_INSTRUCTIONS = """Extract at most 12 compact candidate records from this one source revision.
 Return only claims with proposed anchor IDs already supplied by the source-processing pipeline.
@@ -26,7 +28,12 @@ EXTRACTION_RESPONSE_SCHEMA = {
                 "required": ["family", "anchors", "qualification", "subject", "predicate", "object"],
                 "properties": {
                     "family": {"const": "claim"},
-                    "anchors": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}},
+                    "anchors": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": MAX_ANCHORS_PER_CANDIDATE,
+                        "items": {"type": "string", "minLength": 1, "maxLength": MAX_ANCHOR_ID_LENGTH},
+                    },
                     "qualification": {"type": "string", "minLength": 1, "maxLength": 280},
                     "subject": {"type": "string", "minLength": 1, "maxLength": 240},
                     "predicate": {"type": "string", "minLength": 1, "maxLength": 240},

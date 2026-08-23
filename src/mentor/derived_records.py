@@ -31,6 +31,13 @@ class Facet:
 
 
 @dataclass(frozen=True)
+class CompilerProvenance:
+    model_version: str
+    prompt_version: str
+    schema_version: str
+
+
+@dataclass(frozen=True)
 class DerivedRecord:
     record_id: str
     snapshot_id: str
@@ -42,6 +49,7 @@ class DerivedRecord:
     anchors: tuple[str, ...]
     dependencies: tuple[RecordDependency, ...]
     qualification: str
+    compiler_provenance: CompilerProvenance | None = None
     facets: tuple[Facet, ...] = ()
 
 
@@ -66,6 +74,7 @@ class Claim(DerivedRecord):
         object: str,
         derived_kind: str = "statement",
         evidence_state: str | None = None,
+        compiler_provenance: CompilerProvenance | None = None,
         facets: tuple[Facet, ...] = (),
     ) -> "Claim":
         if derived_kind not in {"statement", "definition", "recommendation", "strategy_implication"}:
@@ -81,6 +90,7 @@ class Claim(DerivedRecord):
             anchors=anchors,
             dependencies=dependencies,
             qualification=qualification,
+            compiler_provenance=compiler_provenance,
             facets=facets,
             subject=subject,
             predicate=predicate,
@@ -191,6 +201,7 @@ def validate_record(record: DerivedRecord) -> None:
         if not isinstance(dependency, RecordDependency) or dependency.kind not in {"source_revision", "derived_record"}:
             raise ValueError("invalid record dependency")
         _require_text(dependency.identifier, "dependency identifier")
+    _validate_compiler_provenance(record.compiler_provenance)
     _validate_facets(record.facets)
     _validate_family(record)
     if record.record_id != _record_id(record):
@@ -213,6 +224,16 @@ def _common(values: dict[str, object], default_kind: str) -> dict[str, object]:
 
 def _default_evidence_state(derived_kind: str) -> str:
     return "cross_source_synthesis" if derived_kind == "strategy_implication" else "raw_taught"
+
+
+def _validate_compiler_provenance(provenance: object) -> None:
+    if provenance is None:
+        return
+    if not isinstance(provenance, CompilerProvenance):
+        raise ValueError("invalid compiler provenance")
+    _require_text(provenance.model_version, "compiler model version")
+    _require_text(provenance.prompt_version, "compiler prompt version")
+    _require_text(provenance.schema_version, "compiler schema version")
 
 
 def _validate_facets(facets: object) -> None:
@@ -274,4 +295,6 @@ def _require_text(value: object, label: str, *, maximum: int | None = None) -> N
 def _record_id(record: DerivedRecord) -> str:
     values = asdict(record)
     values["record_id"] = ""
+    if values["compiler_provenance"] is None:
+        del values["compiler_provenance"]
     return f"rec_{sha256(json.dumps(values, sort_keys=True, separators=(',', ':')).encode()).hexdigest()}"

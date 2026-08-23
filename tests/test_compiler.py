@@ -6,8 +6,14 @@ from types import SimpleNamespace
 import pytest
 
 from mentor.compiler import SourceExtractor
-from mentor.compiler_prompts import EXTRACTION_PROMPT_VERSION, EXTRACTION_SCHEMA_VERSION
-from mentor.knowledge import Source, SourceRevision
+from mentor.compilation import CompilationRun, CorpusSnapshot
+from mentor.compiler_prompts import (
+    EXTRACTION_PROMPT_VERSION,
+    EXTRACTION_RESPONSE_SCHEMA,
+    EXTRACTION_SCHEMA_VERSION,
+)
+from mentor.knowledge import Collection, Source, SourceRevision
+from mentor.storage import Storage
 
 
 FIXTURES = json.loads((Path(__file__).parent / "fixtures" / "compiler_responses.json").read_text())
@@ -23,8 +29,8 @@ class FakeResponses:
         return SimpleNamespace(output_text=json.dumps(self.payload))
 
 
-def revision_for(transcript="Synthetic source text."):
-    source = Source.create(
+def source_for():
+    return Source.create(
         collection_id="collection_synthetic",
         identity_key="synthetic:compiler",
         source_type="transcript",
@@ -35,6 +41,10 @@ def revision_for(transcript="Synthetic source text."):
         original_filename="synthetic.txt",
         local_provenance="C:/synthetic/synthetic.txt",
     )
+
+
+def revision_for(transcript="Synthetic source text."):
+    source = source_for()
     return SourceRevision.create(
         source=source,
         content_sha256=sha256(transcript.encode()).hexdigest(),
@@ -76,6 +86,53 @@ def test_allows_a_source_to_yield_zero_candidates():
 
     assert result.candidates == ()
     assert len(responses.requests) == 1
+
+
+def test_schema_and_parser_share_hard_anchor_bounds():
+    anchor_schema = EXTRACTION_RESPONSE_SCHEMA["properties"]["candidates"]["items"]["properties"]["anchors"]
+    assert anchor_schema["maxItems"] == 8
+    assert anchor_schema["items"]["maxLength"] == 128
+    payload = json.loads(json.dumps(FIXTURES["claim"]))
+    payload["candidates"][0]["anchors"] = ["a" * 128] * 9
+    extractor, _ = extractor_for(payload)
+
+    with pytest.raises(ValueError, match="too many candidate anchors"):
+        extractor.extract(revision=revision_for(), snapshot_id="snap_synthetic", transcript="Synthetic source text.")
+
+
+def test_parser_rejects_an_anchor_id_past_the_schema_limit():
+    payload = json.loads(json.dumps(FIXTURES["claim"]))
+    payload["candidates"][0]["anchors"] = ["a" * 129]
+    extractor, _ = extractor_for(payload)
+
+    with pytest.raises(ValueError, match="invalid candidate anchor"):
+        extractor.extract(revision=revision_for(), snapshot_id="snap_synthetic", transcript="Synthetic source text.")
+
+
+def test_candidate_provenance_survives_storage_reload(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    revision = revision_for()
+    storage.store_collection(Collection("collection_synthetic", "Synthetic", "test", True, "test"))
+    storage.store_source(source_for())
+    storage.store_source_revision(revision)
+    run = CompilationRun("run_compiler", "synthetic-compiler", EXTRACTION_PROMPT_VERSION, EXTRACTION_SCHEMA_VERSION, 1.0)
+    snapshot = CorpusSnapshot.create(
+        run=run,
+        selected_revisions=[revision],
+        raw_store_id="raw_synthetic",
+        derived_store_id="derived_synthetic",
+        created_at=1.0,
+    )
+    storage.create_compilation_candidate(run, snapshot)
+    extractor, _ = extractor_for(FIXTURES["claim"])
+
+    candidate = extractor.extract(
+        revision=revision, snapshot_id=snapshot.snapshot_id, transcript="Synthetic source text."
+    ).candidates[0]
+    storage.store_derived_record(candidate)
+
+    assert storage.derived_records(snapshot.snapshot_id)[0].compiler_provenance == candidate.compiler_provenance
 
 
 @pytest.mark.parametrize(
