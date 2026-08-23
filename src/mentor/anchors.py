@@ -91,6 +91,13 @@ def validate_anchor(anchor: SourceAnchor, revision: SourceRevision, transcript: 
         raise ValueError("anchor_id does not match locator")
 
 
+def resolve_anchor_span(anchor: SourceAnchor, revision: SourceRevision, transcript: str) -> str:
+    """Return a span only after all revision and locator checks pass."""
+    validate_anchor(anchor, revision, transcript)
+    normalized = normalize_transcript(transcript)
+    return normalized[anchor.start_offset : anchor.end_offset]
+
+
 def _revision_id(source_id: str, content_sha256: str) -> str:
     return f"rev_{source_id}_{content_sha256}"
 

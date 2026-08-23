@@ -1,10 +1,14 @@
 """Versioned, bounded source-extraction request definitions."""
 
+import json
+
 from mentor.knowledge import SourceRevision
 
 
 EXTRACTION_PROMPT_VERSION = "source-extraction-v1"
 EXTRACTION_SCHEMA_VERSION = "source-extraction-schema-v1"
+SEMANTIC_VALIDATION_PROMPT_VERSION = "source-semantic-validation-v1"
+SEMANTIC_VALIDATION_SCHEMA_VERSION = "source-semantic-validation-schema-v1"
 MAX_CANDIDATES_PER_SOURCE = 12
 MAX_ANCHORS_PER_CANDIDATE = 8
 MAX_ANCHOR_ID_LENGTH = 128
@@ -59,6 +63,46 @@ def extraction_request(*, revision: SourceRevision, transcript: str, model: str)
                 "type": "json_schema",
                 "name": EXTRACTION_SCHEMA_VERSION,
                 "schema": EXTRACTION_RESPONSE_SCHEMA,
+                "strict": True,
+            }
+        },
+    }
+
+
+SEMANTIC_VALIDATION_INSTRUCTIONS = """Independently assess whether the supplied raw support spans affirmatively teach the proposed claim.
+Return only the requested outcome and one concise audit sentence. Do not rely on extraction rationale or infer beyond the spans.
+"""
+
+SEMANTIC_VALIDATION_RESPONSE_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["outcome", "audit"],
+    "properties": {
+        "outcome": {
+            "enum": [
+                "affirmatively_supported",
+                "partially_supported",
+                "unsupported",
+                "ambiguous",
+                "needs_broader_context",
+            ]
+        },
+        "audit": {"type": "string", "minLength": 1, "maxLength": 280},
+    },
+}
+
+
+def semantic_validation_request(*, claim: dict[str, str], spans: tuple[tuple[str, str], ...], model: str) -> dict[str, object]:
+    return {
+        "model": model,
+        "store": False,
+        "instructions": f"Prompt version: {SEMANTIC_VALIDATION_PROMPT_VERSION}\n{SEMANTIC_VALIDATION_INSTRUCTIONS}",
+        "input": json.dumps({"claim": claim, "supporting_spans": spans}, separators=(",", ":")),
+        "text": {
+            "format": {
+                "type": "json_schema",
+                "name": SEMANTIC_VALIDATION_SCHEMA_VERSION,
+                "schema": SEMANTIC_VALIDATION_RESPONSE_SCHEMA,
                 "strict": True,
             }
         },

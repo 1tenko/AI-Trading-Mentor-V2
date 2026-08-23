@@ -1,0 +1,22 @@
+{
+  "affirmatively_supported": {
+    "outcome": "affirmatively_supported",
+    "audit": "The raw span directly teaches the bounded claim."
+  },
+  "partially_supported": {
+    "outcome": "partially_supported",
+    "audit": "The raw span supports only part of the proposed claim."
+  },
+  "unsupported": {
+    "outcome": "unsupported",
+    "audit": "The raw span does not teach the proposed claim."
+  },
+  "ambiguous": {
+    "outcome": "ambiguous",
+    "audit": "The wording has more than one plausible reading."
+  },
+  "needs_broader_context": {
+    "outcome": "needs_broader_context",
+    "audit": "The supplied span needs surrounding context."
+  }
+}
