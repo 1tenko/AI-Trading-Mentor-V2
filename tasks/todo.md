@@ -20,7 +20,7 @@ Stay on feature/phase-3-knowledge-assimilation. Do not begin Phase 4.
 
 ## source-anchors
 
-- [ ] **Task 3 — Durable anchor model and deterministic validation**
+- [x] **Task 3 — Durable anchor model and deterministic validation**
   - Depends on: Checkpoint A. Verify: anchor drift/offset/timestamp/name tests;
     full pytest.
 
