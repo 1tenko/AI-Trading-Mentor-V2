@@ -632,7 +632,8 @@ class Storage:
             "SELECT 1 FROM derived_records WHERE record_id = ? AND finalized = 1", (record.record_id,)
         ).fetchone() is not None:
             return
-        if self._depends_on_stale_record(connection, record):
+        self._assert_derived_dependencies_belong_to_snapshot(connection, record)
+        if self._depends_on_stale_record(connection, record, reject_cross_snapshot=True):
             raise ValueError("derived records cannot depend on stale records")
         connection.execute(
             """
@@ -682,7 +683,9 @@ class Storage:
             "UPDATE derived_records SET finalized = 1 WHERE record_id = ? AND finalized = 0", (record.record_id,)
         )
 
-    def _depends_on_stale_record(self, connection: sqlite3.Connection, record: DerivedRecord) -> bool:
+    def _assert_derived_dependencies_belong_to_snapshot(
+        self, connection: sqlite3.Connection, record: DerivedRecord
+    ) -> None:
         pending = [dependency.identifier for dependency in record.dependencies if dependency.kind == "derived_record"]
         visited: set[str] = set()
         while pending:
@@ -690,12 +693,56 @@ class Storage:
             if record_id in visited:
                 continue
             visited.add(record_id)
+            owner = connection.execute(
+                "SELECT snapshot_id FROM derived_records WHERE record_id = ? AND finalized = 1", (record_id,)
+            ).fetchone()
+            if owner is None:
+                continue
+            if owner[0] != record.snapshot_id:
+                raise ValueError("derived record dependency belongs to a different snapshot")
+            pending.extend(
+                dependency_id
+                for dependency_kind, dependency_id in connection.execute(
+                    """
+                    SELECT dependency_kind, dependency_id FROM derived_record_dependencies
+                    WHERE record_id = ? ORDER BY position
+                    """,
+                    (record_id,),
+                )
+                if dependency_kind == "derived_record"
+            )
+
+    def _depends_on_stale_record(
+        self, connection: sqlite3.Connection, record: DerivedRecord, *, reject_cross_snapshot: bool
+    ) -> bool:
+        if connection.execute(
+            "SELECT 1 FROM derived_record_staleness WHERE snapshot_id = ? AND record_id = ? LIMIT 1",
+            (record.snapshot_id, record.record_id),
+        ).fetchone():
+            return True
+        pending = [dependency.identifier for dependency in record.dependencies if dependency.kind == "derived_record"]
+        visited: set[str] = set()
+        while pending:
+            record_id = pending.pop()
+            if record_id in visited:
+                continue
+            visited.add(record_id)
+            owner = connection.execute(
+                "SELECT snapshot_id FROM derived_records WHERE record_id = ? AND finalized = 1", (record_id,)
+            ).fetchone()
+            if owner is None:
+                continue
+            owner_snapshot_id = owner[0]
+            if owner_snapshot_id != record.snapshot_id:
+                if reject_cross_snapshot:
+                    raise ValueError("derived record dependency belongs to a different snapshot")
+                return True
             if connection.execute(
                 """
                 SELECT 1 FROM derived_record_staleness
                 WHERE snapshot_id = ? AND record_id = ? LIMIT 1
                 """,
-                (record.snapshot_id, record_id),
+                (owner_snapshot_id, record_id),
             ).fetchone():
                 return True
             pending.extend(
@@ -825,8 +872,8 @@ class Storage:
             raise ValueError("revision IDs must be non-empty")
         with self._connect() as connection:
             status, selected_revision_ids = self._snapshot_state(connection, snapshot_id)
-            if status == "published":
-                raise ValueError("published snapshots cannot be invalidated in place")
+            if status != "building":
+                raise ValueError("only building candidates can be invalidated")
             self._require_selected_revisions(selected_revision_ids, revision_ids)
             graph = self._dependency_graph(connection, snapshot_id)
             stale_by_revision = {revision_id: graph.stale_record_ids((revision_id,)) for revision_id in revision_ids}
@@ -864,15 +911,22 @@ class Storage:
 
     def derived_records(self, snapshot_id: str, *, include_stale: bool = False) -> list[DerivedRecord]:
         with self._connect() as connection:
-            stale_filter = "" if include_stale else " AND NOT EXISTS (SELECT 1 FROM derived_record_staleness stale WHERE stale.snapshot_id = derived_records.snapshot_id AND stale.record_id = derived_records.record_id)"
             rows = connection.execute(
                 """
                 SELECT record_id, snapshot_id, family, derived_kind, evidence_state, validation_state, lifecycle_state, qualification,
                        compiler_model_version, compiler_prompt_version, compiler_schema_version
-                FROM derived_records WHERE snapshot_id = ? AND finalized = 1""" + stale_filter + " ORDER BY record_id",
+                FROM derived_records WHERE snapshot_id = ? AND finalized = 1 ORDER BY record_id
+                """,
                 (snapshot_id,),
             ).fetchall()
-            return [self._derived_record_from_row(connection, row) for row in rows]
+            records = [self._derived_record_from_row(connection, row) for row in rows]
+            if include_stale:
+                return records
+            return [
+                record
+                for record in records
+                if not self._depends_on_stale_record(connection, record, reject_cross_snapshot=False)
+            ]
 
     def _store_record_family(self, connection: sqlite3.Connection, record: DerivedRecord) -> None:
         if isinstance(record, Claim):
