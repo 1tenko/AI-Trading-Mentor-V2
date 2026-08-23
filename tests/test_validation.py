@@ -1,4 +1,5 @@
 import json
+import sqlite3
 from dataclasses import replace
 from hashlib import sha256
 from pathlib import Path
@@ -10,10 +11,10 @@ from mentor.anchors import SourceAnchor, normalize_transcript
 from mentor.compiler import SourceExtractor
 from mentor.compiler_prompts import SEMANTIC_VALIDATION_PROMPT_VERSION
 from mentor.compilation import CompilationRun, CorpusSnapshot
-from mentor.derived_records import RecordDependency, Relationship
+from mentor.derived_records import ConflictUnresolved, Evolution, ProcedureSequenceHierarchy, RecordDependency, Relationship
 from mentor.knowledge import Collection, Source, SourceRevision
 from mentor.storage import Storage
-from mentor.validation import SemanticValidator, can_publish_source_extracted
+from mentor.validation import SemanticValidator, ValidationResult, can_publish_source_extracted
 
 
 FIXTURES = json.loads((Path(__file__).parent / "fixtures" / "validation_responses.json").read_text())
@@ -217,3 +218,57 @@ def test_semantic_validator_rejects_non_claim_records_before_any_mock_client_cal
         )
 
     assert responses.requests == []
+
+
+@pytest.mark.parametrize("family", ["claim", "relationship", "procedure", "evolution", "conflict"])
+def test_storage_rejects_forged_validation_results_for_every_derived_family(tmp_path, family):
+    storage, snapshot = validation_storage(tmp_path)
+    revision, candidate, _ = candidate_and_anchor(snapshot.snapshot_id)
+    common = {
+        "snapshot_id": snapshot.snapshot_id,
+        "anchors": ("anc_synthetic",),
+        "dependencies": (RecordDependency("source_revision", revision.revision_id),),
+        "validation_state": "validated",
+        "lifecycle_state": "candidate",
+        "qualification": "Synthetic.",
+    }
+    record = {
+        "claim": candidate,
+        "relationship": Relationship.create(**common, left="one", relation="supports", right="two"),
+        "procedure": ProcedureSequenceHierarchy.create(**common, kind="procedure", terms=("one", "two")),
+        "evolution": Evolution.create(**common, subject="one", previous="old", current="new"),
+        "conflict": ConflictUnresolved.create(
+            **common, kind="conflict", subject="one", alternatives=("first", "second")
+        ),
+    }[family]
+    forged = ValidationResult(
+        candidate.record_id,
+        snapshot.snapshot_id,
+        "affirmatively_supported",
+        "Forged audit.",
+        (),
+        record,
+    )
+
+    with pytest.raises(ValueError, match="validator-issued"):
+        storage.store_validation_result(forged)
+
+    assert storage.derived_records(snapshot.snapshot_id) == []
+    assert storage.validation_audits(snapshot.snapshot_id) == []
+
+
+def test_validation_result_storage_rolls_back_a_validated_record_when_its_audit_insert_fails(tmp_path):
+    storage, snapshot = validation_storage(tmp_path)
+    revision, candidate, anchor = candidate_and_anchor(snapshot.snapshot_id)
+    partial = SemanticValidator(SimpleNamespace(responses=FakeResponses(FIXTURES["partially_supported"]))).validate(
+        candidate=candidate, revision=revision, transcript=TRANSCRIPT, anchors={anchor.anchor_id: anchor}
+    )
+    affirmative = SemanticValidator(SimpleNamespace(responses=FakeResponses(FIXTURES["affirmatively_supported"]))).validate(
+        candidate=candidate, revision=revision, transcript=TRANSCRIPT, anchors={anchor.anchor_id: anchor}
+    )
+    storage.store_validation_result(partial)
+
+    with pytest.raises(sqlite3.IntegrityError):
+        storage.store_validation_result(affirmative)
+
+    assert storage.derived_records(snapshot.snapshot_id) == []

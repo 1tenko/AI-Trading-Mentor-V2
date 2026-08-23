@@ -20,7 +20,7 @@ from mentor.derived_records import (
     Relationship,
     validate_record,
 )
-from mentor.validation import ValidationResult
+from mentor.validation import ValidationResult, consume_validator_result, is_validator_issued
 from mentor.knowledge import Collection, Source as LibrarySource, SourceRevision
 
 
@@ -565,70 +565,79 @@ class Storage:
             raise ValueError("source-extracted records require a semantic validation result before storage")
         self._store_derived_record(record)
 
-    def _store_derived_record(self, record: DerivedRecord) -> None:
+    def _store_derived_record(self, record: DerivedRecord, connection: sqlite3.Connection | None = None) -> None:
         validate_record(record)
-        with self._connect() as connection:
-            if connection.execute("SELECT 1 FROM corpus_snapshots WHERE snapshot_id = ?", (record.snapshot_id,)).fetchone() is None:
-                raise ValueError("derived record references an unknown snapshot")
-            if connection.execute(
-                "SELECT 1 FROM derived_records WHERE record_id = ? AND finalized = 1", (record.record_id,)
-            ).fetchone() is not None:
-                return
-            connection.execute(
-                """
-                INSERT INTO derived_records(
-                    record_id, snapshot_id, family, derived_kind, evidence_state, validation_state, lifecycle_state, qualification,
-                    compiler_model_version, compiler_prompt_version, compiler_schema_version
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(record_id) DO NOTHING
-                """,
-                (
-                    record.record_id,
-                    record.snapshot_id,
-                    record.family,
-                    record.derived_kind,
-                    record.evidence_state,
-                    record.validation_state,
-                    record.lifecycle_state,
-                    record.qualification,
-                    record.compiler_provenance.model_version if record.compiler_provenance else None,
-                    record.compiler_provenance.prompt_version if record.compiler_provenance else None,
-                    record.compiler_provenance.schema_version if record.compiler_provenance else None,
-                ),
-            )
-            connection.executemany(
-                "INSERT INTO derived_record_anchors(record_id, position, anchor_id) VALUES (?, ?, ?) ON CONFLICT DO NOTHING",
-                [(record.record_id, position, anchor) for position, anchor in enumerate(record.anchors)],
-            )
-            connection.executemany(
-                """
-                INSERT INTO derived_record_dependencies(record_id, position, dependency_kind, dependency_id)
-                VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING
-                """,
-                [
-                    (record.record_id, position, dependency.kind, dependency.identifier)
-                    for position, dependency in enumerate(record.dependencies)
-                ],
-            )
-            connection.executemany(
-                """
-                INSERT INTO derived_record_facets(record_id, position, facet_name, facet_value)
-                VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING
-                """,
-                [(record.record_id, position, facet.name, facet.value) for position, facet in enumerate(record.facets)],
-            )
-            self._store_record_family(connection, record)
-            connection.execute(
-                "UPDATE derived_records SET finalized = 1 WHERE record_id = ? AND finalized = 0", (record.record_id,)
-            )
+        if connection is None:
+            with self._connect() as connection:
+                self._store_derived_record(record, connection)
+            return
+        if connection.execute("SELECT 1 FROM corpus_snapshots WHERE snapshot_id = ?", (record.snapshot_id,)).fetchone() is None:
+            raise ValueError("derived record references an unknown snapshot")
+        if connection.execute(
+            "SELECT 1 FROM derived_records WHERE record_id = ? AND finalized = 1", (record.record_id,)
+        ).fetchone() is not None:
+            return
+        connection.execute(
+            """
+            INSERT INTO derived_records(
+                record_id, snapshot_id, family, derived_kind, evidence_state, validation_state, lifecycle_state, qualification,
+                compiler_model_version, compiler_prompt_version, compiler_schema_version
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(record_id) DO NOTHING
+            """,
+            (
+                record.record_id,
+                record.snapshot_id,
+                record.family,
+                record.derived_kind,
+                record.evidence_state,
+                record.validation_state,
+                record.lifecycle_state,
+                record.qualification,
+                record.compiler_provenance.model_version if record.compiler_provenance else None,
+                record.compiler_provenance.prompt_version if record.compiler_provenance else None,
+                record.compiler_provenance.schema_version if record.compiler_provenance else None,
+            ),
+        )
+        connection.executemany(
+            "INSERT INTO derived_record_anchors(record_id, position, anchor_id) VALUES (?, ?, ?) ON CONFLICT DO NOTHING",
+            [(record.record_id, position, anchor) for position, anchor in enumerate(record.anchors)],
+        )
+        connection.executemany(
+            """
+            INSERT INTO derived_record_dependencies(record_id, position, dependency_kind, dependency_id)
+            VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING
+            """,
+            [
+                (record.record_id, position, dependency.kind, dependency.identifier)
+                for position, dependency in enumerate(record.dependencies)
+            ],
+        )
+        connection.executemany(
+            """
+            INSERT INTO derived_record_facets(record_id, position, facet_name, facet_value)
+            VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING
+            """,
+            [(record.record_id, position, facet.name, facet.value) for position, facet in enumerate(record.facets)],
+        )
+        self._store_record_family(connection, record)
+        connection.execute(
+            "UPDATE derived_records SET finalized = 1 WHERE record_id = ? AND finalized = 0", (record.record_id,)
+        )
 
     def store_validation_result(self, result: ValidationResult) -> None:
+        if not is_validator_issued(result):
+            raise ValueError("semantic validation result is not validator-issued")
         if result.outcome == "affirmatively_supported":
-            if result.source_extracted is None:
+            if not isinstance(result.source_extracted, Claim):
                 raise ValueError("affirmative semantic validation requires a validated source-extracted record")
-            if result.source_extracted.snapshot_id != result.snapshot_id:
+            if (
+                result.source_extracted.snapshot_id != result.snapshot_id
+                or result.source_extracted.record_id == result.candidate_record_id
+                or result.source_extracted.validation_state != "validated"
+                or result.source_extracted.compiler_provenance is None
+            ):
                 raise ValueError("validation result snapshot does not match its source-extracted record")
-            self._store_derived_record(result.source_extracted)
         elif result.source_extracted is not None:
             raise ValueError("nonaffirmative semantic validation cannot retain a source-extracted record")
         if not result.candidate_record_id or not result.snapshot_id or not result.audit.strip() or len(result.audit) > 280:
@@ -636,6 +645,8 @@ class Storage:
         with self._connect() as connection:
             if connection.execute("SELECT 1 FROM corpus_snapshots WHERE snapshot_id = ?", (result.snapshot_id,)).fetchone() is None:
                 raise ValueError("validation result references an unknown snapshot")
+            if result.source_extracted:
+                self._store_derived_record(result.source_extracted, connection)
             connection.execute(
                 """
                 INSERT INTO candidate_validation_audits(
@@ -650,6 +661,7 @@ class Storage:
                     result.source_extracted.record_id if result.source_extracted else None,
                 ),
             )
+        consume_validator_result(result)
 
     def validation_audits(self, snapshot_id: str) -> list[tuple[str, str, str, str | None]]:
         with self._connect() as connection:
