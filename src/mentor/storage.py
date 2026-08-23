@@ -223,6 +223,12 @@ class Storage:
 
     def store_source_revision(self, revision: SourceRevision) -> None:
         with self._connect() as connection:
+            source = connection.execute(
+                "SELECT collection_id FROM library_sources WHERE source_id = ?",
+                (revision.source_id,),
+            ).fetchone()
+            if source is None or source[0] != revision.collection_id:
+                raise ValueError("revision collection_id does not match stored source")
             connection.execute(
                 """
                 INSERT INTO source_revisions(
@@ -248,9 +254,13 @@ class Storage:
         with self._connect() as connection:
             row = connection.execute(
                 """
-                SELECT revision_id, source_id, content_sha256, byte_size, local_locator,
-                       observed_at, lifecycle_state, remote_file_id, remote_vector_store_file_id
-                FROM source_revisions WHERE revision_id = ?
+                SELECT source_revisions.revision_id, library_sources.collection_id,
+                       source_revisions.source_id, source_revisions.content_sha256,
+                       source_revisions.byte_size, source_revisions.local_locator,
+                       source_revisions.observed_at, source_revisions.lifecycle_state,
+                       source_revisions.remote_file_id, source_revisions.remote_vector_store_file_id
+                FROM source_revisions JOIN library_sources USING(source_id)
+                WHERE revision_id = ?
                 """,
                 (revision_id,),
             ).fetchone()
@@ -260,9 +270,13 @@ class Storage:
         with self._connect() as connection:
             rows = connection.execute(
                 """
-                SELECT revision_id, source_id, content_sha256, byte_size, local_locator,
-                       observed_at, lifecycle_state, remote_file_id, remote_vector_store_file_id
-                FROM source_revisions WHERE source_id = ? ORDER BY rowid
+                SELECT source_revisions.revision_id, library_sources.collection_id,
+                       source_revisions.source_id, source_revisions.content_sha256,
+                       source_revisions.byte_size, source_revisions.local_locator,
+                       source_revisions.observed_at, source_revisions.lifecycle_state,
+                       source_revisions.remote_file_id, source_revisions.remote_vector_store_file_id
+                FROM source_revisions JOIN library_sources USING(source_id)
+                WHERE source_revisions.source_id = ? ORDER BY source_revisions.rowid
                 """,
                 (source_id,),
             ).fetchall()

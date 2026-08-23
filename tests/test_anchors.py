@@ -8,12 +8,28 @@ from mentor.anchors import SourceAnchor, normalize_transcript, validate_anchor
 from mentor.knowledge import Source, SourceRevision
 
 
-FIXTURE_TEXT = (Path(__file__).parent / "fixtures" / "anchor_transcript.txt").read_text()
+FIXTURE_TEXT = (Path(__file__).parent / "fixtures" / "anchor_transcript.txt").read_text(encoding="utf-8")
 
 
-def revision_for(source_id: str, transcript: str) -> SourceRevision:
+def source_for(identity_key: str) -> Source:
+    return Source.create(
+        collection_id="collection_synthetic",
+        identity_key=identity_key,
+        source_type="transcript",
+        author="Synthetic Author",
+        course="Synthetic Course",
+        lesson_title="Synthetic lesson",
+        year=2026,
+        original_filename="synthetic.txt",
+        local_provenance="C:/synthetic/synthetic.txt",
+    )
+
+
+def revision_for(source: Source | str, transcript: str) -> SourceRevision:
+    if isinstance(source, str):
+        source = source_for(source)
     return SourceRevision.create(
-        source_id=source_id,
+        source=source,
         content_sha256=sha256(transcript.encode()).hexdigest(),
         byte_size=len(transcript.encode()),
         local_locator="C:/synthetic/duplicate-looking-lesson.txt",
@@ -43,7 +59,7 @@ def test_valid_anchor_binds_a_normalized_span_to_its_specific_revision():
 
     assert anchor.revision_sha256 == revision.content_sha256
     assert anchor.span_fingerprint == sha256("Wait for the liquidity sweep before entry.".encode()).hexdigest()
-    assert anchor.timestamp_seconds == 90.0
+    assert (anchor.timestamp_start_ms, anchor.timestamp_end_ms) == (90_000, 90_000)
     assert anchor.locator_version == "transcript-v1"
 
 
@@ -75,7 +91,9 @@ def test_anchor_rejects_timestamp_drift_when_the_locator_supports_timestamps():
     drifted_anchor = anchor_for(drifted_revision, drifted_text)
 
     with pytest.raises(ValueError, match="timestamp"):
-        validate_anchor(replace(drifted_anchor, timestamp_seconds=anchor.timestamp_seconds), drifted_revision, drifted_text)
+        validate_anchor(
+            replace(drifted_anchor, timestamp_start_ms=anchor.timestamp_start_ms), drifted_revision, drifted_text
+        )
 
 
 def test_anchor_rejects_a_duplicate_looking_name_with_a_different_source_id():
@@ -101,12 +119,77 @@ def test_anchor_rejects_a_duplicate_looking_name_with_a_different_source_id():
         original_filename="duplicate-looking-lesson.txt",
         local_provenance="C:/synthetic/duplicate-looking-lesson.txt",
     )
-    revision = revision_for(original.source_id, FIXTURE_TEXT)
-    duplicate_name_revision = revision_for(duplicate.source_id, FIXTURE_TEXT)
+    revision = revision_for(original, FIXTURE_TEXT)
+    duplicate_name_revision = revision_for(duplicate, FIXTURE_TEXT)
     anchor = anchor_for(revision)
 
     with pytest.raises(ValueError, match="source_id"):
         validate_anchor(anchor, duplicate_name_revision, FIXTURE_TEXT)
+
+
+def test_revision_and_anchor_retain_collection_identity_and_reject_tampering():
+    source = Source.create(
+        collection_id="collection_synthetic",
+        identity_key="legacy:file_collection",
+        source_type="transcript",
+        author="Synthetic Author",
+        course="Synthetic Course",
+        lesson_title="Collection-bound lesson",
+        year=2026,
+        original_filename="collection-bound.txt",
+        local_provenance="C:/synthetic/collection-bound.txt",
+    )
+    revision = SourceRevision.create(
+        source=source,
+        content_sha256=sha256(FIXTURE_TEXT.encode()).hexdigest(),
+        byte_size=len(FIXTURE_TEXT.encode()),
+        local_locator="C:/synthetic/collection-bound.txt",
+        observed_at=1_700_000_000.0,
+        lifecycle_state="active",
+    )
+    anchor = anchor_for(revision)
+
+    validate_anchor(anchor, revision, FIXTURE_TEXT)
+
+    assert revision.collection_id == source.collection_id
+    assert anchor.collection_id == source.collection_id
+    with pytest.raises(ValueError, match="collection_id"):
+        validate_anchor(replace(anchor, collection_id="collection_tampered"), revision, FIXTURE_TEXT)
+
+
+def test_anchor_records_timestamp_range_when_a_span_crosses_a_later_marker():
+    revision = revision_for("src_synthetic", FIXTURE_TEXT)
+    normalized = normalize_transcript(FIXTURE_TEXT)
+    start_offset = normalized.index("Wait for the liquidity sweep")
+    end_offset = normalized.index("Define risk before placing the trade.") + len("Define risk before placing the trade.")
+    anchor = SourceAnchor.create(
+        revision=revision,
+        transcript=FIXTURE_TEXT,
+        start_offset=start_offset,
+        end_offset=end_offset,
+    )
+
+    validate_anchor(anchor, revision, FIXTURE_TEXT)
+
+    assert (anchor.timestamp_start_ms, anchor.timestamp_end_ms) == (90_000, 120_000)
+
+
+def test_anchor_uses_nfc_normalized_coordinates_for_decomposed_fixture_text():
+    transcript = FIXTURE_TEXT.replace("caf\u00e9", "cafe\u0301")
+    revision = revision_for("src_synthetic", transcript)
+    normalized = normalize_transcript(transcript)
+    start_offset = normalized.index("caf\u00e9")
+    end_offset = start_offset + len("caf\u00e9 setup")
+    anchor = SourceAnchor.create(
+        revision=revision,
+        transcript=transcript,
+        start_offset=start_offset,
+        end_offset=end_offset,
+    )
+
+    validate_anchor(anchor, revision, transcript)
+
+    assert anchor.span_fingerprint == sha256("caf\u00e9 setup".encode()).hexdigest()
 
 
 @pytest.mark.parametrize(

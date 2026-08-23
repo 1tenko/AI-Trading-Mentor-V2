@@ -337,7 +337,7 @@ def test_storage_persists_an_immutable_library_source_revision_idempotently(tmp_
         local_provenance="C:/synthetic/synthetic.txt",
     )
     revision = SourceRevision.create(
-        source_id=source.source_id,
+        source=source,
         content_sha256="b" * 64,
         byte_size=42,
         local_locator="C:/synthetic/synthetic.txt",

@@ -1,3 +1,4 @@
 [00:00:00] Review the opening range before the cash open.
 [00:01:30] Wait for the liquidity sweep before entry.
 [00:02:00] Define risk before placing the trade.
+[00:02:30] Calibrate the café setup before the session.

@@ -41,8 +41,19 @@ def test_source_identity_is_stable_when_its_filename_metadata_changes():
 
 
 def test_source_revision_identity_contains_its_sha256_and_cannot_change():
+    source = Source.create(
+        collection_id="collection_synthetic",
+        identity_key="legacy:file_synthetic",
+        source_type="transcript",
+        author="Synthetic Author",
+        course="Synthetic Course",
+        lesson_title="Synthetic lesson",
+        year=2026,
+        original_filename="synthetic.txt",
+        local_provenance="C:/synthetic/synthetic.txt",
+    )
     revision = SourceRevision.create(
-        source_id="src_synthetic",
+        source=source,
         content_sha256="a" * 64,
         byte_size=42,
         local_locator="C:/synthetic/opening-range.txt",
@@ -57,9 +68,20 @@ def test_source_revision_identity_contains_its_sha256_and_cannot_change():
 
 @pytest.mark.parametrize("content_sha256", ["", "a" * 63, "g" * 64])
 def test_source_revision_rejects_values_that_are_not_sha256_hex_digests(content_sha256):
+    source = Source.create(
+        collection_id="collection_synthetic",
+        identity_key="legacy:file_synthetic",
+        source_type="transcript",
+        author="Synthetic Author",
+        course="Synthetic Course",
+        lesson_title="Synthetic lesson",
+        year=2026,
+        original_filename="synthetic.txt",
+        local_provenance="C:/synthetic/synthetic.txt",
+    )
     with pytest.raises(ValueError, match="SHA-256"):
         SourceRevision.create(
-            source_id="src_synthetic",
+            source=source,
             content_sha256=content_sha256,
             byte_size=42,
             local_locator="C:/synthetic/opening-range.txt",

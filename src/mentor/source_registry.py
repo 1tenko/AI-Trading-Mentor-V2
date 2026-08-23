@@ -91,7 +91,7 @@ def backfill_jacob_registry(transcript_root: Path, storage: Storage) -> None:
                 else "replacement_pending"
             )
             matching_revision = SourceRevision.create(
-                source_id=source.source_id,
+                source=source,
                 content_sha256=content_sha256,
                 byte_size=len(content),
                 local_locator=str(local_path.resolve()),

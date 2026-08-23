@@ -58,6 +58,7 @@ class Source:
 @dataclass(frozen=True)
 class SourceRevision:
     revision_id: str
+    collection_id: str
     source_id: str
     content_sha256: str
     byte_size: int
@@ -71,7 +72,7 @@ class SourceRevision:
     def create(
         cls,
         *,
-        source_id: str,
+        source: Source,
         content_sha256: str,
         byte_size: int,
         local_locator: str,
@@ -84,8 +85,9 @@ class SourceRevision:
         if len(content_sha256) != 64 or any(character not in "0123456789abcdef" for character in content_sha256):
             raise ValueError("content_sha256 must be a SHA-256 hex digest")
         return cls(
-            revision_id=f"rev_{source_id}_{content_sha256}",
-            source_id=source_id,
+            revision_id=f"rev_{source.source_id}_{content_sha256}",
+            collection_id=source.collection_id,
+            source_id=source.source_id,
             content_sha256=content_sha256,
             byte_size=byte_size,
             local_locator=local_locator,
