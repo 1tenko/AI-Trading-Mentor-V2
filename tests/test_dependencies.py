@@ -175,3 +175,79 @@ def test_candidate_validation_rejects_dependencies_outside_its_raw_snapshot(tmp_
 
     with pytest.raises(ValueError, match="outside the candidate raw snapshot"):
         storage.transition_snapshot(snapshot.snapshot_id, "validating")
+
+
+def test_published_snapshot_rejects_invalidation_without_changing_current_retrieval(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    revision = source_revision(storage, "source_published")
+    snapshot = candidate(storage, (revision,))
+    record = claim(
+        snapshot.snapshot_id,
+        "published",
+        (RecordDependency("source_revision", revision.revision_id),),
+    )
+    storage.store_derived_record(record)
+    storage.transition_snapshot(snapshot.snapshot_id, "validating")
+    storage.transition_snapshot(snapshot.snapshot_id, "published")
+
+    with pytest.raises(ValueError, match="published"):
+        storage.mark_stale_for_revisions(snapshot.snapshot_id, (revision.revision_id,))
+
+    assert storage.current_snapshot().snapshot_id == snapshot.snapshot_id
+    assert storage.stale_record_ids(snapshot.snapshot_id) == ()
+    assert storage.derived_records(snapshot.snapshot_id) == [record]
+
+
+def test_stale_and_rebuild_require_a_revision_in_the_target_snapshot(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    revision = source_revision(storage, "source_selected_only")
+    snapshot = candidate(storage, (revision,))
+
+    with pytest.raises(ValueError, match="selected by the target snapshot"):
+        storage.mark_stale_for_revisions(snapshot.snapshot_id, ("rev_typo",))
+    with pytest.raises(ValueError, match="selected by the target snapshot"):
+        storage.rebuild_record_ids(snapshot.snapshot_id, ("rev_typo",))
+
+
+def test_storage_rejects_new_direct_and_transitive_dependencies_on_stale_records(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    revision = source_revision(storage, "source_stale")
+    snapshot = candidate(storage, (revision,))
+    stale = claim(
+        snapshot.snapshot_id,
+        "stale",
+        (RecordDependency("source_revision", revision.revision_id),),
+    )
+    intermediary = claim(
+        snapshot.snapshot_id,
+        "intermediary",
+        (
+            RecordDependency("source_revision", revision.revision_id),
+            RecordDependency("derived_record", stale.record_id),
+        ),
+    )
+    storage.store_derived_record(stale)
+    storage.store_derived_record(intermediary)
+    with storage._connect() as connection:
+        connection.execute(
+            "INSERT INTO derived_record_staleness(snapshot_id, record_id, revision_id) VALUES (?, ?, ?)",
+            (snapshot.snapshot_id, stale.record_id, revision.revision_id),
+        )
+
+    direct = claim(
+        snapshot.snapshot_id,
+        "direct",
+        (RecordDependency("derived_record", stale.record_id),),
+    )
+    transitive = claim(
+        snapshot.snapshot_id,
+        "transitive",
+        (RecordDependency("derived_record", intermediary.record_id),),
+    )
+    with pytest.raises(ValueError, match="stale"):
+        storage.store_derived_record(direct)
+    with pytest.raises(ValueError, match="stale"):
+        storage.store_derived_record(transitive)

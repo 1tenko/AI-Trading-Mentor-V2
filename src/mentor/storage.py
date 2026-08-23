@@ -632,6 +632,8 @@ class Storage:
             "SELECT 1 FROM derived_records WHERE record_id = ? AND finalized = 1", (record.record_id,)
         ).fetchone() is not None:
             return
+        if self._depends_on_stale_record(connection, record):
+            raise ValueError("derived records cannot depend on stale records")
         connection.execute(
             """
             INSERT INTO derived_records(
@@ -679,6 +681,35 @@ class Storage:
         connection.execute(
             "UPDATE derived_records SET finalized = 1 WHERE record_id = ? AND finalized = 0", (record.record_id,)
         )
+
+    def _depends_on_stale_record(self, connection: sqlite3.Connection, record: DerivedRecord) -> bool:
+        pending = [dependency.identifier for dependency in record.dependencies if dependency.kind == "derived_record"]
+        visited: set[str] = set()
+        while pending:
+            record_id = pending.pop()
+            if record_id in visited:
+                continue
+            visited.add(record_id)
+            if connection.execute(
+                """
+                SELECT 1 FROM derived_record_staleness
+                WHERE snapshot_id = ? AND record_id = ? LIMIT 1
+                """,
+                (record.snapshot_id, record_id),
+            ).fetchone():
+                return True
+            pending.extend(
+                dependency_id
+                for dependency_kind, dependency_id in connection.execute(
+                    """
+                    SELECT dependency_kind, dependency_id FROM derived_record_dependencies
+                    WHERE record_id = ? ORDER BY position
+                    """,
+                    (record_id,),
+                )
+                if dependency_kind == "derived_record"
+            )
+        return False
 
     def validate_and_store_source_extracted(
         self,
@@ -748,12 +779,7 @@ class Storage:
             return self._dependency_graph(connection, snapshot_id)
 
     def _dependency_graph(self, connection: sqlite3.Connection, snapshot_id: str) -> DependencyGraph:
-        snapshot_row = connection.execute(
-            "SELECT selected_revision_ids_json FROM corpus_snapshots WHERE snapshot_id = ?", (snapshot_id,)
-        ).fetchone()
-        if snapshot_row is None:
-            raise ValueError("unknown snapshot")
-        selected_revision_ids = set(json.loads(snapshot_row[0]))
+        _status, selected_revision_ids = self._snapshot_state(connection, snapshot_id)
         candidate_record_ids = {
             row[0]
             for row in connection.execute(
@@ -781,12 +807,27 @@ class Storage:
             for kind, identifier, record_id in rows
         )
 
+    def _snapshot_state(self, connection: sqlite3.Connection, snapshot_id: str) -> tuple[str, set[str]]:
+        row = connection.execute(
+            "SELECT status, selected_revision_ids_json FROM corpus_snapshots WHERE snapshot_id = ?", (snapshot_id,)
+        ).fetchone()
+        if row is None:
+            raise ValueError("unknown snapshot")
+        return row[0], set(json.loads(row[1]))
+
+    @staticmethod
+    def _require_selected_revisions(selected_revision_ids: set[str], revision_ids: tuple[str, ...]) -> None:
+        if not set(revision_ids) <= selected_revision_ids:
+            raise ValueError("revision IDs must be selected by the target snapshot")
+
     def mark_stale_for_revisions(self, snapshot_id: str, revision_ids: tuple[str, ...]) -> tuple[str, ...]:
         if not revision_ids or any(not isinstance(revision_id, str) or not revision_id for revision_id in revision_ids):
             raise ValueError("revision IDs must be non-empty")
         with self._connect() as connection:
-            if connection.execute("SELECT 1 FROM corpus_snapshots WHERE snapshot_id = ?", (snapshot_id,)).fetchone() is None:
-                raise ValueError("unknown snapshot")
+            status, selected_revision_ids = self._snapshot_state(connection, snapshot_id)
+            if status == "published":
+                raise ValueError("published snapshots cannot be invalidated in place")
+            self._require_selected_revisions(selected_revision_ids, revision_ids)
             graph = self._dependency_graph(connection, snapshot_id)
             stale_by_revision = {revision_id: graph.stale_record_ids((revision_id,)) for revision_id in revision_ids}
             stale_ids = tuple(sorted({record_id for record_ids in stale_by_revision.values() for record_id in record_ids}))
@@ -814,7 +855,12 @@ class Storage:
             )
 
     def rebuild_record_ids(self, snapshot_id: str, revision_ids: tuple[str, ...]) -> tuple[str, ...]:
-        return self.dependency_graph(snapshot_id).rebuild_record_ids(revision_ids)
+        if not revision_ids or any(not isinstance(revision_id, str) or not revision_id for revision_id in revision_ids):
+            raise ValueError("revision IDs must be non-empty")
+        with self._connect() as connection:
+            _status, selected_revision_ids = self._snapshot_state(connection, snapshot_id)
+            self._require_selected_revisions(selected_revision_ids, revision_ids)
+            return self._dependency_graph(connection, snapshot_id).rebuild_record_ids(revision_ids)
 
     def derived_records(self, snapshot_id: str, *, include_stale: bool = False) -> list[DerivedRecord]:
         with self._connect() as connection:
