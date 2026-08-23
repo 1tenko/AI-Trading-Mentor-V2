@@ -75,6 +75,21 @@ class CorpusSnapshot:
 
 
 @dataclass(frozen=True)
+class SourceProcessingResult:
+    revision_id: str
+    status: str
+    record_count: int
+
+
+@dataclass(frozen=True)
+class CandidateGateResult:
+    snapshot_id: str
+    status: str
+    checked_at: float
+    failure_reason: str | None = None
+
+
+@dataclass(frozen=True)
 class CompilationMetric:
     stage: str
     source_count: int

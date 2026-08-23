@@ -2,7 +2,7 @@ from hashlib import sha256
 
 import pytest
 
-from mentor.compilation import CompilationRun, CorpusSnapshot
+from mentor.compilation import CompilationRun, CorpusSnapshot, SourceProcessingResult
 from mentor.dependencies import DependencyEdge, DependencyGraph, DependencyNode
 from mentor.derived_records import Claim, RecordDependency
 from mentor.knowledge import Collection, Source, SourceRevision
@@ -100,6 +100,11 @@ def candidate(
         created_at=1_700_000_001.0,
     )
     storage.create_compilation_candidate(run, snapshot)
+    storage.record_candidate_gate(
+        snapshot.snapshot_id,
+        tuple(SourceProcessingResult(revision.revision_id, "processed", 0) for revision in revisions),
+        checked_at=1_700_000_002.0,
+    )
     return snapshot
 
 
