@@ -66,7 +66,7 @@ Stay on feature/phase-3-knowledge-assimilation. Do not begin Phase 4.
 - [x] **Task 12 — Vector-store adapter and guarded capability preflight**
   - Depends on: Checkpoint C. Verify: fake adapter tests; disposable live
     preflight only with Theo's explicit approval.
-- [ ] **Task 13 — Bounded published-snapshot orientation service**
+- [x] **Task 13 — Bounded published-snapshot orientation service**
   - Depends on: Task 12. Verify: stale/wrong/duplicate/budget/raw-dump tests;
     full pytest.
 
