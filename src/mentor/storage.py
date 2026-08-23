@@ -217,7 +217,8 @@ class Storage:
                     evidence_state TEXT NOT NULL CHECK(evidence_state IN ('raw_taught', 'cross_source_synthesis')),
                     validation_state TEXT NOT NULL CHECK(validation_state IN ('pending', 'validated', 'rejected')),
                     lifecycle_state TEXT NOT NULL CHECK(lifecycle_state IN ('candidate', 'active', 'superseded', 'retired')),
-                    qualification TEXT NOT NULL
+                    qualification TEXT NOT NULL,
+                    finalized INTEGER NOT NULL DEFAULT 0 CHECK(finalized IN (0, 1))
                 );
                 CREATE TABLE IF NOT EXISTS derived_record_anchors (
                     record_id TEXT NOT NULL REFERENCES derived_records(record_id),
@@ -278,6 +279,13 @@ class Storage:
             columns = {row[1] for row in connection.execute("PRAGMA table_info(sources)")}
             if "modified_at" not in columns:
                 connection.execute("ALTER TABLE sources ADD COLUMN modified_at REAL")
+            derived_columns = {row[1] for row in connection.execute("PRAGMA table_info(derived_records)")}
+            if "finalized" not in derived_columns:
+                connection.execute(
+                    "ALTER TABLE derived_records ADD COLUMN finalized INTEGER NOT NULL DEFAULT 0 CHECK(finalized IN (0, 1))"
+                )
+            self._create_derived_record_triggers(connection)
+            connection.execute("UPDATE derived_records SET finalized = 1 WHERE finalized = 0")
             self._backfill_display_turns(connection)
 
     def create_compilation_candidate(self, run: CompilationRun, snapshot: CorpusSnapshot) -> None:
@@ -530,6 +538,10 @@ class Storage:
         with self._connect() as connection:
             if connection.execute("SELECT 1 FROM corpus_snapshots WHERE snapshot_id = ?", (record.snapshot_id,)).fetchone() is None:
                 raise ValueError("derived record references an unknown snapshot")
+            if connection.execute(
+                "SELECT 1 FROM derived_records WHERE record_id = ? AND finalized = 1", (record.record_id,)
+            ).fetchone() is not None:
+                return
             connection.execute(
                 """
                 INSERT INTO derived_records(
@@ -570,13 +582,16 @@ class Storage:
                 [(record.record_id, position, facet.name, facet.value) for position, facet in enumerate(record.facets)],
             )
             self._store_record_family(connection, record)
+            connection.execute(
+                "UPDATE derived_records SET finalized = 1 WHERE record_id = ? AND finalized = 0", (record.record_id,)
+            )
 
     def derived_records(self, snapshot_id: str) -> list[DerivedRecord]:
         with self._connect() as connection:
             rows = connection.execute(
                 """
                 SELECT record_id, snapshot_id, family, derived_kind, evidence_state, validation_state, lifecycle_state, qualification
-                FROM derived_records WHERE snapshot_id = ? ORDER BY record_id
+                FROM derived_records WHERE snapshot_id = ? AND finalized = 1 ORDER BY record_id
                 """,
                 (snapshot_id,),
             ).fetchall()
@@ -722,6 +737,97 @@ class Storage:
         if record.record_id != record_id:
             raise ValueError("stored derived record identity is not canonical")
         return record
+
+    def _create_derived_record_triggers(self, connection: sqlite3.Connection) -> None:
+        connection.executescript(
+            """
+            CREATE TRIGGER IF NOT EXISTS derived_records_require_staging
+            BEFORE INSERT ON derived_records WHEN NEW.finalized = 1
+            BEGIN
+                SELECT RAISE(ABORT, 'derived records must be finalized after their children');
+            END;
+            CREATE TRIGGER IF NOT EXISTS derived_records_require_children
+            BEFORE UPDATE OF finalized ON derived_records WHEN OLD.finalized = 0 AND NEW.finalized = 1
+            BEGIN
+                SELECT CASE WHEN NOT EXISTS(
+                    SELECT 1 FROM derived_record_anchors WHERE record_id = NEW.record_id
+                ) THEN RAISE(ABORT, 'derived records require anchors') END;
+                SELECT CASE WHEN NOT EXISTS(
+                    SELECT 1 FROM derived_record_dependencies WHERE record_id = NEW.record_id
+                ) THEN RAISE(ABORT, 'derived records require dependencies') END;
+                SELECT CASE WHEN NOT (
+                    (NEW.family = 'claim'
+                        AND (SELECT COUNT(*) FROM derived_claims WHERE record_id = NEW.record_id) = 1
+                        AND (SELECT COUNT(*) FROM derived_relationships WHERE record_id = NEW.record_id) = 0
+                        AND (SELECT COUNT(*) FROM derived_procedure_sequence_hierarchy WHERE record_id = NEW.record_id) = 0
+                        AND (SELECT COUNT(*) FROM derived_evolutions WHERE record_id = NEW.record_id) = 0
+                        AND (SELECT COUNT(*) FROM derived_conflict_unresolved WHERE record_id = NEW.record_id) = 0)
+                    OR (NEW.family = 'relationship'
+                        AND (SELECT COUNT(*) FROM derived_claims WHERE record_id = NEW.record_id) = 0
+                        AND (SELECT COUNT(*) FROM derived_relationships WHERE record_id = NEW.record_id) = 1
+                        AND (SELECT COUNT(*) FROM derived_procedure_sequence_hierarchy WHERE record_id = NEW.record_id) = 0
+                        AND (SELECT COUNT(*) FROM derived_evolutions WHERE record_id = NEW.record_id) = 0
+                        AND (SELECT COUNT(*) FROM derived_conflict_unresolved WHERE record_id = NEW.record_id) = 0)
+                    OR (NEW.family = 'procedure_sequence_hierarchy'
+                        AND (SELECT COUNT(*) FROM derived_claims WHERE record_id = NEW.record_id) = 0
+                        AND (SELECT COUNT(*) FROM derived_relationships WHERE record_id = NEW.record_id) = 0
+                        AND (SELECT COUNT(*) FROM derived_procedure_sequence_hierarchy WHERE record_id = NEW.record_id) = 1
+                        AND (SELECT COUNT(*) FROM derived_evolutions WHERE record_id = NEW.record_id) = 0
+                        AND (SELECT COUNT(*) FROM derived_conflict_unresolved WHERE record_id = NEW.record_id) = 0)
+                    OR (NEW.family = 'evolution'
+                        AND (SELECT COUNT(*) FROM derived_claims WHERE record_id = NEW.record_id) = 0
+                        AND (SELECT COUNT(*) FROM derived_relationships WHERE record_id = NEW.record_id) = 0
+                        AND (SELECT COUNT(*) FROM derived_procedure_sequence_hierarchy WHERE record_id = NEW.record_id) = 0
+                        AND (SELECT COUNT(*) FROM derived_evolutions WHERE record_id = NEW.record_id) = 1
+                        AND (SELECT COUNT(*) FROM derived_conflict_unresolved WHERE record_id = NEW.record_id) = 0)
+                    OR (NEW.family = 'conflict_unresolved'
+                        AND (SELECT COUNT(*) FROM derived_claims WHERE record_id = NEW.record_id) = 0
+                        AND (SELECT COUNT(*) FROM derived_relationships WHERE record_id = NEW.record_id) = 0
+                        AND (SELECT COUNT(*) FROM derived_procedure_sequence_hierarchy WHERE record_id = NEW.record_id) = 0
+                        AND (SELECT COUNT(*) FROM derived_evolutions WHERE record_id = NEW.record_id) = 0
+                        AND (SELECT COUNT(*) FROM derived_conflict_unresolved WHERE record_id = NEW.record_id) = 1)
+                ) THEN RAISE(ABORT, 'derived records require one matching family row') END;
+                SELECT CASE WHEN NEW.family = 'procedure_sequence_hierarchy' AND (
+                    SELECT COUNT(*) FROM derived_record_terms WHERE record_id = NEW.record_id AND term_role = 'procedure_term'
+                ) NOT BETWEEN 2 AND 8 THEN RAISE(ABORT, 'derived records require bounded procedure terms') END;
+                SELECT CASE WHEN NEW.family = 'conflict_unresolved' AND (
+                    SELECT COUNT(*) FROM derived_record_terms WHERE record_id = NEW.record_id AND term_role = 'alternative'
+                ) NOT BETWEEN 2 AND 8 THEN RAISE(ABORT, 'derived records require bounded alternatives') END;
+            END;
+            CREATE TRIGGER IF NOT EXISTS derived_records_lock_finalized_rows
+            BEFORE UPDATE ON derived_records WHEN OLD.finalized = 1
+            BEGIN
+                SELECT RAISE(ABORT, 'finalized derived records are immutable');
+            END;
+            """
+        )
+        for table in (
+            "derived_record_anchors",
+            "derived_record_dependencies",
+            "derived_record_facets",
+            "derived_claims",
+            "derived_relationships",
+            "derived_procedure_sequence_hierarchy",
+            "derived_evolutions",
+            "derived_conflict_unresolved",
+            "derived_record_terms",
+        ):
+            for operation in ("INSERT", "UPDATE", "DELETE"):
+                record_check = {
+                    "INSERT": "record_id = NEW.record_id",
+                    "UPDATE": "(record_id = OLD.record_id OR record_id = NEW.record_id)",
+                    "DELETE": "record_id = OLD.record_id",
+                }[operation]
+                connection.execute(
+                    f"""
+                    CREATE TRIGGER IF NOT EXISTS {table}_lock_finalized_{operation.lower()}
+                    BEFORE {operation} ON {table}
+                    WHEN EXISTS(SELECT 1 FROM derived_records WHERE {record_check} AND finalized = 1)
+                    BEGIN
+                        SELECT RAISE(ABORT, 'finalized derived records are immutable');
+                    END;
+                    """
+                )
 
     def store_collection(self, collection: Collection) -> None:
         with self._connect() as connection:

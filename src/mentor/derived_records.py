@@ -12,6 +12,10 @@ EVIDENCE_STATES = frozenset({"raw_taught", "cross_source_synthesis"})
 VALIDATION_STATES = frozenset({"pending", "validated", "rejected"})
 LIFECYCLE_STATES = frozenset({"candidate", "active", "superseded", "retired"})
 FACET_NAMES = frozenset({"scope", "condition", "exception", "outcome", "timeframe"})
+MAX_FACETS = 5
+MAX_FACET_VALUE_LENGTH = 160
+MAX_TERMS = 8
+MAX_TYPED_CONTENT_LENGTH = 240
 
 
 @dataclass(frozen=True)
@@ -23,7 +27,7 @@ class RecordDependency:
 @dataclass(frozen=True)
 class Facet:
     name: str
-    value: object
+    value: str
 
 
 @dataclass(frozen=True)
@@ -106,6 +110,8 @@ class ProcedureSequenceHierarchy(DerivedRecord):
     def create(cls, *, kind: str, terms: tuple[str, ...], **common: object) -> "ProcedureSequenceHierarchy":
         if kind not in {"procedure", "sequence", "hierarchy"} or len(terms) < 2:
             raise ValueError("invalid procedure, sequence, or hierarchy")
+        if len(terms) > MAX_TERMS:
+            raise ValueError("too many terms")
         return _new(
             cls,
             family="procedure_sequence_hierarchy",
@@ -145,6 +151,8 @@ class ConflictUnresolved(DerivedRecord):
     ) -> "ConflictUnresolved":
         if kind not in {"conflict", "unresolved"} or len(alternatives) < 2:
             raise ValueError("invalid conflict or unresolved record")
+        if len(alternatives) > MAX_TERMS:
+            raise ValueError("too many terms")
         return _new(
             cls,
             family="conflict_unresolved",
@@ -210,6 +218,9 @@ def _default_evidence_state(derived_kind: str) -> str:
 def _validate_facets(facets: object) -> None:
     if not isinstance(facets, tuple):
         raise ValueError("facets must be bounded typed facets")
+    if len(facets) > MAX_FACETS:
+        raise ValueError("too many facets")
+    names = set()
     for facet in facets:
         if not isinstance(facet, Facet):
             raise ValueError("facets must be bounded typed facets")
@@ -219,7 +230,10 @@ def _validate_facets(facets: object) -> None:
             raise ValueError("private reasoning is not allowed")
         if facet.name not in FACET_NAMES or not isinstance(facet.value, str):
             raise ValueError("facets must be bounded typed facets")
-        _require_text(facet.value, "facet value")
+        if facet.name in names:
+            raise ValueError("duplicate facet name")
+        names.add(facet.name)
+        _require_text(facet.value, "facet value", maximum=MAX_FACET_VALUE_LENGTH)
 
 
 def _validate_family(record: DerivedRecord) -> None:
@@ -247,12 +261,14 @@ def _validate_family(record: DerivedRecord) -> None:
     else:
         raise ValueError("unknown derived record family")
     for value in strings:
-        _require_text(value, "typed record value")
+        _require_text(value, "typed record value", maximum=MAX_TYPED_CONTENT_LENGTH)
 
 
-def _require_text(value: object, label: str) -> None:
+def _require_text(value: object, label: str, *, maximum: int | None = None) -> None:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{label} must be non-empty text")
+    if maximum is not None and len(value) > maximum:
+        raise ValueError(f"{label} exceeds its maximum length")
 
 
 def _record_id(record: DerivedRecord) -> str:

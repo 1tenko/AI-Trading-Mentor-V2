@@ -1,6 +1,8 @@
 from dataclasses import replace
 from hashlib import sha256
 
+import sqlite3
+
 import pytest
 
 from mentor.compilation import CompilationRun, CorpusSnapshot
@@ -159,6 +161,76 @@ def test_storage_revalidates_tampered_record_data_at_its_boundary(tmp_path):
 
     with pytest.raises(ValueError, match="private reasoning"):
         storage.store_derived_record(replace(record, facets=(Facet("reasoning", "private chain"),)))
+
+
+def test_sqlite_rejects_direct_finalization_without_required_children(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    snapshot = snapshot_for(storage)
+
+    with storage._connect() as connection:
+        connection.execute(
+            """
+            INSERT INTO derived_records(
+                record_id, snapshot_id, family, derived_kind, evidence_state, validation_state,
+                lifecycle_state, qualification
+            ) VALUES ('rec_incomplete', ?, 'claim', 'statement', 'raw_taught', 'validated', 'active', 'Synthetic.')
+            """,
+            (snapshot.snapshot_id,),
+        )
+        with pytest.raises(sqlite3.IntegrityError, match="anchors"):
+            connection.execute("UPDATE derived_records SET finalized = 1 WHERE record_id = 'rec_incomplete'")
+        connection.execute("INSERT INTO derived_record_anchors VALUES ('rec_incomplete', 0, 'anc_synthetic')")
+        with pytest.raises(sqlite3.IntegrityError, match="dependencies"):
+            connection.execute("UPDATE derived_records SET finalized = 1 WHERE record_id = 'rec_incomplete'")
+
+    assert storage.derived_records(snapshot.snapshot_id) == []
+
+
+def test_sqlite_rejects_direct_finalization_without_a_matching_family_row(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    snapshot = snapshot_for(storage)
+
+    with storage._connect() as connection:
+        connection.execute(
+            """
+            INSERT INTO derived_records(
+                record_id, snapshot_id, family, derived_kind, evidence_state, validation_state,
+                lifecycle_state, qualification
+            ) VALUES ('rec_no_family', ?, 'claim', 'statement', 'raw_taught', 'validated', 'active', 'Synthetic.')
+            """,
+            (snapshot.snapshot_id,),
+        )
+        connection.execute("INSERT INTO derived_record_anchors VALUES ('rec_no_family', 0, 'anc_synthetic')")
+        connection.execute(
+            "INSERT INTO derived_record_dependencies VALUES ('rec_no_family', 0, 'source_revision', ?) ",
+            (snapshot.selected_revision_ids[0],),
+        )
+        with pytest.raises(sqlite3.IntegrityError, match="family row"):
+            connection.execute("UPDATE derived_records SET finalized = 1 WHERE record_id = 'rec_no_family'")
+
+    assert storage.derived_records(snapshot.snapshot_id) == []
+
+
+@pytest.mark.parametrize(
+    "factory, message",
+    [
+        (lambda: claim(facets=(Facet("scope", 1),)), "bounded typed facets"),
+        (lambda: claim(facets=(Facet("scope", "x" * 161),)), "facet value"),
+        (lambda: claim(subject="x" * 241), "typed record value"),
+        (
+            lambda: ProcedureSequenceHierarchy.create(
+                **_envelope(), kind="sequence", terms=tuple("term" for _ in range(9))
+            ),
+            "too many terms",
+        ),
+        (lambda: claim(facets=tuple(Facet("scope", "small") for _ in range(6))), "too many facets"),
+    ],
+)
+def test_record_construction_rejects_unbounded_semantic_content(factory, message):
+    with pytest.raises(ValueError, match=message):
+        factory()
 
 
 def snapshot_for(storage: Storage) -> CorpusSnapshot:
