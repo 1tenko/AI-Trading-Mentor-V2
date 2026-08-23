@@ -18,15 +18,22 @@ the currently installed SDK signatures for:
 - `vector_stores.files.delete(file_id, vector_store_id=...)` for detachment
   only. It never deletes the underlying OpenAI File.
 
-The adapter's tests use fakes only. They cover status mapping, attribute-filter
-mapping, search-result mapping, batch polling, detachment, and a reported
+The adapter exposes caller-controlled status retrieval; it does not poll. Its
+tests use fakes only. They cover status mapping, attribute-filter mapping,
+search-result mapping, batch status retrieval, detachment, and a reported
 same-File/multiple-vector-store rejection. A rejection is a capability outcome,
 not permission to silently upload, replace, or delete a File.
+
+The local adapter classifies only explicit multi-store attachment-conflict
+wording as that capability outcome. Confirmation of the live SDK/API's exact
+typed error shape remains **PRE-FLIGHT PENDING**; unrelated attachment errors
+propagate unchanged.
 
 ## Official references
 
 - [Vector Store Search](https://developers.openai.com/api/reference/python/resources/vector_stores/methods/search)
 - [Create Vector Store File](https://developers.openai.com/api/reference/cli/resources/vector_stores/subresources/files/methods/create)
+- [Delete Vector Store File (detach)](https://developers.openai.com/api/reference/python/resources/vector_stores/subresources/files/methods/delete)
 - [Vector Store File Batches](https://developers.openai.com/api/reference/cli/resources/vector_stores/subresources/file_batches)
 
 ## Required live preflight before real compilation
@@ -38,7 +45,7 @@ verify the current API/SDK supports:
 1. creating a disposable store and attaching a disposable File;
 2. attaching the same File to a second disposable candidate store, or clearly
    reporting that unsupported outcome;
-3. batch status progression and vector-store search attribute filters; and
+3. caller-controlled batch status retrieval and vector-store search attribute filters; and
 4. detaching from the disposable store without deleting the underlying File.
 
 Record the SDK version, calls, identifiers, statuses, filter/search result, and

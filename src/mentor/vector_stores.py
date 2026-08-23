@@ -4,7 +4,14 @@ from dataclasses import dataclass
 from typing import Any, Mapping
 
 
-AttributeValue = str | float | bool
+MetadataValue = str
+AttributeValue = str | int | float | bool
+
+
+@dataclass(frozen=True)
+class VectorStoreLastError:
+    code: str | None
+    message: str | None
 
 
 @dataclass(frozen=True)
@@ -18,6 +25,7 @@ class VectorStoreFile:
     file_id: str
     attachment_id: str
     status: str | None
+    last_error: VectorStoreLastError | None
 
 
 @dataclass(frozen=True)
@@ -25,6 +33,7 @@ class VectorStoreBatch:
     batch_id: str
     status: str | None
     file_counts: dict[str, int]
+    last_error: VectorStoreLastError | None
 
 
 @dataclass(frozen=True)
@@ -54,15 +63,17 @@ class VectorStoreAdapter:
     def __init__(self, client: Any):
         self._client = client
 
-    def create_store(self, name: str, metadata: Mapping[str, AttributeValue]) -> VectorStore:
-        remote = self._client.vector_stores.create(name=name, metadata=dict(metadata))
+    def create_store(self, name: str, metadata: Mapping[str, MetadataValue]) -> VectorStore:
+        remote = self._client.vector_stores.create(
+            name=name, metadata=_string_metadata(metadata)
+        )
         return VectorStore(store_id=_required(remote, "id"), status=_optional(remote, "status"))
 
     def attach_file(
         self, vector_store_id: str, file_id: str, attributes: Mapping[str, AttributeValue]
     ) -> VectorStoreFile:
         remote = self._client.vector_stores.files.create(
-            vector_store_id, file_id=file_id, attributes=dict(attributes)
+            vector_store_id, file_id=file_id, attributes=_file_attributes(attributes)
         )
         return _vector_store_file(remote, file_id)
 
@@ -87,7 +98,7 @@ class VectorStoreAdapter:
         self, vector_store_id: str, file_ids: list[str], attributes: Mapping[str, AttributeValue]
     ) -> VectorStoreBatch:
         remote = self._client.vector_stores.file_batches.create(
-            vector_store_id, file_ids=file_ids, attributes=dict(attributes)
+            vector_store_id, file_ids=file_ids, attributes=_file_attributes(attributes)
         )
         return _vector_store_batch(remote)
 
@@ -123,7 +134,7 @@ def _filters(attributes: Mapping[str, AttributeValue]) -> dict[str, Any]:
         "type": "and",
         "filters": [
             {"type": "eq", "key": key, "value": value}
-            for key, value in attributes.items()
+            for key, value in _file_attributes(attributes).items()
         ],
     }
 
@@ -133,6 +144,7 @@ def _vector_store_file(remote: Any, file_id: str) -> VectorStoreFile:
         file_id=file_id,
         attachment_id=_required(remote, "id"),
         status=_optional(remote, "status"),
+        last_error=_last_error(remote),
     )
 
 
@@ -144,6 +156,7 @@ def _vector_store_batch(remote: Any) -> VectorStoreBatch:
         batch_id=_required(remote, "id"),
         status=_optional(remote, "status"),
         file_counts={str(key): int(value) for key, value in counts.items()},
+        last_error=_last_error(remote),
     )
 
 
@@ -187,8 +200,38 @@ def _float_or_none(value: Any) -> float | None:
     return float(value) if isinstance(value, int | float) else None
 
 
+def _string_metadata(metadata: Mapping[str, MetadataValue]) -> dict[str, str]:
+    values = dict(metadata)
+    if any(not isinstance(key, str) or not isinstance(value, str) for key, value in values.items()):
+        raise ValueError("vector-store metadata values must be strings")
+    return values
+
+
+def _file_attributes(attributes: Mapping[str, AttributeValue]) -> dict[str, AttributeValue]:
+    values = dict(attributes)
+    if any(
+        not isinstance(key, str) or not isinstance(value, str | int | float | bool)
+        for key, value in values.items()
+    ):
+        raise ValueError("vector-store-file attributes must be strings, numbers, or booleans")
+    return values
+
+
+def _last_error(remote: Any) -> VectorStoreLastError | None:
+    value = _value(remote, "last_error")
+    if value is None:
+        return None
+    return VectorStoreLastError(code=_optional(value, "code"), message=_optional(value, "message"))
+
+
 def _is_multiple_store_rejection(reason: str) -> bool:
     normalized = " ".join(reason.casefold().split())
-    return "file" in normalized and "vector store" in normalized and (
-        "multiple" in normalized or "cannot" in normalized
+    return any(
+        phrase in normalized
+        for phrase in (
+            "cannot be attached to multiple vector stores",
+            "already attached to another vector store",
+            "already attached to a different vector store",
+            "already associated with another vector store",
+        )
     )
