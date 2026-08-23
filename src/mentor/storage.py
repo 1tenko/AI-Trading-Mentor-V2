@@ -595,7 +595,13 @@ class Storage:
                 """,
                 (snapshot_id,),
             ).fetchall()
-            return [self._derived_record_from_row(connection, row) for row in rows]
+            records = []
+            for row in rows:
+                try:
+                    records.append(self._derived_record_from_row(connection, row))
+                except (IndexError, TypeError, ValueError):
+                    continue
+            return records
 
     def _store_record_family(self, connection: sqlite3.Connection, record: DerivedRecord) -> None:
         if isinstance(record, Claim):
@@ -739,6 +745,7 @@ class Storage:
         return record
 
     def _create_derived_record_triggers(self, connection: sqlite3.Connection) -> None:
+        connection.execute("DROP TRIGGER IF EXISTS derived_records_require_children")
         connection.executescript(
             """
             CREATE TRIGGER IF NOT EXISTS derived_records_require_staging
@@ -793,6 +800,62 @@ class Storage:
                 SELECT CASE WHEN NEW.family = 'conflict_unresolved' AND (
                     SELECT COUNT(*) FROM derived_record_terms WHERE record_id = NEW.record_id AND term_role = 'alternative'
                 ) NOT BETWEEN 2 AND 8 THEN RAISE(ABORT, 'derived records require bounded alternatives') END;
+                SELECT CASE WHEN length(trim(NEW.qualification)) = 0 OR length(NEW.qualification) > 280
+                    THEN RAISE(ABORT, 'derived records require concise qualification') END;
+                SELECT CASE WHEN EXISTS(
+                    SELECT 1 FROM derived_record_anchors
+                    WHERE record_id = NEW.record_id AND length(trim(anchor_id)) = 0
+                ) OR EXISTS(
+                    SELECT 1 FROM derived_record_dependencies
+                    WHERE record_id = NEW.record_id AND length(trim(dependency_id)) = 0
+                ) THEN RAISE(ABORT, 'derived records require non-empty references') END;
+                SELECT CASE WHEN (SELECT COUNT(*) FROM derived_record_facets WHERE record_id = NEW.record_id) > 5
+                    OR EXISTS(
+                        SELECT 1 FROM derived_record_facets
+                        WHERE record_id = NEW.record_id AND (length(trim(facet_value)) = 0 OR length(facet_value) > 160)
+                    ) OR (SELECT COUNT(DISTINCT facet_name) FROM derived_record_facets WHERE record_id = NEW.record_id)
+                        != (SELECT COUNT(*) FROM derived_record_facets WHERE record_id = NEW.record_id)
+                    THEN RAISE(ABORT, 'derived records require bounded unique facets') END;
+                SELECT CASE WHEN NEW.family = 'claim' AND NOT EXISTS(
+                    SELECT 1 FROM derived_claims
+                    WHERE record_id = NEW.record_id
+                      AND NEW.derived_kind IN ('statement', 'definition', 'recommendation', 'strategy_implication')
+                      AND length(trim(subject)) > 0 AND length(subject) <= 240
+                      AND length(trim(predicate)) > 0 AND length(predicate) <= 240
+                      AND length(trim(object)) > 0 AND length(object) <= 240
+                ) THEN RAISE(ABORT, 'derived records require valid claim content') END;
+                SELECT CASE WHEN NEW.family = 'relationship' AND NOT EXISTS(
+                    SELECT 1 FROM derived_relationships
+                    WHERE record_id = NEW.record_id
+                      AND NEW.derived_kind = 'relation'
+                      AND relation IN ('supports', 'contrasts', 'depends_on', 'causes')
+                      AND length(trim(left_term)) > 0 AND length(left_term) <= 240
+                      AND length(trim(right_term)) > 0 AND length(right_term) <= 240
+                ) THEN RAISE(ABORT, 'derived records require valid relationship content') END;
+                SELECT CASE WHEN NEW.family = 'procedure_sequence_hierarchy' AND NOT EXISTS(
+                    SELECT 1 FROM derived_procedure_sequence_hierarchy
+                    WHERE record_id = NEW.record_id AND structure_kind = NEW.derived_kind
+                ) OR NEW.family = 'procedure_sequence_hierarchy' AND EXISTS(
+                    SELECT 1 FROM derived_record_terms
+                    WHERE record_id = NEW.record_id AND term_role = 'procedure_term'
+                      AND (length(trim(value)) = 0 OR length(value) > 240)
+                ) THEN RAISE(ABORT, 'derived records require valid procedure content') END;
+                SELECT CASE WHEN NEW.family = 'evolution' AND NOT EXISTS(
+                    SELECT 1 FROM derived_evolutions
+                    WHERE record_id = NEW.record_id AND NEW.derived_kind = 'change'
+                      AND length(trim(subject)) > 0 AND length(subject) <= 240
+                      AND length(trim(previous_value)) > 0 AND length(previous_value) <= 240
+                      AND length(trim(current_value)) > 0 AND length(current_value) <= 240
+                ) THEN RAISE(ABORT, 'derived records require valid evolution content') END;
+                SELECT CASE WHEN NEW.family = 'conflict_unresolved' AND NOT EXISTS(
+                    SELECT 1 FROM derived_conflict_unresolved
+                    WHERE record_id = NEW.record_id AND issue_kind = NEW.derived_kind
+                      AND length(trim(subject)) > 0 AND length(subject) <= 240
+                ) OR NEW.family = 'conflict_unresolved' AND EXISTS(
+                    SELECT 1 FROM derived_record_terms
+                    WHERE record_id = NEW.record_id AND term_role = 'alternative'
+                      AND (length(trim(value)) = 0 OR length(value) > 240)
+                ) THEN RAISE(ABORT, 'derived records require valid conflict content') END;
             END;
             CREATE TRIGGER IF NOT EXISTS derived_records_lock_finalized_rows
             BEFORE UPDATE ON derived_records WHEN OLD.finalized = 1

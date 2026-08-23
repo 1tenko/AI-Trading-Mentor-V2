@@ -233,6 +233,108 @@ def test_record_construction_rejects_unbounded_semantic_content(factory, message
         factory()
 
 
+@pytest.mark.parametrize(
+    "subject, predicate, object",
+    [
+        ("", "states", "observation"),
+        ("signal", "states", "x" * 241),
+    ],
+)
+def test_sqlite_rejects_direct_finalization_with_invalid_claim_content(tmp_path, subject, predicate, object):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    snapshot = snapshot_for(storage)
+
+    with storage._connect() as connection:
+        _stage_direct_claim(connection, snapshot, "rec_direct_claim", subject, predicate, object)
+        with pytest.raises(sqlite3.IntegrityError, match="claim content"):
+            connection.execute("UPDATE derived_records SET finalized = 1 WHERE record_id = 'rec_direct_claim'")
+
+
+@pytest.mark.parametrize(
+    "facets",
+    [
+        (("scope", "x" * 161),),
+        (("scope", "first"), ("scope", "second")),
+    ],
+)
+def test_sqlite_rejects_direct_finalization_with_invalid_facets(tmp_path, facets):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    snapshot = snapshot_for(storage)
+
+    with storage._connect() as connection:
+        _stage_direct_claim(connection, snapshot, "rec_direct_facets", "signal", "states", "observation")
+        connection.executemany(
+            "INSERT INTO derived_record_facets VALUES ('rec_direct_facets', ?, ?, ?)",
+            [(position, name, value) for position, (name, value) in enumerate(facets)],
+        )
+        with pytest.raises(sqlite3.IntegrityError, match="facets"):
+            connection.execute("UPDATE derived_records SET finalized = 1 WHERE record_id = 'rec_direct_facets'")
+
+
+def test_sqlite_rejects_direct_finalization_with_an_invalid_relationship(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    snapshot = snapshot_for(storage)
+
+    with storage._connect() as connection:
+        connection.execute(
+            """
+            INSERT INTO derived_records(
+                record_id, snapshot_id, family, derived_kind, evidence_state, validation_state,
+                lifecycle_state, qualification
+            ) VALUES ('rec_direct_relationship', ?, 'relationship', 'relation', 'raw_taught', 'validated', 'active', 'Synthetic.')
+            """,
+            (snapshot.snapshot_id,),
+        )
+        connection.execute("INSERT INTO derived_record_anchors VALUES ('rec_direct_relationship', 0, 'anc_synthetic')")
+        connection.execute(
+            "INSERT INTO derived_record_dependencies VALUES ('rec_direct_relationship', 0, 'source_revision', ?)",
+            (snapshot.selected_revision_ids[0],),
+        )
+        connection.execute(
+            "INSERT INTO derived_relationships VALUES ('rec_direct_relationship', 'left', 'invented', 'right')"
+        )
+        with pytest.raises(sqlite3.IntegrityError, match="relationship content"):
+            connection.execute("UPDATE derived_records SET finalized = 1 WHERE record_id = 'rec_direct_relationship'")
+
+
+def test_noncanonical_direct_record_is_ignored_without_breaking_snapshot_reads(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    snapshot = snapshot_for(storage)
+    valid = claim(
+        snapshot_id=snapshot.snapshot_id,
+        dependencies=(RecordDependency("source_revision", snapshot.selected_revision_ids[0]),),
+    )
+    storage.store_derived_record(valid)
+
+    with storage._connect() as connection:
+        _stage_direct_claim(connection, snapshot, f"rec_{'0' * 64}", "signal", "states", "observation")
+        connection.execute(f"UPDATE derived_records SET finalized = 1 WHERE record_id = 'rec_{'0' * 64}'")
+
+    assert storage.derived_records(snapshot.snapshot_id) == [valid]
+
+
+def _stage_direct_claim(connection, snapshot, record_id, subject, predicate, object):
+    connection.execute(
+        """
+        INSERT INTO derived_records(
+            record_id, snapshot_id, family, derived_kind, evidence_state, validation_state,
+            lifecycle_state, qualification
+        ) VALUES (?, ?, 'claim', 'statement', 'raw_taught', 'validated', 'active', 'Synthetic.')
+        """,
+        (record_id, snapshot.snapshot_id),
+    )
+    connection.execute("INSERT INTO derived_record_anchors VALUES (?, 0, 'anc_synthetic')", (record_id,))
+    connection.execute(
+        "INSERT INTO derived_record_dependencies VALUES (?, 0, 'source_revision', ?)",
+        (record_id, snapshot.selected_revision_ids[0]),
+    )
+    connection.execute("INSERT INTO derived_claims VALUES (?, ?, ?, ?)", (record_id, subject, predicate, object))
+
+
 def snapshot_for(storage: Storage) -> CorpusSnapshot:
     collection = Collection("collection_synthetic", "Synthetic", "test", True, "test")
     source = Source.create(
