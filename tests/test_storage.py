@@ -2,6 +2,7 @@ import sqlite3
 
 import pytest
 
+from mentor.knowledge import Collection, Source, SourceRevision
 from mentor.storage import Storage
 
 
@@ -209,3 +210,88 @@ def test_storage_rolls_back_a_thread_delete_if_any_owned_row_cannot_be_removed(t
     assert storage.has_thread(thread_id)
     assert storage.thread_items(thread_id)
     assert storage.display_turns(thread_id)
+
+
+def test_storage_adds_library_tables_to_a_populated_legacy_database_without_changing_phase_two_state(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    storage.set_vector_store("vs_legacy")
+    storage.register_source(
+        relative_path="2026/synthetic-lesson.txt",
+        filename="synthetic-lesson.txt",
+        year=2026,
+        local_path="C:/synthetic/2026/synthetic-lesson.txt",
+        modified_at=1_700_000_000.0,
+        file_id="file_legacy",
+        vector_store_file_id="vsf_legacy",
+    )
+    thread_id = storage.create_thread("Legacy question")
+    storage.append_thread_items(
+        thread_id,
+        [{"role": "user", "content": [{"type": "input_text", "text": "Question"}]}],
+    )
+    storage.record_display_turn(
+        thread_id,
+        user_text="Question",
+        answer_markdown="Answer",
+        citations=[{"file_id": "file_legacy", "filename": "synthetic-lesson.txt"}],
+        evidence=[],
+        diagnostics={"response_id": "resp_legacy"},
+        response_id="resp_legacy",
+        status="completed",
+        incomplete_reason=None,
+    )
+    storage.record_response_diagnostics(thread_id, "resp_legacy", {"response_id": "resp_legacy"})
+
+    storage.initialize()
+
+    assert storage.vector_store_id() == "vs_legacy"
+    assert storage.source_for_file("file_legacy").relative_path == "2026/synthetic-lesson.txt"
+    assert storage.thread_items(thread_id)[0]["content"][0]["text"] == "Question"
+    assert storage.display_turns(thread_id)[0]["citations"] == [
+        {"file_id": "file_legacy", "filename": "synthetic-lesson.txt"}
+    ]
+    assert storage.response_diagnostics(thread_id) == [{"response_id": "resp_legacy"}]
+    with sqlite3.connect(storage.database_path) as connection:
+        tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+    assert {"collections", "library_sources", "source_revisions"} <= tables
+
+    storage.initialize()
+    with sqlite3.connect(storage.database_path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM collections").fetchone()[0] == 0
+
+
+def test_storage_persists_an_immutable_library_source_revision_idempotently(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    collection = Collection("collection_synthetic", "Synthetic", "trading", True, "2026")
+    source = Source.create(
+        collection_id=collection.collection_id,
+        identity_key="legacy:file_synthetic",
+        source_type="transcript",
+        author="Synthetic Author",
+        course="Synthetic Course",
+        lesson_title="Synthetic lesson",
+        year=2026,
+        original_filename="synthetic.txt",
+        local_provenance="C:/synthetic/synthetic.txt",
+    )
+    revision = SourceRevision.create(
+        source_id=source.source_id,
+        content_sha256="b" * 64,
+        byte_size=42,
+        local_locator="C:/synthetic/synthetic.txt",
+        observed_at=1_700_000_000.0,
+        lifecycle_state="active",
+    )
+
+    storage.store_collection(collection)
+    storage.store_source(source)
+    storage.store_source_revision(revision)
+    storage.store_source_revision(revision)
+
+    assert storage.collection(collection.collection_id) == collection
+    assert storage.library_source(source.source_id) == source
+    assert storage.source_revision(revision.revision_id) == revision
+    with sqlite3.connect(storage.database_path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM source_revisions").fetchone()[0] == 1

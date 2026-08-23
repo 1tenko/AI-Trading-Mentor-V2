@@ -5,6 +5,8 @@ import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 
+from mentor.knowledge import Collection, Source as LibrarySource, SourceRevision
+
 
 @dataclass(frozen=True)
 class Source:
@@ -80,12 +82,138 @@ class Storage:
                     raw_end_position INTEGER,
                     PRIMARY KEY(thread_id, turn_number)
                 );
+                CREATE TABLE IF NOT EXISTS collections (
+                    collection_id TEXT PRIMARY KEY,
+                    display_name TEXT NOT NULL,
+                    domain TEXT NOT NULL,
+                    enabled INTEGER NOT NULL CHECK(enabled IN (0, 1)),
+                    scope TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS library_sources (
+                    source_id TEXT PRIMARY KEY,
+                    collection_id TEXT NOT NULL REFERENCES collections(collection_id),
+                    identity_key TEXT NOT NULL,
+                    source_type TEXT NOT NULL,
+                    author TEXT NOT NULL,
+                    course TEXT NOT NULL,
+                    lesson_title TEXT NOT NULL,
+                    year INTEGER NOT NULL,
+                    original_filename TEXT NOT NULL,
+                    local_provenance TEXT NOT NULL,
+                    UNIQUE(collection_id, identity_key)
+                );
+                CREATE TABLE IF NOT EXISTS source_revisions (
+                    revision_id TEXT PRIMARY KEY,
+                    source_id TEXT NOT NULL REFERENCES library_sources(source_id),
+                    content_sha256 TEXT NOT NULL,
+                    byte_size INTEGER NOT NULL CHECK(byte_size >= 0),
+                    local_locator TEXT NOT NULL,
+                    observed_at REAL NOT NULL,
+                    lifecycle_state TEXT NOT NULL,
+                    remote_file_id TEXT,
+                    remote_vector_store_file_id TEXT,
+                    UNIQUE(source_id, content_sha256)
+                );
                 """
             )
             columns = {row[1] for row in connection.execute("PRAGMA table_info(sources)")}
             if "modified_at" not in columns:
                 connection.execute("ALTER TABLE sources ADD COLUMN modified_at REAL")
             self._backfill_display_turns(connection)
+
+    def store_collection(self, collection: Collection) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT INTO collections(collection_id, display_name, domain, enabled, scope) "
+                "VALUES (?, ?, ?, ?, ?) ON CONFLICT(collection_id) DO NOTHING",
+                (
+                    collection.collection_id,
+                    collection.display_name,
+                    collection.domain,
+                    collection.enabled,
+                    collection.scope,
+                ),
+            )
+
+    def collection(self, collection_id: str) -> Collection | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT collection_id, display_name, domain, enabled, scope "
+                "FROM collections WHERE collection_id = ?",
+                (collection_id,),
+            ).fetchone()
+        return None if row is None else Collection(*row[:3], bool(row[3]), row[4])
+
+    def store_source(self, source: LibrarySource) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO library_sources(
+                    source_id, collection_id, identity_key, source_type, author, course,
+                    lesson_title, year, original_filename, local_provenance
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(source_id) DO NOTHING
+                """,
+                (
+                    source.source_id,
+                    source.collection_id,
+                    source.identity_key,
+                    source.source_type,
+                    source.author,
+                    source.course,
+                    source.lesson_title,
+                    source.year,
+                    source.original_filename,
+                    source.local_provenance,
+                ),
+            )
+
+    def library_source(self, source_id: str) -> LibrarySource | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT source_id, collection_id, identity_key, source_type, author, course,
+                       lesson_title, year, original_filename, local_provenance
+                FROM library_sources WHERE source_id = ?
+                """,
+                (source_id,),
+            ).fetchone()
+        return None if row is None else LibrarySource(*row)
+
+    def store_source_revision(self, revision: SourceRevision) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO source_revisions(
+                    revision_id, source_id, content_sha256, byte_size, local_locator,
+                    observed_at, lifecycle_state, remote_file_id, remote_vector_store_file_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(revision_id) DO NOTHING
+                """,
+                (
+                    revision.revision_id,
+                    revision.source_id,
+                    revision.content_sha256,
+                    revision.byte_size,
+                    revision.local_locator,
+                    revision.observed_at,
+                    revision.lifecycle_state,
+                    revision.remote_file_id,
+                    revision.remote_vector_store_file_id,
+                ),
+            )
+
+    def source_revision(self, revision_id: str) -> SourceRevision | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT revision_id, source_id, content_sha256, byte_size, local_locator,
+                       observed_at, lifecycle_state, remote_file_id, remote_vector_store_file_id
+                FROM source_revisions WHERE revision_id = ?
+                """,
+                (revision_id,),
+            ).fetchone()
+        return None if row is None else SourceRevision(*row)
 
     def set_vector_store(self, vector_store_id: str) -> None:
         with self._connect() as connection:
