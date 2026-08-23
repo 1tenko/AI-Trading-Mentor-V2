@@ -160,10 +160,10 @@ def test_normal_storage_excludes_each_nonaffirmative_source_candidate_and_persis
 
     with pytest.raises(ValueError, match="semantic validation"):
         storage.store_derived_record(candidate)
-    result = SemanticValidator(SimpleNamespace(responses=responses)).validate(
+    result = storage.validate_and_store_source_extracted(
+        client=SimpleNamespace(responses=responses),
         candidate=candidate, revision=revision, transcript=TRANSCRIPT, anchors={anchor.anchor_id: anchor}
     )
-    storage.store_validation_result(result)
 
     assert storage.derived_records(snapshot.snapshot_id) == []
     assert storage.validation_audits(snapshot.snapshot_id) == [
@@ -174,13 +174,15 @@ def test_normal_storage_excludes_each_nonaffirmative_source_candidate_and_persis
 def test_normal_storage_persists_only_the_validated_affirmative_replacement(tmp_path):
     storage, snapshot = validation_storage(tmp_path)
     revision, candidate, anchor = candidate_and_anchor(snapshot.snapshot_id)
-    result = SemanticValidator(SimpleNamespace(responses=FakeResponses(FIXTURES["affirmatively_supported"]))).validate(
+    responses = FakeResponses(FIXTURES["affirmatively_supported"])
+
+    result = storage.validate_and_store_source_extracted(
+        client=SimpleNamespace(responses=responses),
         candidate=candidate, revision=revision, transcript=TRANSCRIPT, anchors={anchor.anchor_id: anchor}
     )
 
     with pytest.raises(ValueError, match="semantic validation result"):
         storage.store_derived_record(result.source_extracted)
-    storage.store_validation_result(result)
 
     assert storage.derived_records(snapshot.snapshot_id) == [result.source_extracted]
     assert storage.derived_records(snapshot.snapshot_id)[0].compiler_provenance == candidate.compiler_provenance
@@ -198,7 +200,8 @@ def test_semantic_validator_rejects_sol_before_any_mock_client_call():
     assert responses.requests == []
 
 
-def test_semantic_validator_rejects_non_claim_records_before_any_mock_client_call():
+def test_storage_validation_path_rejects_non_claim_records_before_any_mock_client_call(tmp_path):
+    storage, _ = validation_storage(tmp_path)
     _, revision = source_and_revision()
     non_claim = Relationship.create(
         snapshot_id="snap_synthetic",
@@ -214,7 +217,8 @@ def test_semantic_validator_rejects_non_claim_records_before_any_mock_client_cal
     responses = FakeResponses(FIXTURES["affirmatively_supported"])
 
     with pytest.raises(ValueError, match="Claim candidates"):
-        SemanticValidator(SimpleNamespace(responses=responses)).validate(
+        storage.validate_and_store_source_extracted(
+            client=SimpleNamespace(responses=responses),
             candidate=non_claim, revision=revision, transcript=TRANSCRIPT, anchors={}
         )
 
@@ -222,7 +226,7 @@ def test_semantic_validator_rejects_non_claim_records_before_any_mock_client_cal
 
 
 @pytest.mark.parametrize("family", ["claim", "relationship", "procedure", "evolution", "conflict"])
-def test_storage_rejects_forged_validation_results_for_every_derived_family(tmp_path, family):
+def test_storage_has_no_result_accepting_path_for_forged_validation_results(tmp_path, family):
     storage, snapshot = validation_storage(tmp_path)
     revision, candidate, _ = candidate_and_anchor(snapshot.snapshot_id)
     common = {
@@ -251,8 +255,15 @@ def test_storage_rejects_forged_validation_results_for_every_derived_family(tmp_
         record,
     )
 
-    with pytest.raises(ValueError, match="validator-issued"):
-        storage.store_validation_result(forged)
+    assert not hasattr(storage, "store_validation_result")
+    with pytest.raises(ValueError, match="Claim candidates"):
+        storage.validate_and_store_source_extracted(
+            client=SimpleNamespace(responses=FakeResponses(FIXTURES["affirmatively_supported"])),
+            candidate=forged,
+            revision=revision,
+            transcript=TRANSCRIPT,
+            anchors={},
+        )
 
     assert storage.derived_records(snapshot.snapshot_id) == []
     assert storage.validation_audits(snapshot.snapshot_id) == []
@@ -261,21 +272,24 @@ def test_storage_rejects_forged_validation_results_for_every_derived_family(tmp_
 def test_validation_result_storage_rolls_back_a_validated_record_when_its_audit_insert_fails(tmp_path):
     storage, snapshot = validation_storage(tmp_path)
     revision, candidate, anchor = candidate_and_anchor(snapshot.snapshot_id)
-    partial = SemanticValidator(SimpleNamespace(responses=FakeResponses(FIXTURES["partially_supported"]))).validate(
+    storage.validate_and_store_source_extracted(
+        client=SimpleNamespace(responses=FakeResponses(FIXTURES["partially_supported"])),
         candidate=candidate, revision=revision, transcript=TRANSCRIPT, anchors={anchor.anchor_id: anchor}
     )
-    affirmative = SemanticValidator(SimpleNamespace(responses=FakeResponses(FIXTURES["affirmatively_supported"]))).validate(
-        candidate=candidate, revision=revision, transcript=TRANSCRIPT, anchors={anchor.anchor_id: anchor}
-    )
-    storage.store_validation_result(partial)
 
     with pytest.raises(sqlite3.IntegrityError):
-        storage.store_validation_result(affirmative)
+        storage.validate_and_store_source_extracted(
+            client=SimpleNamespace(responses=FakeResponses(FIXTURES["affirmatively_supported"])),
+            candidate=candidate,
+            revision=revision,
+            transcript=TRANSCRIPT,
+            anchors={anchor.anchor_id: anchor},
+        )
 
     assert storage.derived_records(snapshot.snapshot_id) == []
 
 
-def test_only_semantic_validator_can_issue_a_storage_accepted_result(tmp_path):
+def test_mutated_public_and_private_proof_registries_cannot_enable_forged_storage(tmp_path, monkeypatch):
     storage, snapshot = validation_storage(tmp_path)
     revision, candidate, anchor = candidate_and_anchor(snapshot.snapshot_id)
     legitimate = SemanticValidator(SimpleNamespace(responses=FakeResponses(FIXTURES["affirmatively_supported"]))).validate(
@@ -289,12 +303,34 @@ def test_only_semantic_validator_can_issue_a_storage_accepted_result(tmp_path):
         legitimate.anchor_ids,
         legitimate.source_extracted,
     )
+    proof = object()
+    object.__setattr__(forged, "_proof", proof)
+    monkeypatch.setattr(validation, "ISSUED_RESULTS", {proof: forged}, raising=False)
+    monkeypatch.setattr(
+        validation,
+        "_ISSUED_RESULTS",
+        {
+            proof: (
+                forged.candidate_record_id,
+                forged.snapshot_id,
+                forged.outcome,
+                forged.audit,
+                forged.anchor_ids,
+                forged.source_extracted,
+            )
+        },
+        raising=False,
+    )
 
-    with pytest.raises(AttributeError):
-        validation._issue(forged)
-    with pytest.raises(ValueError, match="validator-issued"):
-        storage.store_validation_result(forged)
+    assert not hasattr(storage, "store_validation_result")
+    with pytest.raises(ValueError, match="Claim candidates"):
+        storage.validate_and_store_source_extracted(
+            client=SimpleNamespace(responses=FakeResponses(FIXTURES["affirmatively_supported"])),
+            candidate=forged,
+            revision=revision,
+            transcript=TRANSCRIPT,
+            anchors={anchor.anchor_id: anchor},
+        )
 
-    storage.store_validation_result(legitimate)
-
-    assert storage.derived_records(snapshot.snapshot_id) == [legitimate.source_extracted]
+    assert storage.derived_records(snapshot.snapshot_id) == []
+    assert storage.validation_audits(snapshot.snapshot_id) == []

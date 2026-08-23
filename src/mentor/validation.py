@@ -1,6 +1,6 @@
 """Deterministic anchors plus separately prompted semantic claim validation."""
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 import json
 from typing import Any, Mapping, Sequence
 
@@ -13,9 +13,6 @@ from mentor.knowledge import SourceRevision
 SEMANTIC_OUTCOMES = frozenset(
     {"affirmatively_supported", "partially_supported", "unsupported", "ambiguous", "needs_broader_context"}
 )
-_ISSUED_RESULTS: dict[object, tuple[object, ...]] = {}
-
-
 @dataclass(frozen=True)
 class ValidationResult:
     candidate_record_id: str
@@ -24,7 +21,6 @@ class ValidationResult:
     audit: str
     anchor_ids: tuple[str, ...]
     source_extracted: Claim | None
-    _proof: object | None = field(default=None, repr=False, compare=False)
 
 
 class SemanticValidator:
@@ -55,32 +51,18 @@ class SemanticValidator:
             )
         )
         outcome, audit = _semantic_response(response)
-        proof = object()
-        result = ValidationResult(
+        return ValidationResult(
             candidate.record_id,
             candidate.snapshot_id,
             outcome,
             audit,
             tuple(anchor_id for anchor_id, _ in spans),
             _validated_replacement(candidate) if outcome == "affirmatively_supported" else None,
-            proof,
         )
-        _ISSUED_RESULTS[proof] = _signature(result)
-        return result
 
 
 def can_publish_source_extracted(results: Sequence[ValidationResult]) -> bool:
     return all(result.source_extracted is not None for result in results)
-
-
-def is_validator_issued(result: ValidationResult) -> bool:
-    return result._proof is not None and _ISSUED_RESULTS.get(result._proof) == _signature(result)
-
-
-def consume_validator_result(result: ValidationResult) -> None:
-    if not is_validator_issued(result):
-        raise ValueError("semantic validation result is not validator-issued")
-    del _ISSUED_RESULTS[result._proof]
 
 
 def _validated_spans(
@@ -130,15 +112,4 @@ def _validated_replacement(candidate: Claim) -> Claim:
         evidence_state=candidate.evidence_state,
         compiler_provenance=candidate.compiler_provenance,
         facets=candidate.facets,
-    )
-
-
-def _signature(result: ValidationResult) -> tuple[object, ...]:
-    return (
-        result.candidate_record_id,
-        result.snapshot_id,
-        result.outcome,
-        result.audit,
-        result.anchor_ids,
-        result.source_extracted,
     )

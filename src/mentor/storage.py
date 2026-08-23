@@ -6,7 +6,9 @@ import time
 from dataclasses import replace
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Mapping
 
+from mentor.anchors import SourceAnchor
 from mentor.compilation import CompilationMetric, CompilationRun, CorpusSnapshot
 from mentor.derived_records import (
     Claim,
@@ -20,7 +22,7 @@ from mentor.derived_records import (
     Relationship,
     validate_record,
 )
-from mentor.validation import ValidationResult, consume_validator_result, is_validator_issued
+from mentor.validation import SemanticValidator, ValidationResult
 from mentor.knowledge import Collection, Source as LibrarySource, SourceRevision
 
 
@@ -625,9 +627,22 @@ class Storage:
             "UPDATE derived_records SET finalized = 1 WHERE record_id = ? AND finalized = 0", (record.record_id,)
         )
 
-    def store_validation_result(self, result: ValidationResult) -> None:
-        if not is_validator_issued(result):
-            raise ValueError("semantic validation result is not validator-issued")
+    def validate_and_store_source_extracted(
+        self,
+        *,
+        client: object,
+        candidate: Claim,
+        revision: SourceRevision,
+        transcript: str,
+        anchors: Mapping[str, SourceAnchor],
+        model: str = "synthetic-validator",
+    ) -> ValidationResult:
+        result = SemanticValidator(client, model=model).validate(
+            candidate=candidate,
+            revision=revision,
+            transcript=transcript,
+            anchors=anchors,
+        )
         if result.outcome == "affirmatively_supported":
             if not isinstance(result.source_extracted, Claim):
                 raise ValueError("affirmative semantic validation requires a validated source-extracted record")
@@ -661,7 +676,7 @@ class Storage:
                     result.source_extracted.record_id if result.source_extracted else None,
                 ),
             )
-        consume_validator_result(result)
+        return result
 
     def validation_audits(self, snapshot_id: str) -> list[tuple[str, str, str, str | None]]:
         with self._connect() as connection:
