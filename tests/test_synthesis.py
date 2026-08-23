@@ -265,7 +265,8 @@ def test_procedure_synthesis_retains_transitive_inputs_and_structured_branches()
         dependencies=(
             RecordDependency("source_revision", "rev_synthetic"),
             RecordDependency("derived_record", context.record_id),
-        )
+        ),
+        conditions=("If confirmation fails.",),
     )
     candidate = SynthesisCandidate.from_records(
         snapshot_id=SNAPSHOT_ID,
@@ -279,6 +280,7 @@ def test_procedure_synthesis_retains_transitive_inputs_and_structured_branches()
             ProcedureBranch(
                 condition="If confirmation fails.",
                 step_concept_ids=(candidate.concept_id_for("Observe"),),
+                condition_index=0,
             ),
         ),
     )
@@ -289,7 +291,7 @@ def test_procedure_synthesis_retains_transitive_inputs_and_structured_branches()
         candidate.concept_id_for("Enter"),
     ]
     assert procedure_synthesis.prerequisite_concept_ids == (candidate.concept_id_for("Context"),)
-    assert procedure_synthesis.conditions == ("Only after confirmation.",)
+    assert procedure_synthesis.conditions == ("If confirmation fails.",)
     assert procedure_synthesis.branches[0].step_concept_ids == (candidate.concept_id_for("Observe"),)
     assert procedure_synthesis.input_record_ids == (record.record_id, context.record_id)
     assert procedure_synthesis.anchor_ids == ("anc_procedure", "anc_context")
@@ -356,13 +358,20 @@ def test_ordered_procedure_and_branch_steps_allow_repeated_concept_ids_with_posi
     record = procedure(
         dependencies=(RecordDependency("source_revision", "rev_synthetic"),),
         terms=("Observe", "Observe", "Enter"),
+        conditions=("Repeat observation.",),
     )
     candidate = SynthesisCandidate.from_records(snapshot_id=SNAPSHOT_ID, records=(record,))
     observe_id = candidate.concept_id_for("Observe")
 
     synthesis = candidate.synthesize_procedure(
         record.record_id,
-        branches=(ProcedureBranch(condition="Repeat observation.", step_concept_ids=(observe_id, observe_id)),),
+        branches=(
+            ProcedureBranch(
+                condition="Repeat observation.",
+                step_concept_ids=(observe_id, observe_id),
+                condition_index=0,
+            ),
+        ),
     )
 
     assert [step.concept_id for step in synthesis.steps[:2]] == [observe_id, observe_id]
@@ -371,7 +380,14 @@ def test_ordered_procedure_and_branch_steps_allow_repeated_concept_ids_with_posi
     with pytest.raises(ValueError, match="positions"):
         candidate.synthesize_procedure(
             record.record_id,
-            branches=(ProcedureBranch(condition="Out of order.", step_concept_ids=(observe_id, observe_id), positions=(1, 0)),),
+            branches=(
+                ProcedureBranch(
+                    condition="Repeat observation.",
+                    step_concept_ids=(observe_id, observe_id),
+                    positions=(1, 0),
+                    condition_index=0,
+                ),
+            ),
         )
 
 
@@ -462,3 +478,96 @@ def test_procedure_rejects_private_text_in_conditions_and_branches():
     private_candidate = SynthesisCandidate.from_records(snapshot_id=SNAPSHOT_ID, records=(private_condition,))
     with pytest.raises(ValueError, match="private"):
         private_candidate.synthesize_procedure(private_condition.record_id)
+
+
+def test_hints_keep_same_label_relationship_roles_in_distinct_scopes():
+    record = relationship(left="Signal", right="Signal")
+    candidate = SynthesisCandidate.from_records(
+        snapshot_id=SNAPSHOT_ID,
+        records=(record,),
+        hints=(
+            ConceptHint(record.record_id, "Signal", scope="entry", role="left"),
+            ConceptHint(record.record_id, "Signal", scope="exit", role="right"),
+        ),
+    )
+
+    synthesis = candidate.synthesize_relationship(record.record_id, left_scope="entry", right_scope="exit")
+    assert synthesis.left_concept_id == candidate.concept_id_for("Signal", scope="entry")
+    assert synthesis.right_concept_id == candidate.concept_id_for("Signal", scope="exit")
+    assert synthesis.left_concept_id != synthesis.right_concept_id
+
+
+def test_hints_keep_repeated_procedure_positions_in_distinct_scopes():
+    record = procedure(
+        dependencies=(RecordDependency("source_revision", "rev_synthetic"),),
+        terms=("Observe", "Observe", "Enter"),
+    )
+    candidate = SynthesisCandidate.from_records(
+        snapshot_id=SNAPSHOT_ID,
+        records=(record,),
+        hints=(
+            ConceptHint(record.record_id, "Observe", scope="first", role="term", position=0),
+            ConceptHint(record.record_id, "Observe", scope="second", role="term", position=1),
+        ),
+    )
+
+    synthesis = candidate.synthesize_procedure(record.record_id, step_scopes=("first", "second", None))
+    assert synthesis.steps[0].concept_id == candidate.concept_id_for("Observe", scope="first")
+    assert synthesis.steps[1].concept_id == candidate.concept_id_for("Observe", scope="second")
+    assert synthesis.steps[0].concept_id != synthesis.steps[1].concept_id
+
+
+def test_hints_reject_ambiguous_repeated_record_labels_without_a_role_or_position():
+    record = procedure(
+        dependencies=(RecordDependency("source_revision", "rev_synthetic"),),
+        terms=("Observe", "Observe", "Enter"),
+    )
+
+    with pytest.raises(ValueError, match="ambiguous"):
+        SynthesisCandidate.from_records(
+            snapshot_id=SNAPSHOT_ID,
+            records=(record,),
+            hints=(ConceptHint(record.record_id, "Observe", scope="first"),),
+        )
+
+
+def test_procedure_conditions_require_an_allowed_structured_source_and_reject_normalized_private_text():
+    record = procedure(
+        dependencies=(RecordDependency("source_revision", "rev_synthetic"),),
+        terms=("Observe", "Enter"),
+        conditions=("Proceed after confirmation.",),
+    )
+    candidate = SynthesisCandidate.from_records(snapshot_id=SNAPSHOT_ID, records=(record,))
+    observe_id = candidate.concept_id_for("Observe")
+
+    with pytest.raises(ValueError, match="provenance"):
+        candidate.synthesize_procedure(
+            record.record_id,
+            branches=(
+                ProcedureBranch(
+                    condition="A safe but unsourced condition.",
+                    step_concept_ids=(observe_id,),
+                    condition_index=0,
+                ),
+            ),
+        )
+
+    sourced = candidate.synthesize_procedure(
+        record.record_id,
+        branches=(ProcedureBranch(condition="Proceed after confirmation.", step_concept_ids=(observe_id,)),),
+    )
+    assert sourced.branches[0].condition_index == 0
+
+    for private_condition in (
+        "My private analysis: hidden details.",
+        "Scratch pad: hidden details.",
+        "Transcript excerpt: exact speaker words.",
+    ):
+        private_record = procedure(
+            dependencies=(RecordDependency("source_revision", "rev_synthetic"),),
+            terms=("Observe", "Enter"),
+            conditions=(private_condition,),
+        )
+        private_candidate = SynthesisCandidate.from_records(snapshot_id=SNAPSHOT_ID, records=(private_record,))
+        with pytest.raises(ValueError, match="private|raw"):
+            private_candidate.synthesize_procedure(private_record.record_id)

@@ -3,6 +3,8 @@
 from dataclasses import dataclass
 from hashlib import sha256
 import json
+import re
+import unicodedata
 from typing import Sequence
 
 from mentor.derived_records import (
@@ -68,11 +70,15 @@ class ConceptHint:
     label: str
     aliases: tuple[str, ...] = ()
     scope: str | None = None
+    role: str | None = None
+    position: int | None = None
 
 
 @dataclass(frozen=True)
 class ConceptOccurrence:
     record_id: str
+    role: str
+    position: int | None
     label_key: str
     scope: str | None
     concept_id: str
@@ -105,6 +111,7 @@ class ProcedureBranch:
     condition: str
     step_concept_ids: tuple[str, ...]
     positions: tuple[int, ...] = ()
+    condition_index: int | None = None
 
 
 @dataclass(frozen=True)
@@ -195,8 +202,12 @@ class SynthesisCandidate:
         if not isinstance(record, Relationship):
             raise ValueError("relationship synthesis requires a relationship record")
         inputs = self._supporting_records(record)
-        left_concept_id = self._concept_id_for_occurrence(record.record_id, record.left, scope=left_scope)
-        right_concept_id = self._concept_id_for_occurrence(record.record_id, record.right, scope=right_scope)
+        left_concept_id = self._concept_id_for_occurrence(
+            record.record_id, "left", None, record.left, scope=left_scope
+        )
+        right_concept_id = self._concept_id_for_occurrence(
+            record.record_id, "right", None, record.right, scope=right_scope
+        )
         justification = _justification(record.relation)
         synthesis = RelationshipSynthesis(
             synthesis_id=_synthesis_id(
@@ -236,18 +247,16 @@ class SynthesisCandidate:
         if not isinstance(step_scopes, tuple) or (step_scopes and len(step_scopes) != len(record.terms)):
             raise ValueError("procedure step scopes must match ordered steps")
         step_scopes = step_scopes or (None,) * len(record.terms)
-        branches = _normalized_branches(branches, self.concepts)
+        conditions = self._procedure_conditions(record)
+        branches = _normalized_branches(branches, self.concepts, conditions)
         inputs = self._supporting_records(record)
         steps = tuple(
             ProcedureStep(
                 position,
-                self._concept_id_for_occurrence(record.record_id, term, scope=step_scopes[position]),
+                self._concept_id_for_occurrence(record.record_id, "term", position, term, scope=step_scopes[position]),
             )
             for position, term in enumerate(record.terms)
         )
-        conditions = tuple(facet.value for facet in record.facets if facet.name == "condition")
-        for condition in conditions:
-            _require_condition(condition)
         justification = _justification("procedure")
         synthesis = ProcedureSynthesis(
             synthesis_id=_synthesis_id(
@@ -258,7 +267,10 @@ class SynthesisCandidate:
                 (
                     tuple(step.concept_id for step in steps),
                     prerequisite_concept_ids,
-                    tuple((branch.condition, branch.step_concept_ids, branch.positions) for branch in branches),
+                    tuple(
+                        (branch.condition, branch.step_concept_ids, branch.positions, branch.condition_index)
+                        for branch in branches
+                    ),
                     conditions,
                     step_scopes,
                 ),
@@ -307,7 +319,10 @@ class SynthesisCandidate:
             _validate_justification(procedure.justification)
             _require_concept_ids(procedure.prerequisite_concept_ids, self.concepts, allow_empty=True)
             _require_ordered_concept_ids(tuple(step.concept_id for step in procedure.steps), self.concepts)
-            _normalized_branches(procedure.branches, self.concepts)
+            source_record = self._record(procedure.source_record_id)
+            if not isinstance(source_record, ProcedureSequenceHierarchy) or source_record.kind != "procedure":
+                raise ValueError("procedure synthesis requires a procedure record")
+            _normalized_branches(procedure.branches, self.concepts, self._procedure_conditions(source_record))
             expected = self.synthesize_procedure(
                 procedure.source_record_id,
                 prerequisite_concept_ids=procedure.prerequisite_concept_ids,
@@ -333,12 +348,19 @@ class SynthesisCandidate:
                 return record
         raise ValueError("unknown validated record")
 
-    def _concept_id_for_occurrence(self, record_id: str, label: str, *, scope: str | None) -> str:
+    def _concept_id_for_occurrence(
+        self, record_id: str, role: str, position: int | None, label: str, *, scope: str | None
+    ) -> str:
         label_key = _label_key(label)
+        role_key = _role_key(role)
+        _require_position(position)
         matches = [
             occurrence
             for occurrence in self.concept_occurrences
-            if occurrence.record_id == record_id and occurrence.label_key == label_key
+            if occurrence.record_id == record_id
+            and occurrence.role == role_key
+            and occurrence.position == position
+            and occurrence.label_key == label_key
         ]
         if len(matches) != 1:
             raise ValueError("record occurrence does not resolve to one concept")
@@ -348,6 +370,12 @@ class SynthesisCandidate:
                 raise ValueError("scope is required for this record occurrence")
             raise ValueError("scope does not match this record occurrence")
         return occurrence.concept_id
+
+    def _procedure_conditions(self, record: ProcedureSequenceHierarchy) -> tuple[str, ...]:
+        conditions = tuple(facet.value for facet in record.facets if facet.name == "condition")
+        for condition in conditions:
+            _require_condition(condition)
+        return conditions
 
     def _supporting_records(self, record: DerivedRecord) -> tuple[DerivedRecord, ...]:
         record_map = {item.record_id: item for item in self.records}
@@ -412,17 +440,19 @@ def _validate_concept_occurrences(
     occurrences: tuple[ConceptOccurrence, ...], records: Sequence[DerivedRecord], concepts: Sequence[Concept]
 ) -> None:
     expected = {
-        (record.record_id, _label_key(label))
+        (record.record_id, role, position)
         for record in records
-        for label in _record_labels(record)
+        for role, position, _ in _record_occurrence_terms(record)
     }
-    occurrence_keys = {(occurrence.record_id, occurrence.label_key) for occurrence in occurrences}
+    occurrence_keys = {(occurrence.record_id, occurrence.role, occurrence.position) for occurrence in occurrences}
     if occurrence_keys != expected or len(occurrence_keys) != len(occurrences):
         raise ValueError("concept occurrences must cover validated record terms exactly once")
     records_by_id = {record.record_id: record for record in records}
     concepts_by_id = {concept.concept_id: concept for concept in concepts}
     for occurrence in occurrences:
         record = records_by_id[occurrence.record_id]
+        _role_key(occurrence.role)
+        _require_position(occurrence.position)
         concept = concepts_by_id.get(occurrence.concept_id)
         if concept is None or record.record_id not in concept.supporting_record_ids:
             raise ValueError("concept occurrence requires a valid supporting concept")
@@ -431,35 +461,53 @@ def _validate_concept_occurrences(
         labels = {_label_key(concept.canonical_label), *(_label_key(alias) for alias in concept.aliases)}
         if occurrence.label_key not in labels:
             raise ValueError("concept occurrence label does not match concept")
+        if (occurrence.role, occurrence.position, occurrence.label_key) not in {
+            (role, position, _label_key(label)) for role, position, label in _record_occurrence_terms(record)
+        }:
+            raise ValueError("concept occurrence does not match a validated record term")
 
 
 def _cluster_concepts(
     snapshot_id: str, records: Sequence[DerivedRecord], hints: Sequence[ConceptHint]
 ) -> tuple[tuple[Concept, ...], tuple[ConceptOccurrence, ...]]:
-    occurrences: dict[tuple[str, str], tuple[DerivedRecord, str, str | None, tuple[str, ...]]] = {}
+    occurrences: dict[
+        tuple[str, str, int | None], tuple[DerivedRecord, str, int | None, str, str | None, tuple[str, ...]]
+    ] = {}
     for record in records:
-        for label in _record_labels(record):
-            occurrences[(record.record_id, _label_key(label))] = (record, label, None, ())
+        for role, position, label in _record_occurrence_terms(record):
+            occurrences[(record.record_id, role, position)] = (record, role, position, label, None, ())
     hinted = set()
     for hint in hints:
         if not isinstance(hint, ConceptHint):
             raise ValueError("concept hints must be typed")
-        key = (hint.record_id, _label_key(hint.label))
-        if key not in occurrences:
+        role = _role_key(hint.role) if hint.role is not None else None
+        _require_position(hint.position)
+        candidates = [
+            key
+            for key, (_, occurrence_role, position, label, _, _) in occurrences.items()
+            if key[0] == hint.record_id
+            and _label_key(label) == _label_key(hint.label)
+            and (role is None or occurrence_role == role)
+            and (hint.position is None or position == hint.position)
+        ]
+        if not candidates:
             raise ValueError("concept hints require a valid supporting record reference")
+        if len(candidates) != 1:
+            raise ValueError("concept hint is ambiguous; role or position is required")
+        key = candidates[0]
         if key in hinted:
             raise ValueError("duplicate concept hint")
         hinted.add(key)
-        record, label, _, _ = occurrences[key]
+        record, occurrence_role, position, label, _, _ = occurrences[key]
         _require_labels(hint.aliases, _label_key(hint.label))
         if hint.scope is not None:
             _scope_key(hint.scope)
-        occurrences[key] = (record, label, hint.scope, hint.aliases)
+        occurrences[key] = (record, occurrence_role, position, label, hint.scope, hint.aliases)
 
     nodes: dict[tuple[str | None, str], list[tuple[DerivedRecord, str]]] = {}
     edges: dict[tuple[str | None, str], set[tuple[str | None, str]]] = {}
     scope_values: dict[str | None, str | None] = {None: None}
-    for record, label, scope, aliases in occurrences.values():
+    for record, _, _, label, scope, aliases in occurrences.values():
         scope_key = _scope_key(scope)
         scope_values.setdefault(scope_key, scope)
         node = (scope_key, _label_key(label))
@@ -501,26 +549,39 @@ def _cluster_concepts(
             supporting_anchor_ids=supporting_anchors,
         )
         concepts.append(concept)
-        for (record_id, label_key), (_, _, scope, _) in occurrences.items():
+        for (record_id, role, position), (_, _, _, label, scope, _) in occurrences.items():
+            label_key = _label_key(label)
             if (_scope_key(scope), label_key) in component:
-                concept_occurrences.append(ConceptOccurrence(record_id, label_key, scope, concept.concept_id))
+                concept_occurrences.append(ConceptOccurrence(record_id, role, position, label_key, scope, concept.concept_id))
     return (
         tuple(concepts),
-        tuple(sorted(concept_occurrences, key=lambda occurrence: (occurrence.record_id, occurrence.label_key))),
+        tuple(
+            sorted(
+                concept_occurrences,
+                key=lambda occurrence: (occurrence.record_id, occurrence.role, occurrence.position or -1),
+            )
+        ),
     )
 
 
-def _record_labels(record: DerivedRecord) -> tuple[str, ...]:
+def _record_occurrence_terms(record: DerivedRecord) -> tuple[tuple[str, int | None, str], ...]:
     if isinstance(record, Claim):
-        return record.subject, record.object
+        return ("subject", None, record.subject), ("object", None, record.object)
     if isinstance(record, Relationship):
-        return record.left, record.right
+        return ("left", None, record.left), ("right", None, record.right)
     if isinstance(record, ProcedureSequenceHierarchy):
-        return record.terms
+        return tuple(("term", position, term) for position, term in enumerate(record.terms))
     if isinstance(record, Evolution):
-        return record.subject, record.previous, record.current
+        return (
+            ("subject", None, record.subject),
+            ("previous", None, record.previous),
+            ("current", None, record.current),
+        )
     if isinstance(record, ConflictUnresolved):
-        return record.subject, *record.alternatives
+        return (
+            ("subject", None, record.subject),
+            *(("alternative", position, term) for position, term in enumerate(record.alternatives)),
+        )
     raise ValueError("unknown validated record")
 
 
@@ -567,7 +628,9 @@ def _require_ordered_concept_ids(concept_ids: tuple[str, ...], concepts: Sequenc
         raise ValueError("published records require valid concept IDs")
 
 
-def _normalized_branches(branches: tuple[ProcedureBranch, ...], concepts: Sequence[Concept]) -> tuple[ProcedureBranch, ...]:
+def _normalized_branches(
+    branches: tuple[ProcedureBranch, ...], concepts: Sequence[Concept], allowed_conditions: tuple[str, ...]
+) -> tuple[ProcedureBranch, ...]:
     if not isinstance(branches, tuple):
         raise ValueError("procedure branches must be a tuple")
     normalized = []
@@ -575,11 +638,27 @@ def _normalized_branches(branches: tuple[ProcedureBranch, ...], concepts: Sequen
         if not isinstance(branch, ProcedureBranch):
             raise ValueError("procedure branches must be structured")
         _require_condition(branch.condition)
+        condition_index = branch.condition_index
+        if condition_index is None:
+            matches = [
+                index for index, condition in enumerate(allowed_conditions) if condition == branch.condition
+            ]
+            if len(matches) != 1:
+                raise ValueError("procedure branch condition requires structured provenance")
+            condition_index = matches[0]
+        if (
+            isinstance(condition_index, bool)
+            or not isinstance(condition_index, int)
+            or condition_index < 0
+            or condition_index >= len(allowed_conditions)
+            or branch.condition != allowed_conditions[condition_index]
+        ):
+            raise ValueError("procedure branch condition requires structured provenance")
         _require_ordered_concept_ids(branch.step_concept_ids, concepts)
         positions = branch.positions or tuple(range(len(branch.step_concept_ids)))
         if not isinstance(positions, tuple) or positions != tuple(range(len(branch.step_concept_ids))):
             raise ValueError("procedure branch positions must be ordered")
-        normalized.append(ProcedureBranch(branch.condition, branch.step_concept_ids, positions))
+        normalized.append(ProcedureBranch(branch.condition, branch.step_concept_ids, positions, condition_index))
     return tuple(normalized)
 
 
@@ -598,20 +677,21 @@ def _validate_justification(justification: object) -> None:
 
 
 def _reject_private_text(value: str, label: str) -> None:
-    if any(
-        marker in value.casefold()
-        for marker in (
-            "chain of thought",
-            "private reasoning",
-            "hidden analysis",
-            "scratchpad",
-            "internal deliberation",
-            "raw transcript",
-            "verbatim transcript",
-            "confidence:",
-        )
+    tokens = frozenset(re.findall(r"[a-z0-9]+", unicodedata.normalize("NFKC", value).casefold()))
+    if (
+        "private" in tokens
+        or "scratchpad" in tokens
+        or "transcript" in tokens
+        or "excerpt" in tokens
+        or "verbatim" in tokens
+        or {"scratch", "pad"} <= tokens
+        or {"chain", "thought"} <= tokens
+        or {"hidden", "analysis"} <= tokens
+        or {"internal", "deliberation"} <= tokens
     ):
-        raise ValueError(f"{label} cannot contain private reasoning")
+        raise ValueError(f"{label} cannot contain private or raw source content")
+    if "confidence" in tokens and any(token.isdigit() for token in tokens):
+        raise ValueError(f"{label} cannot contain numeric confidence")
 
 
 def _concept_id(snapshot_id: str, label_key: str, scope: str | None) -> str:
@@ -629,6 +709,16 @@ def _scope_key(scope: str | None) -> str | None:
         return None
     _require_bounded_text(scope, "scope", MAX_SCOPE_LENGTH)
     return " ".join(scope.split()).casefold()
+
+
+def _role_key(role: str) -> str:
+    _require_bounded_text(role, "concept occurrence role", MAX_LABEL_LENGTH)
+    return " ".join(role.split()).casefold()
+
+
+def _require_position(position: object) -> None:
+    if position is not None and (isinstance(position, bool) or not isinstance(position, int) or position < 0):
+        raise ValueError("concept occurrence position must be a non-negative integer")
 
 
 def _require_labels(aliases: tuple[str, ...], canonical_key: str) -> None:
