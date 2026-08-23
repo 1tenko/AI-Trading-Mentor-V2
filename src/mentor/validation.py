@@ -55,16 +55,18 @@ class SemanticValidator:
             )
         )
         outcome, audit = _semantic_response(response)
-        return _issue(
-            ValidationResult(
+        proof = object()
+        result = ValidationResult(
             candidate.record_id,
             candidate.snapshot_id,
             outcome,
             audit,
             tuple(anchor_id for anchor_id, _ in spans),
             _validated_replacement(candidate) if outcome == "affirmatively_supported" else None,
-            )
+            proof,
         )
+        _ISSUED_RESULTS[proof] = _signature(result)
+        return result
 
 
 def can_publish_source_extracted(results: Sequence[ValidationResult]) -> bool:
@@ -129,21 +131,6 @@ def _validated_replacement(candidate: Claim) -> Claim:
         compiler_provenance=candidate.compiler_provenance,
         facets=candidate.facets,
     )
-
-
-def _issue(result: ValidationResult) -> ValidationResult:
-    proof = object()
-    issued = ValidationResult(
-        result.candidate_record_id,
-        result.snapshot_id,
-        result.outcome,
-        result.audit,
-        result.anchor_ids,
-        result.source_extracted,
-        proof,
-    )
-    _ISSUED_RESULTS[proof] = _signature(issued)
-    return issued
 
 
 def _signature(result: ValidationResult) -> tuple[object, ...]:

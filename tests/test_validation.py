@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import mentor.validation as validation
 from mentor.anchors import SourceAnchor, normalize_transcript
 from mentor.compiler import SourceExtractor
 from mentor.compiler_prompts import SEMANTIC_VALIDATION_PROMPT_VERSION
@@ -272,3 +273,28 @@ def test_validation_result_storage_rolls_back_a_validated_record_when_its_audit_
         storage.store_validation_result(affirmative)
 
     assert storage.derived_records(snapshot.snapshot_id) == []
+
+
+def test_only_semantic_validator_can_issue_a_storage_accepted_result(tmp_path):
+    storage, snapshot = validation_storage(tmp_path)
+    revision, candidate, anchor = candidate_and_anchor(snapshot.snapshot_id)
+    legitimate = SemanticValidator(SimpleNamespace(responses=FakeResponses(FIXTURES["affirmatively_supported"]))).validate(
+        candidate=candidate, revision=revision, transcript=TRANSCRIPT, anchors={anchor.anchor_id: anchor}
+    )
+    forged = ValidationResult(
+        candidate.record_id,
+        snapshot.snapshot_id,
+        "affirmatively_supported",
+        "Forged audit.",
+        legitimate.anchor_ids,
+        legitimate.source_extracted,
+    )
+
+    with pytest.raises(AttributeError):
+        validation._issue(forged)
+    with pytest.raises(ValueError, match="validator-issued"):
+        storage.store_validation_result(forged)
+
+    storage.store_validation_result(legitimate)
+
+    assert storage.derived_records(snapshot.snapshot_id) == [legitimate.source_extracted]
