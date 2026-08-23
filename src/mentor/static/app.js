@@ -189,6 +189,18 @@ function shortOriginalExcerpt(excerpt) {
   return withoutTimestamp.length > limit ? `${withoutTimestamp.slice(0, limit)}…` : withoutTimestamp || "No retrieved excerpt was returned for this citation.";
 }
 
+function orientationSummary(context) {
+  if (!context) return "Not used on this turn.";
+  const status = context.status === "used" ? "Used" : "Orientation unavailable";
+  const snapshot = typeof context.snapshot_id === "string" && context.snapshot_id ? context.snapshot_id : "snapshot unavailable";
+  const records = Number.isInteger(context.record_count) ? `${context.record_count} record${context.record_count === 1 ? "" : "s"}` : "record count unavailable";
+  const budget = context.budget || {};
+  const budgetState = Number.isFinite(budget.used_tokens) && Number.isFinite(budget.max_tokens)
+    ? `${budget.used_tokens}/${budget.max_tokens} budget`
+    : "budget unavailable";
+  return `${status} · ${snapshot} · ${records} · ${budgetState}`;
+}
+
 function showDiagnostics(diagnostics) {
   if (!diagnostics) return;
   const latency = Number.isFinite(diagnostics.latency_ms) ? `${(diagnostics.latency_ms / 1000).toFixed(1)}s` : "Unavailable";
@@ -215,10 +227,15 @@ function showDiagnostics(diagnostics) {
   rows.push(["Native compaction", diagnostics.native_compaction_applied
     ? "Applied for future model replay; included in this response usage."
     : "Not applied on this turn"]);
+  if (diagnostics.knowledge_context) {
+    rows.push(["Assimilated orientation", orientationSummary(diagnostics.knowledge_context)]);
+  }
   const block = document.createElement("details");
   block.className = "diagnostics";
   const summary = document.createElement("summary");
-  summary.textContent = "Evaluation diagnostics";
+  const orientationUnavailable = diagnostics.knowledge_context?.status === "unavailable";
+  summary.textContent = orientationUnavailable ? "Evaluation diagnostics — orientation unavailable" : "Evaluation diagnostics";
+  block.open = orientationUnavailable;
   const content = document.createElement("div");
   content.className = "diagnostics-content";
   const list = document.createElement("dl");

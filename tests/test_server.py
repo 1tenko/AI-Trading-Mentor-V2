@@ -206,6 +206,11 @@ def test_server_serves_the_persistent_chat_controls(tmp_path):
         assert b"formatEvidenceTimestamp" in script
         assert b"markdown-table-scroll" in script
         assert b"Applied for future model replay" in script
+        assert b"Assimilated orientation" in script
+        assert b"knowledge_context" in script
+        assert b"Orientation unavailable" in script
+        assert b"record_ids" not in script
+        assert b"anchor_ids" not in script
         assert b'event.type === "error"' in script
         assert b"Mentor unavailable. You can retry." in script
         status, _, stylesheet = request(server, "GET", "/app.css")

@@ -10,6 +10,7 @@ from mentor.chat_service import (
     FILE_SEARCH_RESULT_BUDGETS,
     _input_item,
     _effective_research_depth,
+    _should_orient,
 )
 from mentor.prompts import MENTOR_INSTRUCTIONS
 from mentor.storage import Storage
@@ -199,6 +200,99 @@ def test_broad_question_uses_a_server_owned_orientation_function_before_raw_sear
     saved = json.dumps(storage.thread_items(1)) + json.dumps(storage.display_turns(1))
     assert "Derived orientation cue that must not persist in replay." not in saved
     assert "anc_orientation" not in saved
+
+
+def test_orientation_continuation_keeps_initial_opaque_output_only_in_the_transient_responses_input(
+    tmp_path, monkeypatch
+):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    storage.set_vector_store("vs_legacy")
+    monkeypatch.setattr(storage, "current_snapshot", published_snapshot)
+    reasoning = {
+        "type": "reasoning",
+        "id": "rs_orientation",
+        "encrypted_content": "opaque-orientation-reasoning",
+        "status": "completed",
+    }
+    function_call = {
+        "type": "function_call",
+        "name": "consult_assimilated_knowledge",
+        "call_id": "call_orientation",
+        "arguments": json.dumps({"question": "How do SMT and TPD work together?"}),
+    }
+    initial = SimpleNamespace(status="completed", output=[reasoning, function_call])
+    final = source_response("Raw answer.", [])
+    responses = SequenceResponses(initial, final)
+
+    ChatService(
+        storage,
+        SimpleNamespace(responses=responses),
+        orientation_service=FakeOrientation(orientation_result()),
+    ).reply(storage.create_thread("Question"), "How do SMT and TPD work together?")
+
+    transient = responses.calls[1]["input"]
+    assert transient[-3:-1] == [_input_item(reasoning), _input_item(function_call)]
+    assert transient[-1]["type"] == "function_call_output"
+    assert "opaque-orientation-reasoning" in json.dumps(transient)
+    saved = json.dumps(storage.thread_items(1)) + json.dumps(storage.replay_items(1))
+    assert "opaque-orientation-reasoning" not in saved
+    assert "Derived orientation cue that must not persist in replay." not in saved
+
+
+@pytest.mark.parametrize(
+    ("question", "requested_depth", "expected"),
+    [
+        ("How do SMT, TPD, and narrative interact?", "auto", True),
+        ("What changed between Jacob's 2025 and 2026 teaching?", "auto", True),
+        ("What factors affect setup probability?", "auto", True),
+        ("How does Jacob's whole system fit together?", "auto", True),
+        ("Tell me everything Jacob teaches about timing.", "auto", True),
+        ("What does TPD stand for?", "deep", False),
+        ("Compare the exact source quotes from 2025 and 2026.", "auto", False),
+        ("Show the exact location, then compare the teachings.", "auto", False),
+        ("Quote Jacob's wording and compare it with 2026.", "auto", False),
+        ("Give me the timestamp and compare the two lessons.", "auto", False),
+    ],
+)
+def test_orientation_intent_uses_question_and_effective_research_depth(question, requested_depth, expected):
+    assert _should_orient(question, _effective_research_depth(question, requested_depth)) is expected
+
+
+@pytest.mark.parametrize("orientation_error", [None, RuntimeError("derived lookup failed")])
+def test_orientation_latency_covers_the_orientation_attempt_and_raw_continuation(
+    tmp_path, monkeypatch, orientation_error
+):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    storage.set_vector_store("vs_legacy")
+    monkeypatch.setattr(storage, "current_snapshot", published_snapshot)
+    clock = {"value": 0.0}
+    monkeypatch.setattr("mentor.chat_service.perf_counter", lambda: clock["value"])
+
+    class TimedOrientation(FakeOrientation):
+        def consult(self, question, **kwargs):
+            clock["value"] = 0.1
+            return super().consult(question, **kwargs)
+
+    class TimedResponses(SequenceResponses):
+        def create(self, **kwargs):
+            response = super().create(**kwargs)
+            if len(self.calls) == 2:
+                clock["value"] = 0.25
+            return response
+
+    responses = TimedResponses(
+        orientation_function_response("How do SMT and TPD work together?"),
+        source_response("Raw answer.", []),
+    )
+    answer = ChatService(
+        storage,
+        SimpleNamespace(responses=responses),
+        orientation_service=TimedOrientation(orientation_result(), orientation_error),
+    ).reply(storage.create_thread("Question"), "How do SMT and TPD work together?")
+
+    assert answer.diagnostics.latency_ms == 250
 
 
 @pytest.mark.parametrize(
@@ -893,6 +987,7 @@ def test_auto_research_depth_distinguishes_definitions_research_comparisons_and_
     assert _effective_research_depth("What is TPD?", "auto") == "normal"
     assert _effective_research_depth("Research this again and verify it.", "auto") == "deep"
     assert _effective_research_depth("What are the differences between 2025 and 2026 teachings?", "auto") == "deep"
+    assert _effective_research_depth("What changed between Jacob's 2025 and 2026 teachings?", "auto") == "deep"
     assert _effective_research_depth("Tell me everything Jacob teaches about SMT.", "auto") == "exhaustive"
 
 

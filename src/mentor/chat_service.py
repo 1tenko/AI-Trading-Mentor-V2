@@ -46,7 +46,8 @@ DIRECT_SOURCE_CLAIM = re.compile(
 )
 EXACT_SOURCE_REQUEST = re.compile(
     r"\bwhere\s+(?:exactly\s+)?(?:does|did|is)\b|\b(?:what|which)\s+(?:video|timestamp)\b"
-    r"|\bgive me\b.*\b(?:video|timestamp)\b|\bexact source\b",
+    r"|\bgive me\b.*\b(?:video|timestamp)\b|\bexact source\b"
+    r"|\b(?:exact|verbatim)\s+(?:source|location|quote|wording|timestamp)\b|\bquote(?:d)?\b",
     re.IGNORECASE,
 )
 CLOCK_TIME = re.compile(
@@ -243,8 +244,8 @@ class ChatService:
         evaluation: EvaluationConfig = DEFAULT_EVALUATION_CONFIG,
     ) -> Answer:
         user_item, request, effective_depth, snapshot = self._request(thread_id, question, evaluation)
-        request, knowledge_context, orientation_response = self._orientation_request(request, snapshot)
         started_at = perf_counter()
+        request, knowledge_context, orientation_response = self._orientation_request(request, snapshot)
         response = self.client.responses.create(**request)
         response, evidence_output, draft_response = self._citation_repaired_response(
             request, response, user_item["content"][0]["text"]
@@ -270,8 +271,8 @@ class ChatService:
     ):
         try:
             user_item, request, effective_depth, snapshot = self._request(thread_id, question, evaluation)
-            request, knowledge_context, orientation_response = self._orientation_request(request, snapshot)
             started_at = perf_counter()
+            request, knowledge_context, orientation_response = self._orientation_request(request, snapshot)
             stream = self.client.responses.create(**request, stream=True)
             for event in stream:
                 if event.type == "response.output_text.delta":
@@ -354,7 +355,7 @@ class ChatService:
         user_item = {"role": "user", "content": [{"type": "input_text", "text": question}]}
         effective_depth = _effective_research_depth(question, evaluation.research_depth)
         replay_items = self.storage.replay_items(thread_id)
-        should_orient = snapshot is not None and _should_orient(question)
+        should_orient = snapshot is not None and _should_orient(question, effective_depth)
         request = {
             "model": self.model,
             "instructions": f"{MENTOR_INSTRUCTIONS}\n\n{_research_instruction(effective_depth)}",
@@ -386,7 +387,8 @@ class ChatService:
         if snapshot is None:
             return request, None, None
         initial = self.client.responses.create(**request)
-        function_call = _orientation_function_call(initial)
+        initial_output = [_as_dict(item) for item in initial.output]
+        function_call = _orientation_function_call(initial_output)
         if function_call is None:
             LOGGER.warning("Orientation tool was not called for a broad Mentor request")
             return _raw_only_request(request), KnowledgeContext.unavailable(snapshot), initial
@@ -414,7 +416,7 @@ class ChatService:
         continuation = _raw_only_request(request)
         continuation["input"] = [
             *request["input"],
-            _input_item(function_call),
+            *(_input_item(item) for item in initial_output),
             {"type": "function_call_output", "call_id": function_call["call_id"], "output": output},
         ]
         return continuation, context, initial
@@ -539,24 +541,25 @@ def _snapshot_identifier(snapshot: Any, name: str) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
-def _should_orient(question: str) -> bool:
+def _should_orient(question: str, effective_depth: str) -> bool:
     normalized = question.casefold()
     if EXACT_SOURCE_REQUEST.search(normalized):
         return False
+    if effective_depth == "exhaustive":
+        return True
     return bool(
         re.search(
-            r"\b(all|every|everything|complete|exhaustive)\b|exact list|full mapping"
-            r"|\b(compare|comparison|difference|differences|changed|change between years|evolution)\b"
-            r"|\b(relationship|relationships|teach me|concepts affect)\b"
-            r"|\b(how do|how does).{0,160}\b(work together|fit together|relate)\b",
+            r"\b(compare|comparison|difference|differences|changed|change|evolution|evolved|refined)\b"
+            r"|\b(relationship|relationships|factor|factors|condition|conditions|affect|affects|influence|influences|interaction|interact)\b"
+            r"|\b(whole|overall|entire)\s+system\b"
+            r"|\b(how do|how does).{0,160}\b(work together|fit together|relate|interact)\b",
             normalized,
         )
     )
 
 
-def _orientation_function_call(response: Any) -> dict | None:
-    for item in _field(response, "output") or []:
-        candidate = _as_dict(item)
+def _orientation_function_call(output: list[dict]) -> dict | None:
+    for candidate in output:
         if (
             candidate.get("type") == "function_call"
             and candidate.get("name") == ORIENTATION_FUNCTION_NAME
@@ -807,7 +810,7 @@ def _effective_research_depth(question: str, requested_depth: str) -> str:
     normalized = question.casefold()
     if re.search(r"\b(all|every|everything|complete|exhaustive)\b|exact list|full mapping|compare all", normalized):
         return "exhaustive"
-    if re.search(r"\b(verify|verification|compare|comparison|difference|differences|different|relationship|why)\b", normalized):
+    if re.search(r"\b(verify|verification|compare|comparison|difference|differences|different|relationship|changed|change|evolution|why)\b", normalized):
         return "deep"
     return "normal"
 
