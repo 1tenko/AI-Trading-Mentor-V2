@@ -1,8 +1,8 @@
 # Phase 3 vector-store capability preflight
 
-**State: PRE-FLIGHT PENDING.** No live preflight has been run. The current
-environment has no configured `OPENAI_API_KEY`; this task did not contact
-OpenAI, inspect existing remote resources, or upload any file.
+**State: PRE-FLIGHT PASSED — 2026-08-23.** Theo authorized one guarded,
+disposable-data-only probe. It contacted no existing project/Jacob resource and
+uploaded no corpus content.
 
 ## Local boundary verified
 
@@ -26,8 +26,8 @@ not permission to silently upload, replace, or delete a File.
 
 The local adapter classifies only explicit multi-store attachment-conflict
 wording as that capability outcome. Confirmation of the live SDK/API's exact
-typed error shape remains **PRE-FLIGHT PENDING**; unrelated attachment errors
-propagate unchanged.
+typed error shape remains deferred because this run observed the supported
+path; unrelated attachment errors continue to propagate unchanged.
 
 ## Official references
 
@@ -57,3 +57,26 @@ vector store for this preflight.
 `PHASE3_VECTOR_STORE_PREFLIGHT=disposable-approved` is an additional local
 guard, not a substitute for Theo's explicit approval. No runner is wired in
 this task, so setting it alone cannot create a remote resource.
+
+## Authorized disposable preflight result
+
+The preflight used `openai` 2.54.0 and one synthetic text marker with an
+opaque, disposable run tag. No OpenAI resource IDs, API key, or private content
+are retained here.
+
+| Observation | Result |
+|---|---|
+| Disposable resources | Two newly created, positively tagged vector stores and one synthetic File only. |
+| Direct attachment | Started `in_progress`; caller-controlled retrieval reached `completed`. |
+| Same File in candidate store | The same synthetic File was attached to the second store through a file batch. The batch started `in_progress` and reached `completed`; file counts were total 1, completed 1, failed 0, cancelled 0. |
+| Attribute-filtered search | A `preflight` equality filter returned exactly one matching synthetic artifact. |
+| Detachment | Deleting the first store attachment returned `deleted: true`. The underlying synthetic OpenAI File was deliberately not deleted. |
+| Cleanup | Both stores created by this run returned `deleted: true`; no existing store, Jacob File, Jacob vector store, or underlying File was deleted. |
+| Cost | The SDK responses exposed no cost value. No cost is claimed or estimated from this probe. |
+
+This is compatible with the Phase 3 immutable raw/derived store-pair design:
+the same File can be attached to current and candidate stores, search filters
+work, and vector-store-file detachment does not require deleting the File. The
+documented byte-identical candidate-upload fallback is not needed for this API
+version, but remains a future compatibility fallback if the observed capability
+changes.
