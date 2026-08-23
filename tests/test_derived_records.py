@@ -300,7 +300,7 @@ def test_sqlite_rejects_direct_finalization_with_an_invalid_relationship(tmp_pat
             connection.execute("UPDATE derived_records SET finalized = 1 WHERE record_id = 'rec_direct_relationship'")
 
 
-def test_noncanonical_direct_record_is_ignored_without_breaking_snapshot_reads(tmp_path):
+def test_sqlite_rejects_noncanonical_direct_record_at_finalization(tmp_path):
     storage = Storage(tmp_path / "mentor.sqlite3")
     storage.initialize()
     snapshot = snapshot_for(storage)
@@ -312,12 +312,13 @@ def test_noncanonical_direct_record_is_ignored_without_breaking_snapshot_reads(t
 
     with storage._connect() as connection:
         _stage_direct_claim(connection, snapshot, f"rec_{'0' * 64}", "signal", "states", "observation")
-        connection.execute(f"UPDATE derived_records SET finalized = 1 WHERE record_id = 'rec_{'0' * 64}'")
+        with pytest.raises(sqlite3.IntegrityError, match="valid typed record"):
+            connection.execute(f"UPDATE derived_records SET finalized = 1 WHERE record_id = 'rec_{'0' * 64}'")
 
     assert storage.derived_records(snapshot.snapshot_id) == [valid]
 
 
-def test_invalid_utf8_direct_records_do_not_break_valid_snapshot_reads(tmp_path):
+def test_sqlite_rejects_invalid_utf8_direct_records_at_finalization(tmp_path):
     storage = Storage(tmp_path / "mentor.sqlite3")
     storage.initialize()
     snapshot = snapshot_for(storage)
@@ -328,17 +329,103 @@ def test_invalid_utf8_direct_records_do_not_break_valid_snapshot_reads(tmp_path)
     storage.store_derived_record(valid)
 
     with storage._connect() as connection:
-        _stage_invalid_utf8_record_id(connection, snapshot)
-        _stage_direct_claim(connection, snapshot, "rec_bad_content", "signal", "states", "observation")
-        connection.execute("UPDATE derived_claims SET subject = CAST(X'80' AS TEXT) WHERE record_id = 'rec_bad_content'")
-        connection.execute("UPDATE derived_records SET finalized = 1 WHERE record_id = 'rec_bad_content'")
-        _stage_direct_claim(connection, snapshot, "rec_bad_facet", "signal", "states", "observation")
-        connection.execute(
-            "INSERT INTO derived_record_facets VALUES ('rec_bad_facet', 0, 'scope', CAST(X'80' AS TEXT))"
+        with pytest.raises(sqlite3.IntegrityError, match="valid typed record"):
+            _stage_invalid_utf8_record_id(connection, snapshot)
+        bad_content = claim(
+            snapshot_id=snapshot.snapshot_id,
+            dependencies=(RecordDependency("source_revision", snapshot.selected_revision_ids[0]),),
+            subject="content seed",
         )
-        connection.execute("UPDATE derived_records SET finalized = 1 WHERE record_id = 'rec_bad_facet'")
+        _stage_direct_claim(
+            connection,
+            snapshot,
+            bad_content.record_id,
+            bad_content.subject,
+            bad_content.predicate,
+            bad_content.object,
+            bad_content.qualification,
+        )
+        connection.execute(
+            "UPDATE derived_claims SET subject = CAST(X'80' AS TEXT) WHERE record_id = ?",
+            (bad_content.record_id,),
+        )
+        with pytest.raises(sqlite3.IntegrityError, match="valid typed record"):
+            connection.execute(
+                "UPDATE derived_records SET finalized = 1 WHERE record_id = ?", (bad_content.record_id,)
+            )
+        bad_facet = claim(
+            snapshot_id=snapshot.snapshot_id,
+            dependencies=(RecordDependency("source_revision", snapshot.selected_revision_ids[0]),),
+            subject="facet seed",
+            facets=(Facet("scope", "synthetic"),),
+        )
+        _stage_direct_claim(
+            connection,
+            snapshot,
+            bad_facet.record_id,
+            bad_facet.subject,
+            bad_facet.predicate,
+            bad_facet.object,
+            bad_facet.qualification,
+        )
+        connection.execute(
+            "INSERT INTO derived_record_facets VALUES (?, 0, 'scope', CAST(X'80' AS TEXT))",
+            (bad_facet.record_id,),
+        )
+        with pytest.raises(sqlite3.IntegrityError, match="valid typed record"):
+            connection.execute("UPDATE derived_records SET finalized = 1 WHERE record_id = ?", (bad_facet.record_id,))
 
     assert storage.derived_records(snapshot.snapshot_id) == [valid]
+
+
+def test_sqlite_rejects_non_text_content_and_facets_at_finalization(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    snapshot = snapshot_for(storage)
+
+    with storage._connect() as connection:
+        bad_content = claim(
+            snapshot_id=snapshot.snapshot_id,
+            dependencies=(RecordDependency("source_revision", snapshot.selected_revision_ids[0]),),
+            subject="blob content seed",
+        )
+        _stage_direct_claim(
+            connection,
+            snapshot,
+            bad_content.record_id,
+            bad_content.subject,
+            bad_content.predicate,
+            bad_content.object,
+            bad_content.qualification,
+        )
+        connection.execute(
+            "UPDATE derived_claims SET subject = X'31' WHERE record_id = ?", (bad_content.record_id,)
+        )
+        with pytest.raises(sqlite3.IntegrityError, match="valid typed record"):
+            connection.execute(
+                "UPDATE derived_records SET finalized = 1 WHERE record_id = ?", (bad_content.record_id,)
+            )
+
+        bad_facet = claim(
+            snapshot_id=snapshot.snapshot_id,
+            dependencies=(RecordDependency("source_revision", snapshot.selected_revision_ids[0]),),
+            subject="blob facet seed",
+            facets=(Facet("scope", "synthetic"),),
+        )
+        _stage_direct_claim(
+            connection,
+            snapshot,
+            bad_facet.record_id,
+            bad_facet.subject,
+            bad_facet.predicate,
+            bad_facet.object,
+            bad_facet.qualification,
+        )
+        connection.execute(
+            "INSERT INTO derived_record_facets VALUES (?, 0, 'scope', X'31')", (bad_facet.record_id,)
+        )
+        with pytest.raises(sqlite3.IntegrityError, match="valid typed record"):
+            connection.execute("UPDATE derived_records SET finalized = 1 WHERE record_id = ?", (bad_facet.record_id,))
 
 
 def _stage_invalid_utf8_record_id(connection, snapshot):
@@ -360,15 +447,15 @@ def _stage_invalid_utf8_record_id(connection, snapshot):
     connection.execute("UPDATE derived_records SET finalized = 1 WHERE record_id = CAST(X'80' AS TEXT)")
 
 
-def _stage_direct_claim(connection, snapshot, record_id, subject, predicate, object):
+def _stage_direct_claim(connection, snapshot, record_id, subject, predicate, object, qualification="Synthetic."):
     connection.execute(
         """
         INSERT INTO derived_records(
             record_id, snapshot_id, family, derived_kind, evidence_state, validation_state,
             lifecycle_state, qualification
-        ) VALUES (?, ?, 'claim', 'statement', 'raw_taught', 'validated', 'active', 'Synthetic.')
+        ) VALUES (?, ?, 'claim', 'statement', 'raw_taught', 'validated', 'active', ?)
         """,
-        (record_id, snapshot.snapshot_id),
+        (record_id, snapshot.snapshot_id, qualification),
     )
     connection.execute("INSERT INTO derived_record_anchors VALUES (?, 0, 'anc_synthetic')", (record_id,))
     connection.execute(

@@ -588,25 +588,14 @@ class Storage:
 
     def derived_records(self, snapshot_id: str) -> list[DerivedRecord]:
         with self._connect() as connection:
-            text_factory = connection.text_factory
-            connection.text_factory = bytes
-            try:
-                rows = connection.execute(
-                    """
-                    SELECT record_id, snapshot_id, family, derived_kind, evidence_state, validation_state, lifecycle_state, qualification
-                    FROM derived_records WHERE snapshot_id = ? AND finalized = 1 ORDER BY record_id
-                    """,
-                    (snapshot_id,),
-                ).fetchall()
-                records = []
-                for row in rows:
-                    try:
-                        records.append(self._derived_record_from_row(connection, row))
-                    except (IndexError, TypeError, UnicodeError, ValueError):
-                        continue
-                return records
-            finally:
-                connection.text_factory = text_factory
+            rows = connection.execute(
+                """
+                SELECT record_id, snapshot_id, family, derived_kind, evidence_state, validation_state, lifecycle_state, qualification
+                FROM derived_records WHERE snapshot_id = ? AND finalized = 1 ORDER BY record_id
+                """,
+                (snapshot_id,),
+            ).fetchall()
+            return [self._derived_record_from_row(connection, row) for row in rows]
 
     def _store_record_family(self, connection: sqlite3.Connection, record: DerivedRecord) -> None:
         if isinstance(record, Claim):
@@ -756,6 +745,23 @@ class Storage:
             raise ValueError("stored derived record identity is not canonical")
         return record
 
+    def _derived_record_is_valid(self, connection: sqlite3.Connection, raw_record_id: object) -> int:
+        try:
+            if not isinstance(raw_record_id, bytes):
+                return 0
+            record_id = raw_record_id.decode("utf-8")
+            row = connection.execute(
+                """
+                SELECT record_id, snapshot_id, family, derived_kind, evidence_state, validation_state, lifecycle_state, qualification
+                FROM derived_records WHERE record_id = ?
+                """,
+                (record_id,),
+            ).fetchone()
+            self._derived_record_from_row(connection, row)
+        except (IndexError, sqlite3.Error, TypeError, UnicodeError, ValueError):
+            return 0
+        return 1
+
     def _create_derived_record_triggers(self, connection: sqlite3.Connection) -> None:
         connection.execute("DROP TRIGGER IF EXISTS derived_records_require_children")
         connection.executescript(
@@ -868,6 +874,8 @@ class Storage:
                     WHERE record_id = NEW.record_id AND term_role = 'alternative'
                       AND (length(trim(value)) = 0 OR length(value) > 240)
                 ) THEN RAISE(ABORT, 'derived records require valid conflict content') END;
+                SELECT CASE WHEN derived_record_is_valid(CAST(NEW.record_id AS BLOB)) != 1
+                    THEN RAISE(ABORT, 'derived records require a valid typed record') END;
             END;
             CREATE TRIGGER IF NOT EXISTS derived_records_lock_finalized_rows
             BEFORE UPDATE ON derived_records WHEN OLD.finalized = 1
@@ -1441,6 +1449,11 @@ class Storage:
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.database_path)
         connection.execute("PRAGMA foreign_keys = ON")
+        connection.create_function(
+            "derived_record_is_valid",
+            1,
+            lambda record_id: self._derived_record_is_valid(connection, record_id),
+        )
         return connection
 
 
@@ -1480,8 +1493,6 @@ def _snapshot_from_row(row: tuple) -> CorpusSnapshot:
 
 
 def _decode_sqlite_text(value: object) -> str:
-    if isinstance(value, bytes):
-        return value.decode("utf-8")
     if isinstance(value, str):
         return value
     raise TypeError("expected SQLite text")
