@@ -8,6 +8,17 @@ from mentor.knowledge import SourceRevision
 
 
 @dataclass(frozen=True)
+class CallUsage:
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cost_usd: float = 0.0
+
+    def __post_init__(self) -> None:
+        if self.input_tokens < 0 or self.output_tokens < 0 or self.cost_usd < 0:
+            raise ValueError("call usage cannot be negative")
+
+
+@dataclass(frozen=True)
 class CompilationRun:
     run_id: str
     model_version: str

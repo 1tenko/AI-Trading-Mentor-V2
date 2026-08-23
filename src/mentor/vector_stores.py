@@ -69,6 +69,15 @@ class VectorStoreAdapter:
         )
         return VectorStore(store_id=_required(remote, "id"), status=_optional(remote, "status"))
 
+    def upload_text(self, filename: str, content: str) -> str:
+        if not isinstance(filename, str) or not filename.strip() or not isinstance(content, str) or not content:
+            raise ValueError("derived artifact requires a filename and content")
+        remote = self._client.files.create(
+            file=(filename, content.encode("utf-8"), "application/json"),
+            purpose="assistants",
+        )
+        return _required(remote, "id")
+
     def attach_file(
         self, vector_store_id: str, file_id: str, attributes: Mapping[str, AttributeValue]
     ) -> VectorStoreFile:

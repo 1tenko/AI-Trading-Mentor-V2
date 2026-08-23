@@ -12,6 +12,7 @@ from mentor.compiler_prompts import (
     MAX_CANDIDATES_PER_SOURCE,
     extraction_request,
 )
+from mentor.compilation import CallUsage
 from mentor.derived_records import (
     Claim,
     CompilerProvenance,
@@ -40,6 +41,7 @@ class ExtractionResult:
     revision_id: str
     provenance: CompilerProvenance
     candidates: tuple[DerivedRecord, ...]
+    usage: CallUsage = CallUsage()
 
 
 class SourceExtractor:
@@ -63,7 +65,7 @@ class SourceExtractor:
             snapshot_id=snapshot_id,
             provenance=self._provenance,
         )
-        return ExtractionResult(revision.revision_id, self._provenance, candidates)
+        return ExtractionResult(revision.revision_id, self._provenance, candidates, _response_usage(response))
 
 
 def _response_output_text(response: Any) -> str:
@@ -71,6 +73,18 @@ def _response_output_text(response: Any) -> str:
     if not isinstance(output_text, str):
         raise ValueError("extraction response requires output_text")
     return output_text
+
+
+def _response_usage(response: Any) -> CallUsage:
+    usage = getattr(response, "usage", None)
+    return CallUsage(
+        input_tokens=_nonnegative_int(getattr(usage, "input_tokens", 0)),
+        output_tokens=_nonnegative_int(getattr(usage, "output_tokens", 0)),
+    )
+
+
+def _nonnegative_int(value: object) -> int:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
 
 
 def _parse_candidates(

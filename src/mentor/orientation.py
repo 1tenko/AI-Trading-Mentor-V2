@@ -1,6 +1,7 @@
 """Bounded, derived-only orientation for the currently published snapshot."""
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
+import json
 from typing import Any
 
 from mentor.derived_records import (
@@ -96,7 +97,6 @@ class OrientationService:
             max_num_results=min(50, self._budget.max_records * 4),
         )
         return self._bound_results(snapshot, local_records, invalid_local_ids, local_concept_ids, remote_results)
-
     def _current_local_records(self, snapshot_id: str) -> tuple[dict[str, DerivedRecord], set[str]]:
         records: dict[str, DerivedRecord] = {}
         invalid_ids: set[str] = set()
@@ -186,6 +186,31 @@ class OrientationService:
         if record is None or not _is_canonical_concept_id(concept_id):
             return None, None
         return record, concept_id
+
+
+def render_orientation_artifact(
+    record: DerivedRecord,
+    concept_id: str,
+    source_area: tuple[str | None, int | None, str | None],
+    *,
+    max_bytes: int,
+) -> str:
+    """Render one compact derived record; raw transcript text is never an input."""
+    validate_record(record)
+    if record.validation_state != "validated" or record.lifecycle_state != "active":
+        raise ValueError("orientation artifacts require validated active records")
+    if not _is_canonical_concept_id(concept_id):
+        raise ValueError("orientation artifacts require a canonical concept ID")
+    if not isinstance(max_bytes, int) or isinstance(max_bytes, bool) or max_bytes < 1:
+        raise ValueError("orientation artifact budget must be positive")
+    content = json.dumps(
+        asdict(_orientation_record(record, concept_id, source_area)),
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    if len(content.encode("utf-8")) > max_bytes:
+        raise ValueError("orientation artifact exceeds its byte budget")
+    return content
 
 
 def _add_scope(

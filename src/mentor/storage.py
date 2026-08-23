@@ -969,8 +969,9 @@ class Storage:
         transcript: str,
         anchors: Mapping[str, SourceAnchor],
         model: str = "synthetic-validator",
+        live_mode: bool = False,
     ) -> ValidationResult:
-        result = SemanticValidator(client, model=model).validate(
+        result = SemanticValidator(client, model=model, live_mode=live_mode).validate(
             candidate=candidate,
             revision=revision,
             transcript=transcript,

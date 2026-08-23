@@ -6,6 +6,7 @@ from typing import Any, Mapping, Sequence
 
 from mentor.anchors import SourceAnchor, resolve_anchor_span
 from mentor.compiler_prompts import semantic_validation_request
+from mentor.compilation import CallUsage
 from mentor.derived_records import Claim
 from mentor.knowledge import SourceRevision
 
@@ -21,14 +22,15 @@ class ValidationResult:
     audit: str
     anchor_ids: tuple[str, ...]
     source_extracted: Claim | None
+    usage: CallUsage = CallUsage()
 
 
 class SemanticValidator:
     """Validate a candidate through a caller-owned Responses-compatible client."""
 
-    def __init__(self, client: Any, *, model: str = "synthetic-validator"):
-        if model == "gpt-5.6-sol":
-            raise ValueError("semantic validation requires an injected mock Responses client")
+    def __init__(self, client: Any, *, model: str = "synthetic-validator", live_mode: bool = False):
+        if model == "gpt-5.6-sol" and not live_mode:
+            raise ValueError("GPT-5.6 Sol requires explicit live mode; use an injected mock otherwise")
         self._client = client
         self._model = model
 
@@ -58,6 +60,7 @@ class SemanticValidator:
             audit,
             tuple(anchor_id for anchor_id, _ in spans),
             _validated_replacement(candidate) if outcome == "affirmatively_supported" else None,
+            _response_usage(response),
         )
 
 
@@ -103,7 +106,7 @@ def _validated_replacement(candidate: Claim) -> Claim:
         anchors=candidate.anchors,
         dependencies=candidate.dependencies,
         validation_state="validated",
-        lifecycle_state=candidate.lifecycle_state,
+        lifecycle_state="active",
         qualification=candidate.qualification,
         subject=candidate.subject,
         predicate=candidate.predicate,
@@ -113,3 +116,15 @@ def _validated_replacement(candidate: Claim) -> Claim:
         compiler_provenance=candidate.compiler_provenance,
         facets=candidate.facets,
     )
+
+
+def _response_usage(response: Any) -> CallUsage:
+    usage = getattr(response, "usage", None)
+    return CallUsage(
+        input_tokens=_nonnegative_int(getattr(usage, "input_tokens", 0)),
+        output_tokens=_nonnegative_int(getattr(usage, "output_tokens", 0)),
+    )
+
+
+def _nonnegative_int(value: object) -> int:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
