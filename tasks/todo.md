@@ -35,12 +35,12 @@ Stay on feature/phase-3-knowledge-assimilation. Do not begin Phase 4.
   - Depends on: Task 4. Verify: family/facet/provenance tests; full pytest.
 - [x] **Task 6 — Mocked per-source extraction with versioned prompts**
   - Depends on: Task 5. Verify: fake Responses fixtures only; full pytest.
-- [ ] **Task 7 — Deterministic and independent semantic claim validation**
+- [x] **Task 7 — Deterministic and independent semantic claim validation**
   - Depends on: Task 6. Verify: hash/range/semantic fixtures; full pytest.
 
 ### Checkpoint B — Mechanical compiler proof
 
-- [ ] All fixtures are synthetic/mocked; no OpenAI calls; full pytest passes.
+- [x] All fixtures are synthetic/mocked; no OpenAI calls; full pytest passes.
 
 ## concept-synthesis
 
