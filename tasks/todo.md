@@ -72,7 +72,7 @@ Stay on feature/phase-3-knowledge-assimilation. Do not begin Phase 4.
 
 ## mentor-knowledge-orchestration
 
-- [ ] **Task 14 — Mentor integration, diagnostics, and replay safety**
+- [x] **Task 14 — Mentor integration, diagnostics, and replay safety**
   - Depends on: Task 13. Verify: citation/timestamp/compaction/streaming
     fixtures; full pytest.
 
