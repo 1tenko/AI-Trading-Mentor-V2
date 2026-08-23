@@ -78,7 +78,7 @@ Stay on feature/phase-3-knowledge-assimilation. Do not begin Phase 4.
 
 ### Checkpoint D — Mentor regression gate
 
-- [ ] Phase 2 behavior remains green; broad fixtures orient and narrow fixtures
+- [x] Phase 2 behavior remains green; broad fixtures orient and narrow fixtures
   do not force orientation; full pytest passes.
 
 ## candidate-compilation-orchestration
