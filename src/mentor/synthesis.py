@@ -71,6 +71,14 @@ class ConceptHint:
 
 
 @dataclass(frozen=True)
+class ConceptOccurrence:
+    record_id: str
+    label_key: str
+    scope: str | None
+    concept_id: str
+
+
+@dataclass(frozen=True)
 class RelationshipSynthesis:
     synthesis_id: str
     snapshot_id: str
@@ -128,6 +136,7 @@ class SynthesisCandidate:
     snapshot_id: str
     records: tuple[DerivedRecord, ...]
     concepts: tuple[Concept, ...]
+    concept_occurrences: tuple[ConceptOccurrence, ...] = ()
 
     @classmethod
     def from_records(
@@ -149,9 +158,11 @@ class SynthesisCandidate:
         if len(record_map) != len(valid_records):
             raise ValueError("duplicate validated record")
         ordered_records = tuple(sorted(record_map.values(), key=lambda record: record.record_id))
-        ordered_concepts = tuple(sorted(_cluster_concepts(snapshot_id, ordered_records, hints), key=lambda concept: concept.concept_id))
+        concepts, occurrences = _cluster_concepts(snapshot_id, ordered_records, hints)
+        ordered_concepts = tuple(sorted(concepts, key=lambda concept: concept.concept_id))
         _validate_concepts(snapshot_id, ordered_concepts, record_map)
-        return cls(snapshot_id, ordered_records, ordered_concepts)
+        _validate_concept_occurrences(occurrences, ordered_records, ordered_concepts)
+        return cls(snapshot_id, ordered_records, ordered_concepts, occurrences)
 
     @property
     def record_ids(self) -> tuple[str, ...]:
@@ -184,8 +195,8 @@ class SynthesisCandidate:
         if not isinstance(record, Relationship):
             raise ValueError("relationship synthesis requires a relationship record")
         inputs = self._supporting_records(record)
-        left_concept_id = self.concept_id_for(record.left, scope=left_scope)
-        right_concept_id = self.concept_id_for(record.right, scope=right_scope)
+        left_concept_id = self._concept_id_for_occurrence(record.record_id, record.left, scope=left_scope)
+        right_concept_id = self._concept_id_for_occurrence(record.record_id, record.right, scope=right_scope)
         justification = _justification(record.relation)
         synthesis = RelationshipSynthesis(
             synthesis_id=_synthesis_id(
@@ -228,7 +239,10 @@ class SynthesisCandidate:
         branches = _normalized_branches(branches, self.concepts)
         inputs = self._supporting_records(record)
         steps = tuple(
-            ProcedureStep(position, self.concept_id_for(term, scope=step_scopes[position]))
+            ProcedureStep(
+                position,
+                self._concept_id_for_occurrence(record.record_id, term, scope=step_scopes[position]),
+            )
             for position, term in enumerate(record.terms)
         )
         conditions = tuple(facet.value for facet in record.facets if facet.name == "condition")
@@ -319,6 +333,22 @@ class SynthesisCandidate:
                 return record
         raise ValueError("unknown validated record")
 
+    def _concept_id_for_occurrence(self, record_id: str, label: str, *, scope: str | None) -> str:
+        label_key = _label_key(label)
+        matches = [
+            occurrence
+            for occurrence in self.concept_occurrences
+            if occurrence.record_id == record_id and occurrence.label_key == label_key
+        ]
+        if len(matches) != 1:
+            raise ValueError("record occurrence does not resolve to one concept")
+        occurrence = matches[0]
+        if _scope_key(scope) != _scope_key(occurrence.scope):
+            if occurrence.scope is not None and scope is None:
+                raise ValueError("scope is required for this record occurrence")
+            raise ValueError("scope does not match this record occurrence")
+        return occurrence.concept_id
+
     def _supporting_records(self, record: DerivedRecord) -> tuple[DerivedRecord, ...]:
         record_map = {item.record_id: item for item in self.records}
         result: list[DerivedRecord] = []
@@ -378,9 +408,34 @@ def _validate_concepts(
             labels.add(key)
 
 
+def _validate_concept_occurrences(
+    occurrences: tuple[ConceptOccurrence, ...], records: Sequence[DerivedRecord], concepts: Sequence[Concept]
+) -> None:
+    expected = {
+        (record.record_id, _label_key(label))
+        for record in records
+        for label in _record_labels(record)
+    }
+    occurrence_keys = {(occurrence.record_id, occurrence.label_key) for occurrence in occurrences}
+    if occurrence_keys != expected or len(occurrence_keys) != len(occurrences):
+        raise ValueError("concept occurrences must cover validated record terms exactly once")
+    records_by_id = {record.record_id: record for record in records}
+    concepts_by_id = {concept.concept_id: concept for concept in concepts}
+    for occurrence in occurrences:
+        record = records_by_id[occurrence.record_id]
+        concept = concepts_by_id.get(occurrence.concept_id)
+        if concept is None or record.record_id not in concept.supporting_record_ids:
+            raise ValueError("concept occurrence requires a valid supporting concept")
+        if _scope_key(occurrence.scope) != _scope_key(concept.scope):
+            raise ValueError("concept occurrence scope does not match concept")
+        labels = {_label_key(concept.canonical_label), *(_label_key(alias) for alias in concept.aliases)}
+        if occurrence.label_key not in labels:
+            raise ValueError("concept occurrence label does not match concept")
+
+
 def _cluster_concepts(
     snapshot_id: str, records: Sequence[DerivedRecord], hints: Sequence[ConceptHint]
-) -> tuple[Concept, ...]:
+) -> tuple[tuple[Concept, ...], tuple[ConceptOccurrence, ...]]:
     occurrences: dict[tuple[str, str], tuple[DerivedRecord, str, str | None, tuple[str, ...]]] = {}
     for record in records:
         for label in _record_labels(record):
@@ -416,6 +471,7 @@ def _cluster_concepts(
             edges[node].add(alias_node)
 
     concepts = []
+    concept_occurrences = []
     visited = set()
     for start in sorted(nodes, key=lambda node: ((node[0] or ""), node[1])):
         if start in visited:
@@ -436,17 +492,22 @@ def _cluster_concepts(
         aliases = tuple(sorted(alias_keys))
         supporting_records = tuple(dict.fromkeys(record.record_id for record, _ in labels))
         supporting_anchors = tuple(dict.fromkeys(anchor for record, _ in labels for anchor in record.anchors))
-        concepts.append(
-            Concept.create(
-                snapshot_id=snapshot_id,
-                canonical_label=canonical_label,
-                aliases=aliases,
-                scope=scope_values[start[0]],
-                supporting_record_ids=supporting_records,
-                supporting_anchor_ids=supporting_anchors,
-            )
+        concept = Concept.create(
+            snapshot_id=snapshot_id,
+            canonical_label=canonical_label,
+            aliases=aliases,
+            scope=scope_values[start[0]],
+            supporting_record_ids=supporting_records,
+            supporting_anchor_ids=supporting_anchors,
         )
-    return tuple(concepts)
+        concepts.append(concept)
+        for (record_id, label_key), (_, _, scope, _) in occurrences.items():
+            if (_scope_key(scope), label_key) in component:
+                concept_occurrences.append(ConceptOccurrence(record_id, label_key, scope, concept.concept_id))
+    return (
+        tuple(concepts),
+        tuple(sorted(concept_occurrences, key=lambda occurrence: (occurrence.record_id, occurrence.label_key))),
+    )
 
 
 def _record_labels(record: DerivedRecord) -> tuple[str, ...]:
@@ -527,13 +588,30 @@ def _require_condition(condition: object) -> None:
         raise ValueError("procedure condition must be non-empty text")
     if len(condition) > MAX_CONDITION_LENGTH:
         raise ValueError("raw text dump is not allowed")
+    _reject_private_text(condition, "procedure condition")
 
 
 def _validate_justification(justification: object) -> None:
     if not isinstance(justification, str) or not justification.strip() or len(justification) > MAX_JUSTIFICATION_LENGTH:
         raise ValueError("synthesis justification must be concise")
-    if any(marker in justification.casefold() for marker in ("chain of thought", "private reasoning", "hidden analysis", "confidence:")):
-        raise ValueError("synthesis justification cannot contain private reasoning")
+    _reject_private_text(justification, "synthesis justification")
+
+
+def _reject_private_text(value: str, label: str) -> None:
+    if any(
+        marker in value.casefold()
+        for marker in (
+            "chain of thought",
+            "private reasoning",
+            "hidden analysis",
+            "scratchpad",
+            "internal deliberation",
+            "raw transcript",
+            "verbatim transcript",
+            "confidence:",
+        )
+    ):
+        raise ValueError(f"{label} cannot contain private reasoning")
 
 
 def _concept_id(snapshot_id: str, label_key: str, scope: str | None) -> str:

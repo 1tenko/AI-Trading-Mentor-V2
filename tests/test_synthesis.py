@@ -50,7 +50,10 @@ def relationship(
 
 
 def procedure(
-    *, dependencies: tuple[RecordDependency, ...], terms: tuple[str, ...] = ("Observe", "Confirm", "Enter")
+    *,
+    dependencies: tuple[RecordDependency, ...],
+    terms: tuple[str, ...] = ("Observe", "Confirm", "Enter"),
+    conditions: tuple[str, ...] = ("Only after confirmation.",),
 ) -> ProcedureSequenceHierarchy:
     return ProcedureSequenceHierarchy.create(
         snapshot_id=SNAPSHOT_ID,
@@ -59,7 +62,7 @@ def procedure(
         validation_state="validated",
         lifecycle_state="candidate",
         qualification="Synthetic support.",
-        facets=(Facet("condition", "Only after confirmation."),),
+        facets=tuple(Facet("condition", condition) for condition in conditions),
         kind="procedure",
         terms=terms,
     )
@@ -385,3 +388,77 @@ def test_procedure_synthesis_requires_explicit_scope_for_scoped_terms():
     synthesis = candidate.synthesize_procedure(record.record_id, step_scopes=("entry", None))
     assert synthesis.steps[0].concept_id == candidate.concept_id_for("Signal", scope="entry")
     assert synthesis.step_scopes == ("entry", None)
+
+
+def test_synthesis_preserves_scoped_record_occurrences_over_global_label_lookup():
+    scoped_relationship = relationship(left="Signal", right="Entry")
+    unscoped_relationship = relationship(left="Signal", right="Risk")
+    differently_scoped_relationship = relationship(left="Signal", right="Target")
+    scoped_procedure = procedure(
+        dependencies=(RecordDependency("source_revision", "rev_synthetic"),),
+        terms=("Signal", "Enter"),
+    )
+    candidate = SynthesisCandidate.from_records(
+        snapshot_id=SNAPSHOT_ID,
+        records=(
+            scoped_relationship,
+            unscoped_relationship,
+            differently_scoped_relationship,
+            scoped_procedure,
+        ),
+        hints=(
+            ConceptHint(scoped_relationship.record_id, "Signal", scope="entry"),
+            ConceptHint(differently_scoped_relationship.record_id, "Signal", scope="exit"),
+            ConceptHint(scoped_procedure.record_id, "Signal", scope="entry"),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="scope"):
+        candidate.synthesize_relationship(scoped_relationship.record_id)
+    with pytest.raises(ValueError, match="scope"):
+        candidate.synthesize_relationship(scoped_relationship.record_id, left_scope="exit")
+    with pytest.raises(ValueError, match="scope"):
+        candidate.synthesize_procedure(scoped_procedure.record_id)
+    with pytest.raises(ValueError, match="scope"):
+        candidate.synthesize_procedure(scoped_procedure.record_id, step_scopes=("exit", None))
+
+    relationship_synthesis = candidate.synthesize_relationship(scoped_relationship.record_id, left_scope="entry")
+    procedure_synthesis = candidate.synthesize_procedure(scoped_procedure.record_id, step_scopes=("entry", None))
+    assert relationship_synthesis.left_concept_id == candidate.concept_id_for("Signal", scope="entry")
+    assert procedure_synthesis.steps[0].concept_id == candidate.concept_id_for("Signal", scope="entry")
+
+
+def test_procedure_rejects_private_text_in_conditions_and_branches():
+    record = procedure(
+        dependencies=(RecordDependency("source_revision", "rev_synthetic"),),
+        terms=("Observe", "Enter"),
+    )
+    candidate = SynthesisCandidate.from_records(snapshot_id=SNAPSHOT_ID, records=(record,))
+    observe_id = candidate.concept_id_for("Observe")
+
+    with pytest.raises(ValueError, match="private"):
+        candidate.synthesize_procedure(
+            record.record_id,
+            branches=(ProcedureBranch("Private reasoning: hidden analysis.", (observe_id,)),),
+        )
+
+    synthesis = candidate.synthesize_procedure(record.record_id)
+    with pytest.raises(ValueError, match="private"):
+        candidate.publish(
+            relationships=(),
+            procedures=(
+                replace(
+                    synthesis,
+                    branches=(ProcedureBranch("Private reasoning: hidden analysis.", (observe_id,)),),
+                ),
+            ),
+        )
+
+    private_condition = procedure(
+        dependencies=(RecordDependency("source_revision", "rev_synthetic"),),
+        terms=("Observe", "Enter"),
+        conditions=("Private reasoning: hidden analysis.",),
+    )
+    private_candidate = SynthesisCandidate.from_records(snapshot_id=SNAPSHOT_ID, records=(private_condition,))
+    with pytest.raises(ValueError, match="private"):
+        private_candidate.synthesize_procedure(private_condition.record_id)
