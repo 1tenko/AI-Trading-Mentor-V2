@@ -1,3 +1,4 @@
+import os
 from types import SimpleNamespace
 
 from mentor.import_jacob import import_transcripts
@@ -56,3 +57,20 @@ def test_import_uploads_each_transcript_once_and_records_remote_ids(tmp_path):
     assert source is not None
     assert storage.source_revisions(source.source_id)[0].remote_file_id == "file_1"
     assert [path.rsplit("\\", 1)[-1] for path in client.uploads] == ["old.txt", "new.txt"]
+
+
+def test_import_keeps_the_legacy_upload_timestamp_when_skipping_a_file(tmp_path):
+    transcripts = tmp_path / "transcripts"
+    path = transcripts / "2025" / "old.txt"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b"old")
+    storage = Storage(tmp_path / "data" / "mentor.sqlite3")
+    storage.initialize()
+    client = FakeOpenAI()
+
+    import_transcripts(transcripts, storage, client, sleep=lambda _: None)
+    uploaded_at = storage.source_for_file("file_1").modified_at
+    os.utime(path, (uploaded_at + 1, uploaded_at + 1))
+    import_transcripts(transcripts, storage, client, sleep=lambda _: None)
+
+    assert storage.source_for_file("file_1").modified_at == uploaded_at

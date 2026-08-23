@@ -42,7 +42,6 @@ def import_transcripts(
     skipped_count = 0
     for transcript in transcripts:
         if storage.has_source(transcript.relative_path):
-            storage.update_source_modified_at(transcript.relative_path, transcript.modified_at)
             skipped_count += 1
             continue
 

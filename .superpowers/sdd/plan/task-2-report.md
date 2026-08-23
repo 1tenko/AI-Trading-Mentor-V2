@@ -79,3 +79,44 @@ exit 0
 
 Did not begin Task 3, amend the plan, create/delete remote resources, use a
 real corpus or runtime database, push, or alter raw transcript bytes.
+
+## Correction — first-backfill stale-linkage guard
+
+### Root cause
+
+The original backfill made the first readable revision `active` whenever no
+library revision existed. That attached the legacy OpenAI IDs even if the file
+had changed after its Phase 2 upload but before the first Phase 3 backfill. The
+legacy `sources.modified_at` value was also being overwritten by the importer
+on every skipped re-run, which could erase the upload-time comparison baseline.
+
+### TDD evidence
+
+Added a synthetic fixture whose local file has a newer mtime than its legacy
+registration before any backfill. RED was recorded with:
+
+```text
+.\\.venv\\Scripts\\python -m pytest tests\\test_source_registry.py -q
+1 failed, 5 passed
+test_backfill_marks_a_changed_file_pending_on_its_first_migration
+expected replacement_pending with no remote IDs; got active with file_legacy
+and vsf_legacy
+```
+
+Added a second synthetic importer test proving that skipping an already-uploaded
+file preserves its original legacy upload timestamp.
+
+### Green implementation and verification
+
+- First backfill now compares the legacy upload mtime to the readable local
+  file mtime. A mismatch creates `replacement_pending` with no remote IDs;
+  only a matching baseline creates the active linked revision.
+- Removed the old skipped-import timestamp update so the stored upload baseline
+  remains stable for future change detection.
+
+```text
+.\\.venv\\Scripts\\python -m pytest tests\\test_source_registry.py tests\\test_import_jacob.py tests\\test_storage.py -q
+16 passed
+```
+
+This correction remains local-only and uses only temporary synthetic fixtures.

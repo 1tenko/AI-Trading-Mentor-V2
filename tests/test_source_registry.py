@@ -39,6 +39,31 @@ def test_backfill_preserves_remote_linkage_for_byte_identical_legacy_input(tmp_p
     assert storage.source_change(source.source_id) is None
 
 
+def test_backfill_marks_a_changed_file_pending_on_its_first_migration(tmp_path):
+    transcripts = tmp_path / "transcripts"
+    path = transcripts / "2025" / "lesson.txt"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b"replacement bytes")
+    storage = _storage_with_legacy_source(
+        tmp_path,
+        path,
+        "2025/lesson.txt",
+        "file_legacy",
+        "vsf_legacy",
+        modified_at=path.stat().st_mtime - 1,
+    )
+
+    backfill_jacob_registry(transcripts, storage)
+
+    source = storage.library_source_for_identity(JACOB_COLLECTION_ID, "legacy:file_legacy")
+    assert source is not None
+    assert [(revision.content_sha256, revision.lifecycle_state, revision.remote_file_id,
+             revision.remote_vector_store_file_id) for revision in storage.source_revisions(source.source_id)] == [
+        (sha256(b"replacement bytes").hexdigest(), "replacement_pending", None, None)
+    ]
+    assert storage.source_change(source.source_id).lifecycle_state == "replacement_pending"
+
+
 def test_backfill_records_changed_bytes_as_a_pending_replacement(tmp_path):
     transcripts = tmp_path / "transcripts"
     path = transcripts / "May" / "lesson.txt"
@@ -104,20 +129,26 @@ def test_backfill_uses_legacy_file_identity_when_filenames_match(tmp_path):
     assert first_source.original_filename == second_source.original_filename == "lesson.txt"
 
 
-def _storage_with_legacy_source(tmp_path, path, relative_path, file_id, vector_store_file_id):
+def _storage_with_legacy_source(
+    tmp_path, path, relative_path, file_id, vector_store_file_id, modified_at=None
+):
     storage = Storage(tmp_path / "data" / "mentor.sqlite3")
     storage.initialize()
-    _register_legacy_source(storage, path, relative_path, file_id, vector_store_file_id)
+    _register_legacy_source(
+        storage, path, relative_path, file_id, vector_store_file_id, modified_at=modified_at
+    )
     return storage
 
 
-def _register_legacy_source(storage, path, relative_path, file_id, vector_store_file_id):
+def _register_legacy_source(
+    storage, path, relative_path, file_id, vector_store_file_id, modified_at=None
+):
     storage.register_source(
         relative_path=relative_path,
         filename=path.name,
         year=2025 if "2025" in relative_path else 2026,
         local_path=str(path),
-        modified_at=path.stat().st_mtime,
+        modified_at=path.stat().st_mtime if modified_at is None else modified_at,
         file_id=file_id,
         vector_store_file_id=vector_store_file_id,
     )

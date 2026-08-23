@@ -71,6 +71,7 @@ def backfill_jacob_registry(transcript_root: Path, storage: Storage) -> None:
         storage.store_source(source)
         try:
             content = local_path.read_bytes()
+            modified_at = local_path.stat().st_mtime
         except FileNotFoundError:
             _record_unavailable_source(storage, source.source_id, "removed", local_path)
             continue
@@ -84,15 +85,22 @@ def backfill_jacob_registry(transcript_root: Path, storage: Storage) -> None:
             (revision for revision in revisions if revision.content_sha256 == content_sha256), None
         )
         if matching_revision is None:
+            lifecycle_state = (
+                "active"
+                if not revisions and legacy_source.modified_at == modified_at
+                else "replacement_pending"
+            )
             matching_revision = SourceRevision.create(
                 source_id=source.source_id,
                 content_sha256=content_sha256,
                 byte_size=len(content),
                 local_locator=str(local_path.resolve()),
                 observed_at=time.time(),
-                lifecycle_state="active" if not revisions else "replacement_pending",
-                remote_file_id=None if revisions else legacy_source.file_id,
-                remote_vector_store_file_id=None if revisions else legacy_source.vector_store_file_id,
+                lifecycle_state=lifecycle_state,
+                remote_file_id=legacy_source.file_id if lifecycle_state == "active" else None,
+                remote_vector_store_file_id=(
+                    legacy_source.vector_store_file_id if lifecycle_state == "active" else None
+                ),
             )
             storage.store_source_revision(matching_revision)
 
