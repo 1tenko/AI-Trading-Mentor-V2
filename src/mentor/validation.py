@@ -17,14 +17,12 @@ SEMANTIC_OUTCOMES = frozenset(
 
 @dataclass(frozen=True)
 class ValidationResult:
-    candidate: Claim
+    candidate_record_id: str
+    snapshot_id: str
     outcome: str
     audit: str
     anchor_ids: tuple[str, ...]
-
-    @property
-    def source_extracted(self) -> Claim | None:
-        return self.candidate if self.outcome == "affirmatively_supported" else None
+    source_extracted: Claim | None
 
 
 class SemanticValidator:
@@ -44,6 +42,8 @@ class SemanticValidator:
         transcript: str,
         anchors: Mapping[str, SourceAnchor],
     ) -> ValidationResult:
+        if not isinstance(candidate, Claim):
+            raise ValueError("semantic validation applies only to Claim candidates")
         spans = _validated_spans(candidate, revision, transcript, anchors)
         response = self._client.responses.create(
             **semantic_validation_request(
@@ -53,7 +53,14 @@ class SemanticValidator:
             )
         )
         outcome, audit = _semantic_response(response)
-        return ValidationResult(candidate, outcome, audit, tuple(anchor_id for anchor_id, _ in spans))
+        return ValidationResult(
+            candidate.record_id,
+            candidate.snapshot_id,
+            outcome,
+            audit,
+            tuple(anchor_id for anchor_id, _ in spans),
+            _validated_replacement(candidate) if outcome == "affirmatively_supported" else None,
+        )
 
 
 def can_publish_source_extracted(results: Sequence[ValidationResult]) -> bool:
@@ -90,3 +97,21 @@ def _semantic_response(response: Any) -> tuple[str, str]:
     if not isinstance(audit, str) or not audit.strip() or len(audit) > 280:
         raise ValueError("semantic validation audit must be concise text")
     return outcome, audit
+
+
+def _validated_replacement(candidate: Claim) -> Claim:
+    return Claim.create(
+        snapshot_id=candidate.snapshot_id,
+        anchors=candidate.anchors,
+        dependencies=candidate.dependencies,
+        validation_state="validated",
+        lifecycle_state=candidate.lifecycle_state,
+        qualification=candidate.qualification,
+        subject=candidate.subject,
+        predicate=candidate.predicate,
+        object=candidate.object,
+        derived_kind=candidate.derived_kind,
+        evidence_state=candidate.evidence_state,
+        compiler_provenance=candidate.compiler_provenance,
+        facets=candidate.facets,
+    )

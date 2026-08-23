@@ -20,6 +20,7 @@ from mentor.derived_records import (
     Relationship,
     validate_record,
 )
+from mentor.validation import ValidationResult
 from mentor.knowledge import Collection, Source as LibrarySource, SourceRevision
 
 
@@ -278,6 +279,19 @@ class Storage:
                     value TEXT NOT NULL,
                     PRIMARY KEY(record_id, term_role, position)
                 );
+                CREATE TABLE IF NOT EXISTS candidate_validation_audits (
+                    candidate_record_id TEXT PRIMARY KEY,
+                    snapshot_id TEXT NOT NULL REFERENCES corpus_snapshots(snapshot_id),
+                    outcome TEXT NOT NULL CHECK(outcome IN (
+                        'affirmatively_supported', 'partially_supported', 'unsupported', 'ambiguous', 'needs_broader_context'
+                    )),
+                    audit TEXT NOT NULL CHECK(length(audit) BETWEEN 1 AND 280),
+                    validated_record_id TEXT REFERENCES derived_records(record_id),
+                    CHECK(
+                        (outcome = 'affirmatively_supported' AND validated_record_id IS NOT NULL)
+                        OR (outcome <> 'affirmatively_supported' AND validated_record_id IS NULL)
+                    )
+                );
                 """
             )
             columns = {row[1] for row in connection.execute("PRAGMA table_info(sources)")}
@@ -400,6 +414,11 @@ class Storage:
                 raise ValueError("failed snapshots require a failure_reason")
             if status == "published" and (not snapshot.raw_store_id or not snapshot.derived_store_id):
                 raise ValueError("published snapshots require raw and derived store IDs")
+            if status == "published" and connection.execute(
+                "SELECT 1 FROM derived_records WHERE snapshot_id = ? AND validation_state <> 'validated' LIMIT 1",
+                (snapshot_id,),
+            ).fetchone():
+                raise ValueError("published snapshots require validated derived records")
 
             connection.execute(
                 """
@@ -542,6 +561,12 @@ class Storage:
 
     def store_derived_record(self, record: DerivedRecord) -> None:
         validate_record(record)
+        if record.compiler_provenance is not None:
+            raise ValueError("source-extracted records require a semantic validation result before storage")
+        self._store_derived_record(record)
+
+    def _store_derived_record(self, record: DerivedRecord) -> None:
+        validate_record(record)
         with self._connect() as connection:
             if connection.execute("SELECT 1 FROM corpus_snapshots WHERE snapshot_id = ?", (record.snapshot_id,)).fetchone() is None:
                 raise ValueError("derived record references an unknown snapshot")
@@ -596,6 +621,45 @@ class Storage:
             connection.execute(
                 "UPDATE derived_records SET finalized = 1 WHERE record_id = ? AND finalized = 0", (record.record_id,)
             )
+
+    def store_validation_result(self, result: ValidationResult) -> None:
+        if result.outcome == "affirmatively_supported":
+            if result.source_extracted is None:
+                raise ValueError("affirmative semantic validation requires a validated source-extracted record")
+            if result.source_extracted.snapshot_id != result.snapshot_id:
+                raise ValueError("validation result snapshot does not match its source-extracted record")
+            self._store_derived_record(result.source_extracted)
+        elif result.source_extracted is not None:
+            raise ValueError("nonaffirmative semantic validation cannot retain a source-extracted record")
+        if not result.candidate_record_id or not result.snapshot_id or not result.audit.strip() or len(result.audit) > 280:
+            raise ValueError("semantic validation audit is invalid")
+        with self._connect() as connection:
+            if connection.execute("SELECT 1 FROM corpus_snapshots WHERE snapshot_id = ?", (result.snapshot_id,)).fetchone() is None:
+                raise ValueError("validation result references an unknown snapshot")
+            connection.execute(
+                """
+                INSERT INTO candidate_validation_audits(
+                    candidate_record_id, snapshot_id, outcome, audit, validated_record_id
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    result.candidate_record_id,
+                    result.snapshot_id,
+                    result.outcome,
+                    result.audit,
+                    result.source_extracted.record_id if result.source_extracted else None,
+                ),
+            )
+
+    def validation_audits(self, snapshot_id: str) -> list[tuple[str, str, str, str | None]]:
+        with self._connect() as connection:
+            return connection.execute(
+                """
+                SELECT candidate_record_id, outcome, audit, validated_record_id
+                FROM candidate_validation_audits WHERE snapshot_id = ? ORDER BY candidate_record_id
+                """,
+                (snapshot_id,),
+            ).fetchall()
 
     def derived_records(self, snapshot_id: str) -> list[DerivedRecord]:
         with self._connect() as connection:

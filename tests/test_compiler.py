@@ -109,7 +109,7 @@ def test_parser_rejects_an_anchor_id_past_the_schema_limit():
         extractor.extract(revision=revision_for(), snapshot_id="snap_synthetic", transcript="Synthetic source text.")
 
 
-def test_candidate_provenance_survives_storage_reload(tmp_path):
+def test_pending_extracted_candidate_cannot_bypass_semantic_validation_storage(tmp_path):
     storage = Storage(tmp_path / "mentor.sqlite3")
     storage.initialize()
     revision = revision_for()
@@ -130,9 +130,10 @@ def test_candidate_provenance_survives_storage_reload(tmp_path):
     candidate = extractor.extract(
         revision=revision, snapshot_id=snapshot.snapshot_id, transcript="Synthetic source text."
     ).candidates[0]
-    storage.store_derived_record(candidate)
+    with pytest.raises(ValueError, match="semantic validation"):
+        storage.store_derived_record(candidate)
 
-    assert storage.derived_records(snapshot.snapshot_id)[0].compiler_provenance == candidate.compiler_provenance
+    assert storage.derived_records(snapshot.snapshot_id) == []
 
 
 @pytest.mark.parametrize(
