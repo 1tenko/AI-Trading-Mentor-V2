@@ -1,0 +1,54 @@
+{
+  "claim": {
+    "candidates": [
+      {
+        "family": "claim",
+        "anchors": ["anc_synthetic"],
+        "qualification": "Only when the synthetic condition is present.",
+        "subject": "liquidity sweep",
+        "predicate": "precedes",
+        "object": "a synthetic entry",
+        "derived_kind": "statement"
+      }
+    ]
+  },
+  "empty": {
+    "candidates": []
+  },
+  "malformed_family": {
+    "candidates": [
+      {
+        "family": "invented",
+        "anchors": ["anc_synthetic"],
+        "qualification": "Synthetic.",
+        "subject": "signal",
+        "predicate": "states",
+        "object": "observation"
+      }
+    ]
+  },
+  "missing_anchors": {
+    "candidates": [
+      {
+        "family": "claim",
+        "qualification": "Synthetic.",
+        "subject": "signal",
+        "predicate": "states",
+        "object": "observation"
+      }
+    ]
+  },
+  "self_validated": {
+    "candidates": [
+      {
+        "family": "claim",
+        "anchors": ["anc_synthetic"],
+        "qualification": "Synthetic.",
+        "subject": "signal",
+        "predicate": "states",
+        "object": "observation",
+        "validation_state": "validated"
+      }
+    ]
+  }
+}
