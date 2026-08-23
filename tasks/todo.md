@@ -63,7 +63,7 @@ Stay on feature/phase-3-knowledge-assimilation. Do not begin Phase 4.
 
 ## derived-orientation-retrieval
 
-- [ ] **Task 12 — Vector-store adapter and guarded capability preflight**
+- [x] **Task 12 — Vector-store adapter and guarded capability preflight**
   - Depends on: Checkpoint C. Verify: fake adapter tests; disposable live
     preflight only with Theo's explicit approval.
 - [ ] **Task 13 — Bounded published-snapshot orientation service**
