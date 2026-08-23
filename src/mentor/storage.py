@@ -214,6 +214,18 @@ class Storage:
             snapshot.schema_version,
         ) != (run.model_version, run.prompt_version, run.schema_version):
             raise ValueError("snapshot versions do not match compilation run")
+        try:
+            expected_ids, expected_fingerprint, expected_snapshot_id = CorpusSnapshot.identity_for(
+                snapshot.run_id, snapshot.selected_revision_ids
+            )
+        except ValueError as error:
+            raise ValueError("snapshot identity is not canonical") from error
+        if (
+            snapshot.selected_revision_ids,
+            snapshot.selected_revision_fingerprint,
+            snapshot.snapshot_id,
+        ) != (expected_ids, expected_fingerprint, expected_snapshot_id):
+            raise ValueError("snapshot identity is not canonical")
         with self._connect() as connection:
             known_revisions = {
                 row[0]
@@ -285,7 +297,7 @@ class Storage:
                 raise ValueError("unknown snapshot")
             snapshot = _snapshot_from_row(row)
             allowed = {
-                "building": {"validating", "failed"},
+                "building": {"validating"},
                 "validating": {"published", "failed"},
                 "failed": set(),
                 "published": set(),

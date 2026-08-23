@@ -59,6 +59,43 @@ def test_candidate_requires_validation_before_publication(tmp_path):
     assert storage.snapshot(snapshot.snapshot_id).status == "building"
 
 
+def test_candidate_cannot_fail_before_validation(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    snapshot = candidate(storage, "run_early_failure", [revision_for(storage, "source_a")])
+
+    with pytest.raises(ValueError, match="building.*failed"):
+        storage.transition_snapshot(snapshot.snapshot_id, "failed", failure_reason="synthetic failure")
+
+    assert storage.snapshot(snapshot.snapshot_id).status == "building"
+
+
+def test_candidate_persistence_rejects_tampered_snapshot_identity(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    first = revision_for(storage, "source_a")
+    second = revision_for(storage, "source_b")
+    run = CompilationRun("run_tampered", "test-model", "prompt-v1", "schema-v1", 1_700_000_000.0)
+    snapshot = CorpusSnapshot.create(
+        run=run,
+        selected_revisions=[first, second],
+        raw_store_id="raw_tampered",
+        derived_store_id="derived_tampered",
+        created_at=1_700_000_001.0,
+    )
+
+    for tampered in (
+        replace(snapshot, selected_revision_ids=tuple(reversed(snapshot.selected_revision_ids))),
+        replace(snapshot, selected_revision_ids=(snapshot.selected_revision_ids[0],) * 2),
+        replace(snapshot, selected_revision_fingerprint="0" * 64),
+        replace(snapshot, snapshot_id="snap_forged"),
+    ):
+        with pytest.raises(ValueError, match="snapshot identity"):
+            storage.create_compilation_candidate(run, tampered)
+
+    assert storage.compilation_run(run.run_id) is None
+
+
 def test_failed_candidate_remains_isolated_from_the_published_snapshot(tmp_path):
     storage = Storage(tmp_path / "mentor.sqlite3")
     storage.initialize()

@@ -47,11 +47,9 @@ class CorpusSnapshot:
         derived_store_id: str | None,
         created_at: float,
     ) -> "CorpusSnapshot":
-        revision_ids = tuple(sorted(revision.revision_id for revision in selected_revisions))
-        if not revision_ids or len(set(revision_ids)) != len(revision_ids):
-            raise ValueError("selected revisions must be non-empty and unique")
-        fingerprint = sha256("\n".join(revision_ids).encode()).hexdigest()
-        snapshot_id = f"snap_{sha256(f'{run.run_id}\0{fingerprint}'.encode()).hexdigest()}"
+        revision_ids, fingerprint, snapshot_id = cls.identity_for(
+            run.run_id, [revision.revision_id for revision in selected_revisions]
+        )
         return cls(
             snapshot_id=snapshot_id,
             run_id=run.run_id,
@@ -65,6 +63,15 @@ class CorpusSnapshot:
             status="building",
             created_at=created_at,
         )
+
+    @staticmethod
+    def identity_for(run_id: str, selected_revision_ids: Sequence[str]) -> tuple[tuple[str, ...], str, str]:
+        revision_ids = tuple(sorted(selected_revision_ids))
+        if not revision_ids or len(set(revision_ids)) != len(revision_ids):
+            raise ValueError("selected revisions must be non-empty and unique")
+        fingerprint = sha256("\n".join(revision_ids).encode()).hexdigest()
+        snapshot_id = f"snap_{sha256(f'{run_id}\0{fingerprint}'.encode()).hexdigest()}"
+        return revision_ids, fingerprint, snapshot_id
 
 
 @dataclass(frozen=True)
