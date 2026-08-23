@@ -51,7 +51,7 @@ Stay on feature/phase-3-knowledge-assimilation. Do not begin Phase 4.
 
 ## invalidation-publication
 
-- [ ] **Task 10 — Dependency DAG and selective stale propagation**
+- [x] **Task 10 — Dependency DAG and selective stale propagation**
   - Depends on: Task 9. Verify: cycle/closure/staleness tests; full pytest.
 - [ ] **Task 11 — Local candidate validation and atomic publication**
   - Depends on: Task 10. Verify: failed-candidate/pointer-swap tests; full pytest.
