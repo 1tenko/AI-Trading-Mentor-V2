@@ -36,11 +36,12 @@ path; unrelated attachment errors continue to propagate unchanged.
 - [Delete Vector Store File (detach)](https://developers.openai.com/api/reference/python/resources/vector_stores/subresources/files/methods/delete)
 - [Vector Store File Batches](https://developers.openai.com/api/reference/cli/resources/vector_stores/subresources/file_batches)
 
-## Required live preflight before real compilation
+## Completed preflight protocol and future rerun guard
 
-After Theo explicitly approves it and configures credentials, run a small,
-disposable-data-only probe against an otherwise unused vector store. It must
-verify the current API/SDK supports:
+Theo explicitly authorized and the project performed the disposable-data-only
+probe described here. This project's observed result is recorded below. The
+probe used an otherwise unused vector store and verified the current API/SDK
+supports:
 
 1. creating a disposable store and attaching a disposable File;
 2. attaching the same File to a second disposable candidate store, or clearly
@@ -48,11 +49,13 @@ verify the current API/SDK supports:
 3. caller-controlled batch status retrieval and vector-store search attribute filters; and
 4. detaching from the disposable store without deleting the underlying File.
 
-Record the SDK version, calls, identifiers, statuses, filter/search result, and
-cleanup result locally. If the same-File behavior or any other capability
+The run recorded the SDK version, statuses, filter/search result, and cleanup
+result locally without retaining credentials or resource IDs. Do not use Jacob
+corpus content, existing Jacob Files, or the Jacob vector store for a
+preflight. If future SDK/API capability drift needs confirmation, Theo must
+explicitly authorize a fresh disposable preflight before it runs. If that probe
 contradicts the approved raw/derived snapshot design, stop Phase 3 work and
-report it. Do not use Jacob corpus content, existing Jacob Files, or the Jacob
-vector store for this preflight.
+report it.
 
 `PHASE3_VECTOR_STORE_PREFLIGHT=disposable-approved` is an additional local
 guard, not a substitute for Theo's explicit approval. No runner is wired in
