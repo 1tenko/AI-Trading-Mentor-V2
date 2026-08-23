@@ -58,7 +58,7 @@ Stay on feature/phase-3-knowledge-assimilation. Do not begin Phase 4.
 
 ### Checkpoint C — Safe local publication
 
-- [ ] Synthetic publication is safe; no remote candidate store exists; full
+- [x] Synthetic publication is safe; no remote candidate store exists; full
   pytest passes.
 
 ## derived-orientation-retrieval
