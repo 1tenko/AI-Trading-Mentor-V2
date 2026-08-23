@@ -1,6 +1,7 @@
 """Small SQLite store for private Trading Mentor state."""
 
 import json
+import re
 import sqlite3
 import time
 from dataclasses import replace
@@ -26,6 +27,7 @@ from mentor.derived_records import (
 )
 from mentor.validation import SemanticValidator, ValidationResult
 from mentor.knowledge import Collection, Source as LibrarySource, SourceRevision
+from mentor.synthesis import Concept
 
 
 @dataclass(frozen=True)
@@ -271,6 +273,12 @@ class Storage:
                     record_id TEXT NOT NULL REFERENCES derived_records(record_id),
                     revision_id TEXT NOT NULL REFERENCES source_revisions(revision_id),
                     PRIMARY KEY(snapshot_id, record_id, revision_id)
+                );
+                CREATE TABLE IF NOT EXISTS derived_record_concepts (
+                    snapshot_id TEXT NOT NULL REFERENCES corpus_snapshots(snapshot_id),
+                    record_id TEXT NOT NULL REFERENCES derived_records(record_id),
+                    concept_id TEXT NOT NULL,
+                    PRIMARY KEY(snapshot_id, record_id)
                 );
                 CREATE TABLE IF NOT EXISTS derived_record_facets (
                     record_id TEXT NOT NULL REFERENCES derived_records(record_id),
@@ -1121,6 +1129,125 @@ class Storage:
                 for record in records
                 if not self._depends_on_stale_record(connection, record, reject_cross_snapshot=False)
             ]
+
+    def store_orientation_concept_ids(
+        self,
+        snapshot_id: str,
+        record_concept_ids: Mapping[str, str],
+        *,
+        concepts: tuple[Concept, ...],
+    ) -> None:
+        """Seal one locally authoritative primary concept for each candidate record."""
+        entries = dict(record_concept_ids)
+        if not entries or any(
+            not isinstance(record_id, str)
+            or not record_id
+            or not isinstance(concept_id, str)
+            or re.fullmatch(r"con_[0-9a-f]{64}", concept_id) is None
+            for record_id, concept_id in entries.items()
+        ):
+            raise ValueError("orientation concept links must use canonical record and concept IDs")
+        known_concepts: dict[str, Concept] = {}
+        for concept in concepts:
+            if not isinstance(concept, Concept) or concept.snapshot_id != snapshot_id:
+                raise ValueError("orientation concept links require current candidate concepts")
+            canonical = Concept.create(
+                snapshot_id=concept.snapshot_id,
+                canonical_label=concept.canonical_label,
+                aliases=concept.aliases,
+                scope=concept.scope,
+                supporting_record_ids=concept.supporting_record_ids,
+                supporting_anchor_ids=concept.supporting_anchor_ids,
+            )
+            if canonical != concept or concept.concept_id in known_concepts:
+                raise ValueError("orientation concept links require canonical unique concepts")
+            known_concepts[concept.concept_id] = concept
+        if any(
+            concept_id not in known_concepts
+            or record_id not in known_concepts[concept_id].supporting_record_ids
+            for record_id, concept_id in entries.items()
+        ):
+            raise ValueError("orientation concept links must be supported by their candidate concepts")
+        with self._connect() as connection:
+            status, _selected_revision_ids = self._snapshot_state(connection, snapshot_id)
+            if status != "building":
+                raise ValueError("orientation concept links require a building candidate")
+            for record_id, concept_id in entries.items():
+                row = connection.execute(
+                    """
+                    SELECT validation_state, lifecycle_state, finalized
+                    FROM derived_records WHERE snapshot_id = ? AND record_id = ?
+                    """,
+                    (snapshot_id, record_id),
+                ).fetchone()
+                if row != ("validated", "active", 1):
+                    raise ValueError("orientation concept links require validated active candidate records")
+                existing = connection.execute(
+                    """
+                    SELECT concept_id FROM derived_record_concepts
+                    WHERE snapshot_id = ? AND record_id = ?
+                    """,
+                    (snapshot_id, record_id),
+                ).fetchone()
+                if existing is not None and existing[0] != concept_id:
+                    raise ValueError("orientation concept links are immutable")
+            connection.executemany(
+                """
+                INSERT INTO derived_record_concepts(snapshot_id, record_id, concept_id)
+                VALUES (?, ?, ?) ON CONFLICT(snapshot_id, record_id) DO NOTHING
+                """,
+                [(snapshot_id, record_id, concept_id) for record_id, concept_id in entries.items()],
+            )
+
+    def orientation_concept_ids(self, snapshot_id: str) -> dict[str, str]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT record_id, concept_id FROM derived_record_concepts
+                WHERE snapshot_id = ? ORDER BY record_id
+                """,
+                (snapshot_id,),
+            ).fetchall()
+        return {str(record_id): str(concept_id) for record_id, concept_id in rows}
+
+    def orientation_source_area(
+        self, snapshot_id: str, record: DerivedRecord
+    ) -> tuple[str | None, int | None, str | None]:
+        """Derive display-safe source context from local revision dependencies only."""
+        revision_ids = tuple(
+            dependency.identifier for dependency in record.dependencies if dependency.kind == "source_revision"
+        )
+        scope = next((facet.value for facet in record.facets if facet.name == "scope"), None)
+        if not revision_ids:
+            return None, None, scope
+        placeholders = ",".join("?" for _ in revision_ids)
+        with self._connect() as connection:
+            owner = connection.execute(
+                """
+                SELECT 1 FROM derived_records
+                WHERE snapshot_id = ? AND record_id = ? AND finalized = 1
+                """,
+                (snapshot_id, record.record_id),
+            ).fetchone()
+            if owner is None:
+                return None, None, scope
+            rows = connection.execute(
+                f"""
+                SELECT library_sources.collection_id, library_sources.year
+                FROM source_revisions JOIN library_sources USING(source_id)
+                WHERE source_revisions.revision_id IN ({placeholders})
+                """,
+                revision_ids,
+            ).fetchall()
+        if len(rows) != len(set(revision_ids)):
+            return None, None, scope
+        collections = {row[0] for row in rows}
+        years = {row[1] for row in rows}
+        return (
+            next(iter(collections)) if len(collections) == 1 else None,
+            next(iter(years)) if len(years) == 1 else None,
+            scope,
+        )
 
     def _store_record_family(self, connection: sqlite3.Connection, record: DerivedRecord) -> None:
         if isinstance(record, Claim):

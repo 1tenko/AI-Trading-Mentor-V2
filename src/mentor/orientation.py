@@ -87,13 +87,14 @@ class OrientationService:
 
         attributes["snapshot_id"] = snapshot.snapshot_id
         local_records, invalid_local_ids = self._current_local_records(snapshot.snapshot_id)
+        local_concept_ids = self._storage.orientation_concept_ids(snapshot.snapshot_id)
         remote_results = self._vector_stores.search(
             snapshot.derived_store_id,
             question,
             attributes=attributes,
             max_num_results=min(50, self._budget.max_records * 4),
         )
-        return self._bound_results(snapshot, local_records, invalid_local_ids, remote_results)
+        return self._bound_results(snapshot, local_records, invalid_local_ids, local_concept_ids, remote_results)
 
     def _current_local_records(self, snapshot_id: str) -> tuple[dict[str, DerivedRecord], set[str]]:
         records: dict[str, DerivedRecord] = {}
@@ -122,28 +123,35 @@ class OrientationService:
         snapshot: Any,
         local_records: dict[str, DerivedRecord],
         invalid_local_ids: set[str],
+        local_concept_ids: dict[str, str],
         remote_results: list[VectorStoreSearchResult],
     ) -> OrientationResult:
         records: list[OrientationRecord] = []
-        seen: set[str] = set()
+        seen_record_ids: set[str] = set()
+        seen_concept_ids: set[str] = set()
         used_tokens = duplicate_count = discarded_count = 0
         truncated = False
         for remote in remote_results:
-            record = self._valid_remote_record(remote, snapshot.snapshot_id, local_records, invalid_local_ids)
-            if record is None:
+            record, concept_id = self._valid_remote_record(
+                remote, snapshot.snapshot_id, local_records, invalid_local_ids, local_concept_ids
+            )
+            if record is None or concept_id is None:
                 discarded_count += 1
                 continue
-            concept_id = _optional_identifier(remote.attributes.get("concept_id"))
-            identity = f"concept:{concept_id}" if concept_id else f"record:{record.record_id}"
-            if identity in seen:
+            if record.record_id in seen_record_ids or concept_id in seen_concept_ids:
                 duplicate_count += 1
                 continue
-            orientation_record = _orientation_record(record, concept_id, remote.attributes)
+            seen_record_ids.add(record.record_id)
+            seen_concept_ids.add(concept_id)
+            orientation_record = _orientation_record(
+                record,
+                concept_id,
+                self._storage.orientation_source_area(snapshot.snapshot_id, record),
+            )
             record_tokens = _conservative_token_upper_bound(orientation_record)
             if len(records) >= self._budget.max_records or used_tokens + record_tokens > self._budget.max_tokens:
                 truncated = True
                 continue
-            seen.add(identity)
             records.append(orientation_record)
             used_tokens += record_tokens
         return OrientationResult(
@@ -163,15 +171,20 @@ class OrientationService:
         snapshot_id: str,
         local_records: dict[str, DerivedRecord],
         invalid_local_ids: set[str],
-    ) -> DerivedRecord | None:
+        local_concept_ids: dict[str, str],
+    ) -> tuple[DerivedRecord | None, str | None]:
         if not isinstance(remote, VectorStoreSearchResult):
-            return None
+            return None, None
         if remote.attributes.get("snapshot_id") != snapshot_id or remote.attributes.get("status") != "published":
-            return None
+            return None, None
         record_id = remote.record_id
         if record_id is None or record_id in invalid_local_ids:
-            return None
-        return local_records.get(record_id)
+            return None, None
+        record = local_records.get(record_id)
+        concept_id = local_concept_ids.get(record_id)
+        if record is None or not _is_canonical_concept_id(concept_id):
+            return None, None
+        return record, concept_id
 
 
 def _add_scope(
@@ -199,8 +212,8 @@ def _require_question(question: str) -> None:
 
 def _orientation_record(
     record: DerivedRecord,
-    concept_id: str | None,
-    attributes: dict[str, object],
+    concept_id: str,
+    source_area: tuple[str | None, int | None, str | None],
 ) -> OrientationRecord:
     return OrientationRecord(
         record_id=record.record_id,
@@ -211,11 +224,7 @@ def _orientation_record(
         qualification=record.qualification,
         statement=_statement(record),
         anchor_ids=record.anchors,
-        source_area=OrientationSourceArea(
-            _safe_metadata_text(attributes.get("collection_id")),
-            _safe_year(attributes.get("year")),
-            _safe_metadata_text(attributes.get("scope")),
-        ),
+        source_area=OrientationSourceArea(*_safe_source_area(source_area)),
     )
 
 
@@ -249,6 +258,20 @@ def _safe_year(value: object) -> int | None:
 
 def _optional_identifier(value: object) -> str | None:
     return value if isinstance(value, str) and value.strip() else None
+
+
+def _is_canonical_concept_id(value: object) -> bool:
+    return isinstance(value, str) and len(value) == 68 and value.startswith("con_") and all(
+        character in "0123456789abcdef" for character in value[4:]
+    )
+
+
+def _safe_source_area(
+    source_area: object,
+) -> tuple[str | None, int | None, str | None]:
+    if not isinstance(source_area, tuple) or len(source_area) != 3:
+        return None, None, None
+    return _safe_metadata_text(source_area[0]), _safe_year(source_area[1]), _safe_metadata_text(source_area[2])
 
 
 def _conservative_token_upper_bound(record: OrientationRecord) -> int:
