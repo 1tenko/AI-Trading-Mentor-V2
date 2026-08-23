@@ -3,7 +3,7 @@ from dataclasses import replace
 import pytest
 
 from mentor.derived_records import Facet, ProcedureSequenceHierarchy, Relationship, Claim, RecordDependency
-from mentor.synthesis import Concept, ProcedureBranch, SynthesisCandidate
+from mentor.synthesis import ConceptHint, ProcedureBranch, SynthesisCandidate
 
 
 SNAPSHOT_ID = "snap_synthetic"
@@ -49,7 +49,9 @@ def relationship(
     )
 
 
-def procedure(*, dependencies: tuple[RecordDependency, ...]) -> ProcedureSequenceHierarchy:
+def procedure(
+    *, dependencies: tuple[RecordDependency, ...], terms: tuple[str, ...] = ("Observe", "Confirm", "Enter")
+) -> ProcedureSequenceHierarchy:
     return ProcedureSequenceHierarchy.create(
         snapshot_id=SNAPSHOT_ID,
         anchors=("anc_procedure",),
@@ -59,99 +61,105 @@ def procedure(*, dependencies: tuple[RecordDependency, ...]) -> ProcedureSequenc
         qualification="Synthetic support.",
         facets=(Facet("condition", "Only after confirmation."),),
         kind="procedure",
-        terms=("Observe", "Confirm", "Enter"),
-    )
-
-
-def concept(label: str, *records, aliases: tuple[str, ...] = (), scope: str | None = None) -> Concept:
-    return Concept.create(
-        snapshot_id=SNAPSHOT_ID,
-        canonical_label=label,
-        aliases=aliases,
-        scope=scope,
-        supporting_record_ids=tuple(record.record_id for record in records),
-        supporting_anchor_ids=tuple(anchor for record in records for anchor in record.anchors),
+        terms=terms,
     )
 
 
 def test_candidate_excludes_invalid_records_and_requires_valid_concept_support():
     validated = claim(subject="validated")
     pending = claim(subject="pending", validation_state="pending")
-    concept = Concept.create(
-        snapshot_id=SNAPSHOT_ID,
-        canonical_label="Validated",
-        aliases=(),
-        scope=None,
-        supporting_record_ids=(validated.record_id,),
-        supporting_anchor_ids=("anc_validated",),
-    )
 
-    candidate = SynthesisCandidate.from_records(
-        snapshot_id=SNAPSHOT_ID,
-        records=(validated, pending),
-        concepts=(concept,),
-    )
+    candidate = SynthesisCandidate.from_records(snapshot_id=SNAPSHOT_ID, records=(validated, pending))
+    clustered = next(concept for concept in candidate.concepts if concept.canonical_label == "validated")
 
     assert candidate.record_ids == (validated.record_id,)
-    assert candidate.concept_id_for("validated") == concept.concept_id
+    assert candidate.concept_id_for("validated") == clustered.concept_id
+    assert clustered.supporting_record_ids == (validated.record_id,)
+    assert clustered.supporting_anchor_ids == validated.anchors
     with pytest.raises(ValueError, match="valid supporting record"):
         SynthesisCandidate.from_records(
             snapshot_id=SNAPSHOT_ID,
             records=(validated, pending),
-            concepts=(
-                Concept.create(
-                    snapshot_id=SNAPSHOT_ID,
-                    canonical_label="Pending",
-                    aliases=(),
-                    scope=None,
-                    supporting_record_ids=(pending.record_id,),
-                    supporting_anchor_ids=("anc_pending",),
-                ),
-            ),
+            hints=(ConceptHint(pending.record_id, "pending"),),
         )
 
 
 def test_candidate_requires_each_concept_anchor_to_belong_to_its_valid_supporting_record():
     validated = claim(subject="validated")
+    candidate = SynthesisCandidate.from_records(snapshot_id=SNAPSHOT_ID, records=(validated,))
+    clustered = candidate.concept_id_for("validated")
 
-    with pytest.raises(ValueError, match="valid supporting anchor"):
-        SynthesisCandidate.from_records(
-            snapshot_id=SNAPSHOT_ID,
-            records=(validated,),
-            concepts=(
-                Concept.create(
-                    snapshot_id=SNAPSHOT_ID,
-                    canonical_label="Validated",
-                    aliases=(),
-                    scope=None,
-                    supporting_record_ids=(validated.record_id,),
-                    supporting_anchor_ids=("anc_other",),
-                ),
-            ),
-        )
+    assert next(concept for concept in candidate.concepts if concept.concept_id == clustered).supporting_anchor_ids == validated.anchors
 
 
 def test_repeated_references_converge_on_one_candidate_scoped_concept_id():
     first = relationship(left="Range", right="Entry")
     second = relationship(left="Range", right="Risk")
-    range_concept = concept("Range", first, second)
-    entry_concept = concept("Entry", first)
-    risk_concept = concept("Risk", second)
     candidate = SynthesisCandidate.from_records(
         snapshot_id=SNAPSHOT_ID,
         records=(first, second),
-        concepts=(range_concept, entry_concept, risk_concept),
     )
 
     first_synthesis = candidate.synthesize_relationship(first.record_id)
     second_synthesis = candidate.synthesize_relationship(second.record_id)
 
-    assert first_synthesis.left_concept_id == second_synthesis.left_concept_id == range_concept.concept_id
-    assert first_synthesis.right_concept_id == entry_concept.concept_id
+    assert first_synthesis.left_concept_id == second_synthesis.left_concept_id == candidate.concept_id_for("Range")
+    assert first_synthesis.right_concept_id == candidate.concept_id_for("Entry")
     assert first_synthesis.relation == "depends_on"
     assert first_synthesis.input_record_ids == (first.record_id,)
     assert first_synthesis.anchor_ids == first.anchors
     assert first_synthesis.justification == "depends_on is supported by validated input records."
+
+
+def test_candidate_clusters_validated_record_terms_without_manual_concepts():
+    first = relationship(left="Range", right="Entry")
+    second = relationship(left="range", right="Risk")
+
+    candidate = SynthesisCandidate.from_records(snapshot_id=SNAPSHOT_ID, records=(first, second))
+
+    first_synthesis = candidate.synthesize_relationship(first.record_id)
+    second_synthesis = candidate.synthesize_relationship(second.record_id)
+    assert first_synthesis.left_concept_id == second_synthesis.left_concept_id
+    assert candidate.concept_id_for("Range") == first_synthesis.left_concept_id
+
+
+def test_explicit_alias_hints_cluster_only_the_supported_scoped_references():
+    support = relationship(left="Support", right="Entry")
+    floor = relationship(left="Floor", right="Risk")
+    candidate = SynthesisCandidate.from_records(
+        snapshot_id=SNAPSHOT_ID,
+        records=(support, floor),
+        hints=(
+            ConceptHint(support.record_id, "Support", aliases=("Floor",), scope="range"),
+            ConceptHint(floor.record_id, "Floor", aliases=("Support",), scope="range"),
+        ),
+    )
+
+    assert candidate.concept_id_for("Floor", scope="range") == candidate.concept_id_for("Support", scope="range")
+    with pytest.raises(ValueError, match="scope"):
+        candidate.concept_id_for("Floor")
+    with pytest.raises(ValueError, match="scope"):
+        candidate.synthesize_relationship(support.record_id)
+    synthesis = candidate.synthesize_relationship(support.record_id, left_scope="range")
+    assert synthesis.left_concept_id == candidate.concept_id_for("Support", scope="range")
+    assert synthesis.left_scope == "range"
+
+
+def test_same_labels_with_explicit_distinct_scopes_do_not_merge():
+    opening = relationship(left="Signal", right="Entry")
+    closing = relationship(left="Signal", right="Risk")
+    candidate = SynthesisCandidate.from_records(
+        snapshot_id=SNAPSHOT_ID,
+        records=(opening, closing),
+        hints=(
+            ConceptHint(opening.record_id, "Signal", scope="opening"),
+            ConceptHint(closing.record_id, "Signal", scope="closing"),
+        ),
+    )
+
+    assert candidate.concept_id_for("Signal", scope="opening") != candidate.concept_id_for("Signal", scope="closing")
+    with pytest.raises(ValueError, match="scope"):
+        candidate.concept_id_for("Signal")
 
 
 def test_synthesis_keeps_a_concise_justification_when_transitive_inputs_are_long():
@@ -177,7 +185,6 @@ def test_synthesis_keeps_a_concise_justification_when_transitive_inputs_are_long
     candidate = SynthesisCandidate.from_records(
         snapshot_id=SNAPSHOT_ID,
         records=(*contexts, record),
-        concepts=(concept("Range", record), concept("Entry", record)),
     )
 
     synthesis = candidate.synthesize_relationship(record.record_id)
@@ -187,50 +194,65 @@ def test_synthesis_keeps_a_concise_justification_when_transitive_inputs_are_long
 
 
 def test_aliases_resolve_only_to_their_own_concept_and_similar_names_remain_distinct():
-    record = claim(subject="support")
-    support = concept("Support", record, aliases=("floor",))
-    resistance = concept("Supportive", record)
+    record = relationship(left="Support", right="Supportive")
     candidate = SynthesisCandidate.from_records(
         snapshot_id=SNAPSHOT_ID,
         records=(record,),
-        concepts=(support, resistance),
+        hints=(ConceptHint(record.record_id, "Support", aliases=("floor",)),),
     )
 
-    assert candidate.concept_id_for("FLOOR") == support.concept_id
-    assert candidate.concept_id_for("support") == support.concept_id
-    assert candidate.concept_id_for("supportive") == resistance.concept_id
-    assert support.concept_id != resistance.concept_id
+    assert candidate.concept_id_for("FLOOR") == candidate.concept_id_for("support")
+    assert candidate.concept_id_for("support") != candidate.concept_id_for("supportive")
 
 
 def test_concept_ids_are_stable_within_one_candidate_and_scoped_to_another_candidate():
-    record = claim(subject="support")
-    first = concept("Support", record, aliases=("floor",), scope="market structure")
-    second = concept("Support", record, aliases=("floor",), scope="market structure")
-
-    assert first.concept_id == second.concept_id
-    assert first.concept_id != Concept.create(
+    record = relationship(left="Support", right="Entry")
+    first = SynthesisCandidate.from_records(
+        snapshot_id=SNAPSHOT_ID,
+        records=(record,),
+        hints=(ConceptHint(record.record_id, "Support", scope="market structure"),),
+    )
+    second = SynthesisCandidate.from_records(
+        snapshot_id=SNAPSHOT_ID,
+        records=(record,),
+        hints=(ConceptHint(record.record_id, "Support", scope="market structure"),),
+    )
+    other = Relationship.create(
         snapshot_id="snap_other",
-        canonical_label="Support",
-        aliases=("floor",),
-        scope="market structure",
-        supporting_record_ids=(record.record_id,),
-        supporting_anchor_ids=record.anchors,
-    ).concept_id
+        anchors=("anc_other",),
+        dependencies=(RecordDependency("source_revision", "rev_synthetic"),),
+        validation_state="validated",
+        lifecycle_state="candidate",
+        qualification="Synthetic support.",
+        left="Support",
+        relation="depends_on",
+        right="Entry",
+    )
+
+    assert first.concept_id_for("Support", scope="market structure") == second.concept_id_for(
+        "Support", scope="market structure"
+    )
+    assert first.concept_id_for("Support", scope="market structure") != SynthesisCandidate.from_records(
+        snapshot_id="snap_other",
+        records=(other,),
+        hints=(ConceptHint(other.record_id, "Support", scope="market structure"),),
+    ).concept_id_for("Support", scope="market structure")
 
 
 def test_explicit_scopes_keep_identical_labels_distinct_without_an_unscoped_alias_collision():
-    record = claim(subject="signal")
-    opening = concept("Signal", record, scope="opening")
-    closing = concept("Signal", record, scope="closing")
+    opening = relationship(left="Signal", right="Entry")
+    closing = relationship(left="Signal", right="Risk")
     candidate = SynthesisCandidate.from_records(
         snapshot_id=SNAPSHOT_ID,
-        records=(record,),
-        concepts=(opening, closing),
+        records=(opening, closing),
+        hints=(
+            ConceptHint(opening.record_id, "Signal", scope="opening"),
+            ConceptHint(closing.record_id, "Signal", scope="closing"),
+        ),
     )
 
-    assert candidate.concept_id_for("Signal", scope="opening") == opening.concept_id
-    assert candidate.concept_id_for("Signal", scope="closing") == closing.concept_id
-    with pytest.raises(ValueError, match="ambiguous"):
+    assert candidate.concept_id_for("Signal", scope="opening") != candidate.concept_id_for("Signal", scope="closing")
+    with pytest.raises(ValueError, match="scope"):
         candidate.concept_id_for("Signal")
 
 
@@ -242,33 +264,30 @@ def test_procedure_synthesis_retains_transitive_inputs_and_structured_branches()
             RecordDependency("derived_record", context.record_id),
         )
     )
-    concepts = (
-        concept("Context", context),
-        concept("Observe", record),
-        concept("Confirm", record),
-        concept("Enter", record),
-    )
     candidate = SynthesisCandidate.from_records(
         snapshot_id=SNAPSHOT_ID,
         records=(context, record),
-        concepts=concepts,
     )
 
     procedure_synthesis = candidate.synthesize_procedure(
         record.record_id,
-        prerequisite_concept_ids=(concepts[0].concept_id,),
+        prerequisite_concept_ids=(candidate.concept_id_for("Context"),),
         branches=(
             ProcedureBranch(
                 condition="If confirmation fails.",
-                step_concept_ids=(concepts[1].concept_id,),
+                step_concept_ids=(candidate.concept_id_for("Observe"),),
             ),
         ),
     )
 
-    assert [step.concept_id for step in procedure_synthesis.steps] == [concept.concept_id for concept in concepts[1:]]
-    assert procedure_synthesis.prerequisite_concept_ids == (concepts[0].concept_id,)
+    assert [step.concept_id for step in procedure_synthesis.steps] == [
+        candidate.concept_id_for("Observe"),
+        candidate.concept_id_for("Confirm"),
+        candidate.concept_id_for("Enter"),
+    ]
+    assert procedure_synthesis.prerequisite_concept_ids == (candidate.concept_id_for("Context"),)
     assert procedure_synthesis.conditions == ("Only after confirmation.",)
-    assert procedure_synthesis.branches[0].step_concept_ids == (concepts[1].concept_id,)
+    assert procedure_synthesis.branches[0].step_concept_ids == (candidate.concept_id_for("Observe"),)
     assert procedure_synthesis.input_record_ids == (record.record_id, context.record_id)
     assert procedure_synthesis.anchor_ids == ("anc_procedure", "anc_context")
     assert procedure_synthesis.evidence_state == "raw_taught"
@@ -279,29 +298,90 @@ def test_procedure_synthesis_retains_transitive_inputs_and_structured_branches()
 
 def test_synthesis_rejects_raw_text_dumps_and_publish_rejects_unknown_concept_ids():
     record = relationship(left="Range", right="Entry")
-    range_concept = concept("Range", record)
-    entry_concept = concept("Entry", record)
     candidate = SynthesisCandidate.from_records(
         snapshot_id=SNAPSHOT_ID,
         records=(record,),
-        concepts=(range_concept, entry_concept),
     )
     relationship_synthesis = candidate.synthesize_relationship(record.record_id)
     procedure_record = procedure(dependencies=(RecordDependency("source_revision", "rev_synthetic"),))
     procedure_candidate = SynthesisCandidate.from_records(
         snapshot_id=SNAPSHOT_ID,
         records=(procedure_record,),
-        concepts=(
-            concept("Observe", procedure_record),
-            concept("Confirm", procedure_record),
-            concept("Enter", procedure_record),
-        ),
     )
 
     with pytest.raises(ValueError, match="raw text dump"):
         procedure_candidate.synthesize_procedure(
             procedure_record.record_id,
-            branches=(ProcedureBranch(condition="source text " * 100, step_concept_ids=(range_concept.concept_id,)),),
+            branches=(
+                ProcedureBranch(condition="source text " * 100, step_concept_ids=(candidate.concept_id_for("Range"),)),
+            ),
         )
     with pytest.raises(ValueError, match="valid concept IDs"):
         candidate.publish(relationships=(replace(relationship_synthesis, left_concept_id="con_unknown"),), procedures=())
+
+
+def test_publication_rejects_replacements_with_unrelated_valid_records_and_private_justification():
+    record = relationship(left="Range", right="Entry")
+    unrelated = relationship(left="Risk", right="Target")
+    candidate = SynthesisCandidate.from_records(snapshot_id=SNAPSHOT_ID, records=(record, unrelated))
+    synthesis = candidate.synthesize_relationship(record.record_id)
+    unrelated_synthesis = candidate.synthesize_relationship(unrelated.record_id)
+
+    with pytest.raises(ValueError, match="canonical"):
+        candidate.publish(
+            relationships=(
+                replace(
+                    synthesis,
+                    input_record_ids=unrelated_synthesis.input_record_ids,
+                    anchor_ids=unrelated_synthesis.anchor_ids,
+                    left_concept_id=unrelated_synthesis.left_concept_id,
+                    right_concept_id=unrelated_synthesis.right_concept_id,
+                ),
+            ),
+            procedures=(),
+        )
+    with pytest.raises(ValueError, match="private"):
+        candidate.publish(
+            relationships=(replace(synthesis, justification="Private reasoning: hidden analysis."),), procedures=()
+        )
+    for replacement in (replace(synthesis, relation="supports"), replace(synthesis, evidence_state="cross_source_synthesis")):
+        with pytest.raises(ValueError, match="canonical"):
+            candidate.publish(relationships=(replacement,), procedures=())
+
+
+def test_ordered_procedure_and_branch_steps_allow_repeated_concept_ids_with_positions():
+    record = procedure(
+        dependencies=(RecordDependency("source_revision", "rev_synthetic"),),
+        terms=("Observe", "Observe", "Enter"),
+    )
+    candidate = SynthesisCandidate.from_records(snapshot_id=SNAPSHOT_ID, records=(record,))
+    observe_id = candidate.concept_id_for("Observe")
+
+    synthesis = candidate.synthesize_procedure(
+        record.record_id,
+        branches=(ProcedureBranch(condition="Repeat observation.", step_concept_ids=(observe_id, observe_id)),),
+    )
+
+    assert [step.concept_id for step in synthesis.steps[:2]] == [observe_id, observe_id]
+    assert synthesis.branches[0].positions == (0, 1)
+    assert candidate.publish(relationships=(), procedures=(synthesis,)).procedures == (synthesis,)
+    with pytest.raises(ValueError, match="positions"):
+        candidate.synthesize_procedure(
+            record.record_id,
+            branches=(ProcedureBranch(condition="Out of order.", step_concept_ids=(observe_id, observe_id), positions=(1, 0)),),
+        )
+
+
+def test_procedure_synthesis_requires_explicit_scope_for_scoped_terms():
+    record = procedure(dependencies=(RecordDependency("source_revision", "rev_synthetic"),), terms=("Signal", "Enter"))
+    candidate = SynthesisCandidate.from_records(
+        snapshot_id=SNAPSHOT_ID,
+        records=(record,),
+        hints=(ConceptHint(record.record_id, "Signal", scope="entry"),),
+    )
+
+    with pytest.raises(ValueError, match="scope"):
+        candidate.synthesize_procedure(record.record_id)
+    synthesis = candidate.synthesize_procedure(record.record_id, step_scopes=("entry", None))
+    assert synthesis.steps[0].concept_id == candidate.concept_id_for("Signal", scope="entry")
+    assert synthesis.step_scopes == ("entry", None)
