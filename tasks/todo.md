@@ -10,12 +10,12 @@ Stay on feature/phase-3-knowledge-assimilation. Do not begin Phase 4.
 
 - [x] **Task 1 — Generic library identity and additive migration**
   - Depends on: none. Verify: focused migration tests; full pytest.
-- [ ] **Task 2 — Idempotent Jacob registry migration and change detection**
+- [x] **Task 2 — Idempotent Jacob registry migration and change detection**
   - Depends on: Task 1. Verify: importer/registry tests; full pytest.
 
 ### Checkpoint A — Library safety
 
-- [ ] Phase 2 conversations/citations remain readable; Jacob backfill is
+- [x] Phase 2 conversations/citations remain readable; Jacob backfill is
   idempotent; full pytest passes.
 
 ## source-anchors
