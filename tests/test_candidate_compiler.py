@@ -50,6 +50,10 @@ class QueueResponses:
         )
 
 
+def occurrence(text, *, aliases=(), scope=None):
+    return {"text": text, "aliases": list(aliases), "scope": scope}
+
+
 class FakeVectorClient:
     def __init__(
         self,
@@ -573,8 +577,8 @@ def test_replacement_reuses_unaffected_records_and_promotes_only_after_candidate
     )
     extraction_responses = QueueResponses([{"candidates": [{
         "family": "claim", "anchors": [replacement_anchor.anchor_id],
-        "qualification": "Synthetic replacement claim.", "subject": "Synthetic replacement",
-        "predicate": "guides", "object": "bounded context",
+        "qualification": "Synthetic replacement claim.", "subject": occurrence("Synthetic replacement"),
+        "predicate": "guides", "object": occurrence("bounded context"), "semantic_subtype": "statement",
     }]}])
     validation_responses = QueueResponses([
         {"outcome": "affirmatively_supported", "audit": "Replacement span supports the claim."}
@@ -626,13 +630,14 @@ def test_selective_rebuild_rejects_context_only_paraphrase_and_keeps_valid_highe
         "family": "claim",
         "anchors": [next(iter(source.anchors))],
         "qualification": "Synthetic cluster claim.",
-        "subject": source.revision.source_id.split("_")[-1].replace("%20", " "),
+        "subject": occurrence(source.revision.source_id.split("_")[-1].replace("%20", " ")),
         "predicate": "guides",
-        "object": "bounded context",
+        "object": occurrence("bounded context"),
+        "semantic_subtype": "statement",
     }]} for source in sources]
     # Stable explicit labels keep the test independent of source ID encoding.
     for output, label in zip(extraction_outputs, ("A one", "A two", "B one", "B two")):
-        output["candidates"][0]["subject"] = label
+        output["candidates"][0]["subject"] = occurrence(label)
     first_synthesizer = HierarchicalClusterSynthesizer()
     first_compiler = CandidateCompiler(
         storage=storage,
@@ -679,9 +684,10 @@ def test_selective_rebuild_rejects_context_only_paraphrase_and_keeps_valid_highe
             "family": "claim",
             "anchors": [replacement_anchor.anchor_id],
             "qualification": "Synthetic replacement cluster claim.",
-            "subject": "A replacement",
+            "subject": occurrence("A replacement"),
             "predicate": "guides",
-            "object": "bounded context",
+            "object": occurrence("bounded context"),
+            "semantic_subtype": "statement",
         }]}]))),
         validation_client=SimpleNamespace(responses=QueueResponses([{
             "outcome": "affirmatively_supported", "audit": "Synthetic replacement support."
@@ -781,9 +787,10 @@ def test_changed_compiler_configuration_forces_reextraction_instead_of_record_re
             "family": "claim",
             "anchors": [next(iter(source.anchors))],
             "qualification": "Recompiled synthetic claim.",
-            "subject": f"Recompiled {index}",
+            "subject": occurrence(f"Recompiled {index}"),
             "predicate": "guides",
-            "object": "bounded context",
+            "object": occurrence("bounded context"),
+            "semantic_subtype": "statement",
         }]}
         for index, source in enumerate(first_request.sources, start=1)
     ])
@@ -864,15 +871,10 @@ def test_validated_concept_aliases_are_searchable_in_bounded_derived_artifacts(t
             "family": "claim",
             "anchors": [next(iter(source.anchors))],
             "qualification": "Synthetic alias claim.",
-            "subject": f"Canonical topic {index}",
+            "subject": occurrence(f"Canonical topic {index}", aliases=(f"Search alias {index}",), scope="synthetic scope"),
             "predicate": "guides",
-            "object": "bounded context",
-            "concept_hints": [{
-                "aliases": [f"Search alias {index}"],
-                "scope": "synthetic scope",
-                "role": "subject",
-                "position": None,
-            }],
+            "object": occurrence("bounded context"),
+            "semantic_subtype": "statement",
         }]}
         for index, source in enumerate(sources, start=1)
     ]
@@ -917,11 +919,10 @@ def test_overlong_concept_term_is_rejected_during_extraction_before_a_validation
                 "family": "claim",
                 "anchors": [next(iter(anchors))],
                 "qualification": qualification,
-                "subject": subject,
+                "subject": occurrence(subject),
                 "predicate": "guides",
-                "object": "bounded context",
+                "object": occurrence("bounded context"),
                 "semantic_subtype": "statement",
-                "concept_hints": [],
             }]}
         return response
 
@@ -970,9 +971,10 @@ def compiler(
             "family": "claim",
             "anchors": [next(iter(source.anchors))],
             "qualification": "Synthetic anchored claim.",
-            "subject": f"Synthetic {index}",
+            "subject": occurrence(f"Synthetic {index}"),
             "predicate": "guides",
-            "object": "bounded context",
+            "object": occurrence("bounded context"),
+            "semantic_subtype": "statement",
         }]}
         for index, source in enumerate(sources, start=1)
     ]
@@ -1119,11 +1121,10 @@ def test_eight_affirmative_and_two_partial_candidates_can_continue_with_only_aff
                     "family": "claim",
                     "anchors": [next(iter(anchors))],
                     "qualification": "Synthetic candidate.",
-                    "subject": f"{prefix} topic {index}",
+                    "subject": occurrence(f"{prefix} topic {index}"),
                     "predicate": "guides",
-                    "object": "bounded context",
+                    "object": occurrence("bounded context"),
                     "semantic_subtype": "statement",
-                    "concept_hints": [],
                 }
                 for index in range(5)
             ]}

@@ -63,6 +63,10 @@ def extractor_for(payload):
     return SourceExtractor(SimpleNamespace(responses=responses), model="synthetic-compiler"), responses
 
 
+def occurrence(text, *, aliases=(), scope=None):
+    return {"text": text, "aliases": list(aliases), "scope": scope}
+
+
 def test_extracts_bounded_pending_candidates_for_one_revision_with_versioned_request():
     extractor, responses = extractor_for(FIXTURES["claim"])
     revision = revision_for()
@@ -88,11 +92,10 @@ def test_extracted_strategy_implication_remains_raw_taught_only_pending_independ
             "family": "claim",
             "anchors": ["anc_strategy"],
             "qualification": "The synthetic source explicitly teaches this implication.",
-            "subject": "context",
+            "subject": occurrence("context"),
             "predicate": "implies",
-            "object": "a bounded action",
+            "object": occurrence("a bounded action"),
             "semantic_subtype": "strategy_implication",
-            "concept_hints": [],
         }]
     }
     extractor, _responses = extractor_for(payload)
@@ -142,36 +145,20 @@ def test_concrete_extraction_emits_relationship_procedure_and_alias_hints():
                 "family": "relationship",
                 "anchors": ["anc_relationship"],
                 "qualification": "Synthetic relationship.",
-                "left": "Primary signal",
+                "left": occurrence("Primary signal", aliases=("PS",), scope="entry"),
                 "relation": "anticipates",
-                "right": "Context filter",
-                "concept_hints": [
-                    {
-                            "aliases": ["PS"],
-                        "scope": "entry",
-                        "role": "left",
-                        "position": None,
-                    }
-                ],
+                "right": occurrence("Context filter"),
             },
             {
                 "family": "procedure_sequence_hierarchy",
                 "anchors": ["anc_procedure"],
                 "qualification": "Synthetic ordered process.",
                 "kind": "procedure",
-                "terms": ["Observe", "Validate", "Act"],
-                "prerequisites": ["Market context"],
+                "terms": [occurrence("Observe"), occurrence("Validate", aliases=("Confirm",)), occurrence("Act")],
+                "prerequisites": [occurrence("Market context")],
                 "conditions": ["Only after confirmation"],
                 "branches": [
-                    {"condition": "If confirmation fails", "steps": ["Observe"]}
-                ],
-                "concept_hints": [
-                    {
-                            "aliases": ["Confirm"],
-                        "scope": None,
-                        "role": "term",
-                        "position": 1,
-                    }
+                    {"condition": "If confirmation fails", "steps": [occurrence("Observe")]}
                 ],
             },
         ]
@@ -199,22 +186,16 @@ def test_concrete_extraction_emits_relationship_procedure_and_alias_hints():
     assert result.hints[1].position == 1
 
 
-def test_extraction_derives_a_hint_label_from_its_typed_record_selector():
+def test_extraction_derives_a_hint_label_from_its_inline_typed_occurrence():
     payload = {
         "candidates": [{
             "family": "claim",
             "anchors": ["anc_selector"],
             "qualification": "Synthetic selector claim.",
-            "subject": "Compact concept",
+            "subject": occurrence("Compact concept", aliases=("CC",), scope="entry"),
             "predicate": "guides",
-            "object": "bounded context",
+            "object": occurrence("bounded context"),
             "semantic_subtype": "statement",
-            "concept_hints": [{
-                "aliases": ["CC"],
-                "scope": "entry",
-                "role": "subject",
-                "position": None,
-            }],
         }]
     }
     extractor, _responses = extractor_for(payload)
@@ -229,15 +210,75 @@ def test_extraction_derives_a_hint_label_from_its_typed_record_selector():
     assert result.hints[0].position is None
 
 
-def test_extraction_rejects_a_hint_selector_outside_the_typed_record_shape():
+def test_inline_occurrences_cover_every_extraction_family_without_model_authored_references():
+    payload = {
+        "candidates": [
+            {
+                "family": "claim", "anchors": ["anc_claim"], "qualification": "Synthetic claim.",
+                "subject": occurrence("Claim subject", aliases=("CS",)), "predicate": "guides",
+                "object": occurrence("Claim object", aliases=("CO",)), "semantic_subtype": "statement",
+            },
+            {
+                "family": "relationship", "anchors": ["anc_relationship"], "qualification": "Synthetic relation.",
+                "left": occurrence("Left", aliases=("L",)), "relation": "supports",
+                "right": occurrence("Right", aliases=("R",)),
+            },
+            {
+                "family": "procedure_sequence_hierarchy", "anchors": ["anc_procedure"],
+                "qualification": "Synthetic procedure.", "kind": "procedure",
+                "terms": [occurrence("First", aliases=("One",)), occurrence("Second", aliases=("Two",))],
+                "prerequisites": [occurrence("Context", aliases=("Ctx",))], "conditions": [],
+                "branches": [{"condition": "If needed", "steps": [occurrence("Fallback", aliases=("Plan B",))]}],
+            },
+        ]
+    }
+    result = extractor_for(payload)[0].extract(
+        revision=revision_for(), snapshot_id="snap_synthetic", transcript="Synthetic source text."
+    )
+
+    assert {(hint.label, hint.role, hint.position) for hint in result.hints} == {
+        ("Claim subject", "subject", None), ("Claim object", "object", None),
+        ("Left", "left", None), ("Right", "right", None),
+        ("First", "term", 0), ("Second", "term", 1),
+        ("Context", "prerequisite", 0), ("Fallback", "branch_step", 0),
+    }
+
+
+def test_inline_occurrence_rejects_selector_fields_and_nonconcept_metadata():
+    selector_payload = {
+        "candidates": [{
+            "family": "claim", "anchors": ["anc_selector"], "qualification": "Synthetic claim.",
+            "subject": occurrence("Subject") | {"role": "subject"}, "predicate": "guides",
+            "object": occurrence("Object"), "semantic_subtype": "statement",
+        }]
+    }
+    with pytest.raises(ValueError, match="inline concept occurrence must be typed"):
+        extractor_for(selector_payload)[0].extract(
+            revision=revision_for(), snapshot_id="snap_synthetic", transcript="Synthetic source text."
+        )
+
+    nonconcept_payload = {
+        "candidates": [{
+            "family": "claim", "anchors": ["anc_nonconcept"], "qualification": "Synthetic claim.",
+            "subject": occurrence("Subject"), "predicate": occurrence("Not a predicate"),
+            "object": occurrence("Object"), "semantic_subtype": "statement",
+        }]
+    }
+    with pytest.raises(ValueError, match="typed record value must be non-empty text"):
+        extractor_for(nonconcept_payload)[0].extract(
+            revision=revision_for(), snapshot_id="snap_synthetic", transcript="Synthetic source text."
+        )
+
+
+def test_extraction_rejects_legacy_model_authored_hint_selectors():
     payload = {
         "candidates": [{
             "family": "claim",
             "anchors": ["anc_selector"],
             "qualification": "Synthetic selector claim.",
-            "subject": "Compact concept",
+            "subject": occurrence("Compact concept"),
             "predicate": "guides",
-            "object": "bounded context",
+            "object": occurrence("bounded context"),
             "semantic_subtype": "statement",
             "concept_hints": [{
                 "aliases": [],
@@ -249,7 +290,7 @@ def test_extraction_rejects_a_hint_selector_outside_the_typed_record_shape():
     }
     extractor, _responses = extractor_for(payload)
 
-    with pytest.raises(ValueError, match="concept hint selector does not identify one typed record occurrence"):
+    with pytest.raises(ValueError, match="candidate contains unsupported fields"):
         extractor.extract(revision=revision_for(), snapshot_id="snap_synthetic", transcript="Synthetic source text.")
 
 
@@ -259,11 +300,10 @@ def test_extraction_rejects_an_overlong_record_term_before_semantic_validation()
             "family": "claim",
             "anchors": ["anc_selector"],
             "qualification": "Synthetic selector claim.",
-            "subject": "x" * 121,
+            "subject": occurrence("x" * 121),
             "predicate": "guides",
-            "object": "bounded context",
+            "object": occurrence("bounded context"),
             "semantic_subtype": "statement",
-            "concept_hints": [],
         }]
     }
     extractor, _responses = extractor_for(payload)
@@ -320,6 +360,30 @@ def test_extraction_schema_is_already_strict_under_the_installed_openai_sdk_cont
             pending.extend(value.values())
         elif isinstance(value, list):
             pending.extend(value)
+
+
+def test_extraction_schema_attaches_concept_metadata_inline_without_a_model_authored_selector():
+    candidate_schemas = EXTRACTION_RESPONSE_SCHEMA["properties"]["candidates"]["items"]["anyOf"]
+    claim_schema = next(
+        item for item in candidate_schemas
+        if item["properties"]["family"]["enum"] == ["claim"]
+    )
+    procedure_schema = next(
+        item for item in candidate_schemas
+        if item["properties"]["family"]["enum"] == ["procedure_sequence_hierarchy"]
+    )
+
+    assert "concept_hints" not in claim_schema["properties"]
+    for field in ("subject", "object"):
+        occurrence = claim_schema["properties"][field]
+        assert occurrence["additionalProperties"] is False
+        assert set(occurrence["required"]) == {"text", "aliases", "scope"}
+        assert "role" not in occurrence["properties"]
+        assert "position" not in occurrence["properties"]
+
+    term_occurrence = procedure_schema["properties"]["terms"]["items"]
+    assert set(term_occurrence["required"]) == {"text", "aliases", "scope"}
+    assert "concept_hints" not in procedure_schema["properties"]
 
 
 def test_pending_extracted_candidate_cannot_bypass_semantic_validation_storage(tmp_path):

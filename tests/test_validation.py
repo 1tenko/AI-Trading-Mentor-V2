@@ -33,6 +33,10 @@ class FakeResponses:
         return SimpleNamespace(output_text=json.dumps(self.payload))
 
 
+def occurrence(text, *, aliases=(), scope=None):
+    return {"text": text, "aliases": list(aliases), "scope": scope}
+
+
 def source_and_revision():
     source = Source.create(
         collection_id="collection_synthetic",
@@ -70,9 +74,10 @@ def candidate_and_anchor(snapshot_id="snap_synthetic"):
         "family": "claim",
         "anchors": [anchor.anchor_id],
         "qualification": "EXTRACTOR-RATIONALE-MUST-NOT-REACH-VALIDATOR",
-        "subject": "liquidity sweep",
+        "subject": occurrence("liquidity sweep"),
         "predicate": "precedes",
-        "object": "entry",
+        "object": occurrence("entry"),
+        "semantic_subtype": "statement",
     }]})))
     candidate = extractor.extract(revision=revision, snapshot_id=snapshot_id, transcript=TRANSCRIPT).candidates[0]
     return revision, candidate, anchor

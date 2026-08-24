@@ -7,8 +7,8 @@ from mentor.derived_records import RELATIONSHIP_TYPES
 from mentor.knowledge import SourceRevision
 
 
-EXTRACTION_PROMPT_VERSION = "source-extraction-v4"
-EXTRACTION_SCHEMA_VERSION = "source-extraction-schema-v4"
+EXTRACTION_PROMPT_VERSION = "source-extraction-v5"
+EXTRACTION_SCHEMA_VERSION = "source-extraction-schema-v5"
 SEMANTIC_VALIDATION_PROMPT_VERSION = "source-semantic-validation-v3"
 SEMANTIC_VALIDATION_SCHEMA_VERSION = "source-semantic-validation-schema-v1"
 MAX_CANDIDATES_PER_SOURCE = 12
@@ -16,8 +16,8 @@ MAX_ANCHORS_PER_CANDIDATE = 8
 MAX_ANCHOR_ID_LENGTH = 128
 
 EXTRACTION_INSTRUCTIONS = """Extract at most 12 compact claim, relationship, or procedure/sequence/hierarchy records from this one source revision.
-Use only proposed anchor IDs already supplied by the source-processing pipeline. Include an empty concept_hints list when no explicit alias or scope is present.
-Each concept hint selects one actual typed record occurrence: provide its role and, only for ordered fields, its zero-based position. Do not write a label, restate a claim, or name a concept that is not an exact record occurrence; the compiler derives the label from the selected typed term.
+Use only proposed anchor IDs already supplied by the source-processing pipeline. Attach aliases and optional scope directly to the typed concept occurrence that they describe. Do not emit separate concept selectors, labels, roles, positions, or concept IDs.
+Every inline occurrence has its exact typed text plus aliases and scope. The compiler derives canonical concept identity, field role, and ordered position from that typed record structure.
 Represent procedure prerequisites, conditions, and conditional branches structurally rather than folding them into prose.
 Use strategy_implication only when the raw passage explicitly teaches that implication; otherwise leave it for cross-source synthesis.
 An empty candidate list is valid. Do not approve, validate, score, or explain candidates.
@@ -29,23 +29,18 @@ _ANCHORS_SCHEMA = {
     "maxItems": MAX_ANCHORS_PER_CANDIDATE,
     "items": {"type": "string", "minLength": 1, "maxLength": MAX_ANCHOR_ID_LENGTH},
 }
-_CONCEPT_HINT_SCHEMA = {
-    "type": "array",
-    "maxItems": 8,
-    "items": {
-        "type": "object",
-        "additionalProperties": False,
-        "required": ["aliases", "scope", "role", "position"],
-        "properties": {
-            "aliases": {
-                "type": "array",
-                "maxItems": 8,
-                "items": {"type": "string", "minLength": 1, "maxLength": 120},
-            },
-            "scope": {"type": ["string", "null"], "maxLength": 160},
-            "role": {"type": ["string", "null"], "maxLength": 120},
-            "position": {"type": ["integer", "null"], "minimum": 0},
+_CONCEPT_OCCURRENCE_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["text", "aliases", "scope"],
+    "properties": {
+        "text": {"type": "string", "minLength": 1, "maxLength": 120},
+        "aliases": {
+            "type": "array",
+            "maxItems": 8,
+            "items": {"type": "string", "minLength": 1, "maxLength": 120},
         },
+        "scope": {"type": ["string", "null"], "maxLength": 160},
     },
 }
 _TEXT_LIST_SCHEMA = {
@@ -53,10 +48,10 @@ _TEXT_LIST_SCHEMA = {
     "maxItems": 8,
     "items": {"type": "string", "minLength": 1, "maxLength": 240},
 }
-_CONCEPT_TERM_LIST_SCHEMA = {
+_CONCEPT_OCCURRENCE_LIST_SCHEMA = {
     "type": "array",
     "maxItems": 8,
-    "items": {"type": "string", "minLength": 1, "maxLength": 120},
+    "items": _CONCEPT_OCCURRENCE_SCHEMA,
 }
 _PROCEDURE_BRANCH_SCHEMA = {
     "type": "array",
@@ -67,7 +62,7 @@ _PROCEDURE_BRANCH_SCHEMA = {
         "required": ["condition", "steps"],
         "properties": {
             "condition": {"type": "string", "minLength": 1, "maxLength": 160},
-            "steps": _CONCEPT_TERM_LIST_SCHEMA | {"minItems": 1},
+            "steps": _CONCEPT_OCCURRENCE_LIST_SCHEMA | {"minItems": 1},
         },
     },
 }
@@ -87,19 +82,18 @@ EXTRACTION_RESPONSE_SCHEMA = {
                         "additionalProperties": False,
                         "required": [
                             "family", "anchors", "qualification", "subject", "predicate",
-                            "object", "semantic_subtype", "concept_hints",
+                            "object", "semantic_subtype",
                         ],
                         "properties": {
                             "family": {"enum": ["claim"]},
                             "anchors": _ANCHORS_SCHEMA,
                             "qualification": {"type": "string", "minLength": 1, "maxLength": 280},
-                            "subject": {"type": "string", "minLength": 1, "maxLength": 120},
+                            "subject": _CONCEPT_OCCURRENCE_SCHEMA,
                             "predicate": {"type": "string", "minLength": 1, "maxLength": 120},
-                            "object": {"type": "string", "minLength": 1, "maxLength": 120},
+                            "object": _CONCEPT_OCCURRENCE_SCHEMA,
                             "semantic_subtype": {
                                 "enum": ["statement", "definition", "recommendation", "strategy_implication"]
                             },
-                            "concept_hints": _CONCEPT_HINT_SCHEMA,
                         },
                     },
                     {
@@ -107,16 +101,14 @@ EXTRACTION_RESPONSE_SCHEMA = {
                         "additionalProperties": False,
                         "required": [
                             "family", "anchors", "qualification", "left", "relation", "right",
-                            "concept_hints",
                         ],
                         "properties": {
                             "family": {"enum": ["relationship"]},
                             "anchors": _ANCHORS_SCHEMA,
                             "qualification": {"type": "string", "minLength": 1, "maxLength": 280},
-                            "left": {"type": "string", "minLength": 1, "maxLength": 120},
+                            "left": _CONCEPT_OCCURRENCE_SCHEMA,
                             "relation": {"enum": sorted(RELATIONSHIP_TYPES)},
-                            "right": {"type": "string", "minLength": 1, "maxLength": 120},
-                            "concept_hints": _CONCEPT_HINT_SCHEMA,
+                            "right": _CONCEPT_OCCURRENCE_SCHEMA,
                         },
                     },
                     {
@@ -124,18 +116,17 @@ EXTRACTION_RESPONSE_SCHEMA = {
                         "additionalProperties": False,
                         "required": [
                             "family", "anchors", "qualification", "kind", "terms",
-                            "prerequisites", "conditions", "branches", "concept_hints",
+                            "prerequisites", "conditions", "branches",
                         ],
                         "properties": {
                             "family": {"enum": ["procedure_sequence_hierarchy"]},
                             "anchors": _ANCHORS_SCHEMA,
                             "qualification": {"type": "string", "minLength": 1, "maxLength": 280},
                             "kind": {"enum": ["procedure", "sequence", "hierarchy"]},
-                            "terms": _CONCEPT_TERM_LIST_SCHEMA | {"minItems": 2},
-                            "prerequisites": _CONCEPT_TERM_LIST_SCHEMA,
+                            "terms": _CONCEPT_OCCURRENCE_LIST_SCHEMA | {"minItems": 2},
+                            "prerequisites": _CONCEPT_OCCURRENCE_LIST_SCHEMA,
                             "conditions": _TEXT_LIST_SCHEMA,
                             "branches": _PROCEDURE_BRANCH_SCHEMA,
-                            "concept_hints": _CONCEPT_HINT_SCHEMA,
                         },
                     },
                 ]

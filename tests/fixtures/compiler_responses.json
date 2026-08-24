@@ -5,9 +5,9 @@
         "family": "claim",
         "anchors": ["anc_synthetic"],
         "qualification": "Only when the synthetic condition is present.",
-        "subject": "liquidity sweep",
+        "subject": {"text": "liquidity sweep", "aliases": [], "scope": null},
         "predicate": "precedes",
-        "object": "a synthetic entry",
+        "object": {"text": "a synthetic entry", "aliases": [], "scope": null},
         "semantic_subtype": "statement"
       }
     ]
@@ -21,9 +21,10 @@
         "family": "invented",
         "anchors": ["anc_synthetic"],
         "qualification": "Synthetic.",
-        "subject": "signal",
+        "subject": {"text": "signal", "aliases": [], "scope": null},
         "predicate": "states",
-        "object": "observation"
+        "object": {"text": "observation", "aliases": [], "scope": null},
+        "semantic_subtype": "statement"
       }
     ]
   },
@@ -32,9 +33,10 @@
       {
         "family": "claim",
         "qualification": "Synthetic.",
-        "subject": "signal",
+        "subject": {"text": "signal", "aliases": [], "scope": null},
         "predicate": "states",
-        "object": "observation"
+        "object": {"text": "observation", "aliases": [], "scope": null},
+        "semantic_subtype": "statement"
       }
     ]
   },
@@ -44,9 +46,9 @@
         "family": "claim",
         "anchors": ["anc_synthetic"],
         "qualification": "Synthetic.",
-        "subject": "signal",
+        "subject": {"text": "signal", "aliases": [], "scope": null},
         "predicate": "states",
-        "object": "observation",
+        "object": {"text": "observation", "aliases": [], "scope": null},
         "validation_state": "validated"
       }
     ]

@@ -21,6 +21,7 @@ from mentor.derived_records import (
     ProcedureSequenceHierarchy,
     RecordDependency,
     Relationship,
+    validate_record,
 )
 from mentor.knowledge import SourceRevision
 from mentor.synthesis import ConceptHint, concept_hint_from_record_selector, validate_record_concept_terms
@@ -47,6 +48,14 @@ class ExtractionResult:
     candidates: tuple[DerivedRecord, ...]
     usage: CallUsage = CallUsage()
     hints: tuple[ConceptHint, ...] = ()
+
+
+@dataclass(frozen=True)
+class _InlineHint:
+    aliases: tuple[str, ...]
+    scope: str | None
+    role: str
+    position: int | None
 
 
 class SourceExtractor:
@@ -128,18 +137,19 @@ def _parse_candidates(
     records = []
     hints = []
     for payload in response["candidates"]:
-        record = _candidate_from_payload(
+        record, record_hints = _candidate_from_payload(
             payload, revision=revision, snapshot_id=snapshot_id, provenance=provenance
         )
         records.append(record)
+        validate_record(record)
         validate_record_concept_terms(record)
-        hints.extend(_concept_hints(payload.get("concept_hints", []), record))
+        hints.extend(_inline_concept_hints(record, record_hints))
     return tuple(records), tuple(hints)
 
 
 def _candidate_from_payload(
     payload: object, *, revision: SourceRevision, snapshot_id: str, provenance: CompilerProvenance
-) -> DerivedRecord:
+) -> tuple[DerivedRecord, tuple[_InlineHint, ...]]:
     if not isinstance(payload, dict):
         raise ValueError("candidate must be an object")
     attempted_validation = _SELF_VALIDATION_FIELDS.intersection(payload)
@@ -157,79 +167,101 @@ def _candidate_from_payload(
         "qualification": payload.get("qualification"),
         "compiler_provenance": provenance,
     }
-    base_fields = {"family", "anchors", "qualification", "concept_hints"}
+    base_fields = {"family", "anchors", "qualification"}
     if family == "claim":
         _allow_fields(
             payload,
             base_fields | {"subject", "predicate", "object", "semantic_subtype"},
         )
+        subject, subject_hint = _inline_occurrence(payload.get("subject"), "subject")
+        object_, object_hint = _inline_occurrence(payload.get("object"), "object")
         return Claim.create(
             **common,
-            subject=payload.get("subject"),
+            subject=subject,
             predicate=payload.get("predicate"),
-            object=payload.get("object"),
+            object=object_,
             semantic_subtype=payload.get("semantic_subtype", "statement"),
             derived_kind="source_extracted_claim",
             evidence_state="raw_taught",
-        )
+        ), (subject_hint, object_hint)
     if family == "relationship":
         _allow_fields(payload, base_fields | {"left", "relation", "right"})
+        left, left_hint = _inline_occurrence(payload.get("left"), "left")
+        right, right_hint = _inline_occurrence(payload.get("right"), "right")
         return Relationship.create(
             **common,
-            left=payload.get("left"),
+            left=left,
             relation=payload.get("relation"),
-            right=payload.get("right"),
-        )
+            right=right,
+        ), (left_hint, right_hint)
     if family == "procedure_sequence_hierarchy":
         _allow_fields(
             payload,
             base_fields | {"kind", "terms", "prerequisites", "conditions", "branches"},
         )
-        terms = payload.get("terms")
-        if not isinstance(terms, list):
-            raise ValueError("procedure terms must be an ordered list")
+        terms, term_hints = _inline_occurrences(payload.get("terms"), "terms", "term", allow_empty=False)
+        prerequisites, prerequisite_hints = _inline_occurrences(
+            payload.get("prerequisites", []), "prerequisites", "prerequisite"
+        )
+        branches, branch_hints = _procedure_branches(payload.get("branches", []))
         return ProcedureSequenceHierarchy.create(
             **common,
             kind=payload.get("kind"),
-            terms=tuple(terms),
-            prerequisites=_procedure_texts(payload.get("prerequisites", []), "prerequisites"),
+            terms=terms,
+            prerequisites=prerequisites,
             conditions=_procedure_texts(payload.get("conditions", []), "conditions"),
-            branches=_procedure_branches(payload.get("branches", [])),
-        )
+            branches=branches,
+        ), (*term_hints, *prerequisite_hints, *branch_hints)
     raise ValueError("unknown derived record family")
 
 
-def _concept_hints(payload: object, record: DerivedRecord) -> tuple[ConceptHint, ...]:
-    if not isinstance(payload, list) or len(payload) > 8:
-        raise ValueError("candidate concept hints must be a bounded list")
-    result = []
-    for item in payload:
-        if not isinstance(item, dict) or set(item) != {"aliases", "scope", "role", "position"}:
-            raise ValueError("candidate concept hints must be typed")
-        aliases = item["aliases"]
-        position = item["position"]
-        if (
-            not isinstance(aliases, list)
-            or len(aliases) > 8
-            or any(not isinstance(alias, str) or not alias.strip() for alias in aliases)
-            or (item["scope"] is not None and not isinstance(item["scope"], str))
-            or (item["role"] is not None and not isinstance(item["role"], str))
-            or (position is not None and (not isinstance(position, int) or isinstance(position, bool) or position < 0))
-        ):
-            raise ValueError("candidate concept hints are invalid")
-        result.append(concept_hint_from_record_selector(
+def _inline_occurrence(value: object, role: str, position: int | None = None) -> tuple[str, _InlineHint]:
+    if not isinstance(value, dict) or set(value) != {"text", "aliases", "scope"}:
+        raise ValueError("inline concept occurrence must be typed")
+    text, aliases, scope = value["text"], value["aliases"], value["scope"]
+    if (
+        not isinstance(text, str)
+        or not text.strip()
+        or not isinstance(aliases, list)
+        or len(aliases) > 8
+        or any(not isinstance(alias, str) or not alias.strip() for alias in aliases)
+        or (scope is not None and not isinstance(scope, str))
+    ):
+        raise ValueError("inline concept occurrence is invalid")
+    return text, _InlineHint(tuple(aliases), scope, role, position)
+
+
+def _inline_occurrences(
+    value: object, label: str, role: str, *, allow_empty: bool = True, start_position: int = 0,
+) -> tuple[tuple[str, ...], tuple[_InlineHint, ...]]:
+    if not isinstance(value, list) or len(value) > 8 or (not allow_empty and not value):
+        raise ValueError(f"procedure {label} must be a bounded ordered list")
+    occurrences = tuple(
+        _inline_occurrence(item, role, start_position + position)
+        for position, item in enumerate(value)
+    )
+    return tuple(item[0] for item in occurrences), tuple(item[1] for item in occurrences)
+
+
+def _inline_concept_hints(record: DerivedRecord, hints: tuple[_InlineHint, ...]) -> tuple[ConceptHint, ...]:
+    return tuple(
+        concept_hint_from_record_selector(
             record,
-            aliases=tuple(aliases),
-            scope=item["scope"],
-            role=item["role"],
-            position=position,
-        ))
-    return tuple(result)
+            aliases=hint.aliases,
+            scope=hint.scope,
+            role=hint.role,
+            position=hint.position,
+        )
+        for hint in hints
+        if hint.aliases or hint.scope is not None
+    )
 
 
 def _allow_fields(payload: dict[str, object], allowed: set[str]) -> None:
     if set(payload).difference(allowed):
         raise ValueError("candidate contains unsupported fields")
+    if set(payload) != allowed:
+        raise ValueError("candidate is missing required fields")
 
 
 def _procedure_texts(value: object, label: str, *, allow_empty: bool = True) -> tuple[str, ...]:
@@ -240,28 +272,30 @@ def _procedure_texts(value: object, label: str, *, allow_empty: bool = True) -> 
     return tuple(value)
 
 
-def _procedure_branches(value: object) -> tuple[ProcedureRecordBranch, ...]:
+def _procedure_branches(value: object) -> tuple[tuple[ProcedureRecordBranch, ...], tuple[_InlineHint, ...]]:
     if not isinstance(value, list) or len(value) > 8:
         raise ValueError("procedure branches must be a bounded ordered list")
     branches = []
+    hints = []
+    position = 0
     for item in value:
         if not isinstance(item, dict) or set(item) != {"condition", "steps"}:
             raise ValueError("procedure branches must be structured")
         condition = item["condition"]
         if not isinstance(condition, str) or not condition.strip():
             raise ValueError("procedure branch condition must be non-empty text")
-        branches.append(
-            ProcedureRecordBranch(
-                condition,
-                _procedure_texts(item["steps"], "branch steps", allow_empty=False),
-            )
+        steps, step_hints = _inline_occurrences(
+            item["steps"], "branch steps", "branch_step", allow_empty=False, start_position=position,
         )
-    return tuple(branches)
+        branches.append(ProcedureRecordBranch(condition, steps))
+        hints.extend(step_hints)
+        position += len(steps)
+    return tuple(branches), tuple(hints)
 
 
 def _anchors(value: object) -> tuple[str, ...]:
-    if not isinstance(value, list):
-        return ()
+    if not isinstance(value, list) or not value:
+        raise ValueError("records require at least one anchor")
     if len(value) > MAX_ANCHORS_PER_CANDIDATE:
         raise ValueError("too many candidate anchors")
     if any(not isinstance(anchor, str) or not anchor or len(anchor) > MAX_ANCHOR_ID_LENGTH for anchor in value):

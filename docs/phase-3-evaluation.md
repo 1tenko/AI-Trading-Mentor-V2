@@ -224,3 +224,27 @@ shapes, lineage fields, and the synthetic candidate compiler path. The failed
 candidate remains incompatible with the new synthesis provenance and is never
 reused or published. Cumulative prior Gate 1 spend is recorded as `$3.607125`
 against the fixed `$25.00` ceiling before any subsequent paid call.
+
+## Gate 1 inline extraction-occurrence hardening
+
+A later fresh pilot failed before synthesis when the former extraction
+`concept_hints` selector did not resolve to one typed record occurrence. The
+source response was intentionally non-persistent (`store=False`), so its exact
+private role/position cannot be reconstructed; the failure demonstrates the
+inherent gap between a model-authored cross-reference and the parsed sibling
+record that it must identify.
+
+Extraction schema v5 removes that indirection. Claim subject/object,
+relationship left/right, and each procedure term, prerequisite, and branch step
+now carry a small closed inline occurrence object: typed text, aliases, and
+optional scope. The compiler derives the canonical occurrence, family role, and
+ordered position after parsing the same typed record. There is no model-authored
+selector, role, position, concept ID, or free-form label to dangle.
+
+Aliases remain model-proposed and are still independently validated against raw
+support before entering candidate concept clustering. The parser now requires
+the exact fields supplied by the closed extraction schema and validates the
+typed record before accepting its inline occurrences. Failed v4 candidates are
+immutable incompatible history, not migration input. The new compiler prompt
+and schema versions are `source-extraction-v5` and
+`source-extraction-schema-v5`.
