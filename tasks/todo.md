@@ -101,7 +101,7 @@ Stay on feature/phase-3-knowledge-assimilation. Do not begin Phase 4.
 - [x] **Task 18 — Deterministic regression suite and isolated pilot harness**
   - Depends on: Task 17. Verify: full pytest, production/pilot runtime and
     pilot-store separation tests, diff/secret checks, browser smoke; no paid calls.
-- [ ] **Task 19 — Six-source pilot manifest and measured-cost protocol**
+- [x] **Task 19 — Six-source pilot manifest and measured-cost protocol**
   - Depends on: Task 18. Verify: manifest/evaluation tests; full pytest; no
     pilot call.
 
