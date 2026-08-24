@@ -81,6 +81,7 @@ def private_response_diagnostic(
     model: str | None,
     prompt_version: str | None,
     schema_version: str | None,
+    requested_max_output_tokens: int | None = None,
 ) -> dict[str, object]:
     """Private, non-reasoning audit material for an ignored pilot artifact."""
     output = _field(response, "output")
@@ -91,12 +92,17 @@ def private_response_diagnostic(
     incomplete = _field(response, "incomplete_details")
     usage = _field(response, "usage")
     refusals = [_field(part, "refusal") for part in content if _field(part, "type") == "refusal"]
+    usage_details = _details(usage)
+    output_details = _details(_field(usage, "output_tokens_details"))
+    if usage_details is not None and output_details is not None:
+        usage_details["output_tokens_details"] = output_details
     return {
         "stage": stage,
         "call_index": call_index,
         "model": model,
         "prompt_version": prompt_version,
         "schema_version": schema_version,
+        "requested_max_output_tokens": requested_max_output_tokens,
         "response_id": _field(response, "id"),
         "status": _field(response, "status"),
         "error": _details(error),
@@ -104,7 +110,7 @@ def private_response_diagnostic(
         "output_item_types": [_field(item, "type") for item in output_items],
         "content_item_types": [_field(part, "type") for part in content],
         "refusal": refusals[0] if refusals else None,
-        "usage": _details(usage),
+        "usage": usage_details,
         "output_text": _field(response, "output_text"),
     }
 
@@ -125,6 +131,6 @@ def _details(value: Any) -> dict[str, Any] | None:
         return None
     return {
         key: _field(value, key)
-        for key in ("code", "type", "message", "reason", "input_tokens", "output_tokens", "total_tokens")
+        for key in ("code", "type", "message", "reason", "input_tokens", "output_tokens", "total_tokens", "reasoning_tokens")
         if _field(value, key) is not None
     }

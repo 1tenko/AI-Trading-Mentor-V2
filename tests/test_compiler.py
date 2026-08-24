@@ -7,7 +7,12 @@ from types import SimpleNamespace
 import pytest
 from openai.lib._pydantic import _ensure_strict_json_schema
 
-from mentor.compiler import SourceExtractor
+from mentor.compiler import (
+    EXTRACTION_INITIAL_MAX_OUTPUT_TOKENS,
+    EXTRACTION_RETRY_MAX_OUTPUT_TOKENS,
+    ExtractionFailure,
+    SourceExtractor,
+)
 from mentor.compilation import CompilationRun, CorpusSnapshot, TokenPricing
 from mentor.compiler_prompts import (
     EXTRACTION_PROMPT_VERSION,
@@ -84,6 +89,115 @@ def test_extracts_bounded_pending_candidates_for_one_revision_with_versioned_req
     assert EXTRACTION_PROMPT_VERSION in responses.requests[0]["instructions"]
     assert responses.requests[0]["text"]["format"]["name"] == EXTRACTION_SCHEMA_VERSION
     assert revision.revision_id in responses.requests[0]["input"]
+    assert responses.requests[0]["max_output_tokens"] == EXTRACTION_INITIAL_MAX_OUTPUT_TOKENS
+
+
+def _live_response(payload, *, status="completed", reason=None, input_tokens=10, output_tokens=5, reasoning_tokens=2):
+    text = json.dumps(payload) if not isinstance(payload, str) else payload
+    content = [SimpleNamespace(type="output_text", text=text)]
+    if status == "completed" and reason == "refusal":
+        content = [SimpleNamespace(type="refusal", refusal="Synthetic refusal.")]
+    return SimpleNamespace(
+        status=status,
+        incomplete_details=None if reason is None or status != "incomplete" else SimpleNamespace(reason=reason),
+        error=SimpleNamespace(code="synthetic_failure") if status == "failed" else None,
+        output_text=text,
+        output=[SimpleNamespace(type="message", content=content)],
+        usage=SimpleNamespace(
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            output_tokens_details=SimpleNamespace(reasoning_tokens=reasoning_tokens),
+        ),
+    )
+
+
+def test_live_extraction_retries_once_only_after_output_limit_and_accounts_both_attempts():
+    class Responses:
+        def __init__(self):
+            self.requests = []
+            self.values = [
+                _live_response('{"truncated":', status="incomplete", reason="max_output_tokens", input_tokens=7, output_tokens=16_384, reasoning_tokens=9_000),
+                _live_response(FIXTURES["empty"], input_tokens=11, output_tokens=13, reasoning_tokens=5),
+            ]
+
+        def create(self, **request):
+            self.requests.append(request)
+            return self.values.pop(0)
+
+    responses = Responses()
+    extractor = SourceExtractor(
+        SimpleNamespace(responses=responses), model="gpt-5.6-sol", live_mode=True,
+        pricing=TokenPricing(2.0, 4.0, 6.0),
+    )
+
+    result = extractor.extract(revision=revision_for(), snapshot_id="snap_synthetic", transcript="Synthetic source text.")
+
+    assert result.candidates == ()
+    assert result.attempt_count == 2
+    assert result.usage.input_tokens == 18
+    assert result.usage.output_tokens == 16_397
+    assert result.usage.reasoning_tokens == 9_005
+    assert [request["max_output_tokens"] for request in responses.requests] == [
+        EXTRACTION_INITIAL_MAX_OUTPUT_TOKENS, EXTRACTION_RETRY_MAX_OUTPUT_TOKENS,
+    ]
+    first, second = responses.requests
+    assert {key: value for key, value in first.items() if key != "max_output_tokens"} == {
+        key: value for key, value in second.items() if key != "max_output_tokens"
+    }
+
+
+def test_live_extraction_rejects_a_second_output_limit_without_parsing_partial_output():
+    class Responses:
+        def __init__(self):
+            self.requests = []
+
+        def create(self, **request):
+            self.requests.append(request)
+            return _live_response('{"truncated":', status="incomplete", reason="max_output_tokens")
+
+    responses = Responses()
+    extractor = SourceExtractor(
+        SimpleNamespace(responses=responses), model="gpt-5.6-sol", live_mode=True,
+        pricing=TokenPricing(2.0, 4.0, 6.0),
+    )
+
+    with pytest.raises(ExtractionFailure, match="response_incomplete_max_output_tokens") as error:
+        extractor.extract(revision=revision_for(), snapshot_id="snap_synthetic", transcript="Synthetic source text.")
+
+    assert error.value.attempt_count == 2
+    assert [request["max_output_tokens"] for request in responses.requests] == [
+        EXTRACTION_INITIAL_MAX_OUTPUT_TOKENS, EXTRACTION_RETRY_MAX_OUTPUT_TOKENS,
+    ]
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        _live_response('{"ignored":true}', status="completed", reason="refusal"),
+        _live_response('{"ignored":true}', status="failed"),
+        _live_response("not JSON"),
+    ],
+    ids=["refusal", "failed", "malformed_completed"],
+)
+def test_live_extraction_does_not_retry_non_budget_failures(response):
+    class Responses:
+        def __init__(self):
+            self.requests = []
+
+        def create(self, **request):
+            self.requests.append(request)
+            return response
+
+    responses = Responses()
+    extractor = SourceExtractor(
+        SimpleNamespace(responses=responses), model="gpt-5.6-sol", live_mode=True,
+        pricing=TokenPricing(2.0, 4.0, 6.0),
+    )
+
+    with pytest.raises(ExtractionFailure):
+        extractor.extract(revision=revision_for(), snapshot_id="snap_synthetic", transcript="Synthetic source text.")
+
+    assert len(responses.requests) == 1
 
 
 def test_extracted_strategy_implication_remains_raw_taught_only_pending_independent_validation():

@@ -6,6 +6,8 @@ from typing import Any, Mapping
 
 from mentor.compiler_prompts import (
     EXTRACTION_PROMPT_VERSION,
+    EXTRACTION_INITIAL_MAX_OUTPUT_TOKENS,
+    EXTRACTION_RETRY_MAX_OUTPUT_TOKENS,
     EXTRACTION_SCHEMA_VERSION,
     MAX_ANCHOR_ID_LENGTH,
     MAX_ANCHORS_PER_CANDIDATE,
@@ -50,6 +52,16 @@ class ExtractionResult:
     candidates: tuple[DerivedRecord, ...]
     usage: CallUsage = CallUsage()
     hints: tuple[ConceptHint, ...] = ()
+    attempt_count: int = 1
+
+
+class ExtractionFailure(ValueError):
+    """A failed extraction attempt sequence with auditable token usage."""
+
+    def __init__(self, error: Exception, usage: CallUsage, attempt_count: int):
+        super().__init__(str(error))
+        self.usage = usage
+        self.attempt_count = attempt_count
 
 
 @dataclass(frozen=True)
@@ -95,27 +107,58 @@ class SourceExtractor:
         transcript: str,
         anchor_spans: Mapping[str, str] | None = None,
     ) -> ExtractionResult:
-        response = self._client.responses.create(
-            **extraction_request(
-                revision=revision,
-                transcript=transcript,
-                model=self._provenance.model_version,
-                anchor_spans=anchor_spans,
-            )
-        )
-        candidates, hints = _parse_candidates_payload(
-            structured_json_payload(response, stage="extraction", allow_synthetic=not self._live_mode),
+        request = extraction_request(
             revision=revision,
-            snapshot_id=snapshot_id,
-            provenance=self._provenance,
+            transcript=transcript,
+            model=self._provenance.model_version,
+            anchor_spans=anchor_spans,
+            max_output_tokens=EXTRACTION_INITIAL_MAX_OUTPUT_TOKENS,
         )
+        response = self._client.responses.create(**request)
+        usages = [usage_from_response(response, pricing=self._pricing)]
+        if _is_output_limit_incomplete(response):
+            try:
+                response = self._client.responses.create(**(request | {
+                    "max_output_tokens": EXTRACTION_RETRY_MAX_OUTPUT_TOKENS,
+                }))
+            except Exception as error:
+                raise ExtractionFailure(error, _sum_usages(usages), len(usages)) from error
+            usages.append(usage_from_response(response, pricing=self._pricing))
+        usage = _sum_usages(usages)
+        try:
+            candidates, hints = _parse_candidates_payload(
+                structured_json_payload(response, stage="extraction", allow_synthetic=not self._live_mode),
+                revision=revision,
+                snapshot_id=snapshot_id,
+                provenance=self._provenance,
+            )
+        except Exception as error:
+            raise ExtractionFailure(error, usage, len(usages)) from error
         return ExtractionResult(
             revision.revision_id,
             self._provenance,
             candidates,
-            usage_from_response(response, pricing=self._pricing),
+            usage,
             hints,
+            len(usages),
         )
+
+
+def _is_output_limit_incomplete(response: object) -> bool:
+    details = getattr(response, "incomplete_details", None)
+    return (
+        getattr(response, "status", None) == "incomplete"
+        and getattr(details, "reason", None) == "max_output_tokens"
+    )
+
+
+def _sum_usages(usages: list[CallUsage]) -> CallUsage:
+    return CallUsage(
+        input_tokens=sum(usage.input_tokens for usage in usages),
+        output_tokens=sum(usage.output_tokens for usage in usages),
+        reasoning_tokens=sum(usage.reasoning_tokens for usage in usages),
+        cost_usd=sum(usage.cost_usd for usage in usages),
+    )
 
 
 def _parse_candidates(

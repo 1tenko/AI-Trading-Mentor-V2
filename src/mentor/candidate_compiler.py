@@ -23,7 +23,7 @@ from mentor.compilation import (
     SourceProcessingResult,
     TokenPricing,
 )
-from mentor.compiler import ExtractionResult, SourceExtractor
+from mentor.compiler import ExtractionFailure, ExtractionResult, SourceExtractor
 from mentor.compiler_prompts import (
     SEMANTIC_VALIDATION_PROMPT_VERSION,
     SEMANTIC_VALIDATION_SCHEMA_VERSION,
@@ -339,7 +339,6 @@ class CandidateCompiler:
             source_failed = False
             try:
                 extraction_started = self._clock()
-                extraction_calls += 1
                 extracted = self._extractor.extract(
                     revision=source.revision,
                     snapshot_id=snapshot.snapshot_id,
@@ -349,11 +348,21 @@ class CandidateCompiler:
                         for anchor_id, anchor in source.anchors.items()
                     },
                 )
+                extraction_calls += extracted.attempt_count
                 _validate_extraction_result(extracted, source)
                 extraction_usage = _sum_usage(extraction_usage, extracted.usage)
                 extracted_candidate_count += len(extracted.candidates)
                 extraction_latency_ms += _elapsed_ms(extraction_started, self._clock())
+            except ExtractionFailure as error:
+                extraction_calls += error.attempt_count
+                extraction_usage = _sum_usage(extraction_usage, error.usage)
+                extraction_latency_ms += _elapsed_ms(extraction_started, self._clock())
+                extraction_failures += 1
+                source_failed = True
+                failures.append(f"extraction failed for {source.revision.revision_id}: {error}")
+                extracted = None
             except Exception as error:
+                extraction_calls += 1
                 extraction_latency_ms += _elapsed_ms(extraction_started, self._clock())
                 extraction_failures += 1
                 source_failed = True

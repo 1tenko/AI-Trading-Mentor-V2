@@ -21,7 +21,12 @@ from mentor.candidate_compiler import (
 from mentor.chat_service import ChatService, EvaluationConfig, FILE_SEARCH_CALL_COST_USD
 from mentor.compilation import CompilationRun, TokenPricing, usage_from_response
 from mentor.compiler import SourceExtractor
-from mentor.compiler_prompts import MAX_CANDIDATES_PER_SOURCE
+from mentor.compiler_prompts import (
+    EXTRACTION_INITIAL_MAX_OUTPUT_TOKENS,
+    EXTRACTION_MAX_ATTEMPTS,
+    EXTRACTION_RETRY_MAX_OUTPUT_TOKENS,
+    MAX_CANDIDATES_PER_SOURCE,
+)
 from mentor.config import load_config
 from mentor.evaluation import EvaluationCase, PilotManifest, PilotManifestEntry, PilotRuntime
 from mentor.orientation import OrientationBudget
@@ -38,10 +43,10 @@ APPROVED_GATE1_MANIFEST_SHA256 = "3798d537cd486f782449d9833b5fc06dd28fa93aed4564
 # Standard short-context rates are deliberately higher than the current model-page promotion.
 CONSERVATIVE_SOL_PRICING = TokenPricing(5.0, 30.0, 30.0)
 HARD_SPEND_CEILING_USD = 30.0
-GATE1_PRIOR_SPEND_USD = 8.502370
+GATE1_PRIOR_SPEND_USD = 9.979610
 _PRICING_MAX_AGE_DAYS = 7
-_OUTPUT_CAPS = {
-    "extraction": 8_000,
+_MAX_OUTPUT_TOKENS_BY_STAGE = {
+    "extraction": EXTRACTION_RETRY_MAX_OUTPUT_TOKENS,
     "validation": 1_000,
     "synthesis": 10_000,
     "mentor_evaluation": 4_000,
@@ -234,7 +239,7 @@ class _BudgetedResponses:
     def create(self, **request):
         stage = _response_stage(request)
         self._call_index += 1
-        cap = _OUTPUT_CAPS[stage]
+        cap = _MAX_OUTPUT_TOKENS_BY_STAGE[stage]
         requested_cap = request.get("max_output_tokens")
         request["max_output_tokens"] = (
             cap if requested_cap is None else min(int(requested_cap), cap)
@@ -267,6 +272,7 @@ class _BudgetedResponses:
                 "model": request.get("model"),
                 "prompt_version": _prompt_version(request),
                 "schema_version": _schema_version(request),
+                "requested_max_output_tokens": request["max_output_tokens"],
                 "transport_error": {"type": type(error).__name__, "message": str(error)},
             })
             raise
@@ -277,6 +283,7 @@ class _BudgetedResponses:
             model=request.get("model"),
             prompt_version=_prompt_version(request),
             schema_version=_schema_version(request),
+            requested_max_output_tokens=request["max_output_tokens"],
         ))
         if not _usage_is_complete(response):
             self._ledger.settle_unknown(ticket, stage=stage)
@@ -342,6 +349,8 @@ class Gate1Runner:
         sources, manifest = _resolve_manifest(
             self.manifest_path, production, self._expected_manifest_sha256
         )
+        if execute:
+            _require_fresh_pricing(self._today())
         plan = estimate_gate1_cost(sources, self.pricing)
         if self.ledger.spent_usd + plan.estimated_upper_bound_usd > self.ledger.limit_usd:
             raise ValueError(
@@ -360,7 +369,6 @@ class Gate1Runner:
                 plan.estimated_upper_bound_usd,
                 self.ledger.spent_usd,
             )
-        _require_fresh_pricing(self._today())
         pilot = PilotRuntime.create(
             self.production_database_path, self.pilot_root, run_id=self.run_id
         )
@@ -460,11 +468,8 @@ def estimate_gate1_cost(
     sources: tuple[CandidateSource, ...], pricing: TokenPricing
 ) -> Gate1CostPlan:
     source_bytes = sum(source.revision.byte_size for source in sources)
-    candidate_count = sum(
-        max(1, min(MAX_CANDIDATES_PER_SOURCE, math.ceil(source.revision.byte_size / 4_000)))
-        for source in sources
-    )
-    extraction_calls = len(sources)
+    candidate_count = len(sources) * MAX_CANDIDATES_PER_SOURCE
+    extraction_calls = len(sources) * EXTRACTION_MAX_ATTEMPTS
     validation_calls = candidate_count
     synthesis_calls = _MAX_SYNTHESIS_CALLS
     evaluation_calls = len(GATE1_EVALUATION_CASES) * 4
@@ -472,29 +477,29 @@ def estimate_gate1_cost(
         (
             "extraction",
             extraction_calls,
-            source_bytes * 2 + extraction_calls * 4_096,
-            extraction_calls * _OUTPUT_CAPS["extraction"],
+            source_bytes * 2 * EXTRACTION_MAX_ATTEMPTS + extraction_calls * 4_096,
+            len(sources) * (EXTRACTION_INITIAL_MAX_OUTPUT_TOKENS + EXTRACTION_RETRY_MAX_OUTPUT_TOKENS),
             0.0,
         ),
         (
             "validation",
             validation_calls,
             validation_calls * 12_000,
-            validation_calls * _OUTPUT_CAPS["validation"],
+            validation_calls * _MAX_OUTPUT_TOKENS_BY_STAGE["validation"],
             0.0,
         ),
         (
             "synthesis",
             synthesis_calls,
             synthesis_calls * 120_000,
-            synthesis_calls * _OUTPUT_CAPS["synthesis"],
+            synthesis_calls * _MAX_OUTPUT_TOKENS_BY_STAGE["synthesis"],
             0.0,
         ),
         (
             "mentor_evaluation",
             evaluation_calls,
             evaluation_calls * _FILE_SEARCH_INPUT_RESERVE_TOKENS,
-            evaluation_calls * _OUTPUT_CAPS["mentor_evaluation"],
+            evaluation_calls * _MAX_OUTPUT_TOKENS_BY_STAGE["mentor_evaluation"],
             evaluation_calls * _FILE_SEARCH_CALL_RESERVE * FILE_SEARCH_CALL_COST_USD,
         ),
     )

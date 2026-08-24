@@ -45,6 +45,8 @@ class QueueResponses:
             raise output
         if callable(output):
             output = output(request)
+        if isinstance(output, SimpleNamespace):
+            return output
         return SimpleNamespace(
             output_text=json.dumps(output),
             usage=SimpleNamespace(input_tokens=11, output_tokens=7),
@@ -1020,6 +1022,46 @@ def compiler(
         artifact_scope=artifact_scope,
     )
     return storage, candidate_compiler, request, vector_client
+
+
+def _incomplete_extraction_response():
+    return SimpleNamespace(
+        status="incomplete",
+        incomplete_details=SimpleNamespace(reason="max_output_tokens"),
+        output_text='{"truncated":',
+        output=[SimpleNamespace(type="message", content=[])],
+        usage=SimpleNamespace(
+            input_tokens=7,
+            output_tokens=16_384,
+            output_tokens_details=SimpleNamespace(reasoning_tokens=4),
+        ),
+    )
+
+
+def test_candidate_source_coverage_succeeds_after_a_bounded_extraction_retry(tmp_path):
+    storage, candidate_compiler, request, _vector_client = compiler(tmp_path)
+    sources = request.sources
+    candidate_compiler._extractor._client.responses = QueueResponses([
+        _incomplete_extraction_response(),
+        {"candidates": [{
+            "family": "claim", "anchors": [next(iter(sources[0].anchors))],
+            "qualification": "Retry succeeded.", "subject": occurrence("First"),
+            "predicate": "guides", "object": occurrence("Context"), "semantic_subtype": "statement",
+        }]},
+        {"candidates": [{
+            "family": "claim", "anchors": [next(iter(sources[1].anchors))],
+            "qualification": "Second source succeeded.", "subject": occurrence("Second"),
+            "predicate": "guides", "object": occurrence("Context"), "semantic_subtype": "statement",
+        }]},
+    ])
+
+    result = candidate_compiler.build(request)
+
+    extraction = next(metric for metric in result.stage_metrics if metric.stage == "extraction")
+    assert result.ready is True
+    assert extraction.call_count == 3
+    assert extraction.failure_count == 0
+    assert {item.status for item in storage.snapshot_source_coverage(result.snapshot.snapshot_id)} == {"processed"}
 
 
 def test_build_composes_a_ready_unpublished_candidate_with_typed_bounded_artifacts_and_metrics(tmp_path):

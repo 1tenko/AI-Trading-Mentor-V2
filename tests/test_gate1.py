@@ -15,9 +15,13 @@ from mentor.gate1 import (
     GATE1_PRICING_CHECKED_ON,
     HARD_SPEND_CEILING_USD,
     BudgetedOpenAIClient,
+    Gate1CostPlan,
     Gate1Runner,
     SpendLedger,
+    StageEstimate,
+    estimate_gate1_cost,
 )
+from mentor.compiler import EXTRACTION_INITIAL_MAX_OUTPUT_TOKENS, ExtractionFailure, SourceExtractor
 from mentor.knowledge import Collection, Source, SourceRevision
 from mentor.storage import Storage
 
@@ -167,6 +171,18 @@ def test_gate1_stops_before_runtime_or_client_when_estimate_exceeds_limit(tmp_pa
     assert production.current_snapshot() == production_snapshot
 
 
+def test_gate1_cost_plan_reserves_validation_for_every_schema_permitted_extraction_candidate(tmp_path):
+    database_path, manifest_path, production, _production_snapshot = _production_runtime(tmp_path)
+    sources, _manifest = gate1_module._resolve_manifest(
+        manifest_path, production, _manifest_hash(manifest_path)
+    )
+
+    plan = estimate_gate1_cost(sources, CONSERVATIVE_SOL_PRICING)
+
+    assert plan.estimated_candidate_count == len(sources) * 12
+    assert next(stage for stage in plan.stages if stage.stage == "validation").call_count == len(sources) * 12
+
+
 def test_gate1_rejects_manifest_metadata_drift_instead_of_substituting(tmp_path):
     database_path, manifest_path, production, production_snapshot = _production_runtime(tmp_path)
     approved_hash = _manifest_hash(manifest_path)
@@ -187,6 +203,17 @@ def test_gate1_rejects_manifest_metadata_drift_instead_of_substituting(tmp_path)
 
 def test_execute_builds_and_publishes_only_in_pilot_then_runs_evaluation(tmp_path, monkeypatch):
     monkeypatch.setattr(gate1_module, "GATE1_PRIOR_SPEND_USD", 0.0)
+    monkeypatch.setattr(
+        gate1_module,
+        "estimate_gate1_cost",
+        lambda sources, _pricing: Gate1CostPlan(
+            len(sources), 0, 0,
+            tuple(StageEstimate(stage, 1, 1, 1, 0.01) for stage in (
+                "extraction", "validation", "synthesis", "mentor_evaluation",
+            )),
+            0.04,
+        ),
+    )
     database_path, manifest_path, production, production_snapshot = _production_runtime(tmp_path)
     observed = {}
 
@@ -293,9 +320,10 @@ def test_budgeted_client_caps_output_and_accounts_actual_usage_before_next_call(
         model="gpt-5.6-sol",
         instructions="Prompt version: source-extraction-v1",
         input="Synthetic request",
+        max_output_tokens=EXTRACTION_INITIAL_MAX_OUTPUT_TOKENS,
     )
 
-    assert calls[0]["max_output_tokens"] == 8_000
+    assert calls[0]["max_output_tokens"] == EXTRACTION_INITIAL_MAX_OUTPUT_TOKENS
     assert ledger.spent_usd == pytest.approx(CONSERVATIVE_SOL_PRICING.cost(
         input_tokens=100, output_tokens=20, reasoning_tokens=10
     ))
@@ -332,6 +360,7 @@ def test_budgeted_client_writes_private_response_envelope_diagnostics(tmp_path):
         instructions="Prompt version: source-extraction-v5",
         input="Synthetic request",
         text={"format": {"name": "source-extraction-schema-v5"}},
+        max_output_tokens=EXTRACTION_INITIAL_MAX_OUTPUT_TOKENS,
     )
 
     diagnostic = json.loads(diagnostic_path.read_text(encoding="utf-8"))
@@ -339,7 +368,51 @@ def test_budgeted_client_writes_private_response_envelope_diagnostics(tmp_path):
     assert diagnostic["incomplete_details"] == {"reason": "max_output_tokens"}
     assert diagnostic["prompt_version"] == "source-extraction-v5"
     assert diagnostic["schema_version"] == "source-extraction-schema-v5"
+    assert diagnostic["requested_max_output_tokens"] == EXTRACTION_INITIAL_MAX_OUTPUT_TOKENS
     assert "reasoning" not in diagnostic
+
+
+def test_extraction_retry_is_blocked_before_the_second_paid_call_when_it_exceeds_the_ceiling():
+    calls = []
+
+    class Responses:
+        def create(self, **request):
+            calls.append(request)
+            return SimpleNamespace(
+                status="incomplete",
+                incomplete_details=SimpleNamespace(reason="max_output_tokens"),
+                output_text='{"truncated":',
+                output=[SimpleNamespace(type="message", content=[])],
+                usage=SimpleNamespace(
+                    input_tokens=1,
+                    output_tokens=1,
+                    output_tokens_details=SimpleNamespace(reasoning_tokens=0),
+                ),
+            )
+
+    client = BudgetedOpenAIClient(
+        SimpleNamespace(responses=Responses()),
+        SpendLedger(0.75, CONSERVATIVE_SOL_PRICING),
+    )
+    extractor = SourceExtractor(
+        client, model="gpt-5.6-sol", live_mode=True, pricing=CONSERVATIVE_SOL_PRICING,
+    )
+    source = Source.create(
+        collection_id="collection_synthetic", identity_key="retry-budget", source_type="transcript",
+        author="Synthetic", course="Synthetic", lesson_title="Synthetic", year=2026,
+        original_filename="synthetic.txt", local_provenance="synthetic.txt",
+    )
+    revision = SourceRevision.create(
+        source=source, content_sha256="a" * 64, byte_size=10, local_locator="synthetic.txt",
+        observed_at=1.0, lifecycle_state="active",
+    )
+
+    with pytest.raises(ExtractionFailure, match="spend ceiling") as error:
+        extractor.extract(revision=revision, snapshot_id="snap_synthetic", transcript="Synthetic")
+
+    assert len(calls) == 1
+    assert error.value.attempt_count == 1
+    assert error.value.usage.input_tokens == 1
 
 
 def test_budgeted_client_records_transport_versions_and_conservatively_charges_unknown_usage(tmp_path):
@@ -358,20 +431,22 @@ def test_budgeted_client_records_transport_versions_and_conservatively_charges_u
             instructions="Prompt version: source-extraction-v5",
             input="Synthetic request",
             text={"format": {"name": "source-extraction-schema-v5"}},
+            max_output_tokens=EXTRACTION_INITIAL_MAX_OUTPUT_TOKENS,
         )
 
     diagnostic = json.loads(diagnostic_path.read_text(encoding="utf-8"))
     assert diagnostic["prompt_version"] == "source-extraction-v5"
     assert diagnostic["schema_version"] == "source-extraction-schema-v5"
+    assert diagnostic["requested_max_output_tokens"] == EXTRACTION_INITIAL_MAX_OUTPUT_TOKENS
     assert ledger.events[-1]["status"] == "usage_unknown"
 
 
 def test_spend_ledger_counts_a_prior_gate1_run_against_the_same_hard_ceiling():
-    assert GATE1_PRIOR_SPEND_USD == pytest.approx(8.502370)
+    assert GATE1_PRIOR_SPEND_USD == pytest.approx(9.979610)
     assert HARD_SPEND_CEILING_USD == pytest.approx(30.0)
     ledger = SpendLedger(HARD_SPEND_CEILING_USD, CONSERVATIVE_SOL_PRICING, prior_spend_usd=GATE1_PRIOR_SPEND_USD)
 
-    assert ledger.spent_usd == pytest.approx(8.502370)
+    assert ledger.spent_usd == pytest.approx(9.979610)
     with pytest.raises(RuntimeError, match="spend ceiling"):
         ledger.ensure("extraction", 21.497631)
 

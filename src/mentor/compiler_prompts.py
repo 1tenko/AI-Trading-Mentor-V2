@@ -9,6 +9,10 @@ from mentor.knowledge import SourceRevision
 
 EXTRACTION_PROMPT_VERSION = "source-extraction-v5"
 EXTRACTION_SCHEMA_VERSION = "source-extraction-schema-v5"
+EXTRACTION_OUTPUT_BUDGET_POLICY_VERSION = "source-extraction-output-budget-v1"
+EXTRACTION_INITIAL_MAX_OUTPUT_TOKENS = 16_384
+EXTRACTION_RETRY_MAX_OUTPUT_TOKENS = 32_768
+EXTRACTION_MAX_ATTEMPTS = 2
 SEMANTIC_VALIDATION_PROMPT_VERSION = "source-semantic-validation-v3"
 SEMANTIC_VALIDATION_SCHEMA_VERSION = "source-semantic-validation-schema-v1"
 MAX_CANDIDATES_PER_SOURCE = 12
@@ -142,11 +146,13 @@ def extraction_request(
     transcript: str,
     model: str,
     anchor_spans: Mapping[str, str] | None = None,
+    max_output_tokens: int = EXTRACTION_INITIAL_MAX_OUTPUT_TOKENS,
 ) -> dict[str, object]:
     anchors = dict(anchor_spans or {})
     return {
         "model": model,
         "store": False,
+        "max_output_tokens": max_output_tokens,
         "instructions": f"Prompt version: {EXTRACTION_PROMPT_VERSION}\n{EXTRACTION_INSTRUCTIONS}",
         "input": (
             f"Source revision: {revision.revision_id}\n\nTranscript:\n{transcript}\n\n"

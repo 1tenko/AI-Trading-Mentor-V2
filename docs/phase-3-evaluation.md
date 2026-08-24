@@ -311,3 +311,38 @@ This was not a downstream structural failure: the completed-response replay
 cannot exercise a newly generated model response that terminates at its output
 limit. The immutable failed candidate is not reused or patched, and no retry
 was performed.
+
+## Gate 1 extraction output-budget hardening
+
+The failed response was an `incomplete` extraction with
+`incomplete_details.reason = max_output_tokens`. The cap came from the isolated
+pilot `BudgetedOpenAIClient` stage wrapper, which had imposed `8,000` when the
+otherwise unconstrained extraction request reached `responses.create`. It did
+not come from the extraction prompt or schema. The diagnostic records `8,000`
+total output tokens and `4,555` input tokens. It predates the token-detail
+audit field, so its reasoning-token and visible-output split is unavailable;
+no reasoning content was retained.
+
+`source-extraction-output-budget-v1` makes the source-level policy explicit:
+an initial `16,384` output-token cap, followed by at most one retry at
+`32,768` only when the response is exactly `incomplete/max_output_tokens`.
+The revision, transcript, anchors, model, prompt/schema versions, and
+reasoning configuration are unchanged. Refusals, transport/API failures,
+malformed completed responses, validation failures, and all later compiler
+failures remain non-retryable. The strict response boundary continues to reject
+incomplete payloads before structured parsing.
+
+Both attempt envelopes retain only status, requested cap, token counts, and
+non-reasoning diagnostic metadata in ignored pilot storage. If the guarded
+second call is blocked or fails, the first attempt's usage is returned with the
+failure so CandidateCompiler metrics cannot erase it. Future diagnostics include
+`output_tokens_details.reasoning_tokens` when the SDK supplies that count, not
+reasoning content.
+
+The new cost preflight reserves the bounded retry and semantic validation for
+all 12 schema-permitted candidates per source. It is deliberately conservative:
+the resulting remaining-run upper bound is `$31.5451`, which alone exceeds the
+fixed `$30.00` ceiling and is far above the `$20.020390` remaining after the
+permanent `$9.979610` prior spend. The preflight therefore blocks another paid
+rerun before any client, pilot runtime, vector store, or production state can
+be touched. No new paid call is authorized by this hardening alone.
