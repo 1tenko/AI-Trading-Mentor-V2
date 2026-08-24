@@ -37,9 +37,37 @@ evolution, and correction behavior, plus:
 - native citation count;
 - orientation calls and deduplicated admitted record IDs/count;
 - raw File Search calls and retrieved passage count;
-- input/output tokens;
+- input/output/reasoning tokens where reported;
 - latency; and
 - estimated cost.
+
+Live GPT-5.6 Sol compiler stages require caller-supplied token pricing. The
+recorded cost is therefore reproducible from persisted token counts and the
+explicit rates rather than silently defaulting to zero.
+
+## Pre-Gate 1 final review closure
+
+The final deterministic review wave remains inside Tasks 1-19 and does not run
+the pilot. It proves that manifest revision IDs resolve through a production
+seam into byte/hash-verified bounded timestamp anchors; extraction,
+independent validation, and reconciliation handle typed claims,
+relationships, and procedure/sequence/hierarchy records with aliases; and
+reconciliation uses bounded primary clusters plus bounded cross-cluster bridge
+passes.
+
+Candidate concepts are persisted with canonical labels, aliases, scopes,
+supporting records/anchors, term occurrences, every record association, and an
+explicit semantic primary. Source replacement tests prove that an unchanged
+source is cloned into the next candidate without re-extraction, a remote-ready
+replacement remains pending while the candidate is reviewed, and only
+publication promotes it while superseding its predecessor. Derived provenance
+kind and semantic subtype remain separate in storage, orientation, and the
+Inspector. Compact-width CSS contracts keep controls, messages, and the
+composer within the viewport while retaining the intentional horizontal thread
+strip.
+
+All of this coverage is synthetic/local. It performs no OpenAI request, vector
+mutation, paid compilation, or production-runtime migration.
 
 A failed case is retained as a failure type while its exception message and
 private output are discarded. Baseline comparison requires the same ordered
