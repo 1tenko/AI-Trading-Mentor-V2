@@ -6,13 +6,14 @@ from types import SimpleNamespace
 import pytest
 
 from mentor.compiler import SourceExtractor
-from mentor.compilation import CompilationRun, CorpusSnapshot
+from mentor.compilation import CompilationRun, CorpusSnapshot, TokenPricing
 from mentor.compiler_prompts import (
     EXTRACTION_PROMPT_VERSION,
     EXTRACTION_RESPONSE_SCHEMA,
     EXTRACTION_SCHEMA_VERSION,
 )
 from mentor.knowledge import Collection, Source, SourceRevision
+from mentor.derived_records import ProcedureSequenceHierarchy, Relationship
 from mentor.storage import Storage
 
 
@@ -77,6 +78,88 @@ def test_extracts_bounded_pending_candidates_for_one_revision_with_versioned_req
     assert EXTRACTION_PROMPT_VERSION in responses.requests[0]["instructions"]
     assert responses.requests[0]["text"]["format"]["name"] == EXTRACTION_SCHEMA_VERSION
     assert revision.revision_id in responses.requests[0]["input"]
+
+
+def test_live_sol_extraction_requires_pricing_and_records_reasoning_cost():
+    response = SimpleNamespace(
+        output_text=json.dumps(FIXTURES["empty"]),
+        usage=SimpleNamespace(
+            input_tokens=100,
+            output_tokens=40,
+            output_tokens_details=SimpleNamespace(reasoning_tokens=25),
+        ),
+    )
+    client = SimpleNamespace(responses=SimpleNamespace(create=lambda **_request: response))
+    with pytest.raises(ValueError, match="pricing"):
+        SourceExtractor(client, model="gpt-5.6-sol", live_mode=True)
+    extractor = SourceExtractor(
+        client, model="gpt-5.6-sol", live_mode=True,
+        pricing=TokenPricing(2.0, 4.0, 6.0),
+    )
+
+    result = extractor.extract(
+        revision=revision_for(), snapshot_id="snap_synthetic", transcript="Synthetic source text."
+    )
+
+    assert result.usage.reasoning_tokens == 25
+    assert result.usage.cost_usd == pytest.approx((100 * 2 + 15 * 4 + 25 * 6) / 1_000_000)
+
+
+def test_concrete_extraction_emits_relationship_procedure_and_alias_hints():
+    transcript = "Synthetic source text."
+    revision = revision_for(transcript)
+    payload = {
+        "candidates": [
+            {
+                "family": "relationship",
+                "anchors": ["anc_relationship"],
+                "qualification": "Synthetic relationship.",
+                "left": "Primary signal",
+                "relation": "depends_on",
+                "right": "Context filter",
+                "concept_hints": [
+                    {
+                        "label": "Primary signal",
+                        "aliases": ["PS"],
+                        "scope": "entry",
+                        "role": "left",
+                        "position": None,
+                    }
+                ],
+            },
+            {
+                "family": "procedure_sequence_hierarchy",
+                "anchors": ["anc_procedure"],
+                "qualification": "Synthetic ordered process.",
+                "kind": "procedure",
+                "terms": ["Observe", "Validate", "Act"],
+                "concept_hints": [
+                    {
+                        "label": "Validate",
+                        "aliases": ["Confirm"],
+                        "scope": None,
+                        "role": "term",
+                        "position": 1,
+                    }
+                ],
+            },
+        ]
+    }
+    extractor, _responses = extractor_for(payload)
+
+    result = extractor.extract(
+        revision=revision,
+        snapshot_id="snap_synthetic",
+        transcript=transcript,
+        anchor_spans={"anc_relationship": "relationship", "anc_procedure": "procedure"},
+    )
+
+    assert isinstance(result.candidates[0], Relationship)
+    assert isinstance(result.candidates[1], ProcedureSequenceHierarchy)
+    assert all(record.derived_kind == "source_extracted_claim" for record in result.candidates)
+    assert result.hints[0].aliases == ("PS",)
+    assert result.hints[1].role == "term"
+    assert result.hints[1].position == 1
 
 
 def test_allows_a_source_to_yield_zero_candidates():

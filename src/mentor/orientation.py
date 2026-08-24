@@ -45,6 +45,8 @@ class OrientationRecord:
     statement: str
     anchor_ids: tuple[str, ...]
     source_area: OrientationSourceArea
+    semantic_subtype: str = "unspecified"
+    concept_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -90,13 +92,23 @@ class OrientationService:
         attributes["snapshot_id"] = snapshot.snapshot_id
         local_records, invalid_local_ids = self._current_local_records(snapshot.snapshot_id)
         local_concept_ids = self._storage.orientation_concept_ids(snapshot.snapshot_id)
+        links_reader = getattr(self._storage, "orientation_concept_links", None)
+        local_concept_links = (
+            links_reader(snapshot.snapshot_id)
+            if callable(links_reader)
+            else {record_id: (concept_id,) for record_id, concept_id in local_concept_ids.items()}
+        )
         remote_results = self._vector_stores.search(
             snapshot.derived_store_id,
             question,
             attributes=attributes,
             max_num_results=min(50, self._budget.max_records * 4),
         )
-        return self._bound_results(snapshot, local_records, invalid_local_ids, local_concept_ids, remote_results)
+        return self._bound_results(
+            snapshot, local_records, invalid_local_ids, local_concept_ids,
+            local_concept_links, remote_results,
+        )
+
     def _current_local_records(self, snapshot_id: str) -> tuple[dict[str, DerivedRecord], set[str]]:
         records: dict[str, DerivedRecord] = {}
         invalid_ids: set[str] = set()
@@ -125,29 +137,30 @@ class OrientationService:
         local_records: dict[str, DerivedRecord],
         invalid_local_ids: set[str],
         local_concept_ids: dict[str, str],
+        local_concept_links: dict[str, tuple[str, ...]],
         remote_results: list[VectorStoreSearchResult],
     ) -> OrientationResult:
         records: list[OrientationRecord] = []
         seen_record_ids: set[str] = set()
-        seen_concept_ids: set[str] = set()
         used_tokens = duplicate_count = discarded_count = 0
         truncated = False
         for remote in remote_results:
-            record, concept_id = self._valid_remote_record(
-                remote, snapshot.snapshot_id, local_records, invalid_local_ids, local_concept_ids
+            record, concept_id, concept_ids = self._valid_remote_record(
+                remote, snapshot.snapshot_id, local_records, invalid_local_ids,
+                local_concept_ids, local_concept_links,
             )
-            if record is None or concept_id is None:
+            if record is None or concept_id is None or concept_ids is None:
                 discarded_count += 1
                 continue
-            if record.record_id in seen_record_ids or concept_id in seen_concept_ids:
+            if record.record_id in seen_record_ids:
                 duplicate_count += 1
                 continue
             seen_record_ids.add(record.record_id)
-            seen_concept_ids.add(concept_id)
             orientation_record = _orientation_record(
                 record,
                 concept_id,
                 self._storage.orientation_source_area(snapshot.snapshot_id, record),
+                concept_ids=concept_ids,
             )
             record_tokens = _conservative_token_upper_bound(orientation_record)
             if len(records) >= self._budget.max_records or used_tokens + record_tokens > self._budget.max_tokens:
@@ -173,19 +186,25 @@ class OrientationService:
         local_records: dict[str, DerivedRecord],
         invalid_local_ids: set[str],
         local_concept_ids: dict[str, str],
-    ) -> tuple[DerivedRecord | None, str | None]:
+        local_concept_links: dict[str, tuple[str, ...]],
+    ) -> tuple[DerivedRecord | None, str | None, tuple[str, ...] | None]:
         if not isinstance(remote, VectorStoreSearchResult):
-            return None, None
+            return None, None, None
         if remote.attributes.get("snapshot_id") != snapshot_id or remote.attributes.get("status") != "published":
-            return None, None
+            return None, None, None
         record_id = remote.record_id
         if record_id is None or record_id in invalid_local_ids:
-            return None, None
+            return None, None, None
         record = local_records.get(record_id)
         concept_id = local_concept_ids.get(record_id)
-        if record is None or not _is_canonical_concept_id(concept_id):
-            return None, None
-        return record, concept_id
+        concept_ids = local_concept_links.get(record_id, ())
+        if (
+            record is None or not _is_canonical_concept_id(concept_id)
+            or not concept_ids or concept_id not in concept_ids
+            or any(not _is_canonical_concept_id(value) for value in concept_ids)
+        ):
+            return None, None, None
+        return record, concept_id, concept_ids
 
 
 def render_orientation_artifact(
@@ -240,17 +259,22 @@ def _orientation_record(
     record: DerivedRecord,
     concept_id: str,
     source_area: tuple[str | None, int | None, str | None],
+    *,
+    concept_ids: tuple[str, ...] | None = None,
 ) -> OrientationRecord:
+    concept_ids = concept_ids or (concept_id,)
     return OrientationRecord(
         record_id=record.record_id,
         concept_id=concept_id,
         family=record.family,
         derived_kind=record.derived_kind,
+        semantic_subtype=record.semantic_subtype,
         evidence_state=record.evidence_state,
         qualification=record.qualification,
         statement=_statement(record),
         anchor_ids=record.anchors,
         source_area=OrientationSourceArea(*_safe_source_area(source_area)),
+        concept_ids=concept_ids,
     )
 
 
@@ -307,10 +331,12 @@ def _conservative_token_upper_bound(record: OrientationRecord) -> int:
         record.concept_id or "",
         record.family,
         record.derived_kind,
+        record.semantic_subtype,
         record.evidence_state,
         record.qualification,
         record.statement,
         *record.anchor_ids,
+        *record.concept_ids,
         record.source_area.collection_id or "",
         str(record.source_area.year or ""),
         record.source_area.scope or "",

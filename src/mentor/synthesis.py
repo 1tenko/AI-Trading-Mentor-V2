@@ -5,7 +5,7 @@ from hashlib import sha256
 import json
 from typing import Any, Sequence
 
-from mentor.compilation import CallUsage
+from mentor.compilation import CallUsage, TokenPricing, usage_from_response
 
 from mentor.derived_records import (
     Claim,
@@ -27,8 +27,8 @@ MAX_ALIASES = 8
 MAX_SCOPE_LENGTH = 160
 MAX_CONDITION_LENGTH = 160
 MAX_JUSTIFICATION_LENGTH = 280
-SYNTHESIS_PROMPT_VERSION = "cross-source-synthesis-v1"
-SYNTHESIS_SCHEMA_VERSION = "cross-source-synthesis-schema-v1"
+SYNTHESIS_PROMPT_VERSION = "cross-source-synthesis-v2"
+SYNTHESIS_SCHEMA_VERSION = "cross-source-synthesis-schema-v2"
 SOL_MODEL = "gpt-5.6-sol"
 MAX_SYNTHESIS_RECORDS = 64
 
@@ -39,16 +39,36 @@ class SynthesisResult:
     provenance: CompilerProvenance
     usage: CallUsage = CallUsage()
     hints: tuple[Any, ...] = ()
+    call_count: int = 0
 
 
 class SynthesisReconciler:
     """Create typed cross-source records through a caller-owned Responses client."""
 
-    def __init__(self, client: Any, *, model: str = "synthetic-synthesizer", live_mode: bool = False):
+    def __init__(
+        self,
+        client: Any,
+        *,
+        model: str = "synthetic-synthesizer",
+        live_mode: bool = False,
+        max_records_per_call: int = 16,
+        pricing: TokenPricing | None = None,
+    ):
         if model == SOL_MODEL and not live_mode:
             raise ValueError("GPT-5.6 Sol synthesis requires explicit live mode; use an injected mock otherwise")
+        if model == SOL_MODEL and pricing is None:
+            raise ValueError("GPT-5.6 Sol live synthesis requires caller-supplied pricing")
+        if (
+            not isinstance(max_records_per_call, int)
+            or isinstance(max_records_per_call, bool)
+            or max_records_per_call < 1
+            or max_records_per_call > MAX_SYNTHESIS_RECORDS
+        ):
+            raise ValueError("synthesis batch size must be bounded")
         self._client = client
         self._provenance = CompilerProvenance(model, SYNTHESIS_PROMPT_VERSION, SYNTHESIS_SCHEMA_VERSION)
+        self._max_records_per_call = max_records_per_call
+        self._pricing = pricing
 
     def synthesize(
         self,
@@ -71,62 +91,102 @@ class SynthesisReconciler:
             for anchor_id, span in anchor_spans.items()
         ):
             raise ValueError("synthesis anchor spans must be an ID-to-text mapping")
-        response = self._client.responses.create(
-            model=self._provenance.model_version,
-            store=False,
-            instructions=(
-                f"Prompt version: {SYNTHESIS_PROMPT_VERSION}\n"
-                "Return only small typed cross-source relationship, evolution, or conflict records. "
-                "Use only supplied record, anchor, and revision IDs. Preserve uncertainty; do not claim raw authority."
-            ),
-            input=json.dumps(
-                {
-                    "snapshot_id": snapshot_id,
-                    "records": [asdict(record) for record in record_values],
-                    "revision_ids": [getattr(revision, "revision_id", None) for revision in revision_values],
-                    "supporting_spans": anchor_spans,
-                },
-                sort_keys=True,
-                separators=(",", ":"),
-            ),
-            text={
-                "format": {
-                    "type": "json_schema",
-                    "name": SYNTHESIS_SCHEMA_VERSION,
-                    "schema": {
-                        "type": "object",
-                        "required": ["records"],
-                        "properties": {
-                            "records": {
-                                "type": "array",
-                                "maxItems": MAX_SYNTHESIS_RECORDS,
-                                "items": {"type": "object"},
-                            }
+        known_revisions = {
+            getattr(revision, "revision_id", None): revision for revision in revision_values
+        }
+        if None in known_revisions or len(known_revisions) != len(revision_values):
+            raise ValueError("synthesis revisions require unique immutable IDs")
+        synthesized: list[DerivedRecord] = []
+        hints: list[ConceptHint] = []
+        usage = CallUsage()
+        for batch in _reconciliation_batches(record_values, self._max_records_per_call):
+            batch_record_ids = tuple(record.record_id for record in batch)
+            batch_anchor_ids = tuple(
+                dict.fromkeys(anchor for record in batch for anchor in record.anchors)
+            )
+            batch_revision_ids = tuple(
+                dict.fromkeys(
+                    dependency.identifier
+                    for record in batch
+                    for dependency in record.dependencies
+                    if dependency.kind == "source_revision"
+                )
+            )
+            if not set(batch_revision_ids) <= set(known_revisions):
+                raise ValueError("synthesis record depends on an unavailable source revision")
+            missing_spans = set(batch_anchor_ids).difference(anchor_spans)
+            if missing_spans:
+                raise ValueError("synthesis is missing a required bounded anchor span")
+            response = self._client.responses.create(
+                model=self._provenance.model_version,
+                store=False,
+                instructions=(
+                    f"Prompt version: {SYNTHESIS_PROMPT_VERSION}\n"
+                    "Return only small typed cross-source relationship, procedure/sequence/hierarchy, "
+                    "evolution, or conflict records plus explicit alias-aware concept hints. "
+                    "Use only supplied record, anchor, and revision IDs. Preserve uncertainty; do not claim raw authority."
+                ),
+                input=json.dumps(
+                    {
+                        "snapshot_id": snapshot_id,
+                        "records": [asdict(record) for record in batch],
+                        "revision_ids": list(batch_revision_ids),
+                        "supporting_spans": {
+                            anchor_id: anchor_spans[anchor_id] for anchor_id in batch_anchor_ids
                         },
                     },
-                    "strict": False,
-                }
-            },
-        )
-        output = _synthesis_output(response)
-        known_record_ids = tuple(record.record_id for record in record_values)
-        known_anchor_ids = tuple(dict.fromkeys(anchor for record in record_values for anchor in record.anchors))
-        known_revision_ids = tuple(getattr(revision, "revision_id", "") for revision in revision_values)
-        synthesized = tuple(
-            _synthesis_record(
-                payload,
-                snapshot_id=snapshot_id,
-                provenance=self._provenance,
-                record_ids=known_record_ids,
-                anchor_ids=known_anchor_ids,
-                revision_ids=known_revision_ids,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                text={
+                    "format": {
+                        "type": "json_schema",
+                        "name": SYNTHESIS_SCHEMA_VERSION,
+                        "schema": {
+                            "type": "object",
+                            "required": ["records"],
+                            "properties": {
+                                "records": {
+                                    "type": "array",
+                                    "maxItems": MAX_SYNTHESIS_RECORDS,
+                                    "items": {"type": "object"},
+                                },
+                                "concept_hints": {"type": "array", "items": {"type": "object"}},
+                            },
+                        },
+                        "strict": False,
+                    }
+                },
             )
-            for payload in output
+            output, hint_payloads = _synthesis_output(response)
+            batch_records = tuple(
+                _synthesis_record(
+                    payload,
+                    snapshot_id=snapshot_id,
+                    provenance=self._provenance,
+                    record_ids=batch_record_ids,
+                    anchor_ids=batch_anchor_ids,
+                    revision_ids=batch_revision_ids,
+                )
+                for payload in output
+            )
+            known_record_ids = {record.record_id for record in synthesized}
+            new_records = tuple(record for record in batch_records if record.record_id not in known_record_ids)
+            synthesized.extend(new_records)
+            hints.extend(
+                hint for hint in _synthesis_hints(hint_payloads, batch_records)
+                if hint.record_id in {record.record_id for record in new_records}
+            )
+            usage = _sum_usage(usage, usage_from_response(response, pricing=self._pricing))
+            if len(synthesized) > MAX_SYNTHESIS_RECORDS:
+                raise ValueError("batched synthesis exceeded the candidate output limit")
+        return SynthesisResult(
+            tuple(synthesized), self._provenance, usage, tuple(hints),
+            call_count=len(_reconciliation_batches(record_values, self._max_records_per_call)),
         )
-        return SynthesisResult(synthesized, self._provenance, _synthesis_usage(response))
 
 
-def _synthesis_output(response: Any) -> list[object]:
+def _synthesis_output(response: Any) -> tuple[list[object], list[object]]:
     output_text = getattr(response, "output_text", None)
     if not isinstance(output_text, str):
         raise ValueError("synthesis response requires output_text")
@@ -134,11 +194,16 @@ def _synthesis_output(response: Any) -> list[object]:
         payload = json.loads(output_text)
     except json.JSONDecodeError as error:
         raise ValueError("synthesis response must be JSON") from error
-    if not isinstance(payload, dict) or set(payload) != {"records"} or not isinstance(payload["records"], list):
-        raise ValueError("synthesis response requires only a records list")
+    if (
+        not isinstance(payload, dict)
+        or set(payload) not in ({"records"}, {"records", "concept_hints"})
+        or not isinstance(payload["records"], list)
+        or not isinstance(payload.get("concept_hints", []), list)
+    ):
+        raise ValueError("synthesis response requires records and optional concept hints")
     if len(payload["records"]) > MAX_SYNTHESIS_RECORDS:
         raise ValueError("too many synthesis records")
-    return payload["records"]
+    return payload["records"], payload.get("concept_hints", [])
 
 
 def _synthesis_record(
@@ -179,6 +244,13 @@ def _synthesis_record(
             left=payload.get("left"),
             relation=payload.get("relation"),
             right=payload.get("right"),
+        )
+    if family == "procedure_sequence_hierarchy":
+        _allow_synthesis_fields(payload, base_fields | {"kind", "terms"})
+        return ProcedureSequenceHierarchy.create(
+            **common,
+            kind=payload.get("kind"),
+            terms=_payload_texts(payload.get("terms")),
         )
     if family == "evolution":
         fields = base_fields | {
@@ -232,7 +304,79 @@ def _synthesis_record(
             conditions=_payload_texts(payload.get("conditions"), allow_empty=True),
             unresolved_questions=_payload_texts(payload.get("unresolved_questions"), allow_empty=True),
         )
-    raise ValueError("synthesis may create only relationship, evolution, or conflict records")
+    raise ValueError("synthesis returned an unsupported typed family")
+
+
+def _synthesis_hints(
+    payloads: list[object], records: tuple[DerivedRecord, ...]
+) -> tuple[ConceptHint, ...]:
+    if len(payloads) > MAX_SYNTHESIS_RECORDS:
+        raise ValueError("too many synthesis concept hints")
+    result = []
+    for payload in payloads:
+        if not isinstance(payload, dict) or set(payload) != {
+            "record_index", "label", "aliases", "scope", "role", "position"
+        }:
+            raise ValueError("synthesis concept hints must be typed")
+        index = payload["record_index"]
+        aliases = payload["aliases"]
+        position = payload["position"]
+        if (
+            not isinstance(index, int)
+            or isinstance(index, bool)
+            or not 0 <= index < len(records)
+            or not isinstance(payload["label"], str)
+            or not payload["label"].strip()
+            or not isinstance(aliases, list)
+            or len(aliases) > MAX_ALIASES
+            or any(not isinstance(alias, str) or not alias.strip() for alias in aliases)
+            or (payload["scope"] is not None and not isinstance(payload["scope"], str))
+            or (payload["role"] is not None and not isinstance(payload["role"], str))
+            or (position is not None and (not isinstance(position, int) or isinstance(position, bool) or position < 0))
+        ):
+            raise ValueError("synthesis concept hints are invalid")
+        result.append(
+            ConceptHint(
+                records[index].record_id,
+                payload["label"],
+                tuple(aliases),
+                payload["scope"],
+                payload["role"],
+                position,
+            )
+        )
+    return tuple(result)
+
+
+def _reconciliation_batches(
+    records: tuple[DerivedRecord, ...], max_records: int
+) -> tuple[tuple[DerivedRecord, ...], ...]:
+    """Keep related record terms adjacent while bounding every model request."""
+    ordered = tuple(sorted(records, key=lambda record: (_record_cluster_key(record), record.record_id)))
+    primary = tuple(
+        ordered[start : start + max_records]
+        for start in range(0, len(ordered), max_records)
+    )
+    if len(primary) < 2 or max_records < 2:
+        return primary
+    bridges = tuple(
+        (primary[index][-1], primary[index + 1][0])
+        for index in range(len(primary) - 1)
+    )
+    return primary + bridges
+
+
+def _record_cluster_key(record: DerivedRecord) -> str:
+    return _label_key(_record_occurrence_terms(record)[0][2])
+
+
+def _sum_usage(first: CallUsage, second: CallUsage) -> CallUsage:
+    return CallUsage(
+        input_tokens=first.input_tokens + second.input_tokens,
+        output_tokens=first.output_tokens + second.output_tokens,
+        cost_usd=first.cost_usd + second.cost_usd,
+        reasoning_tokens=first.reasoning_tokens + second.reasoning_tokens,
+    )
 
 
 def _required_reference_ids(
@@ -281,18 +425,6 @@ def _payload_years(value: object) -> tuple[int, ...]:
 def _allow_synthesis_fields(payload: dict[str, object], allowed: set[str]) -> None:
     if set(payload).difference(allowed):
         raise ValueError("synthesis record contains unsupported fields")
-
-
-def _synthesis_usage(response: Any) -> CallUsage:
-    usage = getattr(response, "usage", None)
-    return CallUsage(
-        input_tokens=_usage_int(getattr(usage, "input_tokens", 0)),
-        output_tokens=_usage_int(getattr(usage, "output_tokens", 0)),
-    )
-
-
-def _usage_int(value: object) -> int:
-    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
 
 
 @dataclass(frozen=True)
@@ -473,6 +605,27 @@ class SynthesisCandidate:
             raise ValueError("scope is required for this concept")
         if len(scoped_matches) != 1:
             raise ValueError("unknown or ambiguous concept label")
+
+    def concept_ids_for_record(self, record_id: str) -> tuple[str, ...]:
+        """Return every explicit concept occurrence in semantic record order."""
+        record = self._record(record_id)
+        occurrences = {
+            (item.role, item.position): item.concept_id
+            for item in self.concept_occurrences
+            if item.record_id == record_id
+        }
+        return tuple(
+            dict.fromkeys(
+                occurrences[(role, position)]
+                for role, position, _label in _record_occurrence_terms(record)
+            )
+        )
+
+    def primary_concept_id_for_record(self, record_id: str) -> str:
+        concept_ids = self.concept_ids_for_record(record_id)
+        if not concept_ids:
+            raise ValueError("record has no concept occurrence")
+        return concept_ids[0]
 
     def synthesize_relationship(
         self, record_id: str, *, left_scope: str | None = None, right_scope: str | None = None

@@ -101,9 +101,60 @@ def test_typed_families_have_a_complete_shared_envelope():
         assert record.qualification == "Only under the stated synthetic condition."
 
 
+def test_derived_kind_is_assimilation_provenance_not_semantic_subtype():
+    extracted = claim(semantic_subtype="definition")
+    synthesized = Relationship.create(
+        snapshot_id="snap_synthetic",
+        anchors=("anc_synthetic",),
+        dependencies=(RecordDependency("source_revision", "rev_synthetic"),),
+        validation_state="validated",
+        lifecycle_state="active",
+        qualification="Synthetic cross-source relationship.",
+        left="signal",
+        relation="supports",
+        right="context",
+        evidence_state="cross_source_synthesis",
+    )
+    unresolved = ConflictUnresolved.create(
+        snapshot_id="snap_synthetic",
+        anchors=("anc_a", "anc_b"),
+        dependencies=(
+            RecordDependency("source_revision", "rev_synthetic"),
+            RecordDependency("derived_record", "rec_a"),
+            RecordDependency("derived_record", "rec_b"),
+        ),
+        validation_state="validated",
+        lifecycle_state="active",
+        qualification="Synthetic evidence remains unresolved.",
+        kind="unresolved",
+        subject="synthetic tension",
+        alternatives=("first", "second"),
+        competing_record_ids=("rec_a", "rec_b"),
+        reconciliation_state="unresolved",
+        relevant_scopes=("synthetic",),
+        unresolved_questions=("Which applies?",),
+        evidence_state="cross_source_synthesis",
+    )
+
+    assert (extracted.derived_kind, extracted.semantic_subtype) == (
+        "source_extracted_claim",
+        "definition",
+    )
+    assert (synthesized.derived_kind, synthesized.semantic_subtype) == (
+        "cross_source_synthesis",
+        "relation",
+    )
+    assert (unresolved.derived_kind, unresolved.semantic_subtype) == (
+        "unresolved_or_conflicting",
+        "unresolved",
+    )
+    with pytest.raises(ValueError, match="derived_kind"):
+        claim(derived_kind="statement")
+
+
 def test_strategy_implications_default_to_cross_source_synthesis_unless_raw_taught():
-    inferred = claim(derived_kind="strategy_implication")
-    raw_taught = claim(derived_kind="strategy_implication", evidence_state="raw_taught")
+    inferred = claim(semantic_subtype="strategy_implication")
+    raw_taught = claim(semantic_subtype="strategy_implication", evidence_state="raw_taught")
 
     assert inferred.evidence_state == "cross_source_synthesis"
     assert raw_taught.evidence_state == "raw_taught"

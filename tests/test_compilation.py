@@ -4,7 +4,16 @@ import sqlite3
 
 import pytest
 
-from mentor.compilation import CandidateGateResult, CompilationMetric, CompilationRun, CorpusSnapshot, SourceProcessingResult
+from mentor.compilation import (
+    CallUsage,
+    CandidateGateResult,
+    CompilationMetric,
+    CompilationRun,
+    CorpusSnapshot,
+    SourceProcessingResult,
+    TokenPricing,
+    usage_from_response,
+)
 from mentor.derived_records import Claim, RecordDependency
 from mentor.knowledge import Collection, Source, SourceRevision
 from mentor.storage import Storage
@@ -65,6 +74,32 @@ def current_pointer(storage: Storage) -> dict[str, str]:
             "('current_snapshot_id', 'active_raw_store_id', 'active_derived_store_id')"
         ).fetchall()
     return {key: value for key, value in rows}
+
+
+def test_usage_captures_reasoning_tokens_and_reproducible_caller_pricing():
+    response = type(
+        "Response",
+        (),
+        {
+            "usage": type(
+                "Usage",
+                (),
+                {
+                    "input_tokens": 1_000,
+                    "output_tokens": 500,
+                    "output_tokens_details": type("Details", (), {"reasoning_tokens": 200})(),
+                },
+            )()
+        },
+    )()
+    pricing = TokenPricing(input_per_million=2.0, output_per_million=4.0, reasoning_per_million=6.0)
+
+    usage = usage_from_response(response, pricing=pricing)
+
+    assert usage.input_tokens == 1_000
+    assert usage.output_tokens == 500
+    assert usage.reasoning_tokens == 200
+    assert usage.cost_usd == pytest.approx(0.0044)
 
 
 def test_candidate_requires_validation_before_publication(tmp_path):

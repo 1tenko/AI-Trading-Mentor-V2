@@ -1,4 +1,6 @@
 from dataclasses import replace
+import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -10,7 +12,12 @@ from mentor.derived_records import (
     RecordDependency,
     Relationship,
 )
-from mentor.synthesis import ConceptHint, ProcedureBranch, SynthesisCandidate
+from mentor.synthesis import (
+    ConceptHint,
+    ProcedureBranch,
+    SynthesisCandidate,
+    SynthesisReconciler,
+)
 
 
 SNAPSHOT_ID = "snap_synthetic"
@@ -72,6 +79,106 @@ def procedure(
         facets=tuple(Facet("condition", condition) for condition in conditions),
         kind="procedure",
         terms=terms,
+    )
+
+
+class RecordingResponses:
+    def __init__(self, responder):
+        self.responder = responder
+        self.calls = []
+
+    def create(self, **request):
+        self.calls.append(request)
+        payload = self.responder(json.loads(request["input"]))
+        return SimpleNamespace(output_text=json.dumps(payload), usage=None)
+
+
+def test_concrete_reconciliation_batches_every_record_and_filters_anchor_spans():
+    records = tuple(claim(subject=f"Concept {index}") for index in range(5))
+    responses = RecordingResponses(lambda _request: {"records": [], "concept_hints": []})
+    reconciler = SynthesisReconciler(
+        SimpleNamespace(responses=responses),
+        max_records_per_call=2,
+    )
+
+    result = reconciler.synthesize(
+        snapshot_id=SNAPSHOT_ID,
+        records=records,
+        revisions=(SimpleNamespace(revision_id="rev_synthetic"),),
+        anchor_spans={record.anchors[0]: f"span {index}" for index, record in enumerate(records)},
+    )
+
+    requests = [json.loads(call["input"]) for call in responses.calls]
+    assert result.records == ()
+    assert len(requests) == 5
+    assert max(len(request["records"]) for request in requests) == 2
+    assert {
+        record["record_id"] for request in requests for record in request["records"]
+    } == {record.record_id for record in records}
+    assert all(
+        set(request["supporting_spans"])
+        == {anchor for record in request["records"] for anchor in record["anchors"]}
+        for request in requests
+    )
+    ordered_primary = requests[:3]
+    assert any(
+        {ordered_primary[0]["records"][-1]["record_id"], ordered_primary[1]["records"][0]["record_id"]}
+        == {record["record_id"] for record in request["records"]}
+        for request in requests[3:]
+    )
+
+
+def test_concrete_reconciliation_emits_structured_procedure_and_alias_hint():
+    records = (claim(subject="Observe"), claim(subject="Act"))
+
+    def response(request):
+        record_ids = [record["record_id"] for record in request["records"]]
+        anchors = [anchor for record in request["records"] for anchor in record["anchors"]]
+        return {
+            "records": [
+                {
+                    "family": "procedure_sequence_hierarchy",
+                    "qualification": "Synthetic cross-source procedure.",
+                    "anchors": anchors,
+                    "input_record_ids": record_ids,
+                    "source_revision_ids": ["rev_synthetic"],
+                    "kind": "procedure",
+                    "terms": ["Observe", "Act"],
+                }
+            ],
+            "concept_hints": [
+                {
+                    "record_index": 0,
+                    "label": "Observe",
+                    "aliases": ["Inspect"],
+                    "scope": "synthetic",
+                    "role": "term",
+                    "position": 0,
+                }
+            ],
+        }
+
+    responses = RecordingResponses(response)
+    reconciler = SynthesisReconciler(SimpleNamespace(responses=responses), max_records_per_call=8)
+
+    result = reconciler.synthesize(
+        snapshot_id=SNAPSHOT_ID,
+        records=records,
+        revisions=(SimpleNamespace(revision_id="rev_synthetic"),),
+        anchor_spans={record.anchors[0]: "bounded span" for record in records},
+    )
+
+    assert isinstance(result.records[0], ProcedureSequenceHierarchy)
+    assert result.records[0].terms == ("Observe", "Act")
+    assert result.hints == (
+        ConceptHint(
+            result.records[0].record_id,
+            "Observe",
+            aliases=("Inspect",),
+            scope="synthetic",
+            role="term",
+            position=0,
+        ),
     )
 
 

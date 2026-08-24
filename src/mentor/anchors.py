@@ -98,6 +98,41 @@ def resolve_anchor_span(anchor: SourceAnchor, revision: SourceRevision, transcri
     return normalized[anchor.start_offset : anchor.end_offset]
 
 
+def bounded_transcript_anchors(
+    revision: SourceRevision, transcript: str, *, max_chars: int
+) -> tuple[SourceAnchor, ...]:
+    """Partition one verified transcript into complete, bounded locator spans."""
+    if not isinstance(max_chars, int) or isinstance(max_chars, bool) or max_chars < 1:
+        raise ValueError("anchor character budget must be positive")
+    normalized = normalize_transcript(transcript)
+    if not normalized:
+        raise ValueError("candidate transcript is empty")
+    spans: list[tuple[int, int]] = []
+    start = 0
+    offset = 0
+    for line in normalized.splitlines(keepends=True):
+        line_end = offset + len(line)
+        if offset > start and line_end - start > max_chars:
+            spans.append((start, offset))
+            start = offset
+        while line_end - start > max_chars:
+            end = start + max_chars
+            spans.append((start, end))
+            start = end
+        offset = line_end
+    if start < len(normalized):
+        spans.append((start, len(normalized)))
+    return tuple(
+        SourceAnchor.create(
+            revision=revision,
+            transcript=transcript,
+            start_offset=start_offset,
+            end_offset=end_offset,
+        )
+        for start_offset, end_offset in spans
+    )
+
+
 def _revision_id(source_id: str, content_sha256: str) -> str:
     return f"rev_{source_id}_{content_sha256}"
 

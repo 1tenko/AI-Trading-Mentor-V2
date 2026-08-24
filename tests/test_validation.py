@@ -200,29 +200,59 @@ def test_semantic_validator_rejects_sol_before_any_mock_client_call():
     assert responses.requests == []
 
 
-def test_storage_validation_path_rejects_non_claim_records_before_any_mock_client_call(tmp_path):
-    storage, _ = validation_storage(tmp_path)
-    _, revision = source_and_revision()
-    non_claim = Relationship.create(
-        snapshot_id="snap_synthetic",
-        anchors=("anc_synthetic",),
+def test_storage_validation_path_accepts_typed_source_extracted_relationships(tmp_path):
+    storage, snapshot = validation_storage(tmp_path)
+    revision, extracted_claim, anchor = candidate_and_anchor(snapshot.snapshot_id)
+    candidate = Relationship.create(
+        snapshot_id=snapshot.snapshot_id,
+        anchors=(anchor.anchor_id,),
         dependencies=(RecordDependency("source_revision", revision.revision_id),),
         validation_state="pending",
         lifecycle_state="candidate",
         qualification="Synthetic.",
+        compiler_provenance=extracted_claim.compiler_provenance,
         left="one",
         relation="supports",
         right="two",
     )
     responses = FakeResponses(FIXTURES["affirmatively_supported"])
 
-    with pytest.raises(ValueError, match="Claim candidates"):
-        storage.validate_and_store_source_extracted(
-            client=SimpleNamespace(responses=responses),
-            candidate=non_claim, revision=revision, transcript=TRANSCRIPT, anchors={}
-        )
+    result = storage.validate_and_store_source_extracted(
+        client=SimpleNamespace(responses=responses),
+        candidate=candidate, revision=revision, transcript=TRANSCRIPT,
+        anchors={anchor.anchor_id: anchor},
+    )
 
-    assert responses.requests == []
+    assert isinstance(result.source_extracted, Relationship)
+    assert storage.derived_records(snapshot.snapshot_id) == [result.source_extracted]
+    assert '"family":"relationship"' in responses.requests[0]["input"]
+
+
+def test_storage_validation_path_accepts_ordered_source_extracted_procedures(tmp_path):
+    storage, snapshot = validation_storage(tmp_path)
+    revision, extracted_claim, anchor = candidate_and_anchor(snapshot.snapshot_id)
+    candidate = ProcedureSequenceHierarchy.create(
+        snapshot_id=snapshot.snapshot_id,
+        anchors=(anchor.anchor_id,),
+        dependencies=(RecordDependency("source_revision", revision.revision_id),),
+        validation_state="pending",
+        lifecycle_state="candidate",
+        qualification="Synthetic procedure.",
+        compiler_provenance=extracted_claim.compiler_provenance,
+        kind="procedure",
+        terms=("wait", "enter"),
+    )
+
+    result = storage.validate_and_store_source_extracted(
+        client=SimpleNamespace(responses=FakeResponses(FIXTURES["affirmatively_supported"])),
+        candidate=candidate,
+        revision=revision,
+        transcript=TRANSCRIPT,
+        anchors={anchor.anchor_id: anchor},
+    )
+
+    assert isinstance(result.source_extracted, ProcedureSequenceHierarchy)
+    assert result.source_extracted.terms == ("wait", "enter")
 
 
 @pytest.mark.parametrize("family", ["claim", "relationship", "procedure", "evolution", "conflict"])
@@ -282,7 +312,7 @@ def test_storage_has_no_result_accepting_path_for_forged_validation_results(tmp_
     )
 
     assert not hasattr(storage, "store_validation_result")
-    with pytest.raises(ValueError, match="Claim candidates"):
+    with pytest.raises(ValueError, match="source-extracted candidates"):
         storage.validate_and_store_source_extracted(
             client=SimpleNamespace(responses=FakeResponses(FIXTURES["affirmatively_supported"])),
             candidate=forged,
@@ -349,7 +379,7 @@ def test_mutated_public_and_private_proof_registries_cannot_enable_forged_storag
     )
 
     assert not hasattr(storage, "store_validation_result")
-    with pytest.raises(ValueError, match="Claim candidates"):
+    with pytest.raises(ValueError, match="source-extracted candidates"):
         storage.validate_and_store_source_extracted(
             client=SimpleNamespace(responses=FakeResponses(FIXTURES["affirmatively_supported"])),
             candidate=forged,

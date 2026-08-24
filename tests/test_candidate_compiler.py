@@ -11,6 +11,8 @@ from mentor.candidate_compiler import (
     BuildRequest,
     CandidateCompiler,
     CandidateSource,
+    CandidateSourcePreparer,
+    MAX_PREPARED_ANCHOR_CHARS,
     SynthesisResult,
 )
 from mentor.compilation import CompilationRun
@@ -289,6 +291,125 @@ def source_bundle(storage, identity, year):
         end_offset=len(transcript),
     )
     return CandidateSource(revision, transcript, {anchor.anchor_id: anchor})
+
+
+def test_manifest_revision_preparation_verifies_bytes_and_builds_bounded_anchors(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3", runtime_scope="pilot")
+    storage.initialize()
+    transcript = "".join(
+        f"[00:00:{second:02d}] Synthetic timestamped section {second} with bounded content.\n"
+        for second in range(1, 9)
+    )
+    path = tmp_path / "timestamped.txt"
+    path.write_text(transcript, encoding="utf-8", newline="")
+    collection = Collection("collection_synthetic", "Synthetic", "trading", True, "test")
+    source = Source.create(
+        collection_id=collection.collection_id,
+        identity_key="timestamped",
+        source_type="transcript",
+        author="Synthetic Author",
+        course="Synthetic Course",
+        lesson_title="Timestamped",
+        year=2026,
+        original_filename=path.name,
+        local_provenance=str(path),
+    )
+    revision = SourceRevision.create(
+        source=source,
+        content_sha256=sha256(path.read_bytes()).hexdigest(),
+        byte_size=path.stat().st_size,
+        local_locator=str(path),
+        observed_at=1.0,
+        lifecycle_state="active",
+        remote_file_id="file_timestamped",
+    )
+    storage.store_collection(collection)
+    storage.store_source(source)
+    storage.store_source_revision(revision)
+
+    prepared = CandidateSourcePreparer(storage, max_anchor_chars=120).prepare((revision.revision_id,))
+
+    assert len(prepared) == 1
+    assert prepared[0].revision == revision
+    assert prepared[0].transcript == transcript
+    assert len(prepared[0].anchors) > 1
+    assert max(anchor.end_offset - anchor.start_offset for anchor in prepared[0].anchors.values()) <= 120
+    assert all(anchor.timestamp_start_ms is not None for anchor in prepared[0].anchors.values())
+    assert MAX_PREPARED_ANCHOR_CHARS >= 120
+
+    path.write_text(transcript + "tampered", encoding="utf-8", newline="")
+    with pytest.raises(ValueError, match="byte size|hash"):
+        CandidateSourcePreparer(storage).prepare((revision.revision_id,))
+
+
+def test_replacement_reuses_unaffected_records_and_promotes_only_after_candidate_publication(tmp_path):
+    storage, first_compiler, first_request, _ = compiler(tmp_path)
+    first_result = first_compiler.build(first_request)
+    assert first_result.ready is True
+    storage.transition_snapshot(first_result.snapshot.snapshot_id, "published", transitioned_at=2.0)
+
+    unchanged = first_request.sources[0]
+    replaced = first_request.sources[1]
+    source = storage.library_source(replaced.revision.source_id)
+    replacement_text = "[00:00:01] Synthetic replacement teaching for deterministic tests."
+    replacement = SourceRevision.create(
+        source=source,
+        content_sha256=sha256(replacement_text.encode()).hexdigest(),
+        byte_size=len(replacement_text.encode()),
+        local_locator="C:/synthetic/replacement.txt",
+        observed_at=3.0,
+        lifecycle_state="replacement_pending",
+    )
+    storage.store_source_revision(replacement)
+    replacement = storage.mark_source_revision_remote_ready(
+        replacement.revision_id, remote_file_id="file_raw_replacement"
+    )
+    replacement_anchor = SourceAnchor.create(
+        revision=replacement, transcript=replacement_text,
+        start_offset=0, end_offset=len(replacement_text),
+    )
+    extraction_responses = QueueResponses([{"candidates": [{
+        "family": "claim", "anchors": [replacement_anchor.anchor_id],
+        "qualification": "Synthetic replacement claim.", "subject": "Synthetic replacement",
+        "predicate": "guides", "object": "bounded context",
+    }]}])
+    validation_responses = QueueResponses([
+        {"outcome": "affirmatively_supported", "audit": "Replacement span supports the claim."}
+    ])
+    second_compiler = CandidateCompiler(
+        storage=storage,
+        extractor=SourceExtractor(SimpleNamespace(responses=extraction_responses)),
+        validation_client=SimpleNamespace(responses=validation_responses),
+        synthesizer=SyntheticSynthesizer(),
+        vector_stores=VectorStoreAdapter(FakeVectorClient()),
+        orientation_budget=OrientationBudget(max_records=12, max_tokens=10_000),
+        readiness_checks=2,
+        sleep=lambda _seconds: None,
+    )
+    second_request = BuildRequest(
+        run=CompilationRun("run_replacement", "synthetic", "prompt-v1", "schema-v1", 3.0),
+        sources=(unchanged, CandidateSource(replacement, replacement_text, {replacement_anchor.anchor_id: replacement_anchor})),
+        artifact_scope=ArtifactScope.PILOT,
+    )
+
+    second_result = second_compiler.build(second_request)
+
+    assert second_result.ready is True
+    assert len(extraction_responses.calls) == 1
+    assert any(
+        isinstance(record, Claim) and record.subject == "Synthetic 1"
+        for record in second_result.records
+    )
+    reused = storage.derived_record_reuse(second_result.snapshot.snapshot_id)
+    assert reused
+    assert all(previous_snapshot_id == first_result.snapshot.snapshot_id for previous_snapshot_id, _ in reused.values())
+    assert storage.source_revision(replaced.revision.revision_id).lifecycle_state == "active"
+    assert storage.source_revision(replacement.revision_id).lifecycle_state == "replacement_pending"
+
+    storage.transition_snapshot(second_result.snapshot.snapshot_id, "published", transitioned_at=4.0)
+
+    assert storage.source_revision(replaced.revision.revision_id).lifecycle_state == "superseded"
+    assert storage.source_revision(replacement.revision_id).lifecycle_state == "active"
 
 
 def compiler(

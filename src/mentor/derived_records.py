@@ -10,6 +10,9 @@ import unicodedata
 FAMILIES = frozenset(
     {"claim", "relationship", "procedure_sequence_hierarchy", "evolution", "conflict_unresolved"}
 )
+DERIVED_KINDS = frozenset(
+    {"source_extracted_claim", "cross_source_synthesis", "unresolved_or_conflicting"}
+)
 EVIDENCE_STATES = frozenset({"raw_taught", "cross_source_synthesis"})
 VALIDATION_STATES = frozenset({"pending", "validated", "rejected"})
 LIFECYCLE_STATES = frozenset({"candidate", "active", "superseded", "retired"})
@@ -73,6 +76,7 @@ class DerivedRecord:
     snapshot_id: str
     family: str
     derived_kind: str
+    semantic_subtype: str
     evidence_state: str
     validation_state: str
     lifecycle_state: str
@@ -102,19 +106,25 @@ class Claim(DerivedRecord):
         subject: str,
         predicate: str,
         object: str,
-        derived_kind: str = "statement",
+        semantic_subtype: str = "statement",
+        derived_kind: str | None = None,
         evidence_state: str | None = None,
         compiler_provenance: CompilerProvenance | None = None,
         facets: tuple[Facet, ...] = (),
     ) -> "Claim":
-        if derived_kind not in {"statement", "definition", "recommendation", "strategy_implication"}:
-            raise ValueError("invalid claim derived_kind")
+        if semantic_subtype not in {"statement", "definition", "recommendation", "strategy_implication"}:
+            raise ValueError("invalid claim semantic_subtype")
+        if derived_kind is None and evidence_state is None and semantic_subtype == "strategy_implication":
+            derived_kind = "cross_source_synthesis"
+        derived_kind = derived_kind or _derived_kind_for_evidence(evidence_state)
+        evidence_state = evidence_state or _evidence_for_derived_kind(derived_kind)
         return _new(
             cls,
             snapshot_id=snapshot_id,
             family="claim",
             derived_kind=derived_kind,
-            evidence_state=evidence_state or _default_evidence_state(derived_kind),
+            semantic_subtype=semantic_subtype,
+            evidence_state=evidence_state,
             validation_state=validation_state,
             lifecycle_state=lifecycle_state,
             anchors=anchors,
@@ -138,7 +148,14 @@ class Relationship(DerivedRecord):
     def create(cls, *, left: str, relation: str, right: str, **common: object) -> "Relationship":
         if relation not in {"supports", "contrasts", "depends_on", "causes"}:
             raise ValueError("invalid relationship relation")
-        return _new(cls, family="relationship", left=left, relation=relation, right=right, **_common(common, "relation"))
+        return _new(
+            cls,
+            family="relationship",
+            left=left,
+            relation=relation,
+            right=right,
+            **_common(common, "relation"),
+        )
 
 
 @dataclass(frozen=True)
@@ -256,7 +273,7 @@ class ConflictUnresolved(DerivedRecord):
             relevant_scopes=relevant_scopes,
             conditions=conditions,
             unresolved_questions=unresolved_questions,
-            **_synthesis_common(common, kind),
+            **_synthesis_common(common, kind, unresolved=True),
         )
 
 
@@ -276,7 +293,15 @@ def validate_record(record: DerivedRecord) -> None:
     if record.lifecycle_state not in LIFECYCLE_STATES:
         raise ValueError("invalid lifecycle_state")
     _require_text(record.snapshot_id, "snapshot_id")
-    _require_text(record.derived_kind, "derived_kind")
+    if record.derived_kind not in DERIVED_KINDS:
+        raise ValueError("invalid derived_kind")
+    _require_text(record.semantic_subtype, "semantic_subtype")
+    if record.derived_kind == "source_extracted_claim" and record.evidence_state != "raw_taught":
+        raise ValueError("source-extracted derived_kind requires raw-taught evidence")
+    if record.derived_kind != "source_extracted_claim" and record.evidence_state != "cross_source_synthesis":
+        raise ValueError("synthesis derived_kind requires synthesis evidence")
+    if record.derived_kind == "unresolved_or_conflicting" and not isinstance(record, ConflictUnresolved):
+        raise ValueError("unresolved derived_kind requires conflict/unresolved semantics")
     _require_auditable_text(record.qualification, "qualification")
     if len(record.qualification) > 280:
         raise ValueError("qualification must be concise")
@@ -302,22 +327,38 @@ def _new(cls: type[DerivedRecord], **values: object) -> DerivedRecord:
     return record
 
 
-def _common(values: dict[str, object], default_kind: str) -> dict[str, object]:
+def _common(values: dict[str, object], semantic_subtype: str) -> dict[str, object]:
     values = dict(values)
-    derived_kind = values.pop("derived_kind", default_kind)
-    evidence_state = values.pop("evidence_state", None) or _default_evidence_state(str(derived_kind))
-    return {"derived_kind": derived_kind, "evidence_state": evidence_state, **values}
+    evidence_state = values.pop("evidence_state", None)
+    derived_kind = values.pop("derived_kind", None) or _derived_kind_for_evidence(evidence_state)
+    return {
+        "derived_kind": derived_kind,
+        "semantic_subtype": semantic_subtype,
+        "evidence_state": evidence_state or _evidence_for_derived_kind(derived_kind),
+        **values,
+    }
 
 
-def _synthesis_common(values: dict[str, object], default_kind: str) -> dict[str, object]:
-    common = _common(values, default_kind)
+def _synthesis_common(
+    values: dict[str, object], semantic_subtype: str, *, unresolved: bool = False
+) -> dict[str, object]:
+    values = dict(values)
+    values.setdefault(
+        "derived_kind", "unresolved_or_conflicting" if unresolved else "cross_source_synthesis"
+    )
+    values.setdefault("evidence_state", "cross_source_synthesis")
+    common = _common(values, semantic_subtype)
     if common["evidence_state"] != "cross_source_synthesis":
         raise ValueError("evolution and conflict records must remain source synthesis or unresolved")
     return common
 
 
-def _default_evidence_state(derived_kind: str) -> str:
-    return "cross_source_synthesis" if derived_kind in {"strategy_implication", "change", "conflict", "unresolved"} else "raw_taught"
+def _derived_kind_for_evidence(evidence_state: str | None) -> str:
+    return "cross_source_synthesis" if evidence_state == "cross_source_synthesis" else "source_extracted_claim"
+
+
+def _evidence_for_derived_kind(derived_kind: str | None) -> str:
+    return "raw_taught" if derived_kind in {None, "source_extracted_claim"} else "cross_source_synthesis"
 
 
 def _validate_compiler_provenance(provenance: object) -> None:
@@ -354,19 +395,19 @@ def _validate_facets(facets: object) -> None:
 def _validate_family(record: DerivedRecord) -> None:
     strings: tuple[str, ...]
     if isinstance(record, Claim):
-        if record.family != "claim" or record.derived_kind not in {"statement", "definition", "recommendation", "strategy_implication"}:
+        if record.family != "claim" or record.semantic_subtype not in {"statement", "definition", "recommendation", "strategy_implication"}:
             raise ValueError("invalid claim record")
         strings = (record.subject, record.predicate, record.object)
     elif isinstance(record, Relationship):
-        if record.family != "relationship" or record.derived_kind != "relation" or record.relation not in {"supports", "contrasts", "depends_on", "causes"}:
+        if record.family != "relationship" or record.semantic_subtype != "relation" or record.relation not in {"supports", "contrasts", "depends_on", "causes"}:
             raise ValueError("invalid relationship record")
         strings = (record.left, record.relation, record.right)
     elif isinstance(record, ProcedureSequenceHierarchy):
-        if record.family != "procedure_sequence_hierarchy" or record.derived_kind != record.kind or record.kind not in {"procedure", "sequence", "hierarchy"} or len(record.terms) < 2:
+        if record.family != "procedure_sequence_hierarchy" or record.semantic_subtype != record.kind or record.kind not in {"procedure", "sequence", "hierarchy"} or len(record.terms) < 2:
             raise ValueError("invalid procedure, sequence, or hierarchy")
         strings = record.terms
     elif isinstance(record, Evolution):
-        if record.family != "evolution" or record.derived_kind != "change":
+        if record.family != "evolution" or record.semantic_subtype != "change":
             raise ValueError("invalid evolution record")
         if is_legacy_record(record):
             strings = (record.subject, record.previous, record.current)
@@ -417,7 +458,7 @@ def _validate_family(record: DerivedRecord) -> None:
         _validate_evolution_negative_claim_wording(record)
         strings = (record.subject, record.previous, record.current)
     elif isinstance(record, ConflictUnresolved):
-        if record.family != "conflict_unresolved" or record.derived_kind != record.kind or record.kind not in {"conflict", "unresolved"} or len(record.alternatives) < 2:
+        if record.family != "conflict_unresolved" or record.semantic_subtype != record.kind or record.kind not in {"conflict", "unresolved"} or len(record.alternatives) < 2:
             raise ValueError("invalid conflict or unresolved record")
         if is_legacy_record(record):
             strings = (record.subject, *record.alternatives)
@@ -626,6 +667,7 @@ def _record_id(record: DerivedRecord) -> str:
 def _legacy_record_id(record: DerivedRecord) -> str:
     values = asdict(record)
     values["record_id"] = ""
+    values["derived_kind"] = values.pop("semantic_subtype")
     if isinstance(record, Evolution):
         for name in (
             "earlier_source_set",
@@ -657,6 +699,7 @@ def _legacy_record_id(record: DerivedRecord) -> str:
 def _first_task9_record_id(record: DerivedRecord) -> str:
     values = asdict(record)
     values["record_id"] = ""
+    values["derived_kind"] = values.pop("semantic_subtype")
     if isinstance(record, Evolution):
         for name in (
             "earlier_coverage_id",

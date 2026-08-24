@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 from hashlib import sha256
+import math
 from typing import Sequence
 
 from mentor.knowledge import SourceRevision
@@ -12,10 +13,71 @@ class CallUsage:
     input_tokens: int = 0
     output_tokens: int = 0
     cost_usd: float = 0.0
+    reasoning_tokens: int = 0
 
     def __post_init__(self) -> None:
-        if self.input_tokens < 0 or self.output_tokens < 0 or self.cost_usd < 0:
+        if (
+            any(
+                isinstance(value, bool) or not isinstance(value, int) or value < 0
+                for value in (self.input_tokens, self.output_tokens, self.reasoning_tokens)
+            )
+            or not isinstance(self.cost_usd, int | float)
+            or isinstance(self.cost_usd, bool)
+            or not math.isfinite(self.cost_usd)
+            or self.cost_usd < 0
+            or self.reasoning_tokens > self.output_tokens
+        ):
             raise ValueError("call usage cannot be negative")
+
+
+@dataclass(frozen=True)
+class TokenPricing:
+    """Caller-owned per-million-token prices for reproducible local accounting."""
+
+    input_per_million: float
+    output_per_million: float
+    reasoning_per_million: float
+
+    def __post_init__(self) -> None:
+        values = (self.input_per_million, self.output_per_million, self.reasoning_per_million)
+        if any(
+            isinstance(value, bool)
+            or not isinstance(value, int | float)
+            or not math.isfinite(value)
+            or value < 0
+            for value in values
+        ) or not any(values):
+            raise ValueError("token pricing requires finite non-negative caller rates")
+
+    def cost(self, *, input_tokens: int, output_tokens: int, reasoning_tokens: int) -> float:
+        visible_output = output_tokens - reasoning_tokens
+        if min(input_tokens, visible_output, reasoning_tokens) < 0:
+            raise ValueError("token counts are inconsistent")
+        return (
+            input_tokens * self.input_per_million
+            + visible_output * self.output_per_million
+            + reasoning_tokens * self.reasoning_per_million
+        ) / 1_000_000
+
+
+def usage_from_response(response: object, *, pricing: TokenPricing | None = None) -> CallUsage:
+    usage = getattr(response, "usage", None)
+    input_tokens = _nonnegative_int(getattr(usage, "input_tokens", 0))
+    output_tokens = _nonnegative_int(getattr(usage, "output_tokens", 0))
+    details = getattr(usage, "output_tokens_details", None)
+    reasoning_tokens = _nonnegative_int(getattr(details, "reasoning_tokens", 0))
+    if reasoning_tokens > output_tokens:
+        raise ValueError("reasoning tokens cannot exceed output tokens")
+    cost_usd = 0.0 if pricing is None else pricing.cost(
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        reasoning_tokens=reasoning_tokens,
+    )
+    return CallUsage(input_tokens, output_tokens, cost_usd, reasoning_tokens)
+
+
+def _nonnegative_int(value: object) -> int:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
 
 
 @dataclass(frozen=True)
@@ -112,6 +174,7 @@ class CompilationMetric:
     cost_usd: float
     remote_calls: int
     failure_count: int
+    reasoning_tokens: int = 0
     model_version: str | None = None
     prompt_version: str | None = None
     schema_version: str | None = None

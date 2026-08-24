@@ -57,6 +57,9 @@ class _Handler(BaseHTTPRequestHandler):
         if path == "/":
             self._send_bytes(HTTPStatus.OK, _static("index.html"), "text/html; charset=utf-8")
             return
+        if path == "/favicon.ico":
+            self._send_bytes(HTTPStatus.NO_CONTENT, b"", "image/x-icon")
+            return
         if path in STATIC_ASSETS:
             filename, content_type = STATIC_ASSETS[path]
             self._send_bytes(HTTPStatus.OK, _static(filename), content_type)
@@ -293,6 +296,7 @@ def _snapshot_detail(storage: Storage, snapshot_id: str) -> dict | None:
     stale_ids = set(storage.stale_record_ids(snapshot_id))
     coverage = storage.snapshot_source_coverage(snapshot_id)
     gate = storage.candidate_gate(snapshot_id)
+    occurrences = storage.orientation_concept_occurrences(snapshot_id)
     return {
         "snapshot": _snapshot_summary(snapshot),
         "compiler": {
@@ -311,6 +315,27 @@ def _snapshot_detail(storage: Storage, snapshot_id: str) -> dict | None:
         },
         "metrics": [_metric_json(metric) for metric in storage.compilation_metrics(snapshot.run_id)],
         "records": [_record_summary(record, record.record_id in stale_ids) for record in records],
+        "concepts": [
+            {
+                "concept_id": concept.concept_id,
+                "canonical_label": concept.canonical_label,
+                "aliases": list(concept.aliases),
+                "scope": concept.scope,
+                "supporting_record_ids": list(concept.supporting_record_ids),
+                "supporting_anchor_ids": list(concept.supporting_anchor_ids),
+                "occurrences": [
+                    {
+                        "record_id": occurrence.record_id,
+                        "role": occurrence.role,
+                        "position": occurrence.position,
+                        "label_key": occurrence.label_key,
+                    }
+                    for occurrence in occurrences
+                    if occurrence.concept_id == concept.concept_id
+                ],
+            }
+            for concept in storage.orientation_concepts(snapshot_id)
+        ],
         "stale_record_ids": sorted(stale_ids),
     }
 
@@ -322,6 +347,7 @@ def _record_detail(storage: Storage, snapshot_id: str, record_id: str) -> dict |
     record = next((value for value in records if value.record_id == record_id), None)
     if record is None:
         return None
+    reused_from = storage.derived_record_reuse(snapshot_id).get(record_id)
     return {
         **_record_summary(record, record_id in storage.stale_record_ids(snapshot_id)),
         "qualification": record.qualification,
@@ -338,6 +364,22 @@ def _record_detail(storage: Storage, snapshot_id: str, record_id: str) -> dict |
             for dependency in record.dependencies
         ],
         "concept_id": storage.orientation_concept_ids(snapshot_id).get(record_id),
+        "concept_ids": list(storage.orientation_concept_links(snapshot_id).get(record_id, ())),
+        "concept_occurrences": [
+            {
+                "concept_id": occurrence.concept_id,
+                "role": occurrence.role,
+                "position": occurrence.position,
+                "label_key": occurrence.label_key,
+                "scope": occurrence.scope,
+            }
+            for occurrence in storage.orientation_concept_occurrences(snapshot_id)
+            if occurrence.record_id == record_id
+        ],
+        "reused_from": None if reused_from is None else {
+            "snapshot_id": reused_from[0],
+            "record_id": reused_from[1],
+        },
     }
 
 
@@ -363,6 +405,7 @@ def _record_summary(record: Any, stale: bool) -> dict:
         "record_id": record.record_id,
         "family": record.family,
         "derived_kind": record.derived_kind,
+        "semantic_subtype": record.semantic_subtype,
         "evidence_state": record.evidence_state,
         "validation_state": record.validation_state,
         "lifecycle_state": record.lifecycle_state,
@@ -416,6 +459,7 @@ def _metric_json(metric: Any) -> dict:
         "call_count": metric.call_count,
         "input_tokens": metric.input_tokens,
         "output_tokens": metric.output_tokens,
+        "reasoning_tokens": metric.reasoning_tokens,
         "latency_ms": metric.latency_ms,
         "cost_usd": metric.cost_usd,
         "remote_calls": metric.remote_calls,

@@ -222,7 +222,8 @@ def test_server_exposes_read_only_inspector_without_raw_or_private_payloads(tmp_
         assert detail["records"] == [{
             "record_id": record.record_id,
             "family": "claim",
-            "derived_kind": "statement",
+            "derived_kind": "source_extracted_claim",
+            "semantic_subtype": "statement",
             "evidence_state": "raw_taught",
             "validation_state": "validated",
             "lifecycle_state": "active",
@@ -599,6 +600,22 @@ def test_server_serves_the_external_stylesheet(tmp_path):
         worker.join()
 
 
+def test_server_handles_the_browser_favicon_request_without_a_console_404(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    server = create_server(storage, FakeChatService(), port=0)
+    worker = threading.Thread(target=server.serve_forever)
+    worker.start()
+    try:
+        status, headers, body = request(server, "GET", "/favicon.ico")
+        assert status == 204
+        assert headers["Content-Type"] == "image/x-icon"
+        assert body == b""
+    finally:
+        server.shutdown()
+        worker.join()
+
+
 def test_server_serves_the_persistent_chat_controls(tmp_path):
     storage = Storage(tmp_path / "mentor.sqlite3")
     storage.initialize()
@@ -635,6 +652,11 @@ def test_server_serves_the_persistent_chat_controls(tmp_path):
         assert b"overflow-wrap: normal" in stylesheet
         assert b".markdown-table-scroll { margin: 1rem 0; max-width: 100%; overflow-x: auto; width: 100%; }" in stylesheet
         assert b"#threads { min-width: 0;" in stylesheet
+        assert b"overflow-x: clip" in stylesheet
+        assert b"grid-template-columns: repeat(auto-fit, minmax(min(7rem, 100%), 1fr))" in stylesheet
+        assert b".composer-wrap, .composer, .conversation, .message-content" in stylesheet
+        standalone_composer = stylesheet.rsplit(b".composer {", 1)[1].split(b"}", 1)[0]
+        assert b"max-width: 100%" not in standalone_composer
     finally:
         server.shutdown()
         worker.join()

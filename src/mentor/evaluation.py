@@ -57,6 +57,7 @@ class EvaluationMetrics:
     output_tokens: int
     latency_ms: int
     estimated_cost_usd: float
+    reasoning_tokens: int = 0
 
     def __post_init__(self) -> None:
         for value in (
@@ -76,6 +77,7 @@ class EvaluationMetrics:
             self.retrieved_passage_count,
             self.input_tokens,
             self.output_tokens,
+            self.reasoning_tokens,
             self.latency_ms,
         )
         if any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in counts):
@@ -132,6 +134,7 @@ class EvaluationSummary:
     output_tokens: int
     latency_ms: int
     estimated_cost_usd: float
+    reasoning_tokens: int = 0
 
 
 @dataclass(frozen=True)
@@ -254,6 +257,7 @@ def _summarize(outcomes: tuple[EvaluationOutcome, ...]) -> EvaluationSummary:
         output_tokens=sum(item.output_tokens for item in metrics),
         latency_ms=sum(item.latency_ms for item in metrics),
         estimated_cost_usd=sum(item.estimated_cost_usd for item in metrics),
+        reasoning_tokens=sum(item.reasoning_tokens for item in metrics),
     )
 
 

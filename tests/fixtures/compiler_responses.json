@@ -8,7 +8,7 @@
         "subject": "liquidity sweep",
         "predicate": "precedes",
         "object": "a synthetic entry",
-        "derived_kind": "statement"
+        "semantic_subtype": "statement"
       }
     ]
   },

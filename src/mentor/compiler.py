@@ -12,14 +12,17 @@ from mentor.compiler_prompts import (
     MAX_CANDIDATES_PER_SOURCE,
     extraction_request,
 )
-from mentor.compilation import CallUsage
+from mentor.compilation import CallUsage, TokenPricing, usage_from_response
 from mentor.derived_records import (
     Claim,
     CompilerProvenance,
     DerivedRecord,
+    ProcedureSequenceHierarchy,
     RecordDependency,
+    Relationship,
 )
 from mentor.knowledge import SourceRevision
+from mentor.synthesis import ConceptHint
 
 
 SOL_MODEL = "gpt-5.6-sol"
@@ -42,15 +45,22 @@ class ExtractionResult:
     provenance: CompilerProvenance
     candidates: tuple[DerivedRecord, ...]
     usage: CallUsage = CallUsage()
+    hints: tuple[ConceptHint, ...] = ()
 
 
 class SourceExtractor:
     """Extract candidates through a caller-owned Responses-compatible client."""
 
-    def __init__(self, client: Any, *, model: str = "synthetic-compiler", live_mode: bool = False):
+    def __init__(
+        self, client: Any, *, model: str = "synthetic-compiler", live_mode: bool = False,
+        pricing: TokenPricing | None = None,
+    ):
         if model == SOL_MODEL and not live_mode:
             raise ValueError("GPT-5.6 Sol requires explicit live mode")
+        if model == SOL_MODEL and pricing is None:
+            raise ValueError("GPT-5.6 Sol live compilation requires caller-supplied pricing")
         self._client = client
+        self._pricing = pricing
         self._provenance = CompilerProvenance(model, EXTRACTION_PROMPT_VERSION, EXTRACTION_SCHEMA_VERSION)
 
     def extract(
@@ -69,13 +79,19 @@ class SourceExtractor:
                 anchor_spans=anchor_spans,
             )
         )
-        candidates = _parse_candidates(
+        candidates, hints = _parse_candidates(
             _response_output_text(response),
             revision=revision,
             snapshot_id=snapshot_id,
             provenance=self._provenance,
         )
-        return ExtractionResult(revision.revision_id, self._provenance, candidates, _response_usage(response))
+        return ExtractionResult(
+            revision.revision_id,
+            self._provenance,
+            candidates,
+            usage_from_response(response, pricing=self._pricing),
+            hints,
+        )
 
 
 def _response_output_text(response: Any) -> str:
@@ -85,21 +101,9 @@ def _response_output_text(response: Any) -> str:
     return output_text
 
 
-def _response_usage(response: Any) -> CallUsage:
-    usage = getattr(response, "usage", None)
-    return CallUsage(
-        input_tokens=_nonnegative_int(getattr(usage, "input_tokens", 0)),
-        output_tokens=_nonnegative_int(getattr(usage, "output_tokens", 0)),
-    )
-
-
-def _nonnegative_int(value: object) -> int:
-    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
-
-
 def _parse_candidates(
     output_text: str, *, revision: SourceRevision, snapshot_id: str, provenance: CompilerProvenance
-) -> tuple[DerivedRecord, ...]:
+) -> tuple[tuple[DerivedRecord, ...], tuple[ConceptHint, ...]]:
     try:
         response = json.loads(output_text)
     except json.JSONDecodeError as error:
@@ -108,10 +112,15 @@ def _parse_candidates(
         raise ValueError("extraction response requires only a candidates list")
     if len(response["candidates"]) > MAX_CANDIDATES_PER_SOURCE:
         raise ValueError("too many source candidates")
-    return tuple(
-        _candidate_from_payload(payload, revision=revision, snapshot_id=snapshot_id, provenance=provenance)
-        for payload in response["candidates"]
-    )
+    records = []
+    hints = []
+    for payload in response["candidates"]:
+        record = _candidate_from_payload(
+            payload, revision=revision, snapshot_id=snapshot_id, provenance=provenance
+        )
+        records.append(record)
+        hints.extend(_concept_hints(payload.get("concept_hints", []), record.record_id))
+    return tuple(records), tuple(hints)
 
 
 def _candidate_from_payload(
@@ -125,8 +134,6 @@ def _candidate_from_payload(
     family = payload.get("family")
     if not isinstance(family, str):
         raise ValueError("unknown derived record family")
-    if family != "claim":
-        raise ValueError("unknown derived record family")
     common = {
         "snapshot_id": snapshot_id,
         "anchors": _anchors(payload.get("anchors")),
@@ -136,14 +143,73 @@ def _candidate_from_payload(
         "qualification": payload.get("qualification"),
         "compiler_provenance": provenance,
     }
-    _allow_fields(payload, {"family", "anchors", "qualification", "subject", "predicate", "object", "derived_kind"})
-    return Claim.create(
-        **common,
-        subject=payload.get("subject"),
-        predicate=payload.get("predicate"),
-        object=payload.get("object"),
-        derived_kind=payload.get("derived_kind", "statement"),
-    )
+    base_fields = {"family", "anchors", "qualification", "concept_hints"}
+    if family == "claim":
+        _allow_fields(
+            payload,
+            base_fields | {"subject", "predicate", "object", "semantic_subtype"},
+        )
+        return Claim.create(
+            **common,
+            subject=payload.get("subject"),
+            predicate=payload.get("predicate"),
+            object=payload.get("object"),
+            semantic_subtype=payload.get("semantic_subtype", "statement"),
+            derived_kind="source_extracted_claim",
+            evidence_state="raw_taught",
+        )
+    if family == "relationship":
+        _allow_fields(payload, base_fields | {"left", "relation", "right"})
+        return Relationship.create(
+            **common,
+            left=payload.get("left"),
+            relation=payload.get("relation"),
+            right=payload.get("right"),
+        )
+    if family == "procedure_sequence_hierarchy":
+        _allow_fields(payload, base_fields | {"kind", "terms"})
+        terms = payload.get("terms")
+        if not isinstance(terms, list):
+            raise ValueError("procedure terms must be an ordered list")
+        return ProcedureSequenceHierarchy.create(
+            **common,
+            kind=payload.get("kind"),
+            terms=tuple(terms),
+        )
+    raise ValueError("unknown derived record family")
+
+
+def _concept_hints(payload: object, record_id: str) -> tuple[ConceptHint, ...]:
+    if not isinstance(payload, list) or len(payload) > 8:
+        raise ValueError("candidate concept hints must be a bounded list")
+    result = []
+    for item in payload:
+        if not isinstance(item, dict) or set(item) != {"label", "aliases", "scope", "role", "position"}:
+            raise ValueError("candidate concept hints must be typed")
+        aliases = item["aliases"]
+        position = item["position"]
+        if (
+            not isinstance(item["label"], str)
+            or not item["label"].strip()
+            or not isinstance(aliases, list)
+            or len(aliases) > 8
+            or any(not isinstance(alias, str) or not alias.strip() for alias in aliases)
+            or (item["scope"] is not None and not isinstance(item["scope"], str))
+            or (item["role"] is not None and not isinstance(item["role"], str))
+            or (position is not None and (not isinstance(position, int) or isinstance(position, bool) or position < 0))
+        ):
+            raise ValueError("candidate concept hints are invalid")
+        result.append(
+            ConceptHint(
+                record_id,
+                item["label"],
+                tuple(aliases),
+                item["scope"],
+                item["role"],
+                position,
+            )
+        )
+    return tuple(result)
 
 
 def _allow_fields(payload: dict[str, object], allowed: set[str]) -> None:

@@ -2,10 +2,17 @@
 
 from dataclasses import dataclass
 from enum import Enum
+from hashlib import sha256
+from pathlib import Path
 import time
 from typing import Any, Callable, Mapping
 
-from mentor.anchors import SourceAnchor, resolve_anchor_span, validate_anchor
+from mentor.anchors import (
+    SourceAnchor,
+    bounded_transcript_anchors,
+    resolve_anchor_span,
+    validate_anchor,
+)
 from mentor.compilation import (
     CallUsage,
     CandidateGateResult,
@@ -13,6 +20,7 @@ from mentor.compilation import (
     CompilationRun,
     CorpusSnapshot,
     SourceProcessingResult,
+    TokenPricing,
 )
 from mentor.compiler import ExtractionResult, SourceExtractor
 from mentor.dependencies import DependencyGraph
@@ -32,6 +40,7 @@ from mentor.synthesis import ConceptHint, SynthesisCandidate, SynthesisResult
 
 
 _TERMINAL_REMOTE_FAILURES = frozenset({"cancelled", "expired", "failed"})
+MAX_PREPARED_ANCHOR_CHARS = 4_000
 
 
 class ArtifactScope(Enum):
@@ -46,12 +55,65 @@ class CandidateSource:
     anchors: Mapping[str, SourceAnchor]
 
 
+class CandidateSourcePreparer:
+    """Resolve immutable revision IDs into hash-verified, bounded compiler inputs."""
+
+    def __init__(self, storage: Any, *, max_anchor_chars: int = MAX_PREPARED_ANCHOR_CHARS):
+        if not isinstance(max_anchor_chars, int) or isinstance(max_anchor_chars, bool) or max_anchor_chars < 1:
+            raise ValueError("anchor character budget must be positive")
+        self._storage = storage
+        self._max_anchor_chars = max_anchor_chars
+
+    def prepare(self, revision_ids: tuple[str, ...]) -> tuple[CandidateSource, ...]:
+        if (
+            not isinstance(revision_ids, tuple)
+            or not revision_ids
+            or len(set(revision_ids)) != len(revision_ids)
+            or any(not isinstance(revision_id, str) or not revision_id for revision_id in revision_ids)
+        ):
+            raise ValueError("candidate preparation requires unique immutable revision IDs")
+        sources = []
+        for revision_id in revision_ids:
+            revision = self._storage.source_revision(revision_id)
+            if revision is None:
+                raise ValueError("candidate preparation found an unknown source revision")
+            if revision.lifecycle_state not in {"active", "replacement_pending"}:
+                raise ValueError("source revision is not candidate eligible")
+            if not revision.remote_file_id:
+                raise ValueError("source revision is not remote eligible")
+            path = Path(revision.local_locator)
+            try:
+                raw = path.read_bytes()
+            except OSError as error:
+                raise ValueError("source revision bytes are unavailable") from error
+            if len(raw) != revision.byte_size:
+                raise ValueError("source revision byte size does not match inventory")
+            if sha256(raw).hexdigest() != revision.content_sha256:
+                raise ValueError("source revision hash does not match inventory")
+            try:
+                transcript = raw.decode("utf-8")
+            except UnicodeDecodeError as error:
+                raise ValueError("source revision is not valid UTF-8") from error
+            anchors = bounded_transcript_anchors(
+                revision, transcript, max_chars=self._max_anchor_chars
+            )
+            sources.append(
+                CandidateSource(
+                    revision,
+                    transcript,
+                    {anchor.anchor_id: anchor for anchor in anchors},
+                )
+            )
+        return tuple(sources)
+
+
 @dataclass(frozen=True)
 class BuildRequest:
     run: CompilationRun
     sources: tuple[CandidateSource, ...]
     artifact_scope: ArtifactScope
     stale_revision_ids: tuple[str, ...] = ()
+    revision_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -60,6 +122,7 @@ class OrientationArtifact:
     concept_id: str
     content: str
     attributes: dict[str, str | int]
+    concept_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -104,6 +167,8 @@ class CandidateCompiler:
         sleep: Callable[[float], None] = time.sleep,
         clock: Callable[[], float] = time.perf_counter,
         now: Callable[[], float] = time.time,
+        source_preparer: CandidateSourcePreparer | None = None,
+        validation_pricing: TokenPricing | None = None,
     ):
         if not isinstance(readiness_checks, int) or isinstance(readiness_checks, bool) or readiness_checks < 1:
             raise ValueError("readiness checks must be positive")
@@ -114,14 +179,18 @@ class CandidateCompiler:
         self._vector_stores = vector_stores
         self._orientation_budget = orientation_budget
         self._validation_model = validation_model
+        self._validation_pricing = validation_pricing
         self._live_mode = live_mode
         self._readiness_checks = readiness_checks
         self._sleep = sleep
         self._clock = clock
         self._now = now
+        self._source_preparer = source_preparer or CandidateSourcePreparer(storage)
 
     def build(self, request: BuildRequest) -> CandidateBuildResult:
         requested_sources = _validate_request(request)
+        if request.revision_ids:
+            requested_sources = self._source_preparer.prepare(request.revision_ids)
         scope = request.artifact_scope.value
         if getattr(self._storage, "runtime_scope", None) != scope:
             raise ValueError("candidate artifact scope does not match runtime scope")
@@ -151,6 +220,7 @@ class CandidateCompiler:
             if existing is not None and existing.status == "failed" and same_versions and same_scope:
                 return self._existing_failed_result(request, existing)
             raise ValueError("compilation run ID already belongs to another or unfinished candidate")
+        previous_snapshot = self._storage.current_snapshot()
         snapshot = CorpusSnapshot.create(
             run=request.run,
             selected_revisions=[source.revision for source in sources],
@@ -173,13 +243,53 @@ class CandidateCompiler:
         empty_derived = RemoteArtifact("derived", request.artifact_scope, None, ())
 
         source_results: list[SourceProcessingResult] = []
+        reused_records: tuple[DerivedRecord, ...] = ()
+        reused_hints: tuple[ConceptHint, ...] = ()
+        reused_revision_ids: set[str] = set()
+        if previous_snapshot is not None:
+            stale_predecessor_revisions = _stale_predecessor_revisions(
+                self._storage, previous_snapshot, sources, request.stale_revision_ids
+            )
+            record_mapping, reused_records = self._storage.clone_reusable_records(
+                previous_snapshot.snapshot_id,
+                snapshot.snapshot_id,
+                selected_revision_ids=snapshot.selected_revision_ids,
+                stale_revision_ids=stale_predecessor_revisions,
+            )
+            reused_hints = _remapped_concept_hints(
+                self._storage, previous_snapshot.snapshot_id, record_mapping
+            )
+            for record in reused_records:
+                if record.derived_kind != "source_extracted_claim":
+                    continue
+                reused_revision_ids.update(
+                    dependency.identifier
+                    for dependency in record.dependencies
+                    if dependency.kind == "source_revision"
+                )
+
         extraction_usage = CallUsage()
         validation_usage = CallUsage()
         extraction_calls = validation_calls = 0
         extraction_failures = validation_failures = 0
         extracted_candidate_count = extraction_latency_ms = validation_latency_ms = 0
 
+        extraction_hints: list[ConceptHint] = []
         for source in sources:
+            if source.revision.revision_id in reused_revision_ids:
+                reused_count = sum(
+                    record.derived_kind == "source_extracted_claim"
+                    and any(
+                        dependency.kind == "source_revision"
+                        and dependency.identifier == source.revision.revision_id
+                        for dependency in record.dependencies
+                    )
+                    for record in reused_records
+                )
+                source_results.append(
+                    SourceProcessingResult(source.revision.revision_id, "processed", reused_count)
+                )
+                continue
             accepted = 0
             source_failed = False
             try:
@@ -197,6 +307,7 @@ class CandidateCompiler:
                 _validate_extraction_result(extracted, source)
                 extraction_usage = _sum_usage(extraction_usage, extracted.usage)
                 extracted_candidate_count += len(extracted.candidates)
+                extraction_hints.extend(extracted.hints)
                 extraction_latency_ms += _elapsed_ms(extraction_started, self._clock())
             except Exception as error:
                 extraction_latency_ms += _elapsed_ms(extraction_started, self._clock())
@@ -217,6 +328,7 @@ class CandidateCompiler:
                             anchors=source.anchors,
                             model=self._validation_model,
                             live_mode=self._live_mode,
+                            pricing=self._validation_pricing,
                         )
                         validation_usage = _sum_usage(validation_usage, outcome.usage)
                         if outcome.source_extracted is None:
@@ -283,20 +395,33 @@ class CandidateCompiler:
         synthesis_started = self._clock()
         synthesis_usage = CallUsage()
         synthesized_count = 0
-        hints: tuple[ConceptHint, ...] = ()
+        synthesis_invoked = False
+        synthesized: SynthesisResult | None = None
+        hints: tuple[ConceptHint, ...] = reused_hints + tuple(extraction_hints)
         try:
             extracted_records = tuple(self._storage.derived_records(snapshot.snapshot_id, include_stale=True))
-            synthesized = self._synthesizer.synthesize(
-                snapshot_id=snapshot.snapshot_id,
-                records=extracted_records,
-                revisions=tuple(source.revision for source in sources),
-                anchor_spans=_source_anchor_spans(sources),
-            )
+            if extraction_calls == 0 and reused_records:
+                synthesized = SynthesisResult(
+                    (), CompilerProvenance(
+                        request.run.model_version, request.run.prompt_version, request.run.schema_version
+                    )
+                )
+            else:
+                synthesis_invoked = True
+                synthesized = self._synthesizer.synthesize(
+                    snapshot_id=snapshot.snapshot_id,
+                    records=tuple(
+                        record for record in extracted_records
+                        if record.derived_kind == "source_extracted_claim"
+                    ),
+                    revisions=tuple(source.revision for source in sources),
+                    anchor_spans=_source_anchor_spans(sources),
+                )
             if not isinstance(synthesized, SynthesisResult):
                 raise ValueError("synthesis stage must return SynthesisResult")
             synthesis_usage = synthesized.usage
             synthesized_count = len(synthesized.records)
-            hints = tuple(synthesized.hints)
+            hints += tuple(synthesized.hints)
             _validate_synthesis_result(
                 synthesized,
                 snapshot.snapshot_id,
@@ -314,16 +439,21 @@ class CandidateCompiler:
         except Exception as error:
             failures.append(f"synthesis failed: {error}")
         records = tuple(self._storage.derived_records(snapshot.snapshot_id, include_stale=True))
+        synthesis_call_count = (
+            synthesized.call_count
+            if isinstance(synthesized, SynthesisResult) and synthesized.call_count > 0
+            else int(synthesis_invoked)
+        )
         stage_metrics.append(
             self._record_metric(
                 request.run,
                 "synthesis",
                 len(sources),
                 synthesized_count,
-                1,
+                synthesis_call_count,
                 synthesis_usage,
                 _elapsed_ms(synthesis_started, self._clock()),
-                1 if self._live_mode else 0,
+                synthesis_call_count if self._live_mode else 0,
                 1 if failures else 0,
             )
         )
@@ -630,21 +760,24 @@ class CandidateCompiler:
         )
         candidate.publish(relationships=relationships, procedures=procedures)
         record_concepts = {
-            record.record_id: min(
-                concept.concept_id
-                for concept in candidate.concepts
-                if record.record_id in concept.supporting_record_ids
-            )
+            record.record_id: candidate.concept_ids_for_record(record.record_id)
+            for record in records
+        }
+        primary_concepts = {
+            record.record_id: candidate.primary_concept_id_for_record(record.record_id)
             for record in records
         }
         self._storage.store_orientation_concept_ids(
             snapshot.snapshot_id,
             record_concepts,
             concepts=candidate.concepts,
+            primary_concept_ids=primary_concepts,
+            concept_occurrences=candidate.concept_occurrences,
         )
         artifacts = []
         for record in records:
-            concept_id = record_concepts[record.record_id]
+            concept_ids = record_concepts[record.record_id]
+            concept_id = primary_concepts[record.record_id]
             collection_id, year, record_scope = self._storage.orientation_source_area(
                 snapshot.snapshot_id, record
             )
@@ -662,6 +795,7 @@ class CandidateCompiler:
                 "concept_id": concept_id,
                 "family": record.family,
                 "derived_kind": record.derived_kind,
+                "semantic_subtype": record.semantic_subtype,
                 "schema_version": snapshot.schema_version,
             }
             if collection_id is not None:
@@ -670,7 +804,7 @@ class CandidateCompiler:
                 attributes["year"] = year
             if record_scope is not None:
                 attributes["scope"] = record_scope
-            artifacts.append(OrientationArtifact(record.record_id, concept_id, content, attributes))
+            artifacts.append(OrientationArtifact(record.record_id, concept_id, content, attributes, concept_ids))
         return tuple(artifacts)
 
     def _await_batch(self, snapshot_id: str, store_id: str, batch: Any) -> int:
@@ -749,16 +883,17 @@ class CandidateCompiler:
         return self._storage.record_compilation_metric(
             run.run_id,
             CompilationMetric(
-                stage,
-                source_count,
-                record_count,
-                call_count,
-                usage.input_tokens,
-                usage.output_tokens,
-                latency_ms,
-                usage.cost_usd,
-                remote_calls,
-                failure_count,
+                stage=stage,
+                source_count=source_count,
+                record_count=record_count,
+                call_count=call_count,
+                input_tokens=usage.input_tokens,
+                output_tokens=usage.output_tokens,
+                latency_ms=latency_ms,
+                cost_usd=usage.cost_usd,
+                remote_calls=remote_calls,
+                failure_count=failure_count,
+                reasoning_tokens=usage.reasoning_tokens,
             ),
         )
 
@@ -766,16 +901,17 @@ class CandidateCompiler:
         self, run: CompilationRun, metrics: list[CompilationMetric]
     ) -> CompilationMetric:
         total = CompilationMetric(
-            "total",
-            max((metric.source_count for metric in metrics), default=0),
-            max((metric.record_count for metric in metrics), default=0),
-            sum(metric.call_count for metric in metrics),
-            sum(metric.input_tokens for metric in metrics),
-            sum(metric.output_tokens for metric in metrics),
-            sum(metric.latency_ms for metric in metrics),
-            sum(metric.cost_usd for metric in metrics),
-            sum(metric.remote_calls for metric in metrics),
-            sum(metric.failure_count for metric in metrics),
+            stage="total",
+            source_count=max((metric.source_count for metric in metrics), default=0),
+            record_count=max((metric.record_count for metric in metrics), default=0),
+            call_count=sum(metric.call_count for metric in metrics),
+            input_tokens=sum(metric.input_tokens for metric in metrics),
+            output_tokens=sum(metric.output_tokens for metric in metrics),
+            latency_ms=sum(metric.latency_ms for metric in metrics),
+            cost_usd=sum(metric.cost_usd for metric in metrics),
+            remote_calls=sum(metric.remote_calls for metric in metrics),
+            failure_count=sum(metric.failure_count for metric in metrics),
+            reasoning_tokens=sum(metric.reasoning_tokens for metric in metrics),
         )
         return self._storage.record_compilation_metric(run.run_id, total)
 
@@ -858,20 +994,73 @@ def _validate_request(request: BuildRequest) -> tuple[CandidateSource, ...]:
         raise ValueError("candidate build requires a building compilation run")
     if not isinstance(request.artifact_scope, ArtifactScope):
         raise ValueError("candidate build requires an explicit artifact scope")
-    if not isinstance(request.sources, tuple) or not request.sources:
-        raise ValueError("candidate build requires selected sources")
+    if not isinstance(request.sources, tuple) or not isinstance(request.revision_ids, tuple):
+        raise ValueError("candidate build selections must be immutable tuples")
+    if bool(request.sources) == bool(request.revision_ids):
+        raise ValueError("candidate build requires sources or revision IDs, not both")
     if any(not isinstance(source, CandidateSource) for source in request.sources):
         raise ValueError("candidate build sources must be typed")
-    revision_ids = tuple(source.revision.revision_id for source in request.sources)
+    revision_ids = (
+        tuple(source.revision.revision_id for source in request.sources)
+        if request.sources
+        else request.revision_ids
+    )
     if len(set(revision_ids)) != len(revision_ids):
         raise ValueError("candidate build revisions must be unique")
     if (
         not isinstance(request.stale_revision_ids, tuple)
         or len(set(request.stale_revision_ids)) != len(request.stale_revision_ids)
-        or not set(request.stale_revision_ids) <= set(revision_ids)
     ):
-        raise ValueError("stale revision IDs must be selected by the candidate")
+        raise ValueError("stale revision IDs must be unique")
     return request.sources
+
+
+def _stale_predecessor_revisions(
+    storage: Any,
+    previous_snapshot: CorpusSnapshot,
+    sources: tuple[CandidateSource, ...],
+    explicit_stale_revision_ids: tuple[str, ...],
+) -> tuple[str, ...]:
+    selected_by_source = {source.revision.source_id: source.revision.revision_id for source in sources}
+    stale = set(explicit_stale_revision_ids)
+    for revision_id in previous_snapshot.selected_revision_ids:
+        revision = storage.source_revision(revision_id)
+        if revision is None:
+            raise ValueError("published predecessor references an unknown source revision")
+        if selected_by_source.get(revision.source_id) != revision_id:
+            stale.add(revision_id)
+    return tuple(sorted(stale))
+
+
+def _remapped_concept_hints(
+    storage: Any, previous_snapshot_id: str, record_id_mapping: Mapping[str, str]
+) -> tuple[ConceptHint, ...]:
+    if not record_id_mapping:
+        return ()
+    concepts = {
+        concept.concept_id: concept for concept in storage.orientation_concepts(previous_snapshot_id)
+    }
+    hints = []
+    for occurrence in storage.orientation_concept_occurrences(previous_snapshot_id):
+        record_id = record_id_mapping.get(occurrence.record_id)
+        concept = concepts.get(occurrence.concept_id)
+        if record_id is None or concept is None:
+            continue
+        aliases = tuple(
+            label for label in (concept.canonical_label, *concept.aliases)
+            if _hint_label_key(label) != occurrence.label_key
+        )
+        hints.append(
+            ConceptHint(
+                record_id, occurrence.label_key, aliases, occurrence.scope,
+                occurrence.role, occurrence.position,
+            )
+        )
+    return tuple(hints)
+
+
+def _hint_label_key(value: str) -> str:
+    return " ".join(value.casefold().split())
 
 
 def _canonical_sources(storage: Any, sources: tuple[CandidateSource, ...]) -> tuple[CandidateSource, ...]:
@@ -887,8 +1076,8 @@ def _canonical_sources(storage: Any, sources: tuple[CandidateSource, ...]) -> tu
 
 
 def _validate_candidate_source(source: CandidateSource) -> None:
-    if source.revision.lifecycle_state != "active":
-        raise ValueError("candidate sources must use active revisions")
+    if source.revision.lifecycle_state not in {"active", "replacement_pending"}:
+        raise ValueError("candidate sources must use eligible revisions")
     if not isinstance(source.revision.remote_file_id, str) or not source.revision.remote_file_id:
         raise ValueError("candidate source requires an uploaded raw File")
     if not isinstance(source.transcript, str) or not source.transcript:
@@ -944,8 +1133,10 @@ def _validate_synthesis_result(
             raise ValueError("source synthesis records must be validated, active, and candidate-owned")
         if record.evidence_state != "cross_source_synthesis":
             raise ValueError("source synthesis cannot claim raw authority")
-        if isinstance(record, Claim) and record.derived_kind != "strategy_implication":
+        if isinstance(record, Claim) and record.semantic_subtype != "strategy_implication":
             raise ValueError("source synthesis claims must remain strategy implications")
+        if record.derived_kind not in {"cross_source_synthesis", "unresolved_or_conflicting"}:
+            raise ValueError("source synthesis requires synthesis provenance")
         if record.compiler_provenance != result.provenance:
             raise ValueError("source synthesis records require matching compiler provenance")
         if not any(dependency.kind == "source_revision" for dependency in record.dependencies):
@@ -961,6 +1152,7 @@ def _sum_usage(first: CallUsage, second: CallUsage) -> CallUsage:
         first.input_tokens + second.input_tokens,
         first.output_tokens + second.output_tokens,
         first.cost_usd + second.cost_usd,
+        first.reasoning_tokens + second.reasoning_tokens,
     )
 
 

@@ -149,15 +149,14 @@ def test_storage_marks_transitive_records_stale_and_rejects_them_from_normal_ret
     for record in (extracted, synthesis, unaffected):
         storage.store_derived_record(record)
 
-    assert storage.mark_stale_for_revisions(snapshot.snapshot_id, (first_revision.revision_id,)) == (
-        extracted.record_id,
-        synthesis.record_id,
-    )
-    assert storage.stale_record_ids(snapshot.snapshot_id) == (extracted.record_id, synthesis.record_id)
-    assert storage.rebuild_record_ids(snapshot.snapshot_id, (first_revision.revision_id,)) == (
-        extracted.record_id,
-        synthesis.record_id,
-    )
+    expected_stale = tuple(sorted((extracted.record_id, synthesis.record_id)))
+    assert storage.mark_stale_for_revisions(
+        snapshot.snapshot_id, (first_revision.revision_id,)
+    ) == expected_stale
+    assert storage.stale_record_ids(snapshot.snapshot_id) == expected_stale
+    assert storage.rebuild_record_ids(
+        snapshot.snapshot_id, (first_revision.revision_id,)
+    ) == expected_stale
     with pytest.raises(ValueError, match="stale"):
         storage.transition_snapshot(snapshot.snapshot_id, "validating")
     assert [record.record_id for record in storage.derived_records(snapshot.snapshot_id)] == [unaffected.record_id]

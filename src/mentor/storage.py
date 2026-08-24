@@ -29,7 +29,7 @@ from mentor.derived_records import (
 )
 from mentor.validation import SemanticValidator, ValidationResult
 from mentor.knowledge import Collection, Source as LibrarySource, SourceRevision
-from mentor.synthesis import Concept
+from mentor.synthesis import Concept, ConceptOccurrence
 
 
 @dataclass(frozen=True)
@@ -270,6 +270,7 @@ class Storage:
                     call_count INTEGER NOT NULL CHECK(call_count >= 0),
                     input_tokens INTEGER NOT NULL CHECK(input_tokens >= 0),
                     output_tokens INTEGER NOT NULL CHECK(output_tokens >= 0),
+                    reasoning_tokens INTEGER NOT NULL DEFAULT 0 CHECK(reasoning_tokens >= 0),
                     latency_ms INTEGER NOT NULL CHECK(latency_ms >= 0),
                     cost_usd REAL NOT NULL CHECK(cost_usd >= 0),
                     remote_calls INTEGER NOT NULL CHECK(remote_calls >= 0),
@@ -282,6 +283,7 @@ class Storage:
                         'claim', 'relationship', 'procedure_sequence_hierarchy', 'evolution', 'conflict_unresolved'
                     )),
                     derived_kind TEXT NOT NULL,
+                    semantic_subtype TEXT NOT NULL DEFAULT '',
                     evidence_state TEXT NOT NULL CHECK(evidence_state IN ('raw_taught', 'cross_source_synthesis')),
                     validation_state TEXT NOT NULL CHECK(validation_state IN ('pending', 'validated', 'rejected')),
                     lifecycle_state TEXT NOT NULL CHECK(lifecycle_state IN ('candidate', 'active', 'superseded', 'retired')),
@@ -323,11 +325,71 @@ class Storage:
                     revision_id TEXT NOT NULL REFERENCES source_revisions(revision_id),
                     PRIMARY KEY(snapshot_id, record_id, revision_id)
                 );
+                CREATE TABLE IF NOT EXISTS derived_record_reuse (
+                    snapshot_id TEXT NOT NULL REFERENCES corpus_snapshots(snapshot_id),
+                    record_id TEXT NOT NULL REFERENCES derived_records(record_id),
+                    previous_snapshot_id TEXT NOT NULL REFERENCES corpus_snapshots(snapshot_id),
+                    previous_record_id TEXT NOT NULL REFERENCES derived_records(record_id),
+                    PRIMARY KEY(snapshot_id, record_id)
+                );
                 CREATE TABLE IF NOT EXISTS derived_record_concepts (
                     snapshot_id TEXT NOT NULL REFERENCES corpus_snapshots(snapshot_id),
                     record_id TEXT NOT NULL REFERENCES derived_records(record_id),
                     concept_id TEXT NOT NULL,
                     PRIMARY KEY(snapshot_id, record_id)
+                );
+                CREATE TABLE IF NOT EXISTS derived_concepts (
+                    snapshot_id TEXT NOT NULL REFERENCES corpus_snapshots(snapshot_id),
+                    concept_id TEXT NOT NULL,
+                    canonical_label TEXT NOT NULL,
+                    scope TEXT NOT NULL,
+                    PRIMARY KEY(snapshot_id, concept_id)
+                );
+                CREATE TABLE IF NOT EXISTS derived_concept_aliases (
+                    snapshot_id TEXT NOT NULL,
+                    concept_id TEXT NOT NULL,
+                    position INTEGER NOT NULL,
+                    alias TEXT NOT NULL,
+                    PRIMARY KEY(snapshot_id, concept_id, position),
+                    FOREIGN KEY(snapshot_id, concept_id) REFERENCES derived_concepts(snapshot_id, concept_id)
+                );
+                CREATE TABLE IF NOT EXISTS derived_concept_supporting_records (
+                    snapshot_id TEXT NOT NULL,
+                    concept_id TEXT NOT NULL,
+                    position INTEGER NOT NULL,
+                    record_id TEXT NOT NULL REFERENCES derived_records(record_id),
+                    PRIMARY KEY(snapshot_id, concept_id, position),
+                    FOREIGN KEY(snapshot_id, concept_id) REFERENCES derived_concepts(snapshot_id, concept_id)
+                );
+                CREATE TABLE IF NOT EXISTS derived_concept_supporting_anchors (
+                    snapshot_id TEXT NOT NULL,
+                    concept_id TEXT NOT NULL,
+                    position INTEGER NOT NULL,
+                    anchor_id TEXT NOT NULL,
+                    PRIMARY KEY(snapshot_id, concept_id, position),
+                    FOREIGN KEY(snapshot_id, concept_id) REFERENCES derived_concepts(snapshot_id, concept_id)
+                );
+                CREATE TABLE IF NOT EXISTS derived_record_concept_links (
+                    snapshot_id TEXT NOT NULL,
+                    record_id TEXT NOT NULL REFERENCES derived_records(record_id),
+                    concept_id TEXT NOT NULL,
+                    position INTEGER NOT NULL,
+                    is_primary INTEGER NOT NULL CHECK(is_primary IN (0, 1)),
+                    PRIMARY KEY(snapshot_id, record_id, concept_id),
+                    UNIQUE(snapshot_id, record_id, position),
+                    FOREIGN KEY(snapshot_id, concept_id) REFERENCES derived_concepts(snapshot_id, concept_id)
+                );
+                CREATE TABLE IF NOT EXISTS derived_concept_occurrences (
+                    snapshot_id TEXT NOT NULL,
+                    record_id TEXT NOT NULL REFERENCES derived_records(record_id),
+                    position INTEGER NOT NULL,
+                    role TEXT NOT NULL,
+                    term_position INTEGER,
+                    label_key TEXT NOT NULL,
+                    scope TEXT NOT NULL,
+                    concept_id TEXT NOT NULL,
+                    PRIMARY KEY(snapshot_id, record_id, position),
+                    FOREIGN KEY(snapshot_id, concept_id) REFERENCES derived_concepts(snapshot_id, concept_id)
                 );
                 CREATE TABLE IF NOT EXISTS derived_record_facets (
                     record_id TEXT NOT NULL REFERENCES derived_records(record_id),
@@ -414,9 +476,28 @@ class Storage:
             if "modified_at" not in columns:
                 connection.execute("ALTER TABLE sources ADD COLUMN modified_at REAL")
             derived_columns = {row[1] for row in connection.execute("PRAGMA table_info(derived_records)")}
+            if "semantic_subtype" not in derived_columns:
+                connection.execute(
+                    "ALTER TABLE derived_records ADD COLUMN semantic_subtype TEXT NOT NULL DEFAULT ''"
+                )
+                connection.execute("UPDATE derived_records SET semantic_subtype = derived_kind")
+                connection.execute(
+                    """
+                    UPDATE derived_records SET derived_kind = CASE
+                        WHEN family = 'conflict_unresolved' THEN 'unresolved_or_conflicting'
+                        WHEN evidence_state = 'raw_taught' THEN 'source_extracted_claim'
+                        ELSE 'cross_source_synthesis'
+                    END
+                    """
+                )
             if "finalized" not in derived_columns:
                 connection.execute(
                     "ALTER TABLE derived_records ADD COLUMN finalized INTEGER NOT NULL DEFAULT 0 CHECK(finalized IN (0, 1))"
+                )
+            metric_columns = {row[1] for row in connection.execute("PRAGMA table_info(compilation_metrics)")}
+            if "reasoning_tokens" not in metric_columns:
+                connection.execute(
+                    "ALTER TABLE compilation_metrics ADD COLUMN reasoning_tokens INTEGER NOT NULL DEFAULT 0 CHECK(reasoning_tokens >= 0)"
                 )
             for column in ("compiler_model_version", "compiler_prompt_version", "compiler_schema_version"):
                 if column not in derived_columns:
@@ -778,6 +859,25 @@ class Storage:
                         "ON CONFLICT(snapshot_id) DO NOTHING",
                         (previous[0], transitioned_at),
                     )
+                selected_revision_ids = tuple(snapshot.selected_revision_ids)
+                selected_rows = connection.execute(
+                    f"""SELECT revision_id, source_id, lifecycle_state
+                        FROM source_revisions WHERE revision_id IN ({','.join('?' for _ in selected_revision_ids)})""",
+                    selected_revision_ids,
+                ).fetchall()
+                for revision_id, source_id, lifecycle_state in selected_rows:
+                    if lifecycle_state == "replacement_pending":
+                        connection.execute(
+                            """UPDATE source_revisions SET lifecycle_state = 'superseded'
+                               WHERE source_id = ? AND lifecycle_state = 'active' AND revision_id <> ?""",
+                            (source_id, revision_id),
+                        )
+                        connection.execute(
+                            """UPDATE source_revisions SET lifecycle_state = 'active'
+                               WHERE revision_id = ? AND lifecycle_state = 'replacement_pending'""",
+                            (revision_id,),
+                        )
+                        connection.execute("DELETE FROM source_changes WHERE source_id = ?", (source_id,))
                 for key, value in (
                     ("current_snapshot_id", snapshot_id),
                     ("active_raw_store_id", snapshot.raw_store_id),
@@ -849,6 +949,7 @@ class Storage:
             metric.call_count,
             metric.input_tokens,
             metric.output_tokens,
+            metric.reasoning_tokens,
             metric.latency_ms,
             metric.cost_usd,
             metric.remote_calls,
@@ -877,9 +978,9 @@ class Storage:
                 """
                 INSERT INTO compilation_metrics(
                     run_id, stage, model_version, prompt_version, schema_version, source_count,
-                    record_count, call_count, input_tokens, output_tokens, latency_ms, cost_usd,
+                    record_count, call_count, input_tokens, output_tokens, reasoning_tokens, latency_ms, cost_usd,
                     remote_calls, failure_count
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     run_id,
@@ -892,6 +993,7 @@ class Storage:
                     metric.call_count,
                     metric.input_tokens,
                     metric.output_tokens,
+                    metric.reasoning_tokens,
                     metric.latency_ms,
                     metric.cost_usd,
                     metric.remote_calls,
@@ -905,7 +1007,7 @@ class Storage:
             rows = connection.execute(
                 """
                 SELECT stage, source_count, record_count, call_count, input_tokens, output_tokens,
-                       latency_ms, cost_usd, remote_calls, failure_count, model_version,
+                       latency_ms, cost_usd, remote_calls, failure_count, reasoning_tokens, model_version,
                        prompt_version, schema_version
                 FROM compilation_metrics WHERE run_id = ? ORDER BY metric_id
                 """,
@@ -1089,9 +1191,9 @@ class Storage:
         connection.execute(
             """
             INSERT INTO derived_records(
-                record_id, snapshot_id, family, derived_kind, evidence_state, validation_state, lifecycle_state, qualification,
+                record_id, snapshot_id, family, derived_kind, semantic_subtype, evidence_state, validation_state, lifecycle_state, qualification,
                 compiler_model_version, compiler_prompt_version, compiler_schema_version
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(record_id) DO NOTHING
             """,
             (
@@ -1099,6 +1201,7 @@ class Storage:
                 record.snapshot_id,
                 record.family,
                 record.derived_kind,
+                record.semantic_subtype,
                 record.evidence_state,
                 record.validation_state,
                 record.lifecycle_state,
@@ -1213,21 +1316,22 @@ class Storage:
         self,
         *,
         client: object,
-        candidate: Claim,
+        candidate: DerivedRecord,
         revision: SourceRevision,
         transcript: str,
         anchors: Mapping[str, SourceAnchor],
         model: str = "synthetic-validator",
         live_mode: bool = False,
+        pricing=None,
     ) -> ValidationResult:
-        result = SemanticValidator(client, model=model, live_mode=live_mode).validate(
+        result = SemanticValidator(client, model=model, live_mode=live_mode, pricing=pricing).validate(
             candidate=candidate,
             revision=revision,
             transcript=transcript,
             anchors=anchors,
         )
         if result.outcome == "affirmatively_supported":
-            if not isinstance(result.source_extracted, Claim):
+            if not isinstance(result.source_extracted, (Claim, Relationship, ProcedureSequenceHierarchy)):
                 raise ValueError("affirmative semantic validation requires a validated source-extracted record")
             if (
                 result.source_extracted.snapshot_id != result.snapshot_id
@@ -1365,7 +1469,7 @@ class Storage:
         with self._connect() as connection:
             rows = connection.execute(
                 """
-                SELECT record_id, snapshot_id, family, derived_kind, evidence_state, validation_state, lifecycle_state, qualification,
+                SELECT record_id, snapshot_id, family, derived_kind, semantic_subtype, evidence_state, validation_state, lifecycle_state, qualification,
                        compiler_model_version, compiler_prompt_version, compiler_schema_version
                 FROM derived_records WHERE snapshot_id = ? AND finalized = 1 ORDER BY record_id
                 """,
@@ -1380,23 +1484,104 @@ class Storage:
                 if not self._depends_on_stale_record(connection, record, reject_cross_snapshot=False)
             ]
 
+    def clone_reusable_records(
+        self,
+        previous_snapshot_id: str,
+        candidate_snapshot_id: str,
+        *,
+        selected_revision_ids: tuple[str, ...],
+        stale_revision_ids: tuple[str, ...] = (),
+    ) -> tuple[dict[str, str], tuple[DerivedRecord, ...]]:
+        """Clone only the predecessor dependency closure unaffected by changed revisions."""
+        selected = set(selected_revision_ids)
+        stale = set(stale_revision_ids)
+        previous = self.snapshot(previous_snapshot_id)
+        candidate = self.snapshot(candidate_snapshot_id)
+        if previous is None or previous.status not in {"published", "archived"}:
+            raise ValueError("selective reuse requires a published predecessor")
+        if candidate is None or candidate.status != "building":
+            raise ValueError("selective reuse requires a building candidate")
+        old_records = self.derived_records(previous_snapshot_id)
+        mapping: dict[str, str] = {}
+        cloned: list[DerivedRecord] = []
+        pending = list(old_records)
+        while pending:
+            progressed = False
+            for record in tuple(pending):
+                source_dependencies = {
+                    item.identifier for item in record.dependencies if item.kind == "source_revision"
+                }
+                derived_dependencies = {
+                    item.identifier for item in record.dependencies if item.kind == "derived_record"
+                }
+                if source_dependencies & stale or not source_dependencies <= selected:
+                    pending.remove(record)
+                    progressed = True
+                    continue
+                if not derived_dependencies <= set(mapping):
+                    continue
+                clone = _clone_derived_record(
+                    record,
+                    snapshot_id=candidate_snapshot_id,
+                    record_id_mapping=mapping,
+                )
+                with self._connect() as connection:
+                    self._store_derived_record(clone, connection)
+                    connection.execute(
+                        """INSERT INTO derived_record_reuse(
+                               snapshot_id, record_id, previous_snapshot_id, previous_record_id
+                           ) VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING""",
+                        (candidate_snapshot_id, clone.record_id, previous_snapshot_id, record.record_id),
+                    )
+                mapping[record.record_id] = clone.record_id
+                cloned.append(clone)
+                pending.remove(record)
+                progressed = True
+            if not progressed:
+                break
+        return mapping, tuple(cloned)
+
+    def derived_record_reuse(self, snapshot_id: str) -> dict[str, tuple[str, str]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """SELECT record_id, previous_snapshot_id, previous_record_id
+                   FROM derived_record_reuse WHERE snapshot_id = ? ORDER BY record_id""",
+                (snapshot_id,),
+            ).fetchall()
+        return {
+            str(record_id): (str(previous_snapshot_id), str(previous_record_id))
+            for record_id, previous_snapshot_id, previous_record_id in rows
+        }
+
     def store_orientation_concept_ids(
         self,
         snapshot_id: str,
-        record_concept_ids: Mapping[str, str],
+        record_concept_ids: Mapping[str, str | tuple[str, ...]],
         *,
         concepts: tuple[Concept, ...],
+        primary_concept_ids: Mapping[str, str] | None = None,
+        concept_occurrences: tuple[ConceptOccurrence, ...] = (),
     ) -> None:
-        """Seal one locally authoritative primary concept for each candidate record."""
-        entries = dict(record_concept_ids)
+        """Seal candidate concepts and every explicit record occurrence association."""
+        raw_entries = dict(record_concept_ids)
+        entries = {
+            record_id: (value,) if isinstance(value, str) else tuple(value)
+            for record_id, value in raw_entries.items()
+        }
+        primary = dict(primary_concept_ids or {
+            record_id: concept_ids[0] for record_id, concept_ids in entries.items() if concept_ids
+        })
         if not entries or any(
             not isinstance(record_id, str)
             or not record_id
-            or not isinstance(concept_id, str)
-            or re.fullmatch(r"con_[0-9a-f]{64}", concept_id) is None
-            for record_id, concept_id in entries.items()
+            or not concept_ids
+            or len(set(concept_ids)) != len(concept_ids)
+            or any(re.fullmatch(r"con_[0-9a-f]{64}", concept_id) is None for concept_id in concept_ids)
+            for record_id, concept_ids in entries.items()
         ):
             raise ValueError("orientation concept links must use canonical record and concept IDs")
+        if set(primary) != set(entries) or any(primary[record_id] not in entries[record_id] for record_id in entries):
+            raise ValueError("orientation concept links require one explicit primary association")
         known_concepts: dict[str, Concept] = {}
         for concept in concepts:
             if not isinstance(concept, Concept) or concept.snapshot_id != snapshot_id:
@@ -1415,14 +1600,25 @@ class Storage:
         if any(
             concept_id not in known_concepts
             or record_id not in known_concepts[concept_id].supporting_record_ids
-            for record_id, concept_id in entries.items()
+            for record_id, concept_ids in entries.items()
+            for concept_id in concept_ids
         ):
             raise ValueError("orientation concept links must be supported by their candidate concepts")
+        if concept_occurrences and (
+            any(
+                not isinstance(occurrence, ConceptOccurrence)
+                or occurrence.record_id not in entries
+                or occurrence.concept_id not in entries[occurrence.record_id]
+                for occurrence in concept_occurrences
+            )
+            or {occurrence.record_id for occurrence in concept_occurrences} != set(entries)
+        ):
+            raise ValueError("orientation concept occurrences must be candidate-owned")
         with self._connect() as connection:
             status, _selected_revision_ids = self._snapshot_state(connection, snapshot_id)
             if status != "building":
                 raise ValueError("orientation concept links require a building candidate")
-            for record_id, concept_id in entries.items():
+            for record_id, concept_ids in entries.items():
                 row = connection.execute(
                     """
                     SELECT validation_state, lifecycle_state, finalized
@@ -1432,21 +1628,67 @@ class Storage:
                 ).fetchone()
                 if row != ("validated", "active", 1):
                     raise ValueError("orientation concept links require validated active candidate records")
-                existing = connection.execute(
-                    """
-                    SELECT concept_id FROM derived_record_concepts
-                    WHERE snapshot_id = ? AND record_id = ?
-                    """,
-                    (snapshot_id, record_id),
-                ).fetchone()
-                if existing is not None and existing[0] != concept_id:
+                existing = tuple(
+                    row[0] for row in connection.execute(
+                        """SELECT concept_id FROM derived_record_concept_links
+                           WHERE snapshot_id = ? AND record_id = ? ORDER BY position""",
+                        (snapshot_id, record_id),
+                    )
+                )
+                if existing and existing != concept_ids:
                     raise ValueError("orientation concept links are immutable")
+            for concept in known_concepts.values():
+                connection.execute(
+                    """INSERT INTO derived_concepts(snapshot_id, concept_id, canonical_label, scope)
+                       VALUES (?, ?, ?, ?) ON CONFLICT(snapshot_id, concept_id) DO NOTHING""",
+                    (snapshot_id, concept.concept_id, concept.canonical_label, concept.scope or ""),
+                )
+                connection.executemany(
+                    """INSERT INTO derived_concept_aliases(snapshot_id, concept_id, position, alias)
+                       VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING""",
+                    [(snapshot_id, concept.concept_id, position, alias)
+                     for position, alias in enumerate(concept.aliases)],
+                )
+                connection.executemany(
+                    """INSERT INTO derived_concept_supporting_records(snapshot_id, concept_id, position, record_id)
+                       VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING""",
+                    [(snapshot_id, concept.concept_id, position, record_id)
+                     for position, record_id in enumerate(concept.supporting_record_ids)],
+                )
+                connection.executemany(
+                    """INSERT INTO derived_concept_supporting_anchors(snapshot_id, concept_id, position, anchor_id)
+                       VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING""",
+                    [(snapshot_id, concept.concept_id, position, anchor_id)
+                     for position, anchor_id in enumerate(concept.supporting_anchor_ids)],
+                )
             connection.executemany(
                 """
                 INSERT INTO derived_record_concepts(snapshot_id, record_id, concept_id)
                 VALUES (?, ?, ?) ON CONFLICT(snapshot_id, record_id) DO NOTHING
                 """,
-                [(snapshot_id, record_id, concept_id) for record_id, concept_id in entries.items()],
+                [(snapshot_id, record_id, primary[record_id]) for record_id in entries],
+            )
+            connection.executemany(
+                """INSERT INTO derived_record_concept_links(
+                       snapshot_id, record_id, concept_id, position, is_primary
+                   ) VALUES (?, ?, ?, ?, ?) ON CONFLICT DO NOTHING""",
+                [
+                    (snapshot_id, record_id, concept_id, position, int(concept_id == primary[record_id]))
+                    for record_id, concept_ids in entries.items()
+                    for position, concept_id in enumerate(concept_ids)
+                ],
+            )
+            connection.executemany(
+                """INSERT INTO derived_concept_occurrences(
+                       snapshot_id, record_id, position, role, term_position, label_key, scope, concept_id
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING""",
+                [
+                    (
+                        snapshot_id, occurrence.record_id, position, occurrence.role,
+                        occurrence.position, occurrence.label_key, occurrence.scope or "", occurrence.concept_id,
+                    )
+                    for position, occurrence in enumerate(concept_occurrences)
+                ],
             )
 
     def orientation_concept_ids(self, snapshot_id: str) -> dict[str, str]:
@@ -1459,6 +1701,63 @@ class Storage:
                 (snapshot_id,),
             ).fetchall()
         return {str(record_id): str(concept_id) for record_id, concept_id in rows}
+
+    def orientation_concept_links(self, snapshot_id: str) -> dict[str, tuple[str, ...]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """SELECT record_id, concept_id FROM derived_record_concept_links
+                   WHERE snapshot_id = ? ORDER BY record_id, position""",
+                (snapshot_id,),
+            ).fetchall()
+        result: dict[str, list[str]] = {}
+        for record_id, concept_id in rows:
+            result.setdefault(str(record_id), []).append(str(concept_id))
+        return {record_id: tuple(concept_ids) for record_id, concept_ids in result.items()}
+
+    def orientation_concepts(self, snapshot_id: str) -> tuple[Concept, ...]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """SELECT concept_id, canonical_label, scope FROM derived_concepts
+                   WHERE snapshot_id = ? ORDER BY concept_id""",
+                (snapshot_id,),
+            ).fetchall()
+            concepts = []
+            for concept_id, label, scope in rows:
+                aliases = tuple(row[0] for row in connection.execute(
+                    """SELECT alias FROM derived_concept_aliases
+                       WHERE snapshot_id = ? AND concept_id = ? ORDER BY position""",
+                    (snapshot_id, concept_id),
+                ))
+                records = tuple(row[0] for row in connection.execute(
+                    """SELECT record_id FROM derived_concept_supporting_records
+                       WHERE snapshot_id = ? AND concept_id = ? ORDER BY position""",
+                    (snapshot_id, concept_id),
+                ))
+                anchors = tuple(row[0] for row in connection.execute(
+                    """SELECT anchor_id FROM derived_concept_supporting_anchors
+                       WHERE snapshot_id = ? AND concept_id = ? ORDER BY position""",
+                    (snapshot_id, concept_id),
+                ))
+                concepts.append(Concept.create(
+                    snapshot_id=snapshot_id, canonical_label=str(label), aliases=aliases,
+                    scope=str(scope) or None, supporting_record_ids=records,
+                    supporting_anchor_ids=anchors,
+                ))
+        return tuple(concepts)
+
+    def orientation_concept_occurrences(self, snapshot_id: str) -> tuple[ConceptOccurrence, ...]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """SELECT record_id, role, term_position, label_key, scope, concept_id
+                   FROM derived_concept_occurrences WHERE snapshot_id = ? ORDER BY record_id, position""",
+                (snapshot_id,),
+            ).fetchall()
+        return tuple(
+            ConceptOccurrence(
+                str(record_id), str(role), term_position, str(label_key), str(scope) or None, str(concept_id)
+            )
+            for record_id, role, term_position, label_key, scope, concept_id in rows
+        )
 
     def orientation_source_area(
         self, snapshot_id: str, record: DerivedRecord
@@ -1583,10 +1882,19 @@ class Storage:
             )
 
     def _derived_record_from_row(self, connection: sqlite3.Connection, row: tuple) -> DerivedRecord:
-        record_id, snapshot_id, family, derived_kind, evidence_state, validation_state, lifecycle_state, qualification = (
-            _decode_sqlite_text(value) for value in row[:8]
+        record_id, snapshot_id, family, derived_kind, semantic_subtype, evidence_state, validation_state, lifecycle_state, qualification = (
+            _decode_sqlite_text(value) for value in row[:9]
         )
-        provenance_values = row[8:]
+        semantic_subtype = semantic_subtype or derived_kind
+        if derived_kind not in {
+            "source_extracted_claim", "cross_source_synthesis", "unresolved_or_conflicting"
+        }:
+            derived_kind = (
+                "unresolved_or_conflicting"
+                if family == "conflict_unresolved"
+                else "source_extracted_claim" if evidence_state == "raw_taught" else "cross_source_synthesis"
+            )
+        provenance_values = row[9:]
         if any(value is None for value in provenance_values):
             if any(value is not None for value in provenance_values):
                 raise ValueError("stored compiler provenance is incomplete")
@@ -1614,6 +1922,8 @@ class Storage:
             "validation_state": validation_state,
             "lifecycle_state": lifecycle_state,
             "qualification": qualification,
+            "derived_kind": derived_kind,
+            "semantic_subtype": semantic_subtype,
             "evidence_state": evidence_state,
             "compiler_provenance": compiler_provenance,
             "facets": tuple(
@@ -1630,7 +1940,6 @@ class Storage:
             values = tuple(_decode_sqlite_text(value) for value in values)
             record = Claim.create(
                 **common,
-                derived_kind=derived_kind,
                 subject=values[0],
                 predicate=values[1],
                 object=values[2],
@@ -1673,7 +1982,6 @@ class Storage:
                 record = Evolution(
                     record_id=record_id,
                     family="evolution",
-                    derived_kind=derived_kind,
                     **common,
                     subject=values[0],
                     previous=values[1],
@@ -1733,7 +2041,6 @@ class Storage:
                 record = ConflictUnresolved(
                     record_id=record_id,
                     family="conflict_unresolved",
-                    derived_kind=derived_kind,
                     **common,
                     kind=kind,
                     subject=subject,
@@ -1766,7 +2073,7 @@ class Storage:
             record_id = raw_record_id.decode("utf-8")
             row = connection.execute(
                 """
-                SELECT record_id, snapshot_id, family, derived_kind, evidence_state, validation_state, lifecycle_state, qualification,
+                SELECT record_id, snapshot_id, family, derived_kind, semantic_subtype, evidence_state, validation_state, lifecycle_state, qualification,
                        compiler_model_version, compiler_prompt_version, compiler_schema_version
                 FROM derived_records WHERE record_id = ?
                 """,
@@ -1897,7 +2204,8 @@ class Storage:
                 SELECT CASE WHEN NEW.family = 'claim' AND NOT EXISTS(
                     SELECT 1 FROM derived_claims
                     WHERE record_id = NEW.record_id
-                      AND NEW.derived_kind IN ('statement', 'definition', 'recommendation', 'strategy_implication')
+                      AND COALESCE(NULLIF(NEW.semantic_subtype, ''), NEW.derived_kind)
+                          IN ('statement', 'definition', 'recommendation', 'strategy_implication')
                       AND length(trim(subject)) > 0 AND length(subject) <= 240
                       AND length(trim(predicate)) > 0 AND length(predicate) <= 240
                       AND length(trim(object)) > 0 AND length(object) <= 240
@@ -1905,14 +2213,15 @@ class Storage:
                 SELECT CASE WHEN NEW.family = 'relationship' AND NOT EXISTS(
                     SELECT 1 FROM derived_relationships
                     WHERE record_id = NEW.record_id
-                      AND NEW.derived_kind = 'relation'
+                      AND COALESCE(NULLIF(NEW.semantic_subtype, ''), NEW.derived_kind) = 'relation'
                       AND relation IN ('supports', 'contrasts', 'depends_on', 'causes')
                       AND length(trim(left_term)) > 0 AND length(left_term) <= 240
                       AND length(trim(right_term)) > 0 AND length(right_term) <= 240
                 ) THEN RAISE(ABORT, 'derived records require valid relationship content') END;
                 SELECT CASE WHEN NEW.family = 'procedure_sequence_hierarchy' AND NOT EXISTS(
                     SELECT 1 FROM derived_procedure_sequence_hierarchy
-                    WHERE record_id = NEW.record_id AND structure_kind = NEW.derived_kind
+                    WHERE record_id = NEW.record_id
+                      AND structure_kind = COALESCE(NULLIF(NEW.semantic_subtype, ''), NEW.derived_kind)
                 ) OR NEW.family = 'procedure_sequence_hierarchy' AND EXISTS(
                     SELECT 1 FROM derived_record_terms
                     WHERE record_id = NEW.record_id AND term_role = 'procedure_term'
@@ -1920,14 +2229,16 @@ class Storage:
                 ) THEN RAISE(ABORT, 'derived records require valid procedure content') END;
                 SELECT CASE WHEN NEW.family = 'evolution' AND NOT EXISTS(
                     SELECT 1 FROM derived_evolutions
-                    WHERE record_id = NEW.record_id AND NEW.derived_kind = 'change'
+                    WHERE record_id = NEW.record_id
+                      AND COALESCE(NULLIF(NEW.semantic_subtype, ''), NEW.derived_kind) = 'change'
                       AND length(trim(subject)) > 0 AND length(subject) <= 240
                       AND length(trim(previous_value)) > 0 AND length(previous_value) <= 240
                       AND length(trim(current_value)) > 0 AND length(current_value) <= 240
                 ) THEN RAISE(ABORT, 'derived records require valid evolution content') END;
                 SELECT CASE WHEN NEW.family = 'conflict_unresolved' AND NOT EXISTS(
                     SELECT 1 FROM derived_conflict_unresolved
-                    WHERE record_id = NEW.record_id AND issue_kind = NEW.derived_kind
+                    WHERE record_id = NEW.record_id
+                      AND issue_kind = COALESCE(NULLIF(NEW.semantic_subtype, ''), NEW.derived_kind)
                       AND length(trim(subject)) > 0 AND length(subject) <= 240
                 ) OR NEW.family = 'conflict_unresolved' AND EXISTS(
                     SELECT 1 FROM derived_record_terms
@@ -1987,6 +2298,43 @@ class Storage:
                     )
                     BEGIN
                         SELECT RAISE(ABORT, 'derived records require a building candidate');
+                    END;
+                    """
+                )
+        for table in (
+            "derived_record_concepts",
+            "derived_concepts",
+            "derived_concept_aliases",
+            "derived_concept_supporting_records",
+            "derived_concept_supporting_anchors",
+            "derived_record_concept_links",
+            "derived_concept_occurrences",
+            "derived_record_reuse",
+        ):
+            for operation, snapshot_expressions in (
+                ("INSERT", ("NEW.snapshot_id",)),
+                ("UPDATE", ("NEW.snapshot_id", "OLD.snapshot_id")),
+                ("DELETE", ("OLD.snapshot_id",)),
+            ):
+                trigger = f"{table}_require_building_{operation.lower()}"
+                connection.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+                blocked = " OR ".join(
+                    f"""NOT EXISTS(
+                        SELECT 1 FROM corpus_snapshots
+                        LEFT JOIN archived_snapshots USING(snapshot_id)
+                        WHERE corpus_snapshots.snapshot_id = {snapshot_expression}
+                          AND corpus_snapshots.status = 'building'
+                          AND archived_snapshots.snapshot_id IS NULL
+                    )"""
+                    for snapshot_expression in snapshot_expressions
+                )
+                connection.execute(
+                    f"""
+                    CREATE TRIGGER {trigger}
+                    BEFORE {operation} ON {table}
+                    WHEN {blocked}
+                    BEGIN
+                        SELECT RAISE(ABORT, 'candidate knowledge requires a building snapshot');
                     END;
                     """
                 )
@@ -2092,6 +2440,39 @@ class Storage:
                     revision.remote_vector_store_file_id,
                 ),
             )
+
+    def mark_source_revision_remote_ready(
+        self, revision_id: str, *, remote_file_id: str, remote_vector_store_file_id: str | None = None
+    ) -> SourceRevision:
+        if (
+            not isinstance(remote_file_id, str) or not remote_file_id.strip()
+            or remote_vector_store_file_id is not None
+            and (not isinstance(remote_vector_store_file_id, str) or not remote_vector_store_file_id.strip())
+        ):
+            raise ValueError("remote eligibility requires non-empty remote IDs")
+        with self._connect() as connection:
+            row = connection.execute(
+                """SELECT lifecycle_state, remote_file_id, remote_vector_store_file_id
+                   FROM source_revisions WHERE revision_id = ?""",
+                (revision_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError("unknown source revision")
+            if row[0] != "replacement_pending":
+                raise ValueError("only pending replacements can become remote eligible")
+            if row[1] not in (None, remote_file_id) or row[2] not in (None, remote_vector_store_file_id):
+                raise ValueError("source revision remote identity is immutable")
+            connection.execute(
+                """UPDATE source_revisions
+                   SET remote_file_id = COALESCE(remote_file_id, ?),
+                       remote_vector_store_file_id = COALESCE(remote_vector_store_file_id, ?)
+                   WHERE revision_id = ?""",
+                (remote_file_id, remote_vector_store_file_id, revision_id),
+            )
+        revision = self.source_revision(revision_id)
+        if revision is None:
+            raise ValueError("source revision disappeared")
+        return revision
 
     def source_revision(self, revision_id: str) -> SourceRevision | None:
         with self._connect() as connection:
@@ -2754,6 +3135,59 @@ def _validate_anchor_identity(anchor: SourceAnchor, identity_key: object) -> Non
         or not _valid_timestamps(anchor.timestamp_start_ms, anchor.timestamp_end_ms)
     ):
         raise ValueError("source anchor identity or locator metadata is invalid")
+
+
+def _clone_derived_record(
+    record: DerivedRecord, *, snapshot_id: str, record_id_mapping: Mapping[str, str]
+) -> DerivedRecord:
+    dependencies = tuple(
+        RecordDependency(
+            dependency.kind,
+            record_id_mapping[dependency.identifier]
+            if dependency.kind == "derived_record"
+            else dependency.identifier,
+        )
+        for dependency in record.dependencies
+    )
+    common = {
+        "snapshot_id": snapshot_id,
+        "anchors": record.anchors,
+        "dependencies": dependencies,
+        "validation_state": record.validation_state,
+        "lifecycle_state": record.lifecycle_state,
+        "qualification": record.qualification,
+        "derived_kind": record.derived_kind,
+        "evidence_state": record.evidence_state,
+        "compiler_provenance": record.compiler_provenance,
+        "facets": record.facets,
+    }
+    if isinstance(record, Claim):
+        return Claim.create(
+            **common, semantic_subtype=record.semantic_subtype,
+            subject=record.subject, predicate=record.predicate, object=record.object,
+        )
+    if isinstance(record, Relationship):
+        return Relationship.create(**common, left=record.left, relation=record.relation, right=record.right)
+    if isinstance(record, ProcedureSequenceHierarchy):
+        return ProcedureSequenceHierarchy.create(**common, kind=record.kind, terms=record.terms)
+    if isinstance(record, Evolution):
+        return Evolution.create(
+            **common, subject=record.subject, previous=record.previous, current=record.current,
+            earlier_source_set=record.earlier_source_set, later_source_set=record.later_source_set,
+            classification=record.classification, negative_evidence_state=record.negative_evidence_state,
+            competing_anchors=record.competing_anchors, earlier_coverage_id=record.earlier_coverage_id,
+            later_coverage_id=record.later_coverage_id, earlier_observed_years=record.earlier_observed_years,
+            later_observed_years=record.later_observed_years,
+            deprecation_evidence_anchors=record.deprecation_evidence_anchors,
+        )
+    if isinstance(record, ConflictUnresolved):
+        return ConflictUnresolved.create(
+            **common, kind=record.kind, subject=record.subject, alternatives=record.alternatives,
+            competing_record_ids=tuple(record_id_mapping[item] for item in record.competing_record_ids),
+            reconciliation_state=record.reconciliation_state, relevant_scopes=record.relevant_scopes,
+            conditions=record.conditions, unresolved_questions=record.unresolved_questions,
+        )
+    raise ValueError("unknown derived record family")
 
 
 def _safe_anchor_metadata(row: tuple) -> dict | None:

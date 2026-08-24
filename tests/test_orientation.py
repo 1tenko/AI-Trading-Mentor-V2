@@ -3,7 +3,7 @@ from hashlib import sha256
 from types import SimpleNamespace
 
 from mentor.compilation import CompilationRun, CorpusSnapshot
-from mentor.derived_records import Claim, RecordDependency
+from mentor.derived_records import Claim, RecordDependency, Relationship
 from mentor.knowledge import Collection, Source, SourceRevision
 from mentor.storage import Storage
 from mentor.synthesis import SynthesisCandidate
@@ -154,7 +154,7 @@ def test_orientation_discards_wrong_snapshot_or_nonpublished_remote_results():
     assert orientation.discarded_result_count == 2
 
 
-def test_orientation_deduplicates_concepts_before_applying_the_record_budget():
+def test_orientation_keeps_distinct_records_that_share_a_concept_until_the_record_budget():
     from mentor.orientation import OrientationBudget, OrientationService
 
     first = claim("first")
@@ -177,9 +177,9 @@ def test_orientation_deduplicates_concepts_before_applying_the_record_budget():
 
     orientation = service.consult("compare")
 
-    assert [record.record_id for record in orientation.records] == [first.record_id, second.record_id]
-    assert orientation.duplicate_result_count == 1
-    assert orientation.truncated is False
+    assert [record.record_id for record in orientation.records] == [first.record_id, duplicate_concept.record_id]
+    assert orientation.duplicate_result_count == 0
+    assert orientation.truncated is True
 
 
 def test_orientation_enforces_a_hard_token_budget_and_reports_truncation():
@@ -241,12 +241,12 @@ def test_orientation_uses_local_concepts_and_source_area_when_remote_metadata_is
 
     orientation = service.consult("compare")
 
-    assert [record.record_id for record in orientation.records] == [first.record_id]
+    assert [record.record_id for record in orientation.records] == [first.record_id, second.record_id]
     assert orientation.records[0].concept_id == local_concept_id
     assert orientation.records[0].source_area.collection_id == "collection_local"
     assert orientation.records[0].source_area.year == 2025
     assert orientation.records[0].source_area.scope == "local scope"
-    assert orientation.duplicate_result_count == 2
+    assert orientation.duplicate_result_count == 1
 
 
 def test_storage_persists_candidate_record_concept_links(tmp_path):
@@ -302,3 +302,48 @@ def test_storage_persists_candidate_record_concept_links(tmp_path):
 
     assert storage.orientation_concept_ids(snapshot.snapshot_id) == {record.record_id: concept_id}
     assert storage.orientation_source_area(snapshot.snapshot_id, record) == ("collection_synthetic", 2026, None)
+
+
+def test_storage_persists_all_record_concept_occurrences_and_explicit_primary(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    collection = Collection("collection_multi", "Multi", "trading", True, "test")
+    source = Source.create(
+        collection_id=collection.collection_id, identity_key="multi", source_type="transcript",
+        author="Synthetic", course="Synthetic", lesson_title="Multi", year=2026,
+        original_filename="multi.txt", local_provenance="C:/multi.txt",
+    )
+    revision = SourceRevision.create(
+        source=source, content_sha256=sha256(b"multi").hexdigest(), byte_size=5,
+        local_locator="C:/multi.txt", observed_at=1.0, lifecycle_state="active",
+    )
+    storage.store_collection(collection)
+    storage.store_source(source)
+    storage.store_source_revision(revision)
+    run = CompilationRun("run_multi", "test", "test", "test", 1.0)
+    snapshot = CorpusSnapshot.create(
+        run=run, selected_revisions=[revision], raw_store_id="raw", derived_store_id="derived", created_at=1.0,
+    )
+    storage.create_compilation_candidate(run, snapshot)
+    record = Relationship.create(
+        snapshot_id=snapshot.snapshot_id, anchors=("anc_multi",),
+        dependencies=(RecordDependency("source_revision", revision.revision_id),),
+        validation_state="validated", lifecycle_state="active", qualification="Synthetic relation.",
+        left="narrative", relation="supports", right="timing",
+    )
+    storage.store_derived_record(record)
+    synthesis = SynthesisCandidate.from_records(snapshot_id=snapshot.snapshot_id, records=[record])
+    concept_ids = synthesis.concept_ids_for_record(record.record_id)
+    primary = synthesis.primary_concept_id_for_record(record.record_id)
+
+    storage.store_orientation_concept_ids(
+        snapshot.snapshot_id, {record.record_id: concept_ids}, concepts=synthesis.concepts,
+        primary_concept_ids={record.record_id: primary},
+        concept_occurrences=synthesis.concept_occurrences,
+    )
+
+    assert len(concept_ids) == 2
+    assert storage.orientation_concept_links(snapshot.snapshot_id) == {record.record_id: concept_ids}
+    assert storage.orientation_concept_ids(snapshot.snapshot_id) == {record.record_id: primary}
+    assert storage.orientation_concepts(snapshot.snapshot_id) == synthesis.concepts
+    assert storage.orientation_concept_occurrences(snapshot.snapshot_id) == synthesis.concept_occurrences
