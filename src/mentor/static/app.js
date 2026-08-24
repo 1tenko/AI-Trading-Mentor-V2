@@ -87,7 +87,13 @@ function recordContentFields(data) {
   const content = data.content || {};
   if (data.family === "claim") return [["Subject", content.subject], ["Predicate", content.predicate], ["Object", content.object]];
   if (data.family === "relationship") return [["From", content.left], ["Relationship", content.relation], ["To", content.right]];
-  if (data.family === "procedure_sequence_hierarchy") return [["Structure", content.kind], ["Ordered items", Array.isArray(content.terms) ? content.terms.join(", ") : null]];
+  if (data.family === "procedure_sequence_hierarchy") return [
+    ["Structure", content.kind],
+    ["Ordered items", Array.isArray(content.terms) ? content.terms.join(", ") : null],
+    ["Prerequisites", Array.isArray(content.prerequisites) ? content.prerequisites.join(", ") : null],
+    ["Conditions", Array.isArray(content.conditions) ? content.conditions.join(", ") : null],
+    ["Branches", Array.isArray(content.branches) ? content.branches.map((branch) => `${branch.condition}: ${(branch.steps || []).join(" → ")}`).join("; ") : null],
+  ];
   if (data.family === "evolution") return [
     ["Subject", content.subject], ["Earlier understanding", content.previous], ["Later understanding", content.current],
     ["Classification", content.classification], ["Evidence state", content.negative_evidence_state],
@@ -118,12 +124,34 @@ async function inspectorJson(path) {
   return response.json();
 }
 
+function appendConcepts(container, concepts) {
+  if (!concepts?.length) {
+    inspectorList(container, [], "No safe concept summaries are available.");
+    return;
+  }
+  concepts.forEach((concept) => {
+    const item = document.createElement("article");
+    item.className = "inspector-concept";
+    inspectorValue(item, "Canonical concept", concept.canonical_label);
+    inspectorValue(item, "Aliases", concept.aliases?.join(", ") || "None");
+    inspectorValue(item, "Scope", concept.scope || "General");
+    inspectorValue(item, "Supporting records", concept.supporting_record_count);
+    inspectorValue(item, "Supporting anchors", concept.supporting_anchor_count);
+    const occurrences = (concept.occurrences || []).map((occurrence) => {
+      const position = Number.isInteger(occurrence.position) ? ` ${occurrence.position + 1}` : "";
+      return `${occurrence.role}${position}: ${occurrence.label}`;
+    });
+    inspectorValue(item, "Occurrences", occurrences.join("; ") || "None recorded");
+    container.append(item);
+  });
+}
+
 function showInspectorOverview(data) {
   inspectorOverview.replaceChildren();
   const overview = inspectorSection("Knowledge library");
   const collections = data.collections || [];
   inspectorValue(overview, "Collections", collections.map((item) => item.display_name).join(", ") || "None");
-  inspectorValue(overview, "Published snapshot", data.current_snapshot?.snapshot_id || "None published");
+  inspectorValue(overview, "Published knowledge", data.current_snapshot ? "Available" : "None published");
   inspectorValue(overview, "Pending source changes", data.pending_source_changes?.length || "None");
   inspectorOverview.append(overview);
 
@@ -134,7 +162,8 @@ function showInspectorOverview(data) {
     const button = document.createElement("button");
     button.type = "button";
     button.className = `inspector-snapshot inspector-snapshot--${snapshot.status}`;
-    button.textContent = `${snapshot.status === "published" ? "Current" : snapshot.status} · ${snapshot.snapshot_id}`;
+    const statusLabel = snapshot.status === "published" ? "Current published knowledge" : `${snapshot.status} candidate`;
+    button.textContent = `${statusLabel} · ${snapshot.source_count} source revisions`;
     button.addEventListener("click", () => loadSnapshot(snapshot.snapshot_id).catch(() => showInspectorError("Could not load this snapshot.")));
     rows.append(button);
   });
@@ -147,7 +176,6 @@ function showSnapshot(data) {
   inspectorDetail.replaceChildren();
   const snapshot = data.snapshot;
   const section = inspectorSection("Snapshot status");
-  inspectorValue(section, "Snapshot", snapshot.snapshot_id);
   inspectorValue(section, "Status", snapshot.status);
   inspectorValue(section, "Source revisions", snapshot.source_count);
   inspectorValue(section, "Coverage", `${data.coverage.processed} processed · ${data.coverage.failed} failed`);
@@ -157,6 +185,10 @@ function showSnapshot(data) {
   const staleRecordIds = data.stale_record_ids;
   if (staleRecordIds?.length) inspectorValue(section, "Stale records", staleRecordIds.length);
   inspectorDetail.append(section);
+
+  const concepts = inspectorSection("Concepts", "inspector--derived");
+  appendConcepts(concepts, data.concepts || []);
+  inspectorDetail.append(concepts);
 
   const records = inspectorSection("Derived records", "inspector--derived");
   const list = document.createElement("div");
@@ -186,6 +218,10 @@ function showRecord(data) {
   recordContentFields(data).forEach(([name, value]) => inspectorValue(record, name, value));
   inspectorDetail.append(record);
 
+  const concepts = inspectorSection("Concepts", "inspector--derived");
+  appendConcepts(concepts, data.concepts || []);
+  inspectorDetail.append(concepts);
+
   const anchors = inspectorSection("Raw source anchors");
   (data.anchors || []).forEach((anchor) => {
     const item = document.createElement("article");
@@ -210,13 +246,13 @@ function showAudit(data) {
   if (!activeThreadId) {
     inspectorList(audit, [], "Select a conversation in chat to inspect its orientation audit.");
   } else {
-    inspectorValue(audit, "Conversation", data.thread_id);
+    inspectorValue(audit, "Conversation", "Current selected conversation");
     (data.turns || []).forEach((turn) => {
       const context = turn.knowledge_context || {};
       const item = document.createElement("article");
       item.className = "inspector-audit-turn";
       inspectorValue(item, `Turn ${turn.turn_number}`, context.status || "Not used");
-      inspectorValue(item, "Snapshot", context.snapshot_id);
+      inspectorValue(item, "Compiled knowledge", context.status === "used" ? "Used" : "Not used");
       inspectorValue(item, "Derived records", context.record_count);
       inspectorValue(item, "Budget", context.budget ? `${context.used_tokens ?? 0}/${context.budget.max_tokens ?? "?"} tokens` : "Not recorded");
       audit.append(item);

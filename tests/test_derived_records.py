@@ -12,6 +12,7 @@ from mentor.derived_records import (
     ConflictUnresolved,
     Evolution,
     Facet,
+    ProcedureRecordBranch,
     ProcedureSequenceHierarchy,
     RecordDependency,
     Relationship,
@@ -99,6 +100,28 @@ def test_typed_families_have_a_complete_shared_envelope():
         assert record.anchors == ("anc_synthetic",)
         assert record.dependencies[0] == RecordDependency("source_revision", "rev_synthetic")
         assert record.qualification == "Only under the stated synthetic condition."
+
+
+@pytest.mark.parametrize(
+    "relation",
+    (
+        "supports",
+        "contrasts",
+        "depends_on",
+        "causes",
+        "applies_when",
+        "exception_to",
+        "refines",
+        "anticipates",
+        "uses_internal_structure",
+    ),
+)
+def test_relationship_vocabulary_covers_generic_conditional_and_evolution_semantics(relation):
+    record = Relationship.create(
+        **_envelope(), left="source concept", relation=relation, right="target concept"
+    )
+
+    assert record.relation == relation
 
 
 def test_derived_kind_is_assimilation_provenance_not_semantic_subtype():
@@ -552,7 +575,14 @@ def test_storage_round_trips_each_typed_family(tmp_path):
     records = [
         claim(**common),
         Relationship.create(**common, left="signal", relation="supports", right="observation"),
-        ProcedureSequenceHierarchy.create(**common, kind="procedure", terms=("observe", "act")),
+        ProcedureSequenceHierarchy.create(
+            **common,
+            kind="procedure",
+            terms=("observe", "act"),
+            prerequisites=("market context",),
+            conditions=("only after confirmation",),
+            branches=(ProcedureRecordBranch("if confirmation fails", ("observe",)),),
+        ),
         Evolution.create(
             **common,
             subject="definition",

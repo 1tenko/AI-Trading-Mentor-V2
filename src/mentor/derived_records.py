@@ -41,6 +41,19 @@ NEGATIVE_EVIDENCE_STATES = frozenset(
 RECONCILIATION_STATES = frozenset(
     {"compatible_under_conditions", "unresolved", "genuinely_contradictory"}
 )
+RELATIONSHIP_TYPES = frozenset(
+    {
+        "supports",
+        "contrasts",
+        "depends_on",
+        "causes",
+        "applies_when",
+        "exception_to",
+        "refines",
+        "anticipates",
+        "uses_internal_structure",
+    }
+)
 FACET_NAMES = frozenset({"scope", "condition", "exception", "outcome", "timeframe"})
 MAX_FACETS = 5
 MAX_FACET_VALUE_LENGTH = 160
@@ -146,7 +159,7 @@ class Relationship(DerivedRecord):
 
     @classmethod
     def create(cls, *, left: str, relation: str, right: str, **common: object) -> "Relationship":
-        if relation not in {"supports", "contrasts", "depends_on", "causes"}:
+        if relation not in RELATIONSHIP_TYPES:
             raise ValueError("invalid relationship relation")
         return _new(
             cls,
@@ -159,12 +172,30 @@ class Relationship(DerivedRecord):
 
 
 @dataclass(frozen=True)
+class ProcedureRecordBranch:
+    condition: str
+    steps: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class ProcedureSequenceHierarchy(DerivedRecord):
     kind: str = ""
     terms: tuple[str, ...] = ()
+    prerequisites: tuple[str, ...] = ()
+    conditions: tuple[str, ...] = ()
+    branches: tuple[ProcedureRecordBranch, ...] = ()
 
     @classmethod
-    def create(cls, *, kind: str, terms: tuple[str, ...], **common: object) -> "ProcedureSequenceHierarchy":
+    def create(
+        cls,
+        *,
+        kind: str,
+        terms: tuple[str, ...],
+        prerequisites: tuple[str, ...] = (),
+        conditions: tuple[str, ...] = (),
+        branches: tuple[ProcedureRecordBranch, ...] = (),
+        **common: object,
+    ) -> "ProcedureSequenceHierarchy":
         if kind not in {"procedure", "sequence", "hierarchy"} or len(terms) < 2:
             raise ValueError("invalid procedure, sequence, or hierarchy")
         if len(terms) > MAX_TERMS:
@@ -174,6 +205,9 @@ class ProcedureSequenceHierarchy(DerivedRecord):
             family="procedure_sequence_hierarchy",
             kind=kind,
             terms=terms,
+            prerequisites=prerequisites,
+            conditions=conditions,
+            branches=branches,
             **_common(common, kind),
         )
 
@@ -399,13 +433,28 @@ def _validate_family(record: DerivedRecord) -> None:
             raise ValueError("invalid claim record")
         strings = (record.subject, record.predicate, record.object)
     elif isinstance(record, Relationship):
-        if record.family != "relationship" or record.semantic_subtype != "relation" or record.relation not in {"supports", "contrasts", "depends_on", "causes"}:
+        if record.family != "relationship" or record.semantic_subtype != "relation" or record.relation not in RELATIONSHIP_TYPES:
             raise ValueError("invalid relationship record")
         strings = (record.left, record.relation, record.right)
     elif isinstance(record, ProcedureSequenceHierarchy):
         if record.family != "procedure_sequence_hierarchy" or record.semantic_subtype != record.kind or record.kind not in {"procedure", "sequence", "hierarchy"} or len(record.terms) < 2:
             raise ValueError("invalid procedure, sequence, or hierarchy")
-        strings = record.terms
+        _require_prose_tuple(record.prerequisites, "procedure prerequisite", allow_empty=True)
+        _require_prose_tuple(record.conditions, "procedure condition", allow_empty=True)
+        if not isinstance(record.branches, tuple) or len(record.branches) > MAX_TERMS:
+            raise ValueError("procedure branches must be a bounded tuple")
+        branch_values: list[str] = []
+        for branch in record.branches:
+            if not isinstance(branch, ProcedureRecordBranch):
+                raise ValueError("procedure branches must be structured")
+            _require_auditable_text(
+                branch.condition, "procedure branch condition", maximum=MAX_FACET_VALUE_LENGTH
+            )
+            _require_prose_tuple(branch.steps, "procedure branch step")
+            if len(branch.steps) > MAX_TERMS:
+                raise ValueError("too many procedure branch steps")
+            branch_values.extend((branch.condition, *branch.steps))
+        strings = (*record.terms, *record.prerequisites, *record.conditions, *branch_values)
     elif isinstance(record, Evolution):
         if record.family != "evolution" or record.semantic_subtype != "change":
             raise ValueError("invalid evolution record")
@@ -621,6 +670,13 @@ def _require_year_tuple(values: object, label: str) -> None:
 
 
 def is_legacy_record(record: DerivedRecord) -> bool:
+    if isinstance(record, ProcedureSequenceHierarchy):
+        return (
+            not record.prerequisites
+            and not record.conditions
+            and not record.branches
+            and record.record_id == _pre_round2_procedure_record_id(record)
+        )
     if isinstance(record, Evolution):
         return (
             not record.earlier_source_set
@@ -712,6 +768,16 @@ def _first_task9_record_id(record: DerivedRecord) -> str:
     elif isinstance(record, ConflictUnresolved):
         for name in ("relevant_scopes", "conditions", "unresolved_questions"):
             values.pop(name)
+    if values["compiler_provenance"] is None:
+        del values["compiler_provenance"]
+    return f"rec_{sha256(json.dumps(values, sort_keys=True, separators=(',', ':')).encode()).hexdigest()}"
+
+
+def _pre_round2_procedure_record_id(record: ProcedureSequenceHierarchy) -> str:
+    values = asdict(record)
+    values["record_id"] = ""
+    for name in ("prerequisites", "conditions", "branches"):
+        values.pop(name)
     if values["compiler_provenance"] is None:
         del values["compiler_provenance"]
     return f"rec_{sha256(json.dumps(values, sort_keys=True, separators=(',', ':')).encode()).hexdigest()}"

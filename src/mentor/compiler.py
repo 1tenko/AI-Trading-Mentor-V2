@@ -17,6 +17,7 @@ from mentor.derived_records import (
     Claim,
     CompilerProvenance,
     DerivedRecord,
+    ProcedureRecordBranch,
     ProcedureSequenceHierarchy,
     RecordDependency,
     Relationship,
@@ -61,7 +62,15 @@ class SourceExtractor:
             raise ValueError("GPT-5.6 Sol live compilation requires caller-supplied pricing")
         self._client = client
         self._pricing = pricing
+        self._live_mode = live_mode
         self._provenance = CompilerProvenance(model, EXTRACTION_PROMPT_VERSION, EXTRACTION_SCHEMA_VERSION)
+        self.preflight_live_pricing()
+
+    def preflight_live_pricing(self) -> None:
+        if self._provenance.model_version == SOL_MODEL:
+            if not self._live_mode or self._pricing is None:
+                raise ValueError("GPT-5.6 Sol live extraction requires complete caller-supplied pricing")
+            self._pricing.require_complete("extraction")
 
     def extract(
         self,
@@ -167,7 +176,10 @@ def _candidate_from_payload(
             right=payload.get("right"),
         )
     if family == "procedure_sequence_hierarchy":
-        _allow_fields(payload, base_fields | {"kind", "terms"})
+        _allow_fields(
+            payload,
+            base_fields | {"kind", "terms", "prerequisites", "conditions", "branches"},
+        )
         terms = payload.get("terms")
         if not isinstance(terms, list):
             raise ValueError("procedure terms must be an ordered list")
@@ -175,6 +187,9 @@ def _candidate_from_payload(
             **common,
             kind=payload.get("kind"),
             terms=tuple(terms),
+            prerequisites=_procedure_texts(payload.get("prerequisites", []), "prerequisites"),
+            conditions=_procedure_texts(payload.get("conditions", []), "conditions"),
+            branches=_procedure_branches(payload.get("branches", [])),
         )
     raise ValueError("unknown derived record family")
 
@@ -215,6 +230,33 @@ def _concept_hints(payload: object, record_id: str) -> tuple[ConceptHint, ...]:
 def _allow_fields(payload: dict[str, object], allowed: set[str]) -> None:
     if set(payload).difference(allowed):
         raise ValueError("candidate contains unsupported fields")
+
+
+def _procedure_texts(value: object, label: str, *, allow_empty: bool = True) -> tuple[str, ...]:
+    if not isinstance(value, list) or len(value) > 8:
+        raise ValueError(f"procedure {label} must be a bounded ordered list")
+    if (not allow_empty and not value) or any(not isinstance(item, str) or not item.strip() for item in value):
+        raise ValueError(f"procedure {label} must contain non-empty text")
+    return tuple(value)
+
+
+def _procedure_branches(value: object) -> tuple[ProcedureRecordBranch, ...]:
+    if not isinstance(value, list) or len(value) > 8:
+        raise ValueError("procedure branches must be a bounded ordered list")
+    branches = []
+    for item in value:
+        if not isinstance(item, dict) or set(item) != {"condition", "steps"}:
+            raise ValueError("procedure branches must be structured")
+        condition = item["condition"]
+        if not isinstance(condition, str) or not condition.strip():
+            raise ValueError("procedure branch condition must be non-empty text")
+        branches.append(
+            ProcedureRecordBranch(
+                condition,
+                _procedure_texts(item["steps"], "branch steps", allow_empty=False),
+            )
+        )
+    return tuple(branches)
 
 
 def _anchors(value: object) -> tuple[str, ...]:

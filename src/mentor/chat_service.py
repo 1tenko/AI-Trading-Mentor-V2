@@ -622,6 +622,24 @@ def _orientation_output(result: OrientationResult) -> dict[str, Any]:
                     "year": record.source_area.year,
                     "scope": record.source_area.scope,
                 },
+                "concepts": [
+                    {
+                        "canonical_label": concept.canonical_label,
+                        "aliases": list(concept.aliases),
+                        "scope": concept.scope,
+                        "supporting_record_count": concept.supporting_record_count,
+                        "supporting_anchor_count": concept.supporting_anchor_count,
+                        "occurrences": [
+                            {
+                                "role": occurrence.role,
+                                "position": occurrence.position,
+                                "label": occurrence.label,
+                            }
+                            for occurrence in concept.occurrences
+                        ],
+                    }
+                    for concept in record.concepts
+                ],
             }
             for record in result.records
         ],

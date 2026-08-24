@@ -18,6 +18,7 @@ from mentor.derived_records import (
     Relationship,
 )
 from mentor.knowledge import derived_provenance_label
+from mentor.orientation import concept_summaries
 from mentor.storage import Storage
 
 LOGGER = logging.getLogger(__name__)
@@ -297,6 +298,7 @@ def _snapshot_detail(storage: Storage, snapshot_id: str) -> dict | None:
     coverage = storage.snapshot_source_coverage(snapshot_id)
     gate = storage.candidate_gate(snapshot_id)
     occurrences = storage.orientation_concept_occurrences(snapshot_id)
+    concepts = storage.orientation_concepts(snapshot_id)
     return {
         "snapshot": _snapshot_summary(snapshot),
         "compiler": {
@@ -315,27 +317,11 @@ def _snapshot_detail(storage: Storage, snapshot_id: str) -> dict | None:
         },
         "metrics": [_metric_json(metric) for metric in storage.compilation_metrics(snapshot.run_id)],
         "records": [_record_summary(record, record.record_id in stale_ids) for record in records],
-        "concepts": [
-            {
-                "concept_id": concept.concept_id,
-                "canonical_label": concept.canonical_label,
-                "aliases": list(concept.aliases),
-                "scope": concept.scope,
-                "supporting_record_ids": list(concept.supporting_record_ids),
-                "supporting_anchor_ids": list(concept.supporting_anchor_ids),
-                "occurrences": [
-                    {
-                        "record_id": occurrence.record_id,
-                        "role": occurrence.role,
-                        "position": occurrence.position,
-                        "label_key": occurrence.label_key,
-                    }
-                    for occurrence in occurrences
-                    if occurrence.concept_id == concept.concept_id
-                ],
-            }
-            for concept in storage.orientation_concepts(snapshot_id)
-        ],
+        "concepts": [_concept_summary_json(concept) for concept in concept_summaries(
+            concepts,
+            occurrences,
+            (concept.concept_id for concept in concepts),
+        )],
         "stale_record_ids": sorted(stale_ids),
     }
 
@@ -348,6 +334,7 @@ def _record_detail(storage: Storage, snapshot_id: str, record_id: str) -> dict |
     if record is None:
         return None
     reused_from = storage.derived_record_reuse(snapshot_id).get(record_id)
+    concept_ids = storage.orientation_concept_links(snapshot_id).get(record_id, ())
     return {
         **_record_summary(record, record_id in storage.stale_record_ids(snapshot_id)),
         "qualification": record.qualification,
@@ -358,28 +345,55 @@ def _record_detail(storage: Storage, snapshot_id: str, record_id: str) -> dict |
             "schema_version": record.compiler_provenance.schema_version,
         },
         "content": _typed_record_content(record),
-        "anchors": storage.source_anchor_metadata(record.anchors),
+        "anchors": [
+            _inspector_anchor(anchor)
+            for anchor in storage.source_anchor_metadata(record.anchors)
+        ],
         "dependencies": [
-            {"kind": dependency.kind, "identifier": dependency.identifier}
+            {"kind": dependency.kind}
             for dependency in record.dependencies
         ],
-        "concept_id": storage.orientation_concept_ids(snapshot_id).get(record_id),
-        "concept_ids": list(storage.orientation_concept_links(snapshot_id).get(record_id, ())),
-        "concept_occurrences": [
+        "concepts": [_concept_summary_json(concept) for concept in concept_summaries(
+            storage.orientation_concepts(snapshot_id),
+            storage.orientation_concept_occurrences(snapshot_id),
+            concept_ids,
+            record_id=record_id,
+        )],
+        "reused": reused_from is not None,
+    }
+
+
+def _concept_summary_json(concept: Any) -> dict:
+    return {
+        "canonical_label": concept.canonical_label,
+        "aliases": list(concept.aliases),
+        "scope": concept.scope,
+        "supporting_record_count": concept.supporting_record_count,
+        "supporting_anchor_count": concept.supporting_anchor_count,
+        "occurrences": [
             {
-                "concept_id": occurrence.concept_id,
                 "role": occurrence.role,
                 "position": occurrence.position,
-                "label_key": occurrence.label_key,
-                "scope": occurrence.scope,
+                "label": occurrence.label,
             }
-            for occurrence in storage.orientation_concept_occurrences(snapshot_id)
-            if occurrence.record_id == record_id
+            for occurrence in concept.occurrences
         ],
-        "reused_from": None if reused_from is None else {
-            "snapshot_id": reused_from[0],
-            "record_id": reused_from[1],
-        },
+    }
+
+
+def _inspector_anchor(anchor: dict) -> dict:
+    """Expose only human-verifiable locator fields, never opaque identity/hash data."""
+    return {
+        key: anchor.get(key)
+        for key in (
+            "filename",
+            "lesson_title",
+            "author",
+            "course",
+            "year",
+            "timestamp_start_ms",
+            "timestamp_end_ms",
+        )
     }
 
 
@@ -422,7 +436,16 @@ def _typed_record_content(record: Any) -> dict:
     if isinstance(record, Relationship):
         return {"left": record.left, "relation": record.relation, "right": record.right}
     if isinstance(record, ProcedureSequenceHierarchy):
-        return {"kind": record.kind, "terms": list(record.terms)}
+        return {
+            "kind": record.kind,
+            "terms": list(record.terms),
+            "prerequisites": list(record.prerequisites),
+            "conditions": list(record.conditions),
+            "branches": [
+                {"condition": branch.condition, "steps": list(branch.steps)}
+                for branch in record.branches
+            ],
+        }
     if isinstance(record, Evolution):
         return {
             "subject": record.subject,
@@ -430,19 +453,17 @@ def _typed_record_content(record: Any) -> dict:
             "current": record.current,
             "classification": record.classification,
             "negative_evidence_state": record.negative_evidence_state,
-            "earlier_source_set": list(record.earlier_source_set),
-            "later_source_set": list(record.later_source_set),
             "earlier_observed_years": list(record.earlier_observed_years),
             "later_observed_years": list(record.later_observed_years),
-            "competing_anchor_ids": list(record.competing_anchors),
-            "deprecation_evidence_anchor_ids": list(record.deprecation_evidence_anchors),
+            "competing_anchor_count": len(record.competing_anchors),
+            "deprecation_evidence_anchor_count": len(record.deprecation_evidence_anchors),
         }
     if isinstance(record, ConflictUnresolved):
         return {
             "kind": record.kind,
             "subject": record.subject,
             "alternatives": list(record.alternatives),
-            "competing_record_ids": list(record.competing_record_ids),
+            "competing_record_count": len(record.competing_record_ids),
             "reconciliation_state": record.reconciliation_state,
             "relevant_scopes": list(record.relevant_scopes),
             "conditions": list(record.conditions),

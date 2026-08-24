@@ -128,6 +128,86 @@ def test_concrete_reconciliation_batches_every_record_and_filters_anchor_spans()
     )
 
 
+def test_reconciliation_rejects_a_batch_size_that_cannot_compare_records():
+    with pytest.raises(ValueError, match="batch size"):
+        SynthesisReconciler(
+            SimpleNamespace(responses=RecordingResponses(lambda _request: {})),
+            max_records_per_call=1,
+        )
+
+
+def test_reconciliation_uses_alias_affinity_instead_of_alphabetical_adjacency():
+    alpha = claim(subject="Alpha setup")
+    middle = tuple(claim(subject=f"Middle {index}") for index in range(4))
+    zulu = claim(subject="Zulu setup")
+    records = (alpha, *middle, zulu)
+    responses = RecordingResponses(lambda _request: {"records": [], "concept_hints": []})
+    reconciler = SynthesisReconciler(
+        SimpleNamespace(responses=responses),
+        max_records_per_call=2,
+    )
+
+    result = reconciler.synthesize(
+        snapshot_id=SNAPSHOT_ID,
+        records=records,
+        revisions=(SimpleNamespace(revision_id="rev_synthetic"),),
+        anchor_spans={record.anchors[0]: "bounded span" for record in records},
+        hints=(
+            ConceptHint(alpha.record_id, "Alpha setup", aliases=("Shared setup",)),
+            ConceptHint(zulu.record_id, "Zulu setup", aliases=("Shared setup",)),
+        ),
+    )
+
+    requests = [json.loads(call["input"]) for call in responses.calls]
+    related_ids = {alpha.record_id, zulu.record_id}
+    assert any(
+        related_ids <= {record["record_id"] for record in request["records"]}
+        for request in requests
+    )
+    assert result.coverage.covered_record_ids == tuple(sorted(record.record_id for record in records))
+    assert result.coverage.complete is True
+    assert result.coverage.bridge_call_count > 0
+
+
+def test_reconciliation_can_emit_more_than_sixty_four_candidate_records_with_bounded_calls():
+    records = tuple(claim(subject=f"Distinct topic {index:03d}") for index in range(70))
+
+    def response(request):
+        outputs = []
+        for record in request["records"]:
+            outputs.append({
+                "family": "relationship",
+                "qualification": "Synthetic per-record relationship.",
+                "anchors": record["anchors"],
+                "input_record_ids": [record["record_id"]],
+                "source_revision_ids": ["rev_synthetic"],
+                "left": record["subject"],
+                "relation": "supports",
+                "right": "bounded meaning",
+            })
+        return {"records": outputs, "concept_hints": []}
+
+    responses = RecordingResponses(response)
+    reconciler = SynthesisReconciler(
+        SimpleNamespace(responses=responses),
+        max_records_per_call=8,
+    )
+
+    result = reconciler.synthesize(
+        snapshot_id=SNAPSHOT_ID,
+        records=records,
+        revisions=(SimpleNamespace(revision_id="rev_synthetic"),),
+        anchor_spans={record.anchors[0]: "bounded span" for record in records},
+    )
+
+    requests = [json.loads(call["input"]) for call in responses.calls]
+    assert len(result.records) == 70
+    assert all(len(request["records"]) <= 8 for request in requests)
+    assert result.coverage.input_record_count == 70
+    assert result.coverage.complete is True
+    assert result.call_count == result.coverage.primary_call_count + result.coverage.bridge_call_count
+
+
 def test_concrete_reconciliation_emits_structured_procedure_and_alias_hint():
     records = (claim(subject="Observe"), claim(subject="Act"))
 
@@ -144,6 +224,11 @@ def test_concrete_reconciliation_emits_structured_procedure_and_alias_hint():
                     "source_revision_ids": ["rev_synthetic"],
                     "kind": "procedure",
                     "terms": ["Observe", "Act"],
+                    "prerequisites": ["Context"],
+                    "conditions": ["Only after confirmation"],
+                    "branches": [
+                        {"condition": "If confirmation fails", "steps": ["Observe"]}
+                    ],
                 }
             ],
             "concept_hints": [
@@ -170,6 +255,10 @@ def test_concrete_reconciliation_emits_structured_procedure_and_alias_hint():
 
     assert isinstance(result.records[0], ProcedureSequenceHierarchy)
     assert result.records[0].terms == ("Observe", "Act")
+    assert result.records[0].prerequisites == ("Context",)
+    assert result.records[0].conditions == ("Only after confirmation",)
+    assert result.records[0].branches[0].condition == "If confirmation fails"
+    assert result.records[0].branches[0].steps == ("Observe",)
     assert result.hints == (
         ConceptHint(
             result.records[0].record_id,

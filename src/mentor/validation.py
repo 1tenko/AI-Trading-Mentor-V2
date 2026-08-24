@@ -9,6 +9,7 @@ from mentor.compiler_prompts import semantic_validation_request
 from mentor.compilation import CallUsage, TokenPricing, usage_from_response
 from mentor.derived_records import Claim, DerivedRecord, ProcedureSequenceHierarchy, Relationship
 from mentor.knowledge import SourceRevision
+from mentor.synthesis import ConceptHint, SynthesisCandidate
 
 
 SEMANTIC_OUTCOMES = frozenset(
@@ -25,6 +26,7 @@ class ValidationResult:
     anchor_ids: tuple[str, ...]
     source_extracted: DerivedRecord | None
     usage: CallUsage = CallUsage()
+    validated_hints: tuple[ConceptHint, ...] = ()
 
 
 class SemanticValidator:
@@ -41,6 +43,14 @@ class SemanticValidator:
         self._client = client
         self._model = model
         self._pricing = pricing
+        self._live_mode = live_mode
+        self.preflight_live_pricing()
+
+    def preflight_live_pricing(self) -> None:
+        if self._model == "gpt-5.6-sol":
+            if not self._live_mode or self._pricing is None:
+                raise ValueError("GPT-5.6 Sol live validation requires complete caller-supplied pricing")
+            self._pricing.require_complete("validation")
 
     def validate(
         self,
@@ -49,26 +59,30 @@ class SemanticValidator:
         revision: SourceRevision,
         transcript: str,
         anchors: Mapping[str, SourceAnchor],
+        concept_hints: Sequence[ConceptHint] = (),
     ) -> ValidationResult:
         if not isinstance(candidate, (Claim, Relationship, ProcedureSequenceHierarchy)):
             raise ValueError("semantic validation applies only to source-extracted candidates")
         spans = _validated_spans(candidate, revision, transcript, anchors)
+        validated_hint_shape = _validated_concept_hint_shape(candidate, concept_hints)
         response = self._client.responses.create(
             **semantic_validation_request(
-                record=_validation_payload(candidate),
+                record=_validation_payload(candidate, validated_hint_shape),
                 spans=spans,
                 model=self._model,
             )
         )
         outcome, audit = _semantic_response(response)
+        affirmative = outcome == "affirmatively_supported"
         return ValidationResult(
             candidate.record_id,
             candidate.snapshot_id,
             outcome,
             audit,
             tuple(anchor_id for anchor_id, _ in spans),
-            _validated_replacement(candidate) if outcome == "affirmatively_supported" else None,
+            _validated_replacement(candidate) if affirmative else None,
             usage_from_response(response, pricing=self._pricing),
+            validated_hint_shape if affirmative else (),
         )
 
 
@@ -129,19 +143,75 @@ def _validated_replacement(candidate: DerivedRecord) -> DerivedRecord:
     if isinstance(candidate, Relationship):
         return Relationship.create(**common, left=candidate.left, relation=candidate.relation, right=candidate.right)
     if isinstance(candidate, ProcedureSequenceHierarchy):
-        return ProcedureSequenceHierarchy.create(**common, kind=candidate.kind, terms=candidate.terms)
+        return ProcedureSequenceHierarchy.create(
+            **common,
+            kind=candidate.kind,
+            terms=candidate.terms,
+            prerequisites=candidate.prerequisites,
+            conditions=candidate.conditions,
+            branches=candidate.branches,
+        )
     raise ValueError("unsupported source-extracted record family")
 
 
-def _validation_payload(candidate: DerivedRecord) -> dict[str, object]:
+def _validation_payload(
+    candidate: DerivedRecord, concept_hints: tuple[ConceptHint, ...]
+) -> dict[str, object]:
     common: dict[str, object] = {
         "family": candidate.family,
         "semantic_subtype": candidate.semantic_subtype,
+        "concept_hints": [
+            {
+                "label": hint.label,
+                "aliases": list(hint.aliases),
+                "scope": hint.scope,
+                "role": hint.role,
+                "position": hint.position,
+            }
+            for hint in concept_hints
+        ],
     }
     if isinstance(candidate, Claim):
         return common | {"subject": candidate.subject, "predicate": candidate.predicate, "object": candidate.object}
     if isinstance(candidate, Relationship):
         return common | {"left": candidate.left, "relation": candidate.relation, "right": candidate.right}
     if isinstance(candidate, ProcedureSequenceHierarchy):
-        return common | {"kind": candidate.kind, "terms": candidate.terms}
+        return common | {
+            "kind": candidate.kind,
+            "terms": candidate.terms,
+            "prerequisites": candidate.prerequisites,
+            "conditions": candidate.conditions,
+            "branches": [
+                {"condition": branch.condition, "steps": branch.steps}
+                for branch in candidate.branches
+            ],
+        }
     raise ValueError("unsupported source-extracted record family")
+
+
+def _validated_concept_hint_shape(
+    candidate: DerivedRecord, hints: Sequence[ConceptHint]
+) -> tuple[ConceptHint, ...]:
+    values = tuple(hints)
+    if any(not isinstance(hint, ConceptHint) or hint.record_id != candidate.record_id for hint in values):
+        raise ValueError("concept hints must belong to the candidate under validation")
+    if not values:
+        return ()
+    replacement = _validated_replacement(candidate)
+    remapped = tuple(
+        ConceptHint(
+            replacement.record_id,
+            hint.label,
+            hint.aliases,
+            hint.scope,
+            hint.role,
+            hint.position,
+        )
+        for hint in values
+    )
+    SynthesisCandidate.from_records(
+        snapshot_id=replacement.snapshot_id,
+        records=(replacement,),
+        hints=remapped,
+    )
+    return remapped

@@ -22,6 +22,7 @@ from mentor.derived_records import (
     DerivedRecord,
     Evolution,
     Facet,
+    ProcedureRecordBranch,
     ProcedureSequenceHierarchy,
     RecordDependency,
     Relationship,
@@ -29,7 +30,7 @@ from mentor.derived_records import (
 )
 from mentor.validation import SemanticValidator, ValidationResult
 from mentor.knowledge import Collection, Source as LibrarySource, SourceRevision
-from mentor.synthesis import Concept, ConceptOccurrence
+from mentor.synthesis import Concept, ConceptHint, ConceptOccurrence
 
 
 @dataclass(frozen=True)
@@ -412,7 +413,10 @@ class Storage:
                 );
                 CREATE TABLE IF NOT EXISTS derived_procedure_sequence_hierarchy (
                     record_id TEXT PRIMARY KEY REFERENCES derived_records(record_id),
-                    structure_kind TEXT NOT NULL CHECK(structure_kind IN ('procedure', 'sequence', 'hierarchy'))
+                    structure_kind TEXT NOT NULL CHECK(structure_kind IN ('procedure', 'sequence', 'hierarchy')),
+                    prerequisites_json TEXT NOT NULL DEFAULT '[]',
+                    conditions_json TEXT NOT NULL DEFAULT '[]',
+                    branches_json TEXT NOT NULL DEFAULT '[]'
                 );
                 CREATE TABLE IF NOT EXISTS derived_evolutions (
                     record_id TEXT PRIMARY KEY REFERENCES derived_records(record_id),
@@ -527,6 +531,18 @@ class Storage:
             ):
                 if column not in conflict_columns:
                     connection.execute(f"ALTER TABLE derived_conflict_unresolved ADD COLUMN {column} {definition}")
+            procedure_columns = {
+                row[1]
+                for row in connection.execute(
+                    "PRAGMA table_info(derived_procedure_sequence_hierarchy)"
+                )
+            }
+            for column in ("prerequisites_json", "conditions_json", "branches_json"):
+                if column not in procedure_columns:
+                    connection.execute(
+                        f"ALTER TABLE derived_procedure_sequence_hierarchy "
+                        f"ADD COLUMN {column} TEXT NOT NULL DEFAULT '[]'"
+                    )
             gate_columns = {row[1] for row in connection.execute("PRAGMA table_info(candidate_gates)")}
             for column, definition in (
                 ("structural_version", "TEXT"),
@@ -1323,12 +1339,14 @@ class Storage:
         model: str = "synthetic-validator",
         live_mode: bool = False,
         pricing=None,
+        concept_hints: tuple[ConceptHint, ...] = (),
     ) -> ValidationResult:
         result = SemanticValidator(client, model=model, live_mode=live_mode, pricing=pricing).validate(
             candidate=candidate,
             revision=revision,
             transcript=transcript,
             anchors=anchors,
+            concept_hints=concept_hints,
         )
         if result.outcome == "affirmatively_supported":
             if not isinstance(result.source_extracted, (Claim, Relationship, ProcedureSequenceHierarchy)):
@@ -1815,10 +1833,20 @@ class Storage:
         elif isinstance(record, ProcedureSequenceHierarchy):
             connection.execute(
                 """
-                INSERT INTO derived_procedure_sequence_hierarchy(record_id, structure_kind)
-                VALUES (?, ?) ON CONFLICT DO NOTHING
+                INSERT INTO derived_procedure_sequence_hierarchy(
+                    record_id, structure_kind, prerequisites_json, conditions_json, branches_json
+                ) VALUES (?, ?, ?, ?, ?) ON CONFLICT DO NOTHING
                 """,
-                (record.record_id, record.kind),
+                (
+                    record.record_id,
+                    record.kind,
+                    json.dumps(record.prerequisites),
+                    json.dumps(record.conditions),
+                    json.dumps([
+                        {"condition": branch.condition, "steps": list(branch.steps)}
+                        for branch in record.branches
+                    ]),
+                ),
             )
             connection.executemany(
                 """
@@ -1951,10 +1979,15 @@ class Storage:
             values = tuple(_decode_sqlite_text(value) for value in values)
             record = Relationship.create(**common, left=values[0], relation=values[1], right=values[2])
         elif family == "procedure_sequence_hierarchy":
-            kind = connection.execute(
-                "SELECT structure_kind FROM derived_procedure_sequence_hierarchy WHERE record_id = ?", (record_id,)
+            kind, prerequisites_json, conditions_json, branches_json = connection.execute(
+                """SELECT structure_kind, prerequisites_json, conditions_json, branches_json
+                   FROM derived_procedure_sequence_hierarchy WHERE record_id = ?""",
+                (record_id,),
             ).fetchone()
-            kind = _decode_sqlite_text(kind[0])
+            kind = _decode_sqlite_text(kind)
+            prerequisites_json = _decode_sqlite_text(prerequisites_json)
+            conditions_json = _decode_sqlite_text(conditions_json)
+            branches_json = _decode_sqlite_text(branches_json)
             terms = tuple(
                 _decode_sqlite_text(item[0])
                 for item in connection.execute(
@@ -1965,7 +1998,28 @@ class Storage:
                     (record_id,),
                 )
             )
-            record = ProcedureSequenceHierarchy.create(**common, kind=kind, terms=terms)
+            prerequisites = tuple(json.loads(prerequisites_json))
+            conditions = tuple(json.loads(conditions_json))
+            branches = tuple(
+                ProcedureRecordBranch(item["condition"], tuple(item["steps"]))
+                for item in json.loads(branches_json)
+            )
+            record = ProcedureSequenceHierarchy.create(
+                **common,
+                kind=kind,
+                terms=terms,
+                prerequisites=prerequisites,
+                conditions=conditions,
+                branches=branches,
+            )
+            if record.record_id != record_id and not prerequisites and not conditions and not branches:
+                record = ProcedureSequenceHierarchy(
+                    record_id=record_id,
+                    family="procedure_sequence_hierarchy",
+                    **common,
+                    kind=kind,
+                    terms=terms,
+                )
         elif family == "evolution":
             values = connection.execute(
                 """
@@ -2214,7 +2268,10 @@ class Storage:
                     SELECT 1 FROM derived_relationships
                     WHERE record_id = NEW.record_id
                       AND COALESCE(NULLIF(NEW.semantic_subtype, ''), NEW.derived_kind) = 'relation'
-                      AND relation IN ('supports', 'contrasts', 'depends_on', 'causes')
+                      AND relation IN (
+                          'supports', 'contrasts', 'depends_on', 'causes', 'applies_when',
+                          'exception_to', 'refines', 'anticipates', 'uses_internal_structure'
+                      )
                       AND length(trim(left_term)) > 0 AND length(left_term) <= 240
                       AND length(trim(right_term)) > 0 AND length(right_term) <= 240
                 ) THEN RAISE(ABORT, 'derived records require valid relationship content') END;
@@ -3169,7 +3226,14 @@ def _clone_derived_record(
     if isinstance(record, Relationship):
         return Relationship.create(**common, left=record.left, relation=record.relation, right=record.right)
     if isinstance(record, ProcedureSequenceHierarchy):
-        return ProcedureSequenceHierarchy.create(**common, kind=record.kind, terms=record.terms)
+        return ProcedureSequenceHierarchy.create(
+            **common,
+            kind=record.kind,
+            terms=record.terms,
+            prerequisites=record.prerequisites,
+            conditions=record.conditions,
+            branches=record.branches,
+        )
     if isinstance(record, Evolution):
         return Evolution.create(
             **common, subject=record.subject, previous=record.previous, current=record.current,

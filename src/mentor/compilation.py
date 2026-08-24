@@ -59,6 +59,15 @@ class TokenPricing:
             + reasoning_tokens * self.reasoning_per_million
         ) / 1_000_000
 
+    def require_complete(self, stage: str) -> None:
+        """Reject a live stage unless every reproducible token rate is explicit."""
+        if any(value <= 0 for value in (
+            self.input_per_million,
+            self.output_per_million,
+            self.reasoning_per_million,
+        )):
+            raise ValueError(f"{stage} pricing requires positive input, output, and reasoning rates")
+
 
 def usage_from_response(response: object, *, pricing: TokenPricing | None = None) -> CallUsage:
     usage = getattr(response, "usage", None)

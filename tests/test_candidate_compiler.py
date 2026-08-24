@@ -15,7 +15,7 @@ from mentor.candidate_compiler import (
     MAX_PREPARED_ANCHOR_CHARS,
     SynthesisResult,
 )
-from mentor.compilation import CompilationRun
+from mentor.compilation import CompilationRun, TokenPricing
 from mentor.compiler import SourceExtractor
 from mentor.derived_records import (
     Claim,
@@ -136,7 +136,7 @@ class SyntheticSynthesizer:
         self.stale = stale
         self.calls = []
 
-    def synthesize(self, *, snapshot_id, records, revisions, anchor_spans):
+    def synthesize(self, *, snapshot_id, records, revisions, anchor_spans, hints=()):
         self.calls.append((snapshot_id, tuple(record.record_id for record in records)))
         assert anchor_spans
         provenance = CompilerProvenance("synthetic-synthesizer", "synthesis-prompt-v1", "synthesis-schema-v1")
@@ -191,6 +191,11 @@ class SyntheticSynthesizer:
             unresolved_questions=("Which synthetic condition applies?",),
         )
         return SynthesisResult((relationship, evolution, conflict), provenance)
+
+
+class MissingPricingSynthesizer(SyntheticSynthesizer):
+    def preflight_live_pricing(self):
+        raise ValueError("GPT-5.6 Sol live synthesis requires complete caller-supplied pricing")
 
 
 class RawClaimBypassSynthesizer:
@@ -412,6 +417,170 @@ def test_replacement_reuses_unaffected_records_and_promotes_only_after_candidate
     assert storage.source_revision(replacement.revision_id).lifecycle_state == "active"
 
 
+def test_candidate_rejects_two_revisions_of_the_same_logical_source_before_any_stage_call(tmp_path):
+    storage, candidate_compiler, request, vector_client = compiler(tmp_path)
+    original = request.sources[0]
+    source = storage.library_source(original.revision.source_id)
+    replacement_text = "[00:00:02] Synthetic duplicate logical source revision."
+    replacement = SourceRevision.create(
+        source=source,
+        content_sha256=sha256(replacement_text.encode()).hexdigest(),
+        byte_size=len(replacement_text.encode()),
+        local_locator="C:/synthetic/duplicate-revision.txt",
+        observed_at=2.0,
+        lifecycle_state="replacement_pending",
+        remote_file_id="file_raw_duplicate_revision",
+    )
+    storage.store_source_revision(replacement)
+    replacement_anchor = SourceAnchor.create(
+        revision=replacement,
+        transcript=replacement_text,
+        start_offset=0,
+        end_offset=len(replacement_text),
+    )
+    duplicate_request = replace(
+        request,
+        sources=(
+            original,
+            CandidateSource(
+                replacement,
+                replacement_text,
+                {replacement_anchor.anchor_id: replacement_anchor},
+            ),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="logical source"):
+        candidate_compiler.build(duplicate_request)
+
+    assert candidate_compiler._extractor._client.responses.calls == []
+    assert vector_client.calls == []
+    assert storage.compilation_run(request.run.run_id) is None
+
+
+def test_changed_compiler_configuration_forces_reextraction_instead_of_record_reuse(tmp_path):
+    storage, first_compiler, first_request, _ = compiler(tmp_path)
+    first_result = first_compiler.build(first_request)
+    storage.transition_snapshot(first_result.snapshot.snapshot_id, "published", transitioned_at=2.0)
+    extraction_responses = QueueResponses([
+        {"candidates": [{
+            "family": "claim",
+            "anchors": [next(iter(source.anchors))],
+            "qualification": "Recompiled synthetic claim.",
+            "subject": f"Recompiled {index}",
+            "predicate": "guides",
+            "object": "bounded context",
+        }]}
+        for index, source in enumerate(first_request.sources, start=1)
+    ])
+    validation_responses = QueueResponses([
+        {"outcome": "affirmatively_supported", "audit": "Synthetic span supports recompilation."},
+        {"outcome": "affirmatively_supported", "audit": "Synthetic span supports recompilation."},
+    ])
+    second_compiler = CandidateCompiler(
+        storage=storage,
+        extractor=SourceExtractor(SimpleNamespace(responses=extraction_responses)),
+        validation_client=SimpleNamespace(responses=validation_responses),
+        synthesizer=SyntheticSynthesizer(),
+        vector_stores=VectorStoreAdapter(FakeVectorClient()),
+        orientation_budget=OrientationBudget(max_records=12, max_tokens=10_000),
+        readiness_checks=2,
+        sleep=lambda _seconds: None,
+    )
+    changed_request = BuildRequest(
+        run=CompilationRun("run_changed_compiler", "synthetic-v2", "prompt-v2", "schema-v2", 3.0),
+        sources=first_request.sources,
+        artifact_scope=ArtifactScope.PILOT,
+    )
+
+    result = second_compiler.build(changed_request)
+
+    assert result.ready is True
+    assert len(extraction_responses.calls) == len(first_request.sources)
+    assert storage.derived_record_reuse(result.snapshot.snapshot_id) == {}
+
+
+@pytest.mark.parametrize(
+    "missing_stage",
+    ("validation", "reconciliation"),
+)
+def test_live_pricing_preflight_fails_before_any_extraction_or_candidate_reservation(tmp_path, missing_stage):
+    synthesizer = MissingPricingSynthesizer() if missing_stage == "reconciliation" else SyntheticSynthesizer()
+    validation_pricing = TokenPricing(2.0, 4.0, 6.0) if missing_stage == "reconciliation" else None
+    storage, candidate_compiler, request, vector_client = compiler(
+        tmp_path,
+        synthesizer=synthesizer,
+        validation_model="gpt-5.6-sol",
+        live_mode=True,
+        validation_pricing=validation_pricing,
+    )
+
+    with pytest.raises(ValueError, match="pricing"):
+        candidate_compiler.build(request)
+
+    assert candidate_compiler._extractor._client.responses.calls == []
+    assert vector_client.calls == []
+    assert storage.compilation_run(request.run.run_id) is None
+
+
+def test_validated_concept_aliases_are_searchable_in_bounded_derived_artifacts(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3", runtime_scope="pilot")
+    storage.initialize()
+    sources = (
+        source_bundle(storage, "alias-earlier", 2025),
+        source_bundle(storage, "alias-later", 2026),
+    )
+    extraction_outputs = [
+        {"candidates": [{
+            "family": "claim",
+            "anchors": [next(iter(source.anchors))],
+            "qualification": "Synthetic alias claim.",
+            "subject": f"Canonical topic {index}",
+            "predicate": "guides",
+            "object": "bounded context",
+            "concept_hints": [{
+                "label": f"Canonical topic {index}",
+                "aliases": [f"Search alias {index}"],
+                "scope": "synthetic scope",
+                "role": "subject",
+                "position": None,
+            }],
+        }]}
+        for index, source in enumerate(sources, start=1)
+    ]
+    extraction_responses = QueueResponses(extraction_outputs)
+    validation_responses = QueueResponses([
+        {"outcome": "affirmatively_supported", "audit": "Synthetic alias is supported."},
+        {"outcome": "affirmatively_supported", "audit": "Synthetic alias is supported."},
+    ])
+    candidate_compiler = CandidateCompiler(
+        storage=storage,
+        extractor=SourceExtractor(SimpleNamespace(responses=extraction_responses)),
+        validation_client=SimpleNamespace(responses=validation_responses),
+        synthesizer=SyntheticSynthesizer(),
+        vector_stores=VectorStoreAdapter(FakeVectorClient()),
+        orientation_budget=OrientationBudget(max_records=12, max_tokens=10_000),
+        readiness_checks=2,
+        sleep=lambda _seconds: None,
+    )
+    request = BuildRequest(
+        run=CompilationRun("run_alias_artifacts", "synthetic", "prompt-v1", "schema-v1", 1.0),
+        sources=sources,
+        artifact_scope=ArtifactScope.PILOT,
+    )
+
+    result = candidate_compiler.build(request)
+
+    assert result.ready is True
+    artifact_payloads = [json.loads(artifact.content) for artifact in result.orientation_artifacts]
+    assert any(
+        "Search alias 1" in concept["aliases"]
+        for payload in artifact_payloads
+        for concept in payload["concepts"]
+    )
+    assert all("record_id" not in payload and "anchor_ids" not in payload for payload in artifact_payloads)
+
+
 def compiler(
     tmp_path,
     *,
@@ -422,6 +591,9 @@ def compiler(
     synthesizer=None,
     runtime_scope="pilot",
     artifact_scope=ArtifactScope.PILOT,
+    validation_model="synthetic-validator",
+    live_mode=False,
+    validation_pricing=None,
 ):
     storage = Storage(tmp_path / "mentor.sqlite3", runtime_scope=runtime_scope)
     storage.initialize()
@@ -460,6 +632,9 @@ def compiler(
         synthesizer=synthesizer or SyntheticSynthesizer(),
         vector_stores=VectorStoreAdapter(vector_client),
         orientation_budget=OrientationBudget(max_records=12, max_tokens=10_000),
+        validation_model=validation_model,
+        live_mode=live_mode,
+        validation_pricing=validation_pricing,
         readiness_checks=2,
         sleep=lambda _seconds: None,
     )
@@ -488,7 +663,8 @@ def test_build_composes_a_ready_unpublished_candidate_with_typed_bounded_artifac
     assert len(result.orientation_artifacts) <= 12
     assert all(len(artifact.content.encode()) <= 10_000 for artifact in result.orientation_artifacts)
     assert all("Synthetic earlier teaching" not in artifact.content for artifact in result.orientation_artifacts)
-    assert all(json.loads(artifact.content)["record_id"] == artifact.record_id for artifact in result.orientation_artifacts)
+    assert all("record_id" not in json.loads(artifact.content) for artifact in result.orientation_artifacts)
+    assert all("concepts" in json.loads(artifact.content) for artifact in result.orientation_artifacts)
     assert all(artifact.attributes["artifact_scope"] == "pilot" for artifact in result.orientation_artifacts)
     assert result.total_metric.call_count == sum(metric.call_count for metric in result.stage_metrics)
     assert result.total_metric.input_tokens == 44
@@ -669,6 +845,9 @@ def test_concrete_reconciliation_stage_builds_typed_provenanced_records_without_
     assert {record.family for record in synthesized} == {"relationship", "evolution", "conflict_unresolved"}
     assert all(record.compiler_provenance is not None for record in synthesized)
     assert next(metric for metric in result.stage_metrics if metric.stage == "synthesis").input_tokens == 11
+    assert result.reconciliation_coverage is not None
+    assert result.reconciliation_coverage.complete is True
+    assert result.reconciliation_coverage.input_record_count == 2
 
 
 def test_concrete_reconciler_rejects_relationship_without_explicit_evidence_references(tmp_path):

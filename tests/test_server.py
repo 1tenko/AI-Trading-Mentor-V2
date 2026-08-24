@@ -13,6 +13,7 @@ from mentor.derived_records import (
     Claim,
     ConflictUnresolved,
     Evolution,
+    ProcedureRecordBranch,
     ProcedureSequenceHierarchy,
     RecordDependency,
     Relationship,
@@ -20,6 +21,7 @@ from mentor.derived_records import (
 from mentor.knowledge import Collection, Source as LibrarySource, SourceRevision
 from mentor.server import create_server
 from mentor.storage import SourceChange, Storage, _safe_filename
+from mentor.synthesis import ConceptHint, SynthesisCandidate
 
 
 class FakeChatService:
@@ -126,6 +128,28 @@ def inspected_snapshot(storage, *, run_id="run_inspector", publish=True, persist
         object="Synthetic object",
     )
     storage.store_derived_record(record)
+    synthesis = SynthesisCandidate.from_records(
+        snapshot_id=snapshot.snapshot_id,
+        records=(record,),
+        hints=(
+            ConceptHint(
+                record.record_id,
+                "Synthetic subject",
+                aliases=("Synthetic alias",),
+                scope="synthetic scope",
+                role="subject",
+            ),
+        ),
+    )
+    storage.store_orientation_concept_ids(
+        snapshot.snapshot_id,
+        {record.record_id: synthesis.concept_ids_for_record(record.record_id)},
+        concepts=synthesis.concepts,
+        primary_concept_ids={
+            record.record_id: synthesis.primary_concept_id_for_record(record.record_id)
+        },
+        concept_occurrences=synthesis.concept_occurrences,
+    )
     storage.record_candidate_gate(
         snapshot.snapshot_id,
         (SourceProcessingResult(revision.revision_id, "processed", 1),),
@@ -235,6 +259,23 @@ def test_server_exposes_read_only_inspector_without_raw_or_private_payloads(tmp_
             "prompt_version": "synthetic-prompt",
             "schema_version": "synthetic-schema",
         }
+        subject_concept = next(
+            concept for concept in detail["concepts"]
+            if concept["canonical_label"] == "Synthetic subject"
+        )
+        assert subject_concept == {
+            "canonical_label": "Synthetic subject",
+            "aliases": ["Synthetic alias"],
+            "scope": "synthetic scope",
+            "supporting_record_count": 1,
+            "supporting_anchor_count": 1,
+            "occurrences": [{
+                "role": "subject",
+                "position": None,
+                "label": "synthetic subject",
+            }],
+        }
+        assert all("concept_id" not in concept for concept in detail["concepts"])
 
         status, _headers, body = request(
             server, "GET", f"/api/knowledge/snapshots/{snapshot.snapshot_id}/records/{record.record_id}"
@@ -242,11 +283,6 @@ def test_server_exposes_read_only_inspector_without_raw_or_private_payloads(tmp_
         record_payload = json.loads(body)
         assert status == 200
         assert record_payload["anchors"] == [{
-            "anchor_id": anchor.anchor_id,
-            "collection_id": anchor.collection_id,
-            "source_id": anchor.source_id,
-            "revision_id": anchor.revision_id,
-            "revision_sha256": anchor.revision_sha256,
             "filename": "synthetic.txt",
             "lesson_title": "Synthetic lesson",
             "author": "Synthetic Author",
@@ -254,12 +290,12 @@ def test_server_exposes_read_only_inspector_without_raw_or_private_payloads(tmp_
             "year": 2026,
             "timestamp_start_ms": 1000,
             "timestamp_end_ms": 1000,
-            "start_offset": 0,
-            "end_offset": len(transcript := "[00:00:01] PRIVATE RAW TRANSCRIPT BODY must never be returned."),
-            "span_fingerprint": anchor.span_fingerprint,
-            "locator_version": "transcript-v1",
         }]
-        assert record_payload["dependencies"] == [{"kind": "source_revision", "identifier": anchor.revision_id}]
+        assert record_payload["dependencies"] == [{"kind": "source_revision"}]
+        assert record_payload["concepts"]
+        assert all("concept_id" not in concept for concept in record_payload["concepts"])
+        assert "concept_id" not in record_payload
+        assert "concept_ids" not in record_payload
         assert b"PRIVATE RAW TRANSCRIPT BODY" not in body
 
         status, _headers, body = request(server, "GET", f"/api/knowledge/threads/{thread_id}/orientation")
@@ -356,7 +392,7 @@ def test_server_inspector_exposes_pending_failed_stale_and_dependency_state(tmp_
         detail = json.loads(body)
         assert status == 200
         assert detail["stale"] is True
-        assert detail["dependencies"] == [{"kind": "source_revision", "identifier": anchor.revision_id}]
+        assert detail["dependencies"] == [{"kind": "source_revision"}]
     finally:
         server.shutdown()
         worker.join()
@@ -387,6 +423,9 @@ def test_server_inspector_serializes_each_typed_derived_family_as_derived(tmp_pa
         qualification="Synthetic sequence.",
         kind="sequence",
         terms=("Observe", "Validate"),
+        prerequisites=("Context",),
+        conditions=("Only after confirmation",),
+        branches=(ProcedureRecordBranch("If invalid", ("Observe",)),),
     )
     evolution = Evolution.create(
         snapshot_id=snapshot.snapshot_id,
@@ -434,7 +473,17 @@ def test_server_inspector_serializes_each_typed_derived_family_as_derived(tmp_pa
     try:
         expected = {
             relationship.record_id: ("relationship", {"left": "Synthetic A", "relation": "supports", "right": "Synthetic B"}, "derived; independently validated against raw anchors"),
-            procedure.record_id: ("procedure_sequence_hierarchy", {"kind": "sequence", "terms": ["Observe", "Validate"]}, "derived; independently validated against raw anchors"),
+            procedure.record_id: (
+                "procedure_sequence_hierarchy",
+                {
+                    "kind": "sequence",
+                    "terms": ["Observe", "Validate"],
+                    "prerequisites": ["Context"],
+                    "conditions": ["Only after confirmation"],
+                    "branches": [{"condition": "If invalid", "steps": ["Observe"]}],
+                },
+                "derived; independently validated against raw anchors",
+            ),
             evolution.record_id: ("evolution", {"classification": "repeated", "negative_evidence_state": "positive_teaching"}, "derived; cross-source synthesis"),
             conflict.record_id: ("conflict_unresolved", {"kind": "unresolved", "reconciliation_state": "unresolved"}, "derived; cross-source synthesis"),
         }
@@ -655,6 +704,8 @@ def test_server_serves_the_persistent_chat_controls(tmp_path):
         assert b"overflow-x: clip" in stylesheet
         assert b"grid-template-columns: repeat(auto-fit, minmax(min(7rem, 100%), 1fr))" in stylesheet
         assert b".composer-wrap, .composer, .conversation, .message-content" in stylesheet
+        assert b"grid-template-columns: minmax(0, auto) minmax(0, 1fr)" in stylesheet
+        assert b".diagnostics dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }" in stylesheet
         standalone_composer = stylesheet.rsplit(b".composer {", 1)[1].split(b"}", 1)[0]
         assert b"max-width: 100%" not in standalone_composer
     finally:
@@ -704,6 +755,10 @@ def test_inspector_static_contract_omits_derived_and_raw_identifiers(tmp_path):
         assert b'aria-controls="inspector"' in page
         assert b'aria-expanded="false"' in page
         assert b"function recordContentFields" in script
+        assert b"Canonical concept" in script
+        assert b"Aliases" in script
+        assert b"Supporting records" in script
+        assert b"Occurrences" in script
         assert b"Object.entries(data.content" not in script
         assert b"content.negative_evidence_state" in script
         assert b"content.reconciliation_state" in script
@@ -711,6 +766,9 @@ def test_inspector_static_contract_omits_derived_and_raw_identifiers(tmp_path):
         assert b"content.earlier_source_set" not in script
         assert b"content.competing_record_ids" not in script
         assert b"data.concept_id" not in script
+        assert b'button.textContent = `${snapshot.status}' not in script
+        assert b'inspectorValue(section, "Snapshot", snapshot.snapshot_id)' not in script
+        assert b'inspectorValue(audit, "Conversation", data.thread_id)' not in script
         assert b"item.identifier" not in script
         assert b"context.record_ids" not in script
         assert b"anchor.revision_sha256" not in script

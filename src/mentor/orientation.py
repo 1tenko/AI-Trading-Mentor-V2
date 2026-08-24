@@ -2,7 +2,7 @@
 
 from dataclasses import asdict, dataclass
 import json
-from typing import Any
+from typing import Any, Iterable, Sequence
 
 from mentor.derived_records import (
     Claim,
@@ -15,6 +15,27 @@ from mentor.derived_records import (
     validate_record,
 )
 from mentor.vector_stores import VectorStoreSearchResult
+
+
+@dataclass(frozen=True)
+class OrientationConceptOccurrence:
+    """Display-safe concept usage; opaque concept/record identities stay server-owned."""
+
+    role: str
+    position: int | None
+    label: str
+
+
+@dataclass(frozen=True)
+class OrientationConceptSummary:
+    """Bounded semantic orientation without raw spans or private identifiers."""
+
+    canonical_label: str
+    aliases: tuple[str, ...]
+    scope: str | None
+    supporting_record_count: int
+    supporting_anchor_count: int
+    occurrences: tuple[OrientationConceptOccurrence, ...]
 
 
 @dataclass(frozen=True)
@@ -47,6 +68,7 @@ class OrientationRecord:
     source_area: OrientationSourceArea
     semantic_subtype: str = "unspecified"
     concept_ids: tuple[str, ...] = ()
+    concepts: tuple[OrientationConceptSummary, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -98,6 +120,12 @@ class OrientationService:
             if callable(links_reader)
             else {record_id: (concept_id,) for record_id, concept_id in local_concept_ids.items()}
         )
+        concepts_reader = getattr(self._storage, "orientation_concepts", None)
+        occurrences_reader = getattr(self._storage, "orientation_concept_occurrences", None)
+        local_concepts = tuple(concepts_reader(snapshot.snapshot_id)) if callable(concepts_reader) else ()
+        local_occurrences = (
+            tuple(occurrences_reader(snapshot.snapshot_id)) if callable(occurrences_reader) else ()
+        )
         remote_results = self._vector_stores.search(
             snapshot.derived_store_id,
             question,
@@ -106,7 +134,7 @@ class OrientationService:
         )
         return self._bound_results(
             snapshot, local_records, invalid_local_ids, local_concept_ids,
-            local_concept_links, remote_results,
+            local_concept_links, local_concepts, local_occurrences, remote_results,
         )
 
     def _current_local_records(self, snapshot_id: str) -> tuple[dict[str, DerivedRecord], set[str]]:
@@ -138,6 +166,8 @@ class OrientationService:
         invalid_local_ids: set[str],
         local_concept_ids: dict[str, str],
         local_concept_links: dict[str, tuple[str, ...]],
+        local_concepts: tuple[Any, ...],
+        local_occurrences: tuple[Any, ...],
         remote_results: list[VectorStoreSearchResult],
     ) -> OrientationResult:
         records: list[OrientationRecord] = []
@@ -161,6 +191,12 @@ class OrientationService:
                 concept_id,
                 self._storage.orientation_source_area(snapshot.snapshot_id, record),
                 concept_ids=concept_ids,
+                concepts=_concept_summaries(
+                    local_concepts,
+                    local_occurrences,
+                    concept_ids,
+                    record_id=record.record_id,
+                ),
             )
             record_tokens = _conservative_token_upper_bound(orientation_record)
             if len(records) >= self._budget.max_records or used_tokens + record_tokens > self._budget.max_tokens:
@@ -213,6 +249,7 @@ def render_orientation_artifact(
     source_area: tuple[str | None, int | None, str | None],
     *,
     max_bytes: int,
+    concepts: tuple[OrientationConceptSummary, ...] = (),
 ) -> str:
     """Render one compact derived record; raw transcript text is never an input."""
     validate_record(record)
@@ -222,8 +259,21 @@ def render_orientation_artifact(
         raise ValueError("orientation artifacts require a canonical concept ID")
     if not isinstance(max_bytes, int) or isinstance(max_bytes, bool) or max_bytes < 1:
         raise ValueError("orientation artifact budget must be positive")
+    orientation = _orientation_record(record, concept_id, source_area, concepts=concepts)
+    # The vector artifact is semantic navigation context, not an identity or
+    # citation payload. Opaque IDs and raw-source anchors remain local-only.
+    payload = {
+        "family": orientation.family,
+        "derived_kind": orientation.derived_kind,
+        "semantic_subtype": orientation.semantic_subtype,
+        "evidence_state": orientation.evidence_state,
+        "qualification": orientation.qualification,
+        "statement": orientation.statement,
+        "source_area": asdict(orientation.source_area),
+        "concepts": [asdict(concept) for concept in orientation.concepts],
+    }
     content = json.dumps(
-        asdict(_orientation_record(record, concept_id, source_area)),
+        payload,
         sort_keys=True,
         separators=(",", ":"),
     )
@@ -261,6 +311,7 @@ def _orientation_record(
     source_area: tuple[str | None, int | None, str | None],
     *,
     concept_ids: tuple[str, ...] | None = None,
+    concepts: tuple[OrientationConceptSummary, ...] = (),
 ) -> OrientationRecord:
     concept_ids = concept_ids or (concept_id,)
     return OrientationRecord(
@@ -275,7 +326,82 @@ def _orientation_record(
         anchor_ids=record.anchors,
         source_area=OrientationSourceArea(*_safe_source_area(source_area)),
         concept_ids=concept_ids,
+        concepts=concepts,
     )
+
+
+def concept_summaries(
+    concepts: Sequence[Any],
+    occurrences: Sequence[Any],
+    concept_ids: Iterable[str],
+    *,
+    record_id: str | None = None,
+) -> tuple[OrientationConceptSummary, ...]:
+    """Create safe, identity-free summaries from validated local concept rows."""
+    return _concept_summaries(concepts, occurrences, tuple(concept_ids), record_id=record_id)
+
+
+def _concept_summaries(
+    concepts: Sequence[Any],
+    occurrences: Sequence[Any],
+    concept_ids: tuple[str, ...],
+    *,
+    record_id: str | None,
+) -> tuple[OrientationConceptSummary, ...]:
+    wanted = set(concept_ids)
+    occurrences_by_concept: dict[str, list[Any]] = {}
+    for occurrence in occurrences:
+        occurrence_concept_id = getattr(occurrence, "concept_id", None)
+        if occurrence_concept_id not in wanted:
+            continue
+        if record_id is not None and getattr(occurrence, "record_id", None) != record_id:
+            continue
+        occurrences_by_concept.setdefault(occurrence_concept_id, []).append(occurrence)
+    result: list[OrientationConceptSummary] = []
+    for concept in concepts:
+        if getattr(concept, "concept_id", None) not in wanted:
+            continue
+        canonical_label = _safe_concept_text(getattr(concept, "canonical_label", None), 120)
+        if canonical_label is None:
+            continue
+        aliases = tuple(
+            alias
+            for value in getattr(concept, "aliases", ())
+            if (alias := _safe_concept_text(value, 120)) is not None
+        )
+        scope = _safe_concept_text(getattr(concept, "scope", None), 160)
+        concept_occurrences = []
+        for occurrence in occurrences_by_concept.get(concept.concept_id, ()):
+            role = _safe_concept_text(getattr(occurrence, "role", None), 120)
+            label = _safe_concept_text(getattr(occurrence, "label_key", None), 120)
+            position = getattr(occurrence, "position", None)
+            if role is None or label is None or (
+                position is not None
+                and (isinstance(position, bool) or not isinstance(position, int) or position < 0)
+            ):
+                continue
+            concept_occurrences.append(OrientationConceptOccurrence(role, position, label))
+        result.append(
+            OrientationConceptSummary(
+                canonical_label,
+                aliases,
+                scope,
+                len(tuple(getattr(concept, "supporting_record_ids", ()))),
+                len(tuple(getattr(concept, "supporting_anchor_ids", ()))),
+                tuple(concept_occurrences),
+            )
+        )
+    return tuple(result)
+
+
+def _safe_concept_text(value: object, maximum: int) -> str | None:
+    if not isinstance(value, str) or not value.strip() or len(value) > maximum:
+        return None
+    try:
+        reject_private_or_raw_text(value, "orientation concept")
+    except ValueError:
+        return None
+    return value
 
 
 def _statement(record: DerivedRecord) -> str:
@@ -340,5 +466,20 @@ def _conservative_token_upper_bound(record: OrientationRecord) -> int:
         record.source_area.collection_id or "",
         str(record.source_area.year or ""),
         record.source_area.scope or "",
+        *(
+            value
+            for concept in record.concepts
+            for value in (
+                concept.canonical_label,
+                *concept.aliases,
+                concept.scope or "",
+                str(concept.supporting_record_count),
+                str(concept.supporting_anchor_count),
+                *(
+                    f"{occurrence.role}:{occurrence.position}:{occurrence.label}"
+                    for occurrence in concept.occurrences
+                ),
+            )
+        ),
     )
     return len("\n".join(fields).encode("utf-8"))

@@ -35,8 +35,13 @@ from mentor.derived_records import (
     validate_record,
 )
 from mentor.knowledge import SourceRevision
-from mentor.orientation import OrientationBudget, render_orientation_artifact
-from mentor.synthesis import ConceptHint, SynthesisCandidate, SynthesisResult
+from mentor.orientation import OrientationBudget, concept_summaries, render_orientation_artifact
+from mentor.synthesis import (
+    ConceptHint,
+    ReconciliationCoverage,
+    SynthesisCandidate,
+    SynthesisResult,
+)
 
 
 _TERMINAL_REMOTE_FAILURES = frozenset({"cancelled", "expired", "failed"})
@@ -72,7 +77,7 @@ class CandidateSourcePreparer:
             or any(not isinstance(revision_id, str) or not revision_id for revision_id in revision_ids)
         ):
             raise ValueError("candidate preparation requires unique immutable revision IDs")
-        sources = []
+        revisions = []
         for revision_id in revision_ids:
             revision = self._storage.source_revision(revision_id)
             if revision is None:
@@ -81,6 +86,11 @@ class CandidateSourcePreparer:
                 raise ValueError("source revision is not candidate eligible")
             if not revision.remote_file_id:
                 raise ValueError("source revision is not remote eligible")
+            revisions.append(revision)
+        if len({revision.source_id for revision in revisions}) != len(revisions):
+            raise ValueError("candidate preparation cannot select multiple revisions of one logical source")
+        sources = []
+        for revision in revisions:
             path = Path(revision.local_locator)
             try:
                 raw = path.read_bytes()
@@ -147,6 +157,7 @@ class CandidateBuildResult:
     total_metric: CompilationMetric
     failures: tuple[str, ...]
     excluded_record_ids: tuple[str, ...] = ()
+    reconciliation_coverage: ReconciliationCoverage | None = None
 
 
 class CandidateCompiler:
@@ -189,11 +200,12 @@ class CandidateCompiler:
 
     def build(self, request: BuildRequest) -> CandidateBuildResult:
         requested_sources = _validate_request(request)
-        if request.revision_ids:
-            requested_sources = self._source_preparer.prepare(request.revision_ids)
         scope = request.artifact_scope.value
         if getattr(self._storage, "runtime_scope", None) != scope:
             raise ValueError("candidate artifact scope does not match runtime scope")
+        self._preflight_live_pricing()
+        if request.revision_ids:
+            requested_sources = self._source_preparer.prepare(request.revision_ids)
         sources = _canonical_sources(self._storage, requested_sources)
         for source in sources:
             _validate_candidate_source(source)
@@ -246,7 +258,7 @@ class CandidateCompiler:
         reused_records: tuple[DerivedRecord, ...] = ()
         reused_hints: tuple[ConceptHint, ...] = ()
         reused_revision_ids: set[str] = set()
-        if previous_snapshot is not None:
+        if previous_snapshot is not None and _compiler_config_matches(previous_snapshot, request.run):
             stale_predecessor_revisions = _stale_predecessor_revisions(
                 self._storage, previous_snapshot, sources, request.stale_revision_ids
             )
@@ -307,7 +319,6 @@ class CandidateCompiler:
                 _validate_extraction_result(extracted, source)
                 extraction_usage = _sum_usage(extraction_usage, extracted.usage)
                 extracted_candidate_count += len(extracted.candidates)
-                extraction_hints.extend(extracted.hints)
                 extraction_latency_ms += _elapsed_ms(extraction_started, self._clock())
             except Exception as error:
                 extraction_latency_ms += _elapsed_ms(extraction_started, self._clock())
@@ -329,6 +340,10 @@ class CandidateCompiler:
                             model=self._validation_model,
                             live_mode=self._live_mode,
                             pricing=self._validation_pricing,
+                            concept_hints=tuple(
+                                hint for hint in extracted.hints
+                                if hint.record_id == candidate.record_id
+                            ),
                         )
                         validation_usage = _sum_usage(validation_usage, outcome.usage)
                         if outcome.source_extracted is None:
@@ -339,6 +354,7 @@ class CandidateCompiler:
                             )
                         else:
                             accepted += 1
+                            extraction_hints.extend(outcome.validated_hints)
                     except Exception as error:
                         validation_failures += 1
                         source_failed = True
@@ -416,6 +432,7 @@ class CandidateCompiler:
                     ),
                     revisions=tuple(source.revision for source in sources),
                     anchor_spans=_source_anchor_spans(sources),
+                    hints=hints,
                 )
             if not isinstance(synthesized, SynthesisResult):
                 raise ValueError("synthesis stage must return SynthesisResult")
@@ -734,7 +751,22 @@ class CandidateCompiler:
             tuple(stage_metrics),
             total,
             (),
+            reconciliation_coverage=(
+                synthesized.coverage if isinstance(synthesized, SynthesisResult) else None
+            ),
         )
+
+    def _preflight_live_pricing(self) -> None:
+        for stage in (self._extractor, self._synthesizer):
+            preflight = getattr(stage, "preflight_live_pricing", None)
+            if callable(preflight):
+                preflight()
+        if self._validation_model == "gpt-5.6-sol":
+            if not self._live_mode or self._validation_pricing is None:
+                raise ValueError(
+                    "GPT-5.6 Sol live validation requires complete caller-supplied pricing"
+                )
+            self._validation_pricing.require_complete("validation")
 
     def _build_orientation_artifacts(
         self,
@@ -786,6 +818,12 @@ class CandidateCompiler:
                 concept_id,
                 (collection_id, year, record_scope),
                 max_bytes=self._orientation_budget.max_tokens,
+                concepts=concept_summaries(
+                    candidate.concepts,
+                    candidate.concept_occurrences,
+                    concept_ids,
+                    record_id=record.record_id,
+                ),
             )
             attributes: dict[str, str | int] = {
                 "snapshot_id": snapshot.snapshot_id,
@@ -1007,6 +1045,10 @@ def _validate_request(request: BuildRequest) -> tuple[CandidateSource, ...]:
     )
     if len(set(revision_ids)) != len(revision_ids):
         raise ValueError("candidate build revisions must be unique")
+    if request.sources and len({source.revision.source_id for source in request.sources}) != len(
+        request.sources
+    ):
+        raise ValueError("candidate build cannot select multiple revisions of one logical source")
     if (
         not isinstance(request.stale_revision_ids, tuple)
         or len(set(request.stale_revision_ids)) != len(request.stale_revision_ids)
@@ -1072,6 +1114,8 @@ def _canonical_sources(storage: Any, sources: tuple[CandidateSource, ...]) -> tu
         if canonical != source.revision:
             raise ValueError("requested source revision does not match canonical stored identity")
         canonical_sources.append(CandidateSource(canonical, source.transcript, source.anchors))
+    if len({source.revision.source_id for source in canonical_sources}) != len(canonical_sources):
+        raise ValueError("candidate build cannot select multiple revisions of one logical source")
     return tuple(canonical_sources)
 
 
@@ -1105,6 +1149,25 @@ def _validate_extraction_result(result: ExtractionResult, source: CandidateSourc
     for candidate in result.candidates:
         if not set(candidate.anchors) <= known_anchor_ids:
             raise ValueError("extraction returned an unknown deterministic anchor")
+    candidate_ids = {candidate.record_id for candidate in result.candidates}
+    if len(candidate_ids) != len(result.candidates):
+        raise ValueError("extraction returned duplicate candidate identities")
+    for hint in result.hints:
+        if not isinstance(hint, ConceptHint) or hint.record_id not in candidate_ids:
+            raise ValueError("extraction concept hint does not belong to an extracted candidate")
+
+
+def _compiler_config_matches(snapshot: CorpusSnapshot, run: CompilationRun) -> bool:
+    """Only identical compiler provenance may participate in selective reuse."""
+    return (
+        snapshot.model_version,
+        snapshot.prompt_version,
+        snapshot.schema_version,
+    ) == (
+        run.model_version,
+        run.prompt_version,
+        run.schema_version,
+    )
 
 
 def _validate_candidate_dependencies(

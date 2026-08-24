@@ -16,6 +16,8 @@ from mentor.prompts import MENTOR_INSTRUCTIONS
 from mentor.storage import Storage
 from mentor.orientation import (
     OrientationBudget,
+    OrientationConceptOccurrence,
+    OrientationConceptSummary,
     OrientationRecord,
     OrientationResult,
     OrientationSourceArea,
@@ -80,6 +82,16 @@ def orientation_result():
                 statement="Derived orientation cue that must not persist in replay.",
                 anchor_ids=("anc_orientation",),
                 source_area=OrientationSourceArea("collection_jacob", 2026, "timing"),
+                concepts=(
+                    OrientationConceptSummary(
+                        "Canonical timing",
+                        ("Timing alias",),
+                        "timing",
+                        2,
+                        2,
+                        (OrientationConceptOccurrence("left", None, "canonical timing"),),
+                    ),
+                ),
             ),
         ),
         used_tokens=96,
@@ -184,7 +196,16 @@ def test_broad_question_uses_a_server_owned_orientation_function_before_raw_sear
     ]
     function_output = responses.calls[1]["input"][-1]
     assert function_output["type"] == "function_call_output"
-    assert json.loads(function_output["output"])["records"][0]["record_id"] == "rec_orientation"
+    oriented_record = json.loads(function_output["output"])["records"][0]
+    assert oriented_record["record_id"] == "rec_orientation"
+    assert oriented_record["concepts"] == [{
+        "canonical_label": "Canonical timing",
+        "aliases": ["Timing alias"],
+        "scope": "timing",
+        "supporting_record_count": 2,
+        "supporting_anchor_count": 2,
+        "occurrences": [{"role": "left", "position": None, "label": "canonical timing"}],
+    }]
     diagnostics = storage.display_turns(1)[0]["diagnostics"]
     assert diagnostics["knowledge_context"] == {
         "status": "used",

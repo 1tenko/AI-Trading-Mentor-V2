@@ -15,6 +15,7 @@ from mentor.compilation import CompilationRun, CorpusSnapshot
 from mentor.derived_records import ConflictUnresolved, Evolution, ProcedureSequenceHierarchy, RecordDependency, Relationship
 from mentor.knowledge import Collection, Source, SourceRevision
 from mentor.storage import Storage
+from mentor.synthesis import ConceptHint
 from mentor.validation import SemanticValidator, ValidationResult, can_publish_source_extracted
 
 
@@ -128,6 +129,42 @@ def test_semantic_request_has_its_own_versioned_prompt_and_never_receives_extrac
     assert SEMANTIC_VALIDATION_PROMPT_VERSION in request["instructions"]
     assert "EXTRACTOR-RATIONALE-MUST-NOT-REACH-VALIDATOR" not in request["input"]
     assert "Wait for the liquidity sweep before entry." in request["input"]
+
+
+@pytest.mark.parametrize(
+    ("outcome", "retained"),
+    (("affirmatively_supported", True), ("unsupported", False)),
+)
+def test_alias_hints_cross_independent_validation_before_they_can_be_retained(outcome, retained):
+    revision, candidate, anchor = candidate_and_anchor()
+    hints = (
+        ConceptHint(candidate.record_id, "liquidity sweep", aliases=("LS",), scope="entry"),
+    )
+    responses = FakeResponses(FIXTURES[outcome])
+
+    result = SemanticValidator(SimpleNamespace(responses=responses)).validate(
+        candidate=candidate,
+        revision=revision,
+        transcript=TRANSCRIPT,
+        anchors={anchor.anchor_id: anchor},
+        concept_hints=hints,
+    )
+
+    validation_input = json.loads(responses.requests[0]["input"])
+    assert validation_input["record"]["concept_hints"] == [{
+        "label": "liquidity sweep",
+        "aliases": ["LS"],
+        "scope": "entry",
+        "role": None,
+        "position": None,
+    }]
+    assert result.validated_hints == (
+        (
+            replace(hints[0], record_id=result.source_extracted.record_id),
+        )
+        if retained
+        else ()
+    )
 
 
 @pytest.mark.parametrize(

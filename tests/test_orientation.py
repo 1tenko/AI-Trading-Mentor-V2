@@ -6,7 +6,7 @@ from mentor.compilation import CompilationRun, CorpusSnapshot
 from mentor.derived_records import Claim, RecordDependency, Relationship
 from mentor.knowledge import Collection, Source, SourceRevision
 from mentor.storage import Storage
-from mentor.synthesis import SynthesisCandidate
+from mentor.synthesis import ConceptHint, SynthesisCandidate
 from mentor.vector_stores import VectorStoreSearchResult
 
 
@@ -14,11 +14,15 @@ SNAPSHOT_ID = "snap_current"
 
 
 class FakeStorage:
-    def __init__(self, snapshot, records, concept_ids=None, source_areas=None):
+    def __init__(
+        self, snapshot, records, concept_ids=None, source_areas=None, concepts=(), occurrences=()
+    ):
         self.snapshot = snapshot
         self.records = list(records)
         self.concept_ids = dict(concept_ids or {})
         self.source_areas = dict(source_areas or {})
+        self.concepts = tuple(concepts)
+        self.occurrences = tuple(occurrences)
 
     def current_snapshot(self):
         return self.snapshot
@@ -34,6 +38,14 @@ class FakeStorage:
     def orientation_source_area(self, snapshot_id, record):
         assert snapshot_id == self.snapshot.snapshot_id
         return self.source_areas.get(record.record_id, (None, None, None))
+
+    def orientation_concepts(self, snapshot_id):
+        assert snapshot_id == self.snapshot.snapshot_id
+        return self.concepts
+
+    def orientation_concept_occurrences(self, snapshot_id):
+        assert snapshot_id == self.snapshot.snapshot_id
+        return self.occurrences
 
 
 class FakeVectorStores:
@@ -132,6 +144,49 @@ def test_orientation_searches_only_current_derived_store_and_omits_raw_search_te
     assert orientation.records[0].source_area.scope == "local market scope"
     assert "RAW TRANSCRIPT" not in repr(orientation)
     assert "citations" not in orientation.__dataclass_fields__
+
+
+def test_orientation_returns_safe_canonical_labels_aliases_and_occurrence_summaries():
+    from mentor.orientation import OrientationBudget, OrientationService
+
+    record = claim("canonical timing")
+    candidate = SynthesisCandidate.from_records(
+        snapshot_id=SNAPSHOT_ID,
+        records=(record,),
+        hints=(
+            ConceptHint(
+                record.record_id,
+                "canonical timing",
+                aliases=("timing alias",),
+                scope="synthetic scope",
+                role="subject",
+            ),
+        ),
+    )
+    concept_ids = {record.record_id: candidate.primary_concept_id_for_record(record.record_id)}
+    storage = FakeStorage(
+        published_snapshot(),
+        [record],
+        concept_ids,
+        concepts=candidate.concepts,
+        occurrences=candidate.concept_occurrences,
+    )
+    service = OrientationService(
+        storage,
+        FakeVectorStores([result(record)]),
+        budget=OrientationBudget(max_records=2, max_tokens=2_000),
+    )
+
+    orientation = service.consult("timing alias")
+
+    [concept] = orientation.records[0].concepts
+    assert concept.canonical_label == "canonical timing"
+    assert concept.aliases == ("timing alias",)
+    assert concept.scope == "synthetic scope"
+    assert concept.supporting_record_count == 1
+    assert concept.supporting_anchor_count == 1
+    assert concept.occurrences[0].role == "subject"
+    assert not hasattr(concept, "concept_id")
 
 
 def test_orientation_discards_wrong_snapshot_or_nonpublished_remote_results():

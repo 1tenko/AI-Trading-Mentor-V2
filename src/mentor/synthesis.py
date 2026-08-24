@@ -13,6 +13,7 @@ from mentor.derived_records import (
     ConflictUnresolved,
     DerivedRecord,
     Evolution,
+    ProcedureRecordBranch,
     ProcedureSequenceHierarchy,
     Relationship,
     RecordDependency,
@@ -27,10 +28,30 @@ MAX_ALIASES = 8
 MAX_SCOPE_LENGTH = 160
 MAX_CONDITION_LENGTH = 160
 MAX_JUSTIFICATION_LENGTH = 280
-SYNTHESIS_PROMPT_VERSION = "cross-source-synthesis-v2"
-SYNTHESIS_SCHEMA_VERSION = "cross-source-synthesis-schema-v2"
+SYNTHESIS_PROMPT_VERSION = "cross-source-synthesis-v3"
+SYNTHESIS_SCHEMA_VERSION = "cross-source-synthesis-schema-v3"
 SOL_MODEL = "gpt-5.6-sol"
-MAX_SYNTHESIS_RECORDS = 64
+MAX_SYNTHESIS_RECORDS_PER_CALL = 64
+MAX_SYNTHESIS_RECORDS_PER_CANDIDATE = 4_096
+MAX_RECONCILIATION_CALLS = 1_024
+
+
+@dataclass(frozen=True)
+class ReconciliationCoverage:
+    input_record_count: int
+    covered_record_ids: tuple[str, ...]
+    primary_call_count: int
+    bridge_call_count: int
+
+    @property
+    def complete(self) -> bool:
+        return self.input_record_count == len(self.covered_record_ids)
+
+
+@dataclass(frozen=True)
+class _ReconciliationBatch:
+    records: tuple[DerivedRecord, ...]
+    kind: str
 
 
 @dataclass(frozen=True)
@@ -40,6 +61,7 @@ class SynthesisResult:
     usage: CallUsage = CallUsage()
     hints: tuple[Any, ...] = ()
     call_count: int = 0
+    coverage: ReconciliationCoverage | None = None
 
 
 class SynthesisReconciler:
@@ -52,6 +74,8 @@ class SynthesisReconciler:
         model: str = "synthetic-synthesizer",
         live_mode: bool = False,
         max_records_per_call: int = 16,
+        max_total_records: int = MAX_SYNTHESIS_RECORDS_PER_CANDIDATE,
+        max_calls: int = MAX_RECONCILIATION_CALLS,
         pricing: TokenPricing | None = None,
     ):
         if model == SOL_MODEL and not live_mode:
@@ -61,14 +85,36 @@ class SynthesisReconciler:
         if (
             not isinstance(max_records_per_call, int)
             or isinstance(max_records_per_call, bool)
-            or max_records_per_call < 1
-            or max_records_per_call > MAX_SYNTHESIS_RECORDS
+            or max_records_per_call < 2
+            or max_records_per_call > MAX_SYNTHESIS_RECORDS_PER_CALL
         ):
             raise ValueError("synthesis batch size must be bounded")
+        if (
+            not isinstance(max_total_records, int)
+            or isinstance(max_total_records, bool)
+            or not 1 <= max_total_records <= MAX_SYNTHESIS_RECORDS_PER_CANDIDATE
+        ):
+            raise ValueError("synthesis candidate size must be bounded")
+        if (
+            not isinstance(max_calls, int)
+            or isinstance(max_calls, bool)
+            or not 1 <= max_calls <= MAX_RECONCILIATION_CALLS
+        ):
+            raise ValueError("synthesis call count must be bounded")
         self._client = client
         self._provenance = CompilerProvenance(model, SYNTHESIS_PROMPT_VERSION, SYNTHESIS_SCHEMA_VERSION)
         self._max_records_per_call = max_records_per_call
+        self._max_total_records = max_total_records
+        self._max_calls = max_calls
         self._pricing = pricing
+        self._live_mode = live_mode
+        self.preflight_live_pricing()
+
+    def preflight_live_pricing(self) -> None:
+        if self._provenance.model_version == SOL_MODEL:
+            if not self._live_mode or self._pricing is None:
+                raise ValueError("GPT-5.6 Sol live synthesis requires complete caller-supplied pricing")
+            self._pricing.require_complete("synthesis")
 
     def synthesize(
         self,
@@ -77,15 +123,23 @@ class SynthesisReconciler:
         records: Sequence[DerivedRecord],
         revisions: Sequence[object],
         anchor_spans: dict[str, str],
+        hints: Sequence[ConceptHint] = (),
     ) -> SynthesisResult:
         record_values = tuple(records)
+        hint_values = tuple(hints)
         revision_values = tuple(revisions)
         for record in record_values:
             validate_record(record)
             if record.snapshot_id != snapshot_id or record.validation_state != "validated":
                 raise ValueError("synthesis requires validated candidate records")
         if not record_values:
-            return SynthesisResult((), self._provenance)
+            return SynthesisResult(
+                (), self._provenance,
+                coverage=ReconciliationCoverage(0, (), 0, 0),
+            )
+        if len(record_values) > self._max_total_records:
+            raise ValueError("reconciliation input exceeds the candidate safety limit")
+        _validate_reconciliation_hints(record_values, hint_values)
         if not isinstance(anchor_spans, dict) or any(
             not isinstance(anchor_id, str) or not isinstance(span, str)
             for anchor_id, span in anchor_spans.items()
@@ -96,10 +150,14 @@ class SynthesisReconciler:
         }
         if None in known_revisions or len(known_revisions) != len(revision_values):
             raise ValueError("synthesis revisions require unique immutable IDs")
-        synthesized: list[DerivedRecord] = []
+        batches = _reconciliation_batches(record_values, self._max_records_per_call, hint_values)
+        if len(batches) > self._max_calls:
+            raise ValueError("reconciliation call plan exceeds the bounded safety limit")
+        synthesized_by_id: dict[str, DerivedRecord] = {}
         hints: list[ConceptHint] = []
         usage = CallUsage()
-        for batch in _reconciliation_batches(record_values, self._max_records_per_call):
+        for planned_batch in batches:
+            batch = planned_batch.records
             batch_record_ids = tuple(record.record_id for record in batch)
             batch_anchor_ids = tuple(
                 dict.fromkeys(anchor for record in batch for anchor in record.anchors)
@@ -124,11 +182,13 @@ class SynthesisReconciler:
                     f"Prompt version: {SYNTHESIS_PROMPT_VERSION}\n"
                     "Return only small typed cross-source relationship, procedure/sequence/hierarchy, "
                     "evolution, or conflict records plus explicit alias-aware concept hints. "
+                    "Keep procedure prerequisites, conditions, and conditional branches structured. "
                     "Use only supplied record, anchor, and revision IDs. Preserve uncertainty; do not claim raw authority."
                 ),
                 input=json.dumps(
                     {
                         "snapshot_id": snapshot_id,
+                        "reconciliation_batch": {"kind": planned_batch.kind},
                         "records": [asdict(record) for record in batch],
                         "revision_ids": list(batch_revision_ids),
                         "supporting_spans": {
@@ -148,7 +208,7 @@ class SynthesisReconciler:
                             "properties": {
                                 "records": {
                                     "type": "array",
-                                    "maxItems": MAX_SYNTHESIS_RECORDS,
+                                    "maxItems": MAX_SYNTHESIS_RECORDS_PER_CALL,
                                     "items": {"type": "object"},
                                 },
                                 "concept_hints": {"type": "array", "items": {"type": "object"}},
@@ -170,19 +230,32 @@ class SynthesisReconciler:
                 )
                 for payload in output
             )
-            known_record_ids = {record.record_id for record in synthesized}
-            new_records = tuple(record for record in batch_records if record.record_id not in known_record_ids)
-            synthesized.extend(new_records)
+            new_records = tuple(
+                record for record in batch_records if record.record_id not in synthesized_by_id
+            )
+            synthesized_by_id.update((record.record_id, record) for record in new_records)
             hints.extend(
                 hint for hint in _synthesis_hints(hint_payloads, batch_records)
                 if hint.record_id in {record.record_id for record in new_records}
             )
             usage = _sum_usage(usage, usage_from_response(response, pricing=self._pricing))
-            if len(synthesized) > MAX_SYNTHESIS_RECORDS:
+            if len(synthesized_by_id) > self._max_total_records:
                 raise ValueError("batched synthesis exceeded the candidate output limit")
+        primary_batches = tuple(batch for batch in batches if batch.kind == "primary")
+        bridge_batches = tuple(batch for batch in batches if batch.kind != "primary")
+        covered_record_ids = tuple(sorted({
+            record.record_id for batch in primary_batches for record in batch.records
+        }))
+        coverage = ReconciliationCoverage(
+            len(record_values), covered_record_ids, len(primary_batches), len(bridge_batches)
+        )
+        if not coverage.complete or set(covered_record_ids) != {
+            record.record_id for record in record_values
+        }:
+            raise ValueError("reconciliation coverage is incomplete")
         return SynthesisResult(
-            tuple(synthesized), self._provenance, usage, tuple(hints),
-            call_count=len(_reconciliation_batches(record_values, self._max_records_per_call)),
+            tuple(synthesized_by_id.values()), self._provenance, usage, tuple(hints),
+            call_count=len(batches), coverage=coverage,
         )
 
 
@@ -201,7 +274,7 @@ def _synthesis_output(response: Any) -> tuple[list[object], list[object]]:
         or not isinstance(payload.get("concept_hints", []), list)
     ):
         raise ValueError("synthesis response requires records and optional concept hints")
-    if len(payload["records"]) > MAX_SYNTHESIS_RECORDS:
+    if len(payload["records"]) > MAX_SYNTHESIS_RECORDS_PER_CALL:
         raise ValueError("too many synthesis records")
     return payload["records"], payload.get("concept_hints", [])
 
@@ -246,11 +319,17 @@ def _synthesis_record(
             right=payload.get("right"),
         )
     if family == "procedure_sequence_hierarchy":
-        _allow_synthesis_fields(payload, base_fields | {"kind", "terms"})
+        _allow_synthesis_fields(
+            payload,
+            base_fields | {"kind", "terms", "prerequisites", "conditions", "branches"},
+        )
         return ProcedureSequenceHierarchy.create(
             **common,
             kind=payload.get("kind"),
             terms=_payload_texts(payload.get("terms")),
+            prerequisites=_payload_texts(payload.get("prerequisites", []), allow_empty=True),
+            conditions=_payload_texts(payload.get("conditions", []), allow_empty=True),
+            branches=_payload_procedure_branches(payload.get("branches", [])),
         )
     if family == "evolution":
         fields = base_fields | {
@@ -310,7 +389,7 @@ def _synthesis_record(
 def _synthesis_hints(
     payloads: list[object], records: tuple[DerivedRecord, ...]
 ) -> tuple[ConceptHint, ...]:
-    if len(payloads) > MAX_SYNTHESIS_RECORDS:
+    if len(payloads) > MAX_SYNTHESIS_RECORDS_PER_CALL:
         raise ValueError("too many synthesis concept hints")
     result = []
     for payload in payloads:
@@ -349,25 +428,162 @@ def _synthesis_hints(
 
 
 def _reconciliation_batches(
-    records: tuple[DerivedRecord, ...], max_records: int
+    records: tuple[DerivedRecord, ...],
+    max_records: int,
+    hints: tuple[ConceptHint, ...] = (),
+) -> tuple[_ReconciliationBatch, ...]:
+    """Build complete bounded primary coverage plus semantic and global bridge passes."""
+    components = _affinity_components(records, hints)
+    units: list[tuple[int, tuple[DerivedRecord, ...]]] = []
+    for component_index, component in enumerate(components):
+        units.extend(
+            (component_index, component[start : start + max_records])
+            for start in range(0, len(component), max_records)
+        )
+
+    primary_records: list[tuple[DerivedRecord, ...]] = []
+    primary_components: list[set[int]] = []
+    current: list[DerivedRecord] = []
+    current_components: set[int] = set()
+    for component_index, unit in units:
+        if current and len(current) + len(unit) > max_records:
+            primary_records.append(tuple(current))
+            primary_components.append(set(current_components))
+            current = []
+            current_components = set()
+        current.extend(unit)
+        current_components.add(component_index)
+    if current:
+        primary_records.append(tuple(current))
+        primary_components.append(current_components)
+
+    bridges: list[_ReconciliationBatch] = []
+    if max_records >= 2:
+        for component_index, component in enumerate(components):
+            containing = [
+                batch
+                for batch, component_ids in zip(primary_records, primary_components)
+                if component_index in component_ids
+            ]
+            representatives = tuple(
+                next(record for record in batch if record in component)
+                for batch in containing
+            )
+            bridges.extend(
+                _hub_bridge_batches(representatives, max_records, "affinity_bridge")
+            )
+
+        # Connect every bounded primary batch into one reconciliation graph.
+        # Affinity-specific bridges above handle a concept that spans batches;
+        # boundary bridges provide complete cross-batch connectivity without
+        # injecting the corpus into one prompt.
+        bridges.extend(
+            _ReconciliationBatch((left[-1], right[0]), "global_bridge")
+            for left, right in zip(primary_records, primary_records[1:])
+        )
+
+    primary = tuple(_ReconciliationBatch(batch, "primary") for batch in primary_records)
+    seen = {tuple(record.record_id for record in batch.records) for batch in primary}
+    deduplicated_bridges = []
+    for bridge in bridges:
+        key = tuple(record.record_id for record in bridge.records)
+        if key not in seen:
+            seen.add(key)
+            deduplicated_bridges.append(bridge)
+    return primary + tuple(deduplicated_bridges)
+
+
+def _hub_bridge_batches(
+    representatives: tuple[DerivedRecord, ...], max_records: int, kind: str
+) -> tuple[_ReconciliationBatch, ...]:
+    if len(representatives) < 2:
+        return ()
+    hub = representatives[0]
+    width = max_records - 1
+    return tuple(
+        _ReconciliationBatch((hub, *representatives[start : start + width]), kind)
+        for start in range(1, len(representatives), width)
+    )
+
+
+def _affinity_components(
+    records: tuple[DerivedRecord, ...], hints: tuple[ConceptHint, ...]
 ) -> tuple[tuple[DerivedRecord, ...], ...]:
-    """Keep related record terms adjacent while bounding every model request."""
-    ordered = tuple(sorted(records, key=lambda record: (_record_cluster_key(record), record.record_id)))
-    primary = tuple(
-        ordered[start : start + max_records]
-        for start in range(0, len(ordered), max_records)
+    by_id = {record.record_id: record for record in records}
+    keys = {record.record_id: _record_affinity_keys(record) for record in records}
+    for hint in hints:
+        keys[hint.record_id].update(
+            _semantic_affinity_keys((hint.label, *hint.aliases))
+        )
+    parents = {record.record_id: record.record_id for record in records}
+
+    def find(record_id: str) -> str:
+        while parents[record_id] != record_id:
+            parents[record_id] = parents[parents[record_id]]
+            record_id = parents[record_id]
+        return record_id
+
+    def union(first: str, second: str) -> None:
+        left, right = find(first), find(second)
+        if left != right:
+            parents[max(left, right)] = min(left, right)
+
+    inverted: dict[str, list[str]] = {}
+    for record_id, record_keys in keys.items():
+        for key in record_keys:
+            inverted.setdefault(key, []).append(record_id)
+    for record_ids in inverted.values():
+        for record_id in record_ids[1:]:
+            union(record_ids[0], record_id)
+
+    grouped: dict[str, list[DerivedRecord]] = {}
+    for record_id in sorted(by_id):
+        grouped.setdefault(find(record_id), []).append(by_id[record_id])
+    return tuple(
+        tuple(sorted(component, key=lambda record: record.record_id))
+        for _root, component in sorted(grouped.items())
     )
-    if len(primary) < 2 or max_records < 2:
-        return primary
-    bridges = tuple(
-        (primary[index][-1], primary[index + 1][0])
-        for index in range(len(primary) - 1)
-    )
-    return primary + bridges
 
 
-def _record_cluster_key(record: DerivedRecord) -> str:
-    return _label_key(_record_occurrence_terms(record)[0][2])
+_AFFINITY_STOPWORDS = frozenset(
+    {"a", "an", "and", "bounded", "concept", "context", "distinct", "meaning", "record", "synthetic", "the", "topic"}
+)
+
+
+def _record_affinity_keys(record: DerivedRecord) -> set[str]:
+    return _semantic_affinity_keys(
+        tuple(label for _role, _position, label in _record_occurrence_terms(record))
+    )
+
+
+def _semantic_affinity_keys(labels: Sequence[str]) -> set[str]:
+    result = set()
+    for label in labels:
+        normalized = _label_key(label)
+        tokens = tuple(
+            token for token in normalized.replace("-", " ").split()
+            if len(token) > 2 and token not in _AFFINITY_STOPWORDS
+        )
+        if tokens:
+            result.add(f"label:{normalized}")
+            result.update(f"token:{token}" for token in tokens)
+    return result
+
+
+def _validate_reconciliation_hints(
+    records: tuple[DerivedRecord, ...], hints: tuple[ConceptHint, ...]
+) -> None:
+    record_ids = {record.record_id for record in records}
+    for hint in hints:
+        if not isinstance(hint, ConceptHint) or hint.record_id not in record_ids:
+            raise ValueError("reconciliation hints require candidate-owned records")
+        _label_key(hint.label)
+        _require_labels(hint.aliases, _label_key(hint.label))
+        if hint.scope is not None:
+            _scope_key(hint.scope)
+        if hint.role is not None:
+            _role_key(hint.role)
+        _require_position(hint.position)
 
 
 def _sum_usage(first: CallUsage, second: CallUsage) -> CallUsage:
@@ -420,6 +636,25 @@ def _payload_years(value: object) -> tuple[int, ...]:
     if not isinstance(value, list):
         raise ValueError("synthesis years must be a list")
     return tuple(value)
+
+
+def _payload_procedure_branches(value: object) -> tuple[ProcedureRecordBranch, ...]:
+    if not isinstance(value, list) or len(value) > MAX_SYNTHESIS_RECORDS_PER_CALL:
+        raise ValueError("synthesis procedure branches must be a bounded list")
+    branches = []
+    for item in value:
+        if not isinstance(item, dict) or set(item) != {"condition", "steps"}:
+            raise ValueError("synthesis procedure branches must be structured")
+        condition = item["condition"]
+        if not isinstance(condition, str) or not condition.strip():
+            raise ValueError("synthesis procedure branch condition must be non-empty text")
+        branches.append(
+            ProcedureRecordBranch(
+                condition,
+                _payload_texts(item["steps"]),
+            )
+        )
+    return tuple(branches)
 
 
 def _allow_synthesis_fields(payload: dict[str, object], allowed: set[str]) -> None:
@@ -675,11 +910,38 @@ class SynthesisCandidate:
         record = self._record(record_id)
         if not isinstance(record, ProcedureSequenceHierarchy) or record.kind != "procedure":
             raise ValueError("procedure synthesis requires a procedure record")
+        if not prerequisite_concept_ids and record.prerequisites:
+            prerequisite_concept_ids = tuple(
+                self._concept_id_for_occurrence(
+                    record.record_id, "prerequisite", position, prerequisite, scope=None
+                )
+                for position, prerequisite in enumerate(record.prerequisites)
+            )
         _require_concept_ids(prerequisite_concept_ids, self.concepts, allow_empty=True)
         if not isinstance(step_scopes, tuple) or (step_scopes and len(step_scopes) != len(record.terms)):
             raise ValueError("procedure step scopes must match ordered steps")
         step_scopes = step_scopes or (None,) * len(record.terms)
         conditions = self._procedure_conditions(record)
+        if not branches and record.branches:
+            flat_position = 0
+            derived_branches = []
+            for branch in record.branches:
+                branch_concept_ids = []
+                for step in branch.steps:
+                    branch_concept_ids.append(
+                        self._concept_id_for_occurrence(
+                            record.record_id,
+                            "branch_step",
+                            flat_position,
+                            step,
+                            scope=None,
+                        )
+                    )
+                    flat_position += 1
+                derived_branches.append(
+                    ProcedureBranch(branch.condition, tuple(branch_concept_ids))
+                )
+            branches = tuple(derived_branches)
         branches = _normalized_branches(branches, self.concepts, conditions)
         inputs = self._supporting_records(record)
         steps = tuple(
@@ -804,7 +1066,11 @@ class SynthesisCandidate:
         return occurrence.concept_id
 
     def _procedure_conditions(self, record: ProcedureSequenceHierarchy) -> tuple[str, ...]:
-        conditions = tuple(facet.value for facet in record.facets if facet.name == "condition")
+        conditions = tuple(dict.fromkeys((
+            *record.conditions,
+            *(facet.value for facet in record.facets if facet.name == "condition"),
+            *(branch.condition for branch in record.branches),
+        )))
         for condition in conditions:
             _require_condition(condition)
         return conditions
@@ -938,6 +1204,7 @@ def _cluster_concepts(
 
     nodes: dict[tuple[str | None, str], list[tuple[DerivedRecord, str]]] = {}
     edges: dict[tuple[str | None, str], set[tuple[str | None, str]]] = {}
+    display_labels: dict[tuple[str | None, str], str] = {}
     scope_values: dict[str | None, str | None] = {None: None}
     for record, _, _, label, scope, aliases in occurrences.values():
         scope_key = _scope_key(scope)
@@ -945,10 +1212,12 @@ def _cluster_concepts(
         node = (scope_key, _label_key(label))
         nodes.setdefault(node, []).append((record, label))
         edges.setdefault(node, set())
+        display_labels.setdefault(node, label)
         for alias in aliases:
             alias_node = (scope_key, _label_key(alias))
             edges.setdefault(alias_node, set()).add(node)
             edges[node].add(alias_node)
+            display_labels.setdefault(alias_node, alias)
 
     concepts = []
     concept_occurrences = []
@@ -968,8 +1237,11 @@ def _cluster_concepts(
         labels = [item for node in component for item in nodes.get(node, ())]
         canonical_label = min((label for _, label in labels), key=lambda label: (_label_key(label), label))
         canonical_key = _label_key(canonical_label)
-        alias_keys = {node[1] for node in component} - {canonical_key}
-        aliases = tuple(sorted(alias_keys))
+        alias_nodes = sorted(
+            (node for node in component if node[1] != canonical_key),
+            key=lambda node: (node[1], display_labels[node]),
+        )
+        aliases = tuple(display_labels[node] for node in alias_nodes)
         supporting_records = tuple(dict.fromkeys(record.record_id for record, _ in labels))
         supporting_anchors = tuple(dict.fromkeys(anchor for record, _ in labels for anchor in record.anchors))
         concept = Concept.create(
@@ -1002,7 +1274,12 @@ def _record_occurrence_terms(record: DerivedRecord) -> tuple[tuple[str, int | No
     if isinstance(record, Relationship):
         return ("left", None, record.left), ("right", None, record.right)
     if isinstance(record, ProcedureSequenceHierarchy):
-        return tuple(("term", position, term) for position, term in enumerate(record.terms))
+        branch_steps = tuple(step for branch in record.branches for step in branch.steps)
+        return (
+            *(('term', position, term) for position, term in enumerate(record.terms)),
+            *(('prerequisite', position, term) for position, term in enumerate(record.prerequisites)),
+            *(('branch_step', position, term) for position, term in enumerate(branch_steps)),
+        )
     if isinstance(record, Evolution):
         return (
             ("subject", None, record.subject),

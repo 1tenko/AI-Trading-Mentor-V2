@@ -1,9 +1,11 @@
 import json
+from copy import deepcopy
 from hashlib import sha256
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from openai.lib._pydantic import _ensure_strict_json_schema
 
 from mentor.compiler import SourceExtractor
 from mentor.compilation import CompilationRun, CorpusSnapshot, TokenPricing
@@ -13,7 +15,7 @@ from mentor.compiler_prompts import (
     EXTRACTION_SCHEMA_VERSION,
 )
 from mentor.knowledge import Collection, Source, SourceRevision
-from mentor.derived_records import ProcedureSequenceHierarchy, Relationship
+from mentor.derived_records import ProcedureRecordBranch, ProcedureSequenceHierarchy, Relationship
 from mentor.storage import Storage
 
 
@@ -80,6 +82,32 @@ def test_extracts_bounded_pending_candidates_for_one_revision_with_versioned_req
     assert revision.revision_id in responses.requests[0]["input"]
 
 
+def test_extracted_strategy_implication_remains_raw_taught_only_pending_independent_validation():
+    payload = {
+        "candidates": [{
+            "family": "claim",
+            "anchors": ["anc_strategy"],
+            "qualification": "The synthetic source explicitly teaches this implication.",
+            "subject": "context",
+            "predicate": "implies",
+            "object": "a bounded action",
+            "semantic_subtype": "strategy_implication",
+            "concept_hints": [],
+        }]
+    }
+    extractor, _responses = extractor_for(payload)
+
+    [candidate] = extractor.extract(
+        revision=revision_for(),
+        snapshot_id="snap_synthetic",
+        transcript="Synthetic source text.",
+    ).candidates
+
+    assert candidate.derived_kind == "source_extracted_claim"
+    assert candidate.evidence_state == "raw_taught"
+    assert candidate.validation_state == "pending"
+
+
 def test_live_sol_extraction_requires_pricing_and_records_reasoning_cost():
     response = SimpleNamespace(
         output_text=json.dumps(FIXTURES["empty"]),
@@ -115,7 +143,7 @@ def test_concrete_extraction_emits_relationship_procedure_and_alias_hints():
                 "anchors": ["anc_relationship"],
                 "qualification": "Synthetic relationship.",
                 "left": "Primary signal",
-                "relation": "depends_on",
+                "relation": "anticipates",
                 "right": "Context filter",
                 "concept_hints": [
                     {
@@ -133,6 +161,11 @@ def test_concrete_extraction_emits_relationship_procedure_and_alias_hints():
                 "qualification": "Synthetic ordered process.",
                 "kind": "procedure",
                 "terms": ["Observe", "Validate", "Act"],
+                "prerequisites": ["Market context"],
+                "conditions": ["Only after confirmation"],
+                "branches": [
+                    {"condition": "If confirmation fails", "steps": ["Observe"]}
+                ],
                 "concept_hints": [
                     {
                         "label": "Validate",
@@ -157,6 +190,12 @@ def test_concrete_extraction_emits_relationship_procedure_and_alias_hints():
     assert isinstance(result.candidates[0], Relationship)
     assert isinstance(result.candidates[1], ProcedureSequenceHierarchy)
     assert all(record.derived_kind == "source_extracted_claim" for record in result.candidates)
+    assert result.candidates[0].relation == "anticipates"
+    assert result.candidates[1].prerequisites == ("Market context",)
+    assert result.candidates[1].conditions == ("Only after confirmation",)
+    assert result.candidates[1].branches == (
+        ProcedureRecordBranch("If confirmation fails", ("Observe",)),
+    )
     assert result.hints[0].aliases == ("PS",)
     assert result.hints[1].role == "term"
     assert result.hints[1].position == 1
@@ -172,7 +211,8 @@ def test_allows_a_source_to_yield_zero_candidates():
 
 
 def test_schema_and_parser_share_hard_anchor_bounds():
-    anchor_schema = EXTRACTION_RESPONSE_SCHEMA["properties"]["candidates"]["items"]["properties"]["anchors"]
+    candidate_schemas = EXTRACTION_RESPONSE_SCHEMA["properties"]["candidates"]["items"]["anyOf"]
+    anchor_schema = candidate_schemas[0]["properties"]["anchors"]
     assert anchor_schema["maxItems"] == 8
     assert anchor_schema["items"]["maxLength"] == 128
     payload = json.loads(json.dumps(FIXTURES["claim"]))
@@ -190,6 +230,25 @@ def test_parser_rejects_an_anchor_id_past_the_schema_limit():
 
     with pytest.raises(ValueError, match="invalid candidate anchor"):
         extractor.extract(revision=revision_for(), snapshot_id="snap_synthetic", transcript="Synthetic source text.")
+
+
+def test_extraction_schema_is_already_strict_under_the_installed_openai_sdk_contract():
+    schema = deepcopy(EXTRACTION_RESPONSE_SCHEMA)
+    converted = _ensure_strict_json_schema(schema, path=(), root=schema)
+
+    assert converted == EXTRACTION_RESPONSE_SCHEMA
+
+    pending = [converted]
+    while pending:
+        value = pending.pop()
+        if isinstance(value, dict):
+            properties = value.get("properties")
+            if isinstance(properties, dict):
+                assert value.get("additionalProperties") is False
+                assert set(value.get("required", ())) == set(properties)
+            pending.extend(value.values())
+        elif isinstance(value, list):
+            pending.extend(value)
 
 
 def test_pending_extracted_candidate_cannot_bypass_semantic_validation_storage(tmp_path):
