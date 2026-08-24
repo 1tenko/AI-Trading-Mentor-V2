@@ -75,11 +75,20 @@ procedure, 2025/2026 comparison, exception/condition, synthesis/evolution,
 and conflict/uncertainty material.
 
 The manifest must be selected from the migrated `SourceRevision` inventory;
-lesson filenames or legacy upload IDs are not substitutes. The current local
-runtime still has only the legacy source registrations, so it has no eligible
-revision inventory from which to create that artifact. It remains intentionally
-absent until a separately authorized migration can establish the immutable
-revision identities. No raw transcript was opened to work around this boundary.
+lesson filenames or legacy upload IDs are not substitutes. On 2026-08-24, Theo
+authorized the local-only immutable revision migration needed for Task 19. The
+migration was proven on an ignored runtime copy before being applied to the
+normal local database: all 150 legacy registrations remained intact, all 150
+mapped to one active immutable revision with preserved remote linkage, no
+exceptions or duplicates were found, and a second run was idempotent. Phase 2
+conversation, replay, display, citation/evidence, diagnostic, and settings data
+remained byte-for-byte unchanged. A socket-level guard recorded zero network
+attempts and the OpenAI SDK was not imported.
+
+The resulting six-revision Gate 1 manifest validated successfully and remains
+private under the ignored `data/pilots/` tree. It contains no transcript bodies
+and has not been compiled. The pre-migration backup and disposable verification
+runtime are also ignored local artifacts.
 
 ## Measured-cost protocol
 
