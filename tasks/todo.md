@@ -93,7 +93,7 @@ Stay on feature/phase-3-knowledge-assimilation. Do not begin Phase 4.
 - [x] **Task 16 — Read-only Knowledge Inspector API**
   - Depends on: Task 15. Verify: loopback/read-only/safe-JSON API tests;
     full pytest.
-- [ ] **Task 17 — Minimal static Assimilation Inspector**
+- [x] **Task 17 — Minimal static Assimilation Inspector**
   - Depends on: Task 16. Verify: full pytest and desktop/compact browser smoke.
 
 ## phase-3-evaluation
