@@ -13,7 +13,7 @@ from mentor.storage import Storage
 
 def main() -> None:
     config = load_config(os.environ, Path(".env"))
-    storage = Storage(Path("data") / "mentor.sqlite3")
+    storage = Storage(Path("data") / "mentor.sqlite3", runtime_scope=config.runtime_scope)
     storage.initialize()
     server = create_server(storage, ChatService(storage, OpenAI(api_key=config.api_key), config.model))
     print("Open http://127.0.0.1:8765 in your browser. Press Ctrl+C to stop.")

@@ -5,6 +5,11 @@ from pathlib import Path
 from typing import Mapping
 
 
+PRODUCTION_RUNTIME_SCOPE = "production"
+PILOT_RUNTIME_SCOPE = "pilot"
+RUNTIME_SCOPES = frozenset({PRODUCTION_RUNTIME_SCOPE, PILOT_RUNTIME_SCOPE})
+
+
 class ConfigError(RuntimeError):
     """Raised when the private application cannot start safely."""
 
@@ -14,6 +19,7 @@ class Config:
     api_key: str
     model: str = "gpt-5.6-sol"
     vector_store_preflight_approved: bool = False
+    runtime_scope: str = PRODUCTION_RUNTIME_SCOPE
 
     def require_vector_store_preflight(self) -> None:
         if not self.vector_store_preflight_approved:

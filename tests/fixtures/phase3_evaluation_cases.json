@@ -1,0 +1,13 @@
+[
+  {"case_id": "raw-authority", "category": "source_authority", "prompt": "Verify a synthetic teaching against its raw source."},
+  {"case_id": "provenance", "category": "provenance", "prompt": "Separate a synthetic extracted claim from synthesis."},
+  {"case_id": "coverage", "category": "coverage", "prompt": "Report every processed or failed synthetic source."},
+  {"case_id": "anchor", "category": "anchor_precision", "prompt": "Verify a synthetic source range and timestamp."},
+  {"case_id": "evolution", "category": "evolution", "prompt": "Compare an earlier and later synthetic teaching."},
+  {"case_id": "conflict", "category": "conflict", "prompt": "Keep two incompatible synthetic passages unresolved."},
+  {"case_id": "orientation", "category": "orientation", "prompt": "Connect several synthetic concepts before raw verification."},
+  {"case_id": "baseline", "category": "baseline_comparison", "prompt": "Compare baseline and assimilated synthetic answers."},
+  {"case_id": "exhaustive", "category": "exhaustive", "prompt": "Find every synthetic mapping and search for omissions."},
+  {"case_id": "timestamp", "category": "exact_timestamp", "prompt": "Find the exact timestamp for a synthetic statement."},
+  {"case_id": "correction", "category": "adversarial_correction", "prompt": "Reject and correct a fabricated synthetic claim."}
+]

@@ -33,6 +33,12 @@ STATIC_ASSETS = {
 
 def create_server(storage: Storage, chat_service: Any, port: int = 8765) -> ThreadingHTTPServer:
     """Create a server bound exclusively to this computer's loopback address."""
+    service_storage = getattr(chat_service, "storage", None)
+    if isinstance(service_storage, Storage) and (
+        service_storage.database_path.resolve() != storage.database_path.resolve()
+        or service_storage.runtime_scope != storage.runtime_scope
+    ):
+        raise ValueError("server and chat service must use the same runtime")
 
     class Handler(_Handler):
         pass

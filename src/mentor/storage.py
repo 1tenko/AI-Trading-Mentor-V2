@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Mapping
 
 from mentor.anchors import LOCATOR_VERSION, SourceAnchor
+from mentor.config import PRODUCTION_RUNTIME_SCOPE, RUNTIME_SCOPES
 from mentor.compilation import CandidateGateResult, CompilationMetric, CompilationRun, CorpusSnapshot, SourceProcessingResult
 from mentor.dependencies import DependencyEdge, DependencyGraph, DependencyNode
 from mentor.derived_records import (
@@ -93,8 +94,11 @@ _CANDIDATE_GATE_STRUCTURE_VERSION = "record-structure-v1"
 
 
 class Storage:
-    def __init__(self, database_path: Path):
+    def __init__(self, database_path: Path, runtime_scope: str = PRODUCTION_RUNTIME_SCOPE):
+        if runtime_scope not in RUNTIME_SCOPES:
+            raise ValueError("invalid runtime scope")
         self.database_path = database_path
+        self.runtime_scope = runtime_scope
 
     def initialize(self) -> None:
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
@@ -396,6 +400,16 @@ class Storage:
                 );
                 """
             )
+            stored_scope = connection.execute(
+                "SELECT value FROM settings WHERE key = 'runtime_scope'"
+            ).fetchone()
+            if stored_scope is None:
+                connection.execute(
+                    "INSERT INTO settings(key, value) VALUES ('runtime_scope', ?)",
+                    (self.runtime_scope,),
+                )
+            elif stored_scope[0] != self.runtime_scope:
+                raise ValueError("database runtime scope does not match requested runtime scope")
             columns = {row[1] for row in connection.execute("PRAGMA table_info(sources)")}
             if "modified_at" not in columns:
                 connection.execute("ALTER TABLE sources ADD COLUMN modified_at REAL")
@@ -710,6 +724,15 @@ class Storage:
             if status == "published" and (not snapshot.raw_store_id or not snapshot.derived_store_id):
                 raise ValueError("published snapshots require raw and derived store IDs")
             if status == "published":
+                artifact_scope = connection.execute(
+                    "SELECT artifact_scope FROM candidate_artifact_scopes WHERE snapshot_id = ?",
+                    (snapshot_id,),
+                ).fetchone()
+                artifact_scope = None if artifact_scope is None else artifact_scope[0]
+                if artifact_scope != self.runtime_scope and not (
+                    artifact_scope is None and self.runtime_scope == PRODUCTION_RUNTIME_SCOPE
+                ):
+                    raise ValueError("candidate artifact scope does not match runtime scope")
                 self._require_passing_candidate_gate(connection, snapshot_id)
             if status == "published" and connection.execute(
                 "SELECT 1 FROM derived_records WHERE snapshot_id = ? AND validation_state <> 'validated' LIMIT 1",
@@ -778,6 +801,8 @@ class Storage:
         with self._connect() as connection:
             row = connection.execute(
                 _SNAPSHOT_QUERY
+                + " LEFT JOIN candidate_artifact_scopes AS current_scope"
+                " ON current_scope.snapshot_id = corpus_snapshots.snapshot_id"
                 + " JOIN settings AS current_pointer ON current_pointer.key = 'current_snapshot_id'"
                 " AND current_pointer.value = corpus_snapshots.snapshot_id"
                 " JOIN settings AS raw_pointer ON raw_pointer.key = 'active_raw_store_id'"
@@ -785,6 +810,9 @@ class Storage:
                 " JOIN settings AS derived_pointer ON derived_pointer.key = 'active_derived_store_id'"
                 " AND derived_pointer.value = corpus_snapshots.derived_store_id"
                 " WHERE corpus_snapshots.status = 'published' AND archived_snapshots.snapshot_id IS NULL"
+                " AND (current_scope.artifact_scope = ?"
+                " OR (current_scope.artifact_scope IS NULL AND ? = 'production'))",
+                (self.runtime_scope, self.runtime_scope),
             ).fetchone()
         return None if row is None else _snapshot_from_row(row)
 
