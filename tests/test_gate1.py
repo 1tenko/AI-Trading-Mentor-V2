@@ -12,6 +12,7 @@ from mentor.gate1 import (
     CONSERVATIVE_SOL_PRICING,
     GATE1_PRIOR_SPEND_USD,
     GATE1_PRICING_CHECKED_ON,
+    HARD_SPEND_CEILING_USD,
     BudgetedOpenAIClient,
     Gate1Runner,
     SpendLedger,
@@ -306,11 +307,12 @@ def test_budgeted_client_caps_output_and_accounts_actual_usage_before_next_call(
 
 def test_spend_ledger_counts_a_prior_gate1_run_against_the_same_hard_ceiling():
     assert GATE1_PRIOR_SPEND_USD == pytest.approx(2.172875)
-    ledger = SpendLedger(20.0, CONSERVATIVE_SOL_PRICING, prior_spend_usd=GATE1_PRIOR_SPEND_USD)
+    assert HARD_SPEND_CEILING_USD == pytest.approx(25.0)
+    ledger = SpendLedger(HARD_SPEND_CEILING_USD, CONSERVATIVE_SOL_PRICING, prior_spend_usd=GATE1_PRIOR_SPEND_USD)
 
     assert ledger.spent_usd == pytest.approx(2.172875)
     with pytest.raises(RuntimeError, match="spend ceiling"):
-        ledger.ensure("extraction", 17.827126)
+        ledger.ensure("extraction", 22.827126)
 
 
 def test_budgeted_client_enforces_stage_budget_before_a_paid_call():
