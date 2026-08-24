@@ -25,6 +25,7 @@ from mentor.derived_records import (
 )
 from mentor.knowledge import SourceRevision
 from mentor.synthesis import ConceptHint, concept_hint_from_record_selector, validate_record_concept_terms
+from mentor.structured_response import structured_json_payload
 
 
 SOL_MODEL = "gpt-5.6-sol"
@@ -101,8 +102,8 @@ class SourceExtractor:
                 anchor_spans=anchor_spans,
             )
         )
-        candidates, hints = _parse_candidates(
-            _response_output_text(response),
+        candidates, hints = _parse_candidates_payload(
+            structured_json_payload(response, stage="extraction", allow_synthetic=not self._live_mode),
             revision=revision,
             snapshot_id=snapshot_id,
             provenance=self._provenance,
@@ -116,13 +117,6 @@ class SourceExtractor:
         )
 
 
-def _response_output_text(response: Any) -> str:
-    output_text = getattr(response, "output_text", None)
-    if not isinstance(output_text, str):
-        raise ValueError("extraction response requires output_text")
-    return output_text
-
-
 def _parse_candidates(
     output_text: str, *, revision: SourceRevision, snapshot_id: str, provenance: CompilerProvenance
 ) -> tuple[tuple[DerivedRecord, ...], tuple[ConceptHint, ...]]:
@@ -130,6 +124,14 @@ def _parse_candidates(
         response = json.loads(output_text)
     except json.JSONDecodeError as error:
         raise ValueError("extraction response must be JSON") from error
+    return _parse_candidates_payload(
+        response, revision=revision, snapshot_id=snapshot_id, provenance=provenance
+    )
+
+
+def _parse_candidates_payload(
+    response: object, *, revision: SourceRevision, snapshot_id: str, provenance: CompilerProvenance
+) -> tuple[tuple[DerivedRecord, ...], tuple[ConceptHint, ...]]:
     if not isinstance(response, dict) or set(response) != {"candidates"} or not isinstance(response["candidates"], list):
         raise ValueError("extraction response requires only a candidates list")
     if len(response["candidates"]) > MAX_CANDIDATES_PER_SOURCE:

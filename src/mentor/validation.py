@@ -10,6 +10,7 @@ from mentor.compilation import CallUsage, TokenPricing, usage_from_response
 from mentor.derived_records import Claim, DerivedRecord, ProcedureSequenceHierarchy, Relationship
 from mentor.knowledge import SourceRevision
 from mentor.synthesis import ConceptHint, SynthesisCandidate
+from mentor.structured_response import structured_json_payload
 
 
 SEMANTIC_OUTCOMES = frozenset(
@@ -72,7 +73,7 @@ class SemanticValidator:
                 model=self._model,
             )
         )
-        outcome, audit = _semantic_response(response)
+        outcome, audit = _semantic_response(response, allow_synthetic=not self._live_mode)
         affirmative = outcome == "affirmatively_supported"
         return ValidationResult(
             candidate.record_id,
@@ -104,14 +105,10 @@ def _validated_spans(
     return tuple(spans)
 
 
-def _semantic_response(response: Any) -> tuple[str, str]:
-    output_text = getattr(response, "output_text", None)
-    if not isinstance(output_text, str):
-        raise ValueError("semantic validation response requires output_text")
-    try:
-        payload = json.loads(output_text)
-    except json.JSONDecodeError as error:
-        raise ValueError("semantic validation response must be JSON") from error
+def _semantic_response(response: Any, *, allow_synthetic: bool = False) -> tuple[str, str]:
+    payload = structured_json_payload(
+        response, stage="semantic_validation", allow_synthetic=allow_synthetic
+    )
     if not isinstance(payload, dict) or set(payload) != {"outcome", "audit"}:
         raise ValueError("semantic validation response requires outcome and audit")
     outcome, audit = payload["outcome"], payload["audit"]

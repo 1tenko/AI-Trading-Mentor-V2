@@ -438,7 +438,7 @@ class SynthesisReconciler:
                     }
                 },
             )
-            output, hint_payloads = _synthesis_output(response)
+            output, hint_payloads = _synthesis_output(response, allow_synthetic=not self._live_mode)
             parsed_records = tuple(
                 _synthesis_record(
                     payload,
@@ -516,14 +516,10 @@ class SynthesisReconciler:
         )
 
 
-def _synthesis_output(response: Any) -> tuple[list[object], list[object]]:
-    output_text = getattr(response, "output_text", None)
-    if not isinstance(output_text, str):
-        raise ValueError("synthesis response requires output_text")
-    try:
-        payload = json.loads(output_text)
-    except json.JSONDecodeError as error:
-        raise ValueError("synthesis response must be JSON") from error
+def _synthesis_output(response: Any, *, allow_synthetic: bool = False) -> tuple[list[object], list[object]]:
+    from mentor.structured_response import structured_json_payload
+
+    payload = structured_json_payload(response, stage="synthesis", allow_synthetic=allow_synthetic)
     if (
         not isinstance(payload, dict)
         or set(payload) not in ({"records"}, {"records", "concept_hints"})

@@ -134,7 +134,7 @@ def test_gate1_preflight_blocks_an_over_ceiling_dry_run_without_creating_a_pilot
             production_database_path=database_path,
             manifest_path=manifest_path,
             pilot_root=pilot_root,
-            spend_limit_usd=4.75,
+            spend_limit_usd=6.20,
             client_factory=lambda: client_calls.append("called"),
             today=lambda: GATE1_PRICING_CHECKED_ON,
             expected_manifest_sha256=_manifest_hash(manifest_path),
@@ -155,7 +155,7 @@ def test_gate1_stops_before_runtime_or_client_when_estimate_exceeds_limit(tmp_pa
             production_database_path=database_path,
             manifest_path=manifest_path,
             pilot_root=pilot_root,
-            spend_limit_usd=4.75,
+            spend_limit_usd=6.20,
             client_factory=lambda: client_calls.append("called"),
             today=lambda: GATE1_PRICING_CHECKED_ON,
             expected_manifest_sha256=_manifest_hash(manifest_path),
@@ -305,14 +305,73 @@ def test_budgeted_client_caps_output_and_accounts_actual_usage_before_next_call(
     assert len(calls) == 1
 
 
+def test_budgeted_client_writes_private_response_envelope_diagnostics(tmp_path):
+    class Responses:
+        def create(self, **_request):
+            return SimpleNamespace(
+                id="resp_synthetic",
+                status="incomplete",
+                incomplete_details=SimpleNamespace(reason="max_output_tokens"),
+                output_text="{\"partial\":true}",
+                output=[SimpleNamespace(type="message", content=[SimpleNamespace(type="output_text", text="{\"partial\":true}")])],
+                usage=SimpleNamespace(input_tokens=3, output_tokens=2),
+            )
+
+    diagnostic_path = tmp_path / "private" / "response-envelopes.jsonl"
+    diagnostic_path.parent.mkdir()
+    client = BudgetedOpenAIClient(
+        SimpleNamespace(responses=Responses()),
+        SpendLedger(1.0, CONSERVATIVE_SOL_PRICING),
+        diagnostic_path,
+    )
+
+    client.responses.create(
+        model="gpt-5.6-sol",
+        instructions="Prompt version: source-extraction-v5",
+        input="Synthetic request",
+        text={"format": {"name": "source-extraction-schema-v5"}},
+    )
+
+    diagnostic = json.loads(diagnostic_path.read_text(encoding="utf-8"))
+    assert diagnostic["status"] == "incomplete"
+    assert diagnostic["incomplete_details"] == {"reason": "max_output_tokens"}
+    assert diagnostic["prompt_version"] == "source-extraction-v5"
+    assert diagnostic["schema_version"] == "source-extraction-schema-v5"
+    assert "reasoning" not in diagnostic
+
+
+def test_budgeted_client_records_transport_versions_and_conservatively_charges_unknown_usage(tmp_path):
+    class FailingResponses:
+        def create(self, **_request):
+            raise RuntimeError("synthetic transport failure")
+
+    diagnostic_path = tmp_path / "private" / "response-envelopes.jsonl"
+    diagnostic_path.parent.mkdir()
+    ledger = SpendLedger(1.0, CONSERVATIVE_SOL_PRICING)
+    client = BudgetedOpenAIClient(SimpleNamespace(responses=FailingResponses()), ledger, diagnostic_path)
+
+    with pytest.raises(RuntimeError, match="transport failure"):
+        client.responses.create(
+            model="gpt-5.6-sol",
+            instructions="Prompt version: source-extraction-v5",
+            input="Synthetic request",
+            text={"format": {"name": "source-extraction-schema-v5"}},
+        )
+
+    diagnostic = json.loads(diagnostic_path.read_text(encoding="utf-8"))
+    assert diagnostic["prompt_version"] == "source-extraction-v5"
+    assert diagnostic["schema_version"] == "source-extraction-schema-v5"
+    assert ledger.events[-1]["status"] == "usage_unknown"
+
+
 def test_spend_ledger_counts_a_prior_gate1_run_against_the_same_hard_ceiling():
-    assert GATE1_PRIOR_SPEND_USD == pytest.approx(4.742720)
+    assert GATE1_PRIOR_SPEND_USD == pytest.approx(6.163620)
     assert HARD_SPEND_CEILING_USD == pytest.approx(25.0)
     ledger = SpendLedger(HARD_SPEND_CEILING_USD, CONSERVATIVE_SOL_PRICING, prior_spend_usd=GATE1_PRIOR_SPEND_USD)
 
-    assert ledger.spent_usd == pytest.approx(4.742720)
+    assert ledger.spent_usd == pytest.approx(6.163620)
     with pytest.raises(RuntimeError, match="spend ceiling"):
-        ledger.ensure("extraction", 20.257281)
+        ledger.ensure("extraction", 18.836381)
 
 
 def test_budgeted_client_enforces_stage_budget_before_a_paid_call():

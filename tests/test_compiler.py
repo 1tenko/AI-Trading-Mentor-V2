@@ -114,6 +114,11 @@ def test_extracted_strategy_implication_remains_raw_taught_only_pending_independ
 def test_live_sol_extraction_requires_pricing_and_records_reasoning_cost():
     response = SimpleNamespace(
         output_text=json.dumps(FIXTURES["empty"]),
+        status="completed",
+        output=[SimpleNamespace(
+            type="message",
+            content=[SimpleNamespace(type="output_text", text=json.dumps(FIXTURES["empty"]))],
+        )],
         usage=SimpleNamespace(
             input_tokens=100,
             output_tokens=40,

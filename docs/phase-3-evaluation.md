@@ -252,3 +252,24 @@ typed record before accepting its inline occurrences. Failed v4 candidates are
 immutable incompatible history, not migration input. The new compiler prompt
 and schema versions are `source-extraction-v5` and
 `source-extraction-schema-v5`.
+
+## Gate 1 Responses envelope hardening
+
+The next isolated pilot reached six extraction calls and 57 extracted
+candidates, then stopped before synthesis because one returned response was
+handed directly to JSON parsing. Its raw non-persistent response was not kept,
+so the existing artifact cannot establish whether it was incomplete, refused,
+or a completed non-JSON structured response.
+
+Compiler stages now share a strict Responses envelope boundary. It rejects
+failed, incomplete (including output-limit), refusal, missing-content, and
+unexpected-output states before JSON or typed-domain parsing. A completed,
+non-refusal payload that cannot decode as JSON remains a distinct contract
+failure; it is never repaired or silently retried. Extraction, validation, and
+synthesis retain their independent strict schema and domain parsers afterward.
+
+Gate 1 writes ignored, pilot-only response-envelope diagnostics for every
+paid attempt: stage/call/model/version metadata, status, error or incomplete
+details, item types, refusal, usage, response ID, and structured payload. It
+does not retain reasoning content or enable server-side storage. Cumulative
+spend after the stopped run is `$6.163620` of the fixed `$25.00` ceiling.

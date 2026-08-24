@@ -28,6 +28,7 @@ from mentor.orientation import OrientationBudget
 from mentor.storage import Storage
 from mentor.synthesis import SynthesisReconciler
 from mentor.vector_stores import VectorStoreAdapter
+from mentor.structured_response import private_response_diagnostic
 
 
 GATE1_MODEL = "gpt-5.6-sol"
@@ -37,7 +38,7 @@ APPROVED_GATE1_MANIFEST_SHA256 = "3798d537cd486f782449d9833b5fc06dd28fa93aed4564
 # Standard short-context rates are deliberately higher than the current model-page promotion.
 CONSERVATIVE_SOL_PRICING = TokenPricing(5.0, 30.0, 30.0)
 HARD_SPEND_CEILING_USD = 25.0
-GATE1_PRIOR_SPEND_USD = 4.742720
+GATE1_PRIOR_SPEND_USD = 6.163620
 _PRICING_MAX_AGE_DAYS = 7
 _OUTPUT_CAPS = {
     "extraction": 8_000,
@@ -224,12 +225,15 @@ class SpendLedger:
 
 
 class _BudgetedResponses:
-    def __init__(self, responses: Any, ledger: SpendLedger):
+    def __init__(self, responses: Any, ledger: SpendLedger, diagnostic_path: Path | None = None):
         self._responses = responses
         self._ledger = ledger
+        self._diagnostic_path = diagnostic_path
+        self._call_index = 0
 
     def create(self, **request):
         stage = _response_stage(request)
+        self._call_index += 1
         cap = _OUTPUT_CAPS[stage]
         requested_cap = request.get("max_output_tokens")
         request["max_output_tokens"] = (
@@ -255,21 +259,46 @@ class _BudgetedResponses:
         ticket = self._ledger.reserve(stage, projected)
         try:
             response = self._responses.create(**request)
-        except Exception:
+        except Exception as error:
             self._ledger.settle_unknown(ticket, stage=stage)
+            self._write_diagnostic({
+                "stage": stage,
+                "call_index": self._call_index,
+                "model": request.get("model"),
+                "prompt_version": _prompt_version(request),
+                "schema_version": _schema_version(request),
+                "transport_error": {"type": type(error).__name__, "message": str(error)},
+            })
             raise
+        self._write_diagnostic(private_response_diagnostic(
+            response,
+            stage=stage,
+            call_index=self._call_index,
+            model=request.get("model"),
+            prompt_version=_prompt_version(request),
+            schema_version=_schema_version(request),
+        ))
+        if not _usage_is_complete(response):
+            self._ledger.settle_unknown(ticket, stage=stage)
+            return response
         usage = usage_from_response(response, pricing=self._ledger.pricing)
         actual = usage.cost_usd + _file_search_calls(response) * FILE_SEARCH_CALL_COST_USD
         self._ledger.settle(ticket, stage=stage, actual_cost_usd=actual)
         return response
 
+    def _write_diagnostic(self, value: dict[str, object]) -> None:
+        if self._diagnostic_path is None:
+            return
+        with self._diagnostic_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(value, sort_keys=True, default=str) + "\n")
+
 
 class BudgetedOpenAIClient:
     """Delegate every non-Responses API while enforcing the Responses spend boundary."""
 
-    def __init__(self, client: Any, ledger: SpendLedger):
+    def __init__(self, client: Any, ledger: SpendLedger, diagnostic_path: Path | None = None):
         self._client = client
-        self.responses = _BudgetedResponses(client.responses, ledger)
+        self.responses = _BudgetedResponses(client.responses, ledger, diagnostic_path)
 
     def __getattr__(self, name: str):
         return getattr(self._client, name)
@@ -341,7 +370,10 @@ class Gate1Runner:
             pilot_sources = CandidateSourcePreparer(pilot.storage).prepare(manifest.revision_ids)
             if tuple(source.revision.revision_id for source in pilot_sources) != manifest.revision_ids:
                 raise ValueError("pilot source order no longer matches the approved manifest")
-            paid_client = BudgetedOpenAIClient(self._client_factory(), self.ledger)
+            paid_client = BudgetedOpenAIClient(
+                self._client_factory(), self.ledger,
+                pilot.output_directory / "response-envelopes.jsonl",
+            )
             compiler = self._compiler_factory(pilot.storage, paid_client, self.pricing)
             self.ledger.ensure(
                 "compiler",
@@ -574,6 +606,30 @@ def _response_stage(request: dict[str, Any]) -> str:
     if "cross-source-synthesis" in marker:
         return "synthesis"
     return "mentor_evaluation"
+
+
+def _prompt_version(request: dict[str, Any]) -> str | None:
+    first_line = str(request.get("instructions", "")).splitlines()[0:1]
+    value = first_line[0].removeprefix("Prompt version: ").strip() if first_line else ""
+    return value or None
+
+
+def _schema_version(request: dict[str, Any]) -> str | None:
+    text = request.get("text")
+    if not isinstance(text, dict):
+        return None
+    format_ = text.get("format")
+    return format_.get("name") if isinstance(format_, dict) and isinstance(format_.get("name"), str) else None
+
+
+def _usage_is_complete(response: Any) -> bool:
+    usage = getattr(response, "usage", None)
+    return all(
+        isinstance(getattr(usage, field, None), int)
+        and not isinstance(getattr(usage, field, None), bool)
+        and getattr(usage, field) >= 0
+        for field in ("input_tokens", "output_tokens")
+    )
 
 
 def _file_search_calls(response: Any) -> int:
