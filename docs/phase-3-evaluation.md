@@ -282,3 +282,32 @@ cost `$0.000815`, bringing cumulative Gate 1 spend to `$6.164435`.
 The subsequent captured six-source replay attempt brought cumulative Gate 1
 spend to `$8.502370`. The runner ledger must retain that actual cumulative
 amount; it must not reset to the earlier envelope-probe total.
+
+## Final six-source Gate 1 rerun
+
+Theo authorized a fixed cumulative Gate 1 ceiling of `$30.00`; the prior
+`$8.502370` remains permanent ledger spend. On 2026-08-24, the unchanged
+approved six-source manifest passed local preflight with a conservative
+remaining-run upper bound of `$18.548850` and current standard GPT-5.6 Sol
+pricing of `$5.00` input / `$30.00` output per million tokens.
+
+The fresh isolated candidate stopped at readiness after five completed source
+extractions, one capped extraction response, and 57 independent validation
+calls. The capped response was correctly classified as
+`response_incomplete_max_output_tokens`. The strict candidate gate marked that
+source failed, retained the diagnostic privately, and prevented concept
+construction, synthesis, vector-store creation, publication, orientation, and
+Mentor evaluation. Production pointers remained unchanged.
+
+The retained partial audit contains 57 extraction candidates: 47
+affirmatively supported source-extracted records, nine partially supported
+candidates, and one unsupported candidate. The candidate has 17 claims, 27
+procedures/sequences/hierarchies, and three relationships; it has no published
+concepts, aliases, synthesis, evolution, conflict, orientation artifacts, or
+remote stores. Actual incremental spend was `$1.477240`, for cumulative Gate
+1 spend of `$9.979610` and `$20.020390` remaining under the approved ceiling.
+
+This was not a downstream structural failure: the completed-response replay
+cannot exercise a newly generated model response that terminates at its output
+limit. The immutable failed candidate is not reused or patched, and no retry
+was performed.
