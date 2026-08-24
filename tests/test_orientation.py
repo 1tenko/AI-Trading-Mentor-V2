@@ -291,6 +291,54 @@ def test_orientation_enforces_a_hard_token_budget_and_reports_truncation():
     assert orientation.truncated is True
 
 
+def test_orientation_budget_counts_dependency_heavy_conclusion_lineage():
+    from mentor.orientation import OrientationBudget, OrientationService
+
+    inputs = tuple(
+        Claim.create(
+            snapshot_id=SNAPSHOT_ID,
+            anchors=("anc_shared",),
+            dependencies=(RecordDependency("source_revision", "rev_shared"),),
+            validation_state="validated",
+            lifecycle_state="active",
+            qualification="One bounded synthetic input.",
+            subject=f"Input {index}",
+            predicate="supports",
+            object="one conclusion",
+        )
+        for index in range(64)
+    )
+    conclusion = Relationship.create(
+        snapshot_id=SNAPSHOT_ID,
+        anchors=("anc_shared",),
+        dependencies=(
+            RecordDependency("source_revision", "rev_shared"),
+            *(RecordDependency("derived_record", record.record_id) for record in inputs),
+        ),
+        validation_state="validated",
+        lifecycle_state="active",
+        qualification="A dependency-heavy synthetic conclusion.",
+        evidence_state="cross_source_synthesis",
+        left="Many bounded inputs",
+        relation="supports",
+        right="One conclusion",
+    )
+    concept_ids = context((*inputs, conclusion))
+    service = OrientationService(
+        FakeStorage(published_snapshot(), [*inputs, conclusion], concept_ids),
+        FakeVectorStores([
+            result(conclusion, concept_id=concept_ids[conclusion.record_id]),
+        ]),
+        budget=OrientationBudget(max_records=2, max_tokens=1_000),
+    )
+
+    orientation = service.consult("How do all the inputs support the conclusion?")
+
+    assert orientation.records == ()
+    assert orientation.used_tokens == 0
+    assert orientation.truncated is True
+
+
 def test_orientation_rejects_invalid_or_wrong_snapshot_local_records():
     from mentor.orientation import OrientationBudget, OrientationService
 

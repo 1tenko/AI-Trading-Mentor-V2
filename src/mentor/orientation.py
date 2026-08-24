@@ -468,6 +468,8 @@ def _conservative_token_upper_bound(record: OrientationRecord) -> int:
         record.qualification,
         record.statement,
         *record.anchor_ids,
+        *record.input_record_ids,
+        *record.source_revision_ids,
         *record.concept_ids,
         record.source_area.collection_id or "",
         str(record.source_area.year or ""),
