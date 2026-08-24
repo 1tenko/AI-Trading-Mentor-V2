@@ -223,7 +223,11 @@ all four synthesis families through the local parser, closed family and hint
 shapes, lineage fields, and the synthetic candidate compiler path. The failed
 candidate remains incompatible with the new synthesis provenance and is never
 reused or published. Cumulative prior Gate 1 spend is recorded as `$3.607125`
-against the fixed `$25.00` ceiling before any subsequent paid call.
+against the fixed `$25.00` ceiling before the second extraction attempt.
+
+The second extraction-only attempt added `$1.135595`, bringing cumulative Gate
+1 spend to `$4.742720` against that unchanged `$25.00` ceiling. It did not
+create vector stores, publish a candidate, or change production pointers.
 
 ## Gate 1 inline extraction-occurrence hardening
 
