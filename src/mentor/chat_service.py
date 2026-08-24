@@ -617,6 +617,8 @@ def _orientation_output(result: OrientationResult) -> dict[str, Any]:
                 "qualification": record.qualification,
                 "statement": record.statement,
                 "anchor_ids": list(record.anchor_ids),
+                "input_record_ids": list(record.input_record_ids),
+                "source_revision_ids": list(record.source_revision_ids),
                 "source_area": {
                     "collection_id": record.source_area.collection_id,
                     "year": record.source_area.year,

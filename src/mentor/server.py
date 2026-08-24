@@ -16,6 +16,8 @@ from mentor.derived_records import (
     Evolution,
     ProcedureSequenceHierarchy,
     Relationship,
+    conclusion_lineage,
+    conflict_side_lineages,
 )
 from mentor.knowledge import derived_provenance_label
 from mentor.orientation import concept_summaries
@@ -335,6 +337,7 @@ def _record_detail(storage: Storage, snapshot_id: str, record_id: str) -> dict |
         return None
     reused_from = storage.derived_record_reuse(snapshot_id).get(record_id)
     concept_ids = storage.orientation_concept_links(snapshot_id).get(record_id, ())
+    lineage = conclusion_lineage(record, {value.record_id: value for value in records})
     return {
         **_record_summary(record, record_id in storage.stale_record_ids(snapshot_id)),
         "qualification": record.qualification,
@@ -353,6 +356,40 @@ def _record_detail(storage: Storage, snapshot_id: str, record_id: str) -> dict |
             {"kind": dependency.kind}
             for dependency in record.dependencies
         ],
+        "lineage": {
+            "conclusion_record_id": lineage.conclusion_record_id,
+            "input_record_ids": list(lineage.input_record_ids),
+            "anchor_ids": list(lineage.anchor_ids),
+            "source_revision_ids": list(lineage.source_revision_ids),
+            "transitive_records": [
+                {
+                    "record_id": item.record_id,
+                    "input_record_ids": list(item.input_record_ids),
+                    "anchor_ids": list(item.anchor_ids),
+                    "source_revision_ids": list(item.source_revision_ids),
+                }
+                for item in lineage.transitive_records
+            ],
+            "complete": lineage.complete,
+            "conflict_sides": (
+                [
+                    {
+                        "alternative": side.alternative,
+                        "input_record_id": side.input_record_id,
+                        "anchor_ids": list(side_lineage.anchor_ids),
+                        "source_revision_ids": list(side_lineage.source_revision_ids),
+                        "transitive_record_ids": [
+                            item.record_id for item in side_lineage.transitive_records
+                        ],
+                    }
+                    for side, side_lineage in conflict_side_lineages(
+                        record, {value.record_id: value for value in records}
+                    )
+                ]
+                if isinstance(record, ConflictUnresolved)
+                else []
+            ),
+        },
         "concepts": [_concept_summary_json(concept) for concept in concept_summaries(
             storage.orientation_concepts(snapshot_id),
             storage.orientation_concept_occurrences(snapshot_id),

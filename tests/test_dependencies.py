@@ -165,6 +165,57 @@ def test_storage_marks_transitive_records_stale_and_rejects_them_from_normal_ret
     )
 
 
+def test_revision_change_invalidates_only_conclusions_in_its_exact_transitive_lineage(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    revision_a = source_revision(storage, "lineage_a")
+    revision_b = source_revision(storage, "lineage_b")
+    snapshot = candidate(storage, (revision_a, revision_b), run_id="run_exact_lineage")
+    raw_a = claim(
+        snapshot.snapshot_id,
+        "raw a",
+        (RecordDependency("source_revision", revision_a.revision_id),),
+    )
+    conclusion_a = claim(
+        snapshot.snapshot_id,
+        "conclusion a",
+        (
+            RecordDependency("source_revision", revision_a.revision_id),
+            RecordDependency("derived_record", raw_a.record_id),
+        ),
+    )
+    higher_a = claim(
+        snapshot.snapshot_id,
+        "higher a",
+        (
+            RecordDependency("source_revision", revision_a.revision_id),
+            RecordDependency("derived_record", conclusion_a.record_id),
+        ),
+    )
+    raw_b = claim(
+        snapshot.snapshot_id,
+        "raw b",
+        (RecordDependency("source_revision", revision_b.revision_id),),
+    )
+    conclusion_b = claim(
+        snapshot.snapshot_id,
+        "conclusion b",
+        (
+            RecordDependency("source_revision", revision_b.revision_id),
+            RecordDependency("derived_record", raw_b.record_id),
+        ),
+    )
+    for record in (raw_a, conclusion_a, higher_a, raw_b, conclusion_b):
+        storage.store_derived_record(record)
+
+    assert set(storage.mark_stale_for_revisions(snapshot.snapshot_id, (revision_a.revision_id,))) == {
+        raw_a.record_id,
+        conclusion_a.record_id,
+        higher_a.record_id,
+    }
+    assert set(storage.derived_records(snapshot.snapshot_id)) == {raw_b, conclusion_b}
+
+
 def test_candidate_validation_rejects_dependencies_outside_its_raw_snapshot(tmp_path):
     storage = Storage(tmp_path / "mentor.sqlite3")
     storage.initialize()

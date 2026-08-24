@@ -101,6 +101,113 @@ class DerivedRecord:
 
 
 @dataclass(frozen=True)
+class ConclusionLineageNode:
+    record_id: str
+    input_record_ids: tuple[str, ...]
+    anchor_ids: tuple[str, ...]
+    source_revision_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class ConclusionLineage:
+    conclusion_record_id: str
+    input_record_ids: tuple[str, ...]
+    anchor_ids: tuple[str, ...]
+    source_revision_ids: tuple[str, ...]
+    transitive_records: tuple[ConclusionLineageNode, ...]
+    complete: bool
+
+
+def input_record_ids(record: DerivedRecord) -> tuple[str, ...]:
+    return tuple(
+        dependency.identifier
+        for dependency in record.dependencies
+        if dependency.kind == "derived_record"
+    )
+
+
+def source_revision_ids(record: DerivedRecord) -> tuple[str, ...]:
+    return tuple(
+        dependency.identifier
+        for dependency in record.dependencies
+        if dependency.kind == "source_revision"
+    )
+
+
+def conclusion_lineage(
+    record: DerivedRecord, records_by_id: dict[str, DerivedRecord]
+) -> ConclusionLineage:
+    """Resolve exact record-to-record lineage without exposing source text."""
+    result: list[ConclusionLineageNode] = []
+    seen: set[str] = set()
+    active: set[str] = set()
+    complete = True
+
+    def visit(record_id: str) -> None:
+        nonlocal complete
+        if record_id in seen:
+            return
+        if record_id in active:
+            complete = False
+            return
+        dependency = records_by_id.get(record_id)
+        if dependency is None:
+            complete = False
+            return
+        active.add(record_id)
+        result.append(
+            ConclusionLineageNode(
+                dependency.record_id,
+                input_record_ids(dependency),
+                dependency.anchors,
+                source_revision_ids(dependency),
+            )
+        )
+        for child_id in input_record_ids(dependency):
+            visit(child_id)
+        active.remove(record_id)
+        seen.add(record_id)
+
+    for dependency_id in input_record_ids(record):
+        visit(dependency_id)
+    return ConclusionLineage(
+        record.record_id,
+        input_record_ids(record),
+        record.anchors,
+        source_revision_ids(record),
+        tuple(result),
+        complete,
+    )
+
+
+def validate_conclusion_lineage(
+    record: DerivedRecord, records_by_id: dict[str, DerivedRecord]
+) -> None:
+    """Require one exposed synthesis conclusion to match its exact direct inputs."""
+    if record.evidence_state != "cross_source_synthesis":
+        return
+    input_ids = input_record_ids(record)
+    if not input_ids or len(input_ids) != len(set(input_ids)):
+        raise ValueError("synthesis conclusion lineage requires unique direct input records")
+    direct_records = tuple(records_by_id.get(record_id) for record_id in input_ids)
+    if any(value is None for value in direct_records):
+        raise ValueError("synthesis conclusion lineage references an unavailable input record")
+    inputs = tuple(value for value in direct_records if value is not None)
+    expected_anchors = {
+        anchor_id for input_record in inputs for anchor_id in input_record.anchors
+    }
+    expected_revisions = {
+        revision_id
+        for input_record in inputs
+        for revision_id in source_revision_ids(input_record)
+    }
+    if set(record.anchors) != expected_anchors or set(source_revision_ids(record)) != expected_revisions:
+        raise ValueError("synthesis conclusion lineage is ambiguous or leaks evidence")
+    if not conclusion_lineage(record, records_by_id).complete:
+        raise ValueError("synthesis conclusion lineage is incomplete or cyclic")
+
+
+@dataclass(frozen=True)
 class Claim(DerivedRecord):
     subject: str = ""
     predicate: str = ""
@@ -268,6 +375,12 @@ class Evolution(DerivedRecord):
 
 
 @dataclass(frozen=True)
+class ConflictSide:
+    alternative: str
+    input_record_id: str
+
+
+@dataclass(frozen=True)
 class ConflictUnresolved(DerivedRecord):
     kind: str = ""
     subject: str = ""
@@ -277,6 +390,15 @@ class ConflictUnresolved(DerivedRecord):
     relevant_scopes: tuple[str, ...] = ()
     conditions: tuple[str, ...] = ()
     unresolved_questions: tuple[str, ...] = ()
+
+    @property
+    def competing_sides(self) -> tuple[ConflictSide, ...]:
+        return tuple(
+            ConflictSide(alternative, record_id)
+            for alternative, record_id in zip(
+                self.alternatives, self.competing_record_ids, strict=True
+            )
+        )
 
     @classmethod
     def create(
@@ -296,6 +418,8 @@ class ConflictUnresolved(DerivedRecord):
             raise ValueError("invalid conflict or unresolved record")
         if len(alternatives) > MAX_TERMS:
             raise ValueError("too many terms")
+        if len(alternatives) != len(competing_record_ids):
+            raise ValueError("each conflict alternative requires its own input record")
         return _new(
             cls,
             family="conflict_unresolved",
@@ -309,6 +433,17 @@ class ConflictUnresolved(DerivedRecord):
             unresolved_questions=unresolved_questions,
             **_synthesis_common(common, kind, unresolved=True),
         )
+
+
+def conflict_side_lineages(
+    record: ConflictUnresolved, records_by_id: dict[str, DerivedRecord]
+) -> tuple[tuple[ConflictSide, ConclusionLineage], ...]:
+    """Resolve each competing statement independently through its input record."""
+    return tuple(
+        (side, conclusion_lineage(records_by_id[side.input_record_id], records_by_id))
+        for side in record.competing_sides
+        if side.input_record_id in records_by_id
+    )
 
 
 def create_record(family: str, **_: object) -> DerivedRecord:
@@ -347,6 +482,13 @@ def validate_record(record: DerivedRecord) -> None:
         if not isinstance(dependency, RecordDependency) or dependency.kind not in {"source_revision", "derived_record"}:
             raise ValueError("invalid record dependency")
         _require_text(dependency.identifier, "dependency identifier")
+    if isinstance(record, ConflictUnresolved):
+        if len(record.alternatives) != len(record.competing_record_ids):
+            raise ValueError("each conflict alternative requires its own input record")
+        if len(set(record.competing_record_ids)) != len(record.competing_record_ids):
+            raise ValueError("conflict alternatives require distinct input records")
+        if not set(record.competing_record_ids) <= set(input_record_ids(record)):
+            raise ValueError("conflict side lineage must be a direct record dependency")
     _validate_compiler_provenance(record.compiler_provenance)
     _validate_facets(record.facets)
     _validate_family(record)

@@ -330,6 +330,55 @@ def test_server_exposes_read_only_inspector_without_raw_or_private_payloads(tmp_
         worker.join()
 
 
+def test_inspector_resolves_exact_lineage_for_one_derived_conclusion(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    snapshot, source_claim, anchor, _source = inspected_snapshot(storage, publish=False)
+    conclusion = Relationship.create(
+        snapshot_id=snapshot.snapshot_id,
+        anchors=(anchor.anchor_id,),
+        dependencies=(
+            RecordDependency("source_revision", anchor.revision_id),
+            RecordDependency("derived_record", source_claim.record_id),
+        ),
+        validation_state="validated",
+        lifecycle_state="active",
+        qualification="One traceable synthetic conclusion.",
+        evidence_state="cross_source_synthesis",
+        left="Synthetic conclusion",
+        relation="depends_on",
+        right="Synthetic source claim",
+    )
+    storage.store_derived_record(conclusion)
+
+    server = create_server(storage, FakeChatService(), port=0)
+    worker = threading.Thread(target=server.serve_forever)
+    worker.start()
+    try:
+        status, _headers, body = request(
+            server,
+            "GET",
+            f"/api/knowledge/snapshots/{snapshot.snapshot_id}/records/{conclusion.record_id}",
+        )
+        assert status == 200
+        lineage = json.loads(body)["lineage"]
+        assert lineage["conclusion_record_id"] == conclusion.record_id
+        assert lineage["input_record_ids"] == [source_claim.record_id]
+        assert lineage["anchor_ids"] == [anchor.anchor_id]
+        assert lineage["source_revision_ids"] == [anchor.revision_id]
+        assert lineage["transitive_records"] == [{
+            "record_id": source_claim.record_id,
+            "input_record_ids": [],
+            "anchor_ids": [anchor.anchor_id],
+            "source_revision_ids": [anchor.revision_id],
+        }]
+        assert lineage["complete"] is True
+        assert b"PRIVATE RAW TRANSCRIPT BODY" not in body
+    finally:
+        server.shutdown()
+        worker.join()
+
+
 def test_source_anchor_storage_rejects_malformed_locator_metadata(tmp_path):
     storage = Storage(tmp_path / "mentor.sqlite3")
     storage.initialize()

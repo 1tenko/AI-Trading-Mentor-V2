@@ -37,6 +37,7 @@ from mentor.derived_records import (
     Evolution,
     ProcedureSequenceHierarchy,
     Relationship,
+    validate_conclusion_lineage,
     validate_record,
 )
 from mentor.knowledge import SourceRevision
@@ -510,6 +511,7 @@ class CandidateCompiler:
                 snapshot.snapshot_id,
                 {anchor_id for source in sources for anchor_id in source.anchors},
                 source_metadata,
+                extracted_records + reconciliation_context,
             )
             _validate_reconciliation_coverage(synthesized, synthesis_inputs)
             synthesized = _filter_synthesis_target_lineage(synthesized, synthesis_inputs)
@@ -550,6 +552,9 @@ class CandidateCompiler:
         graph = empty_graph
         excluded_record_ids: tuple[str, ...] = ()
         try:
+            records_by_id = {record.record_id: record for record in records}
+            for record in records:
+                validate_conclusion_lineage(record, records_by_id)
             graph = self._storage.dependency_graph(snapshot.snapshot_id)
             excluded = set(graph.stale_record_ids(request.stale_revision_ids))
             excluded.update(record.record_id for record in records if record.lifecycle_state != "active")
@@ -1437,10 +1442,14 @@ def _validate_synthesis_result(
     snapshot_id: str,
     known_anchor_ids: set[str],
     source_metadata: tuple[ReconciliationSource, ...],
+    input_records: tuple[DerivedRecord, ...] = (),
 ) -> None:
     if not isinstance(result.provenance, CompilerProvenance):
         raise ValueError("source synthesis requires compiler provenance")
     allowed = (Claim, Relationship, ProcedureSequenceHierarchy, Evolution, ConflictUnresolved)
+    records_by_id = {
+        record.record_id: record for record in (*input_records, *result.records)
+    }
     for record in result.records:
         validate_record(record)
         if not isinstance(record, allowed):
@@ -1459,6 +1468,7 @@ def _validate_synthesis_result(
             raise ValueError("source synthesis records require source revision provenance")
         if not set(record.anchors) <= known_anchor_ids:
             raise ValueError("source synthesis records require canonical source anchors")
+        validate_conclusion_lineage(record, records_by_id)
         if isinstance(record, Evolution):
             earlier = source_coverage(record.earlier_source_set, source_metadata)
             later = source_coverage(record.later_source_set, source_metadata)

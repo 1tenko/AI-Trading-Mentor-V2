@@ -290,6 +290,7 @@ def test_reconciliation_filters_context_only_paraphrase_and_preserves_selected_s
         target_summary = next(
             summary for summary in summaries if summary["lineage_role"] == "target"
         )
+        target_conclusion = target_summary["conclusions"][0]
         common = {
             "family": "relationship",
             "relation": "depends_on",
@@ -299,17 +300,17 @@ def test_reconciliation_filters_context_only_paraphrase_and_preserves_selected_s
                 "qualification": "Paraphrased unchanged B-only conclusion.",
                 "anchors": ["anc_context"],
                 "input_record_ids": [context.record_id],
-                "input_summary_ids": [],
+                "input_conclusion_ids": [],
                 "source_revision_ids": ["rev_context"],
                 "left": "Reworded B framework",
                 "right": "B-only context",
             },
             common | {
                 "qualification": "Affected A reconciled with unchanged B.",
-                "anchors": ["anc_context"],
+                "anchors": ["anc_context", "anc_affected"],
                 "input_record_ids": [context.record_id],
-                "input_summary_ids": [target_summary["summary_id"]],
-                "source_revision_ids": ["rev_context"],
+                "input_conclusion_ids": [target_conclusion["conclusion_id"]],
+                "source_revision_ids": ["rev_context", "rev_affected"],
                 "left": "Affected A framework",
                 "right": "Unchanged B cluster",
             },
@@ -364,9 +365,7 @@ def test_reconciliation_does_not_expose_an_omitted_child_conclusion_without_its_
         )
         for index in range(3)
     )
-    records_by_conclusion = {
-        f"{record.subject} | meaning": record for record in contexts
-    }
+    records_by_id = {record.record_id: record for record in contexts}
     omitted_conclusion = None
     selected_context = None
 
@@ -384,41 +383,30 @@ def test_reconciliation_does_not_expose_an_omitted_child_conclusion_without_its_
             ]
             selected_conclusion = context_summaries[0]["conclusions"][0]
             omitted_conclusion = context_summaries[1]["conclusions"][0]
-            selected_context = records_by_conclusion[selected_conclusion]
+            selected_context = records_by_id[selected_conclusion["conclusion_id"]]
             selected_index = contexts.index(selected_context)
+            target_conclusion = target_summary["conclusions"][0]
             return {"records": [{
                 "family": "relationship",
                 "qualification": "Affected target reconciled with selected context.",
-                "anchors": [selected_context.anchors[0]],
-                "input_record_ids": [selected_context.record_id],
-                "input_summary_ids": [target_summary["summary_id"]],
-                "source_revision_ids": [f"rev_context_{selected_index}"],
+                "anchors": [selected_context.anchors[0], "anc_target"],
+                "input_record_ids": [],
+                "input_conclusion_ids": [
+                    selected_conclusion["conclusion_id"],
+                    target_conclusion["conclusion_id"],
+                ],
+                "source_revision_ids": [f"rev_context_{selected_index}", "rev_target"],
                 "left": "Affected target",
                 "relation": "depends_on",
                 "right": selected_context.subject,
             }], "concept_hints": []}
 
         assert omitted_conclusion is not None
-        if omitted_conclusion in target_summary["conclusions"]:
-            tail_conclusion = next(
-                summary["conclusions"][0]
-                for summary in summaries
-                if summary["summary_id"] != target_summary["summary_id"]
-            )
-            tail = records_by_conclusion[tail_conclusion]
-            tail_index = contexts.index(tail)
-            omitted = records_by_conclusion[omitted_conclusion]
-            return {"records": [{
-                "family": "relationship",
-                "qualification": "Illegitimate use of an untraced child conclusion.",
-                "anchors": [tail.anchors[0]],
-                "input_record_ids": [tail.record_id],
-                "input_summary_ids": [target_summary["summary_id"]],
-                "source_revision_ids": [f"rev_context_{tail_index}"],
-                "left": omitted.subject,
-                "relation": "depends_on",
-                "right": "Leaked conclusion",
-            }], "concept_hints": []}
+        if any(
+            conclusion["conclusion_id"] == omitted_conclusion["conclusion_id"]
+            for conclusion in target_summary["conclusions"]
+        ):
+            raise AssertionError("omitted conclusion leaked into the merged summary")
         return {"records": [], "concept_hints": []}
 
     responses = RecordingResponses(response)
@@ -455,9 +443,15 @@ def test_reconciliation_does_not_expose_an_omitted_child_conclusion_without_its_
         for summary in reduction_requests[-1]["prior_cluster_summaries"]
         if summary["lineage_role"] == "target"
     )
-    assert omitted_conclusion not in final_target_summary["conclusions"]
+    assert omitted_conclusion["conclusion_id"] not in {
+        conclusion["conclusion_id"]
+        for conclusion in final_target_summary["conclusions"]
+    }
     assert selected_context is not None
-    assert f"{selected_context.subject} | meaning" in final_target_summary["conclusions"]
+    assert [
+        conclusion["conclusion_id"]
+        for conclusion in final_target_summary["conclusions"]
+    ] == [result.records[0].record_id]
     assert len(result.records) == 1
     assert result.records[0].right == selected_context.subject
     selected_index = contexts.index(selected_context)

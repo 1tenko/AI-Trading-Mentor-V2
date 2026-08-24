@@ -28,8 +28,8 @@ MAX_ALIASES = 8
 MAX_SCOPE_LENGTH = 160
 MAX_CONDITION_LENGTH = 160
 MAX_JUSTIFICATION_LENGTH = 280
-SYNTHESIS_PROMPT_VERSION = "cross-source-synthesis-v4"
-SYNTHESIS_SCHEMA_VERSION = "cross-source-synthesis-schema-v5"
+SYNTHESIS_PROMPT_VERSION = "cross-source-synthesis-v5"
+SYNTHESIS_SCHEMA_VERSION = "cross-source-synthesis-schema-v6"
 SOL_MODEL = "gpt-5.6-sol"
 MAX_SYNTHESIS_RECORDS_PER_CALL = 64
 MAX_SYNTHESIS_RECORDS_PER_CANDIDATE = 4_096
@@ -77,7 +77,6 @@ class _ClusterSummary:
     representative: DerivedRecord
     covered_records: tuple[DerivedRecord, ...]
     lineage_records: tuple[DerivedRecord, ...]
-    conclusions: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -235,8 +234,10 @@ class SynthesisReconciler:
             missing_spans = set(batch_anchor_ids).difference(anchor_spans)
             if missing_spans:
                 raise ValueError("synthesis is missing a required bounded anchor span")
-            summaries_by_id = {
-                _cluster_summary_id(summary): summary for summary in prior_summaries
+            summary_records_by_id = {
+                record.record_id: record
+                for summary in prior_summaries
+                for record in summary.lineage_records
             }
             response = self._client.responses.create(
                 model=self._provenance.model_version,
@@ -247,9 +248,10 @@ class SynthesisReconciler:
                     "evolution, or conflict records plus explicit alias-aware concept hints. "
                     "Keep procedure prerequisites, conditions, and conditional branches structured. "
                     "Use only supplied record, anchor, and revision IDs. Preserve uncertainty; do not claim raw authority. "
-                    "Prior cluster summaries may contain unchanged validated context: connect them when relevant, "
-                    "but do not restate their lower-level conclusions. Every output must identify only the direct "
-                    "input_record_ids and input_summary_ids it actually uses; context-only outputs are discarded."
+                    "Prior cluster summaries contain independently addressable validated conclusions. Connect them "
+                    "when relevant, but do not restate lower-level conclusions. Every output must identify only the "
+                    "direct input_record_ids and input_conclusion_ids it actually uses. Never select a whole summary; "
+                    "context-only outputs are discarded."
                 ),
                 input=json.dumps(
                     {
@@ -303,7 +305,7 @@ class SynthesisReconciler:
                     snapshot_id=snapshot_id,
                     provenance=self._provenance,
                     records_by_id={record.record_id: record for record in batch},
-                    summaries_by_id=summaries_by_id,
+                    summary_records_by_id=summary_records_by_id,
                     source_metadata=canonical_sources,
                 )
                 for payload in output
@@ -400,46 +402,26 @@ def _synthesis_record(
     snapshot_id: str,
     provenance: CompilerProvenance,
     records_by_id: Mapping[str, DerivedRecord],
-    summaries_by_id: Mapping[str, _ClusterSummary],
+    summary_records_by_id: Mapping[str, DerivedRecord],
     source_metadata: dict[str, ReconciliationSource],
 ) -> DerivedRecord:
     if not isinstance(payload, dict) or not isinstance(payload.get("family"), str):
         raise ValueError("synthesis record must be a typed object")
     family = payload["family"]
-    inputs = _required_reference_ids(
+    inputs = _optional_reference_ids(
         payload, "input_record_ids", tuple(records_by_id)
     )
-    summary_ids = _optional_reference_ids(
-        payload, "input_summary_ids", tuple(summaries_by_id)
+    conclusion_ids = _optional_reference_ids(
+        payload, "input_conclusion_ids", tuple(summary_records_by_id)
     )
+    if not inputs and not conclusion_ids:
+        raise ValueError("synthesis requires at least one exact input conclusion")
     direct_records = tuple(records_by_id[record_id] for record_id in inputs)
-    summary_records = tuple(dict.fromkeys(
-        record
-        for summary_id in summary_ids
-        for record in summaries_by_id[summary_id].lineage_records
-    ))
+    summary_records = tuple(summary_records_by_id[record_id] for record_id in conclusion_ids)
     lineage_records = tuple(dict.fromkeys((*direct_records, *summary_records)))
     lineage_record_ids = tuple(record.record_id for record in lineage_records)
-    direct_anchor_ids = tuple(dict.fromkeys(
-        anchor for record in direct_records for anchor in record.anchors
-    ))
-    summary_anchor_ids = tuple(dict.fromkeys(
-        anchor for record in summary_records for anchor in record.anchors
-    ))
     lineage_anchor_ids = tuple(dict.fromkeys(
         anchor for record in lineage_records for anchor in record.anchors
-    ))
-    direct_revision_ids = tuple(dict.fromkeys(
-        dependency.identifier
-        for record in direct_records
-        for dependency in record.dependencies
-        if dependency.kind == "source_revision"
-    ))
-    summary_revision_ids = tuple(dict.fromkeys(
-        dependency.identifier
-        for record in summary_records
-        for dependency in record.dependencies
-        if dependency.kind == "source_revision"
     ))
     lineage_revision_ids = tuple(dict.fromkeys(
         dependency.identifier
@@ -448,18 +430,18 @@ def _synthesis_record(
         if dependency.kind == "source_revision"
     ))
     declared_anchors = _required_reference_ids(
-        payload, "anchors", direct_anchor_ids
+        payload, "anchors", lineage_anchor_ids
     )
     declared_sources = _required_reference_ids(
-        payload, "source_revision_ids", direct_revision_ids
+        payload, "source_revision_ids", lineage_revision_ids
     )
     if (
-        set(declared_anchors) != set(direct_anchor_ids)
-        or set(declared_sources) != set(direct_revision_ids)
+        set(declared_anchors) != set(lineage_anchor_ids)
+        or set(declared_sources) != set(lineage_revision_ids)
     ):
         raise ValueError("synthesis evidence references must exactly match explicit input lineage")
-    anchors = tuple(dict.fromkeys((*declared_anchors, *summary_anchor_ids)))
-    sources = tuple(dict.fromkeys((*declared_sources, *summary_revision_ids)))
+    anchors = tuple(dict.fromkeys(declared_anchors))
+    sources = tuple(dict.fromkeys(declared_sources))
     common = {
         "snapshot_id": snapshot_id,
         "anchors": anchors,
@@ -474,7 +456,7 @@ def _synthesis_record(
         "compiler_provenance": provenance,
     }
     base_fields = {
-        "family", "qualification", "anchors", "input_record_ids", "input_summary_ids",
+        "family", "qualification", "anchors", "input_record_ids", "input_conclusion_ids",
         "source_revision_ids"
     }
     if family == "relationship":
@@ -715,10 +697,7 @@ def _hierarchical_call_count(primary_count: int, width: int) -> int:
 def _cluster_summary(
     covered_records: tuple[DerivedRecord, ...], outputs: tuple[DerivedRecord, ...]
 ) -> _ClusterSummary:
-    conclusions = _compact_conclusions(outputs or covered_records)
-    return _ClusterSummary(
-        covered_records[0], covered_records, outputs or covered_records, conclusions
-    )
+    return _ClusterSummary(covered_records[0], covered_records, outputs or covered_records)
 
 
 def _merged_cluster_summary(
@@ -728,32 +707,12 @@ def _merged_cluster_summary(
         record for child in children for record in child.covered_records
     ))
     if outputs:
-        selected_record_ids = {
-            dependency.identifier
-            for output in outputs
-            for dependency in output.dependencies
-            if dependency.kind == "derived_record"
-        }
-        selected_children = tuple(
-            child
-            for child in children
-            if {record.record_id for record in child.lineage_records} <= selected_record_ids
-        )
-        conclusions = _bounded_unique_strings((
-            *(_compact_conclusions(outputs)),
-            *(conclusion for child in selected_children for conclusion in child.conclusions),
-        ))
         lineage_records = outputs
     else:
-        conclusions = _bounded_unique_strings(tuple(
-            conclusion for child in children for conclusion in child.conclusions
-        ))
         lineage_records = tuple(dict.fromkeys(
             record for child in children for record in child.lineage_records
         ))
-    return _ClusterSummary(
-        children[0].representative, covered, lineage_records, conclusions
-    )
+    return _ClusterSummary(children[0].representative, covered, lineage_records)
 
 
 def _cluster_summary_id(summary: _ClusterSummary) -> str:
@@ -787,7 +746,28 @@ def _cluster_summary_payload(
         ),
         "covered_record_count": len(covered_ids),
         "coverage_digest": sha256("\n".join(covered_ids).encode()).hexdigest(),
-        "conclusions": list(summary.conclusions),
+        "conclusions": [
+            _conclusion_payload(record) for record in summary.lineage_records
+        ],
+    }
+
+
+def _conclusion_payload(record: DerivedRecord) -> dict[str, object]:
+    """Expose one conclusion with only the evidence that supports that record."""
+    return {
+        "conclusion_id": record.record_id,
+        "statement": _compact_conclusions((record,))[0],
+        "input_record_ids": [
+            dependency.identifier
+            for dependency in record.dependencies
+            if dependency.kind == "derived_record"
+        ],
+        "anchor_ids": list(record.anchors),
+        "source_revision_ids": [
+            dependency.identifier
+            for dependency in record.dependencies
+            if dependency.kind == "source_revision"
+        ],
     }
 
 

@@ -381,6 +381,36 @@ class RawClaimBypassSynthesizer:
         ),), provenance)
 
 
+class AmbiguousLineageSynthesizer(SyntheticSynthesizer):
+    def synthesize(self, *, snapshot_id, records, **_kwargs):
+        first, second = records[:2]
+        first_revision = next(
+            dependency.identifier
+            for dependency in first.dependencies
+            if dependency.kind == "source_revision"
+        )
+        ambiguous = Relationship.create(
+            snapshot_id=snapshot_id,
+            anchors=first.anchors + second.anchors,
+            dependencies=(
+                RecordDependency("source_revision", first_revision),
+                RecordDependency("derived_record", first.record_id),
+            ),
+            validation_state="validated",
+            lifecycle_state="active",
+            qualification="This conclusion leaks an unrelated anchor.",
+            evidence_state="cross_source_synthesis",
+            compiler_provenance=self.provenance,
+            left=first.subject,
+            relation="supports",
+            right="Ambiguous evidence",
+        )
+        coverage = ReconciliationCoverage(
+            len(records), tuple(sorted(record.record_id for record in records)), 1, 0
+        )
+        return SynthesisResult((ambiguous,), self.provenance, coverage=coverage)
+
+
 def synthesis_response(request):
     supplied = json.loads(request["input"])
     records = supplied["records"]
@@ -1139,6 +1169,20 @@ def test_synthesis_cannot_bypass_storage_owned_source_claim_validation(tmp_path)
     assert result.snapshot.status == "failed"
     assert any("source synthesis" in failure for failure in result.failures)
     assert all(record.subject != "Injected" for record in storage.derived_records(result.snapshot.snapshot_id))
+
+
+def test_candidate_compiler_rejects_an_exposed_conclusion_with_ambiguous_lineage(tmp_path):
+    storage, candidate_compiler, request, vector_client = compiler(
+        tmp_path, synthesizer=AmbiguousLineageSynthesizer()
+    )
+
+    result = candidate_compiler.build(request)
+
+    assert result.ready is False
+    assert any("lineage" in failure for failure in result.failures)
+    assert result.orientation_artifacts == ()
+    assert vector_client.calls == []
+    assert storage.current_snapshot() is None
 
 
 def test_concrete_reconciliation_stage_builds_typed_provenanced_records_without_network(tmp_path):

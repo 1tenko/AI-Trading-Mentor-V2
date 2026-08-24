@@ -146,6 +146,43 @@ def test_orientation_searches_only_current_derived_store_and_omits_raw_search_te
     assert "citations" not in orientation.__dataclass_fields__
 
 
+def test_orientation_preserves_conclusion_identity_and_exact_direct_lineage():
+    from mentor.chat_service import _orientation_output
+    from mentor.orientation import OrientationBudget, OrientationService
+
+    source_claim = claim("timing source")
+    conclusion = Relationship.create(
+        snapshot_id=SNAPSHOT_ID,
+        anchors=source_claim.anchors,
+        dependencies=(
+            RecordDependency("source_revision", "rev_synthetic"),
+            RecordDependency("derived_record", source_claim.record_id),
+        ),
+        validation_state="validated",
+        lifecycle_state="active",
+        qualification="One bounded synthesized conclusion.",
+        evidence_state="cross_source_synthesis",
+        left="timing",
+        relation="supports",
+        right="context",
+    )
+    concept_ids = context((source_claim, conclusion))
+    service = OrientationService(
+        FakeStorage(published_snapshot(), [source_claim, conclusion], concept_ids),
+        FakeVectorStores([result(conclusion, concept_id=concept_ids[conclusion.record_id])]),
+        budget=OrientationBudget(max_records=2, max_tokens=2_000),
+    )
+
+    orientation = service.consult("How does timing support context?")
+    [record] = orientation.records
+    assert getattr(record, "input_record_ids", ()) == (source_claim.record_id,)
+    assert getattr(record, "source_revision_ids", ()) == ("rev_synthetic",)
+    payload = _orientation_output(orientation)["records"][0]
+    assert payload["record_id"] == conclusion.record_id
+    assert payload["input_record_ids"] == [source_claim.record_id]
+    assert payload["source_revision_ids"] == ["rev_synthetic"]
+
+
 def test_orientation_returns_safe_canonical_labels_aliases_and_occurrence_summaries():
     from mentor.orientation import OrientationBudget, OrientationService
 

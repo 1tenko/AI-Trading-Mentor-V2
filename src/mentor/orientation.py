@@ -11,7 +11,9 @@ from mentor.derived_records import (
     Evolution,
     ProcedureSequenceHierarchy,
     Relationship,
+    input_record_ids,
     reject_private_or_raw_text,
+    source_revision_ids,
     validate_record,
 )
 from mentor.vector_stores import VectorStoreSearchResult
@@ -66,6 +68,8 @@ class OrientationRecord:
     statement: str
     anchor_ids: tuple[str, ...]
     source_area: OrientationSourceArea
+    input_record_ids: tuple[str, ...] = ()
+    source_revision_ids: tuple[str, ...] = ()
     semantic_subtype: str = "unspecified"
     concept_ids: tuple[str, ...] = ()
     concepts: tuple[OrientationConceptSummary, ...] = ()
@@ -324,6 +328,8 @@ def _orientation_record(
         qualification=record.qualification,
         statement=_statement(record),
         anchor_ids=record.anchors,
+        input_record_ids=input_record_ids(record),
+        source_revision_ids=source_revision_ids(record),
         source_area=OrientationSourceArea(*_safe_source_area(source_area)),
         concept_ids=concept_ids,
         concepts=concepts,
