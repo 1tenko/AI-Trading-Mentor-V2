@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass
 import json
-from typing import Any
+from typing import Any, Mapping
 
 from mentor.compiler_prompts import (
     EXTRACTION_PROMPT_VERSION,
@@ -54,10 +54,20 @@ class SourceExtractor:
         self._provenance = CompilerProvenance(model, EXTRACTION_PROMPT_VERSION, EXTRACTION_SCHEMA_VERSION)
 
     def extract(
-        self, *, revision: SourceRevision, snapshot_id: str, transcript: str
+        self,
+        *,
+        revision: SourceRevision,
+        snapshot_id: str,
+        transcript: str,
+        anchor_spans: Mapping[str, str] | None = None,
     ) -> ExtractionResult:
         response = self._client.responses.create(
-            **extraction_request(revision=revision, transcript=transcript, model=self._provenance.model_version)
+            **extraction_request(
+                revision=revision,
+                transcript=transcript,
+                model=self._provenance.model_version,
+                anchor_spans=anchor_spans,
+            )
         )
         candidates = _parse_candidates(
             _response_output_text(response),

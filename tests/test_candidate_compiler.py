@@ -15,7 +15,14 @@ from mentor.candidate_compiler import (
 )
 from mentor.compilation import CompilationRun
 from mentor.compiler import SourceExtractor
-from mentor.derived_records import ConflictUnresolved, Evolution, RecordDependency, Relationship
+from mentor.derived_records import (
+    Claim,
+    CompilerProvenance,
+    ConflictUnresolved,
+    Evolution,
+    RecordDependency,
+    Relationship,
+)
 from mentor.knowledge import Collection, Source, SourceRevision
 from mentor.orientation import OrientationBudget
 from mentor.storage import Storage
@@ -39,12 +46,13 @@ class QueueResponses:
 
 
 class FakeVectorClient:
-    def __init__(self, *, attachment_status="completed", batch_status="completed"):
+    def __init__(self, *, attachment_status="completed", batch_status="completed", create_failure_at=None):
         self.calls = []
         self.attachment_status = attachment_status
         self.batch_result_status = batch_status
         self.next_store = 0
         self.next_file = 0
+        self.create_failure_at = create_failure_at
         self.files = SimpleNamespace(create=self.upload)
         self.vector_store_files = SimpleNamespace(
             create=self.attach,
@@ -61,6 +69,8 @@ class FakeVectorClient:
     def create_store(self, **kwargs):
         self.next_store += 1
         self.calls.append(("create_store", kwargs))
+        if self.next_store == self.create_failure_at:
+            raise RuntimeError("Synthetic store setup failure.")
         return SimpleNamespace(id=f"vs_synthetic_{self.next_store}", status="completed")
 
     def upload(self, **kwargs):
@@ -112,10 +122,12 @@ class SyntheticSynthesizer:
         self.stale = stale
         self.calls = []
 
-    def synthesize(self, *, snapshot_id, records, revisions):
+    def synthesize(self, *, snapshot_id, records, revisions, anchor_spans):
         self.calls.append((snapshot_id, tuple(record.record_id for record in records)))
+        assert anchor_spans
+        provenance = CompilerProvenance("synthetic-synthesizer", "synthesis-prompt-v1", "synthesis-schema-v1")
         if len(records) < 2:
-            return SynthesisResult(())
+            return SynthesisResult((), provenance)
         first, second = records[:2]
         source_dependencies = tuple(
             RecordDependency("source_revision", revision.revision_id) for revision in revisions
@@ -132,6 +144,7 @@ class SyntheticSynthesizer:
             "lifecycle_state": "active",
             "qualification": "Synthetic cross-source comparison.",
             "evidence_state": "cross_source_synthesis",
+            "compiler_provenance": provenance,
         }
         relationship = Relationship.create(
             **(common | ({"lifecycle_state": "superseded"} if self.stale else {})),
@@ -163,7 +176,25 @@ class SyntheticSynthesizer:
             relevant_scopes=("synthetic scope",),
             unresolved_questions=("Which synthetic condition applies?",),
         )
-        return SynthesisResult((relationship, evolution, conflict))
+        return SynthesisResult((relationship, evolution, conflict), provenance)
+
+
+class RawClaimBypassSynthesizer:
+    def synthesize(self, *, snapshot_id, records, revisions, **_kwargs):
+        first = records[0]
+        provenance = CompilerProvenance("synthetic", "prompt", "schema")
+        return SynthesisResult((Claim.create(
+            snapshot_id=snapshot_id,
+            anchors=first.anchors,
+            dependencies=(RecordDependency("source_revision", revisions[0].revision_id),),
+            validation_state="validated",
+            lifecycle_state="active",
+            qualification="Synthetic bypass attempt.",
+            subject="Injected",
+            predicate="claims",
+            object="raw authority",
+            compiler_provenance=provenance,
+        ),), provenance)
 
 
 def source_bundle(storage, identity, year):
@@ -201,7 +232,15 @@ def source_bundle(storage, identity, year):
     return CandidateSource(revision, transcript, {anchor.anchor_id: anchor})
 
 
-def compiler(tmp_path, *, extraction_outputs=None, validation_outputs=None, vector_client=None, synthesizer=None):
+def compiler(
+    tmp_path,
+    *,
+    extraction_outputs=None,
+    validation_outputs=None,
+    synthesis_outputs=None,
+    vector_client=None,
+    synthesizer=None,
+):
     storage = Storage(tmp_path / "mentor.sqlite3")
     storage.initialize()
     sources = (
@@ -226,6 +265,12 @@ def compiler(tmp_path, *, extraction_outputs=None, validation_outputs=None, vect
     extraction_responses = QueueResponses(extraction_outputs)
     validation_responses = QueueResponses(validation_outputs)
     vector_client = vector_client or FakeVectorClient()
+    if synthesis_outputs is not None:
+        from mentor.synthesis import SynthesisReconciler
+
+        synthesizer = SynthesisReconciler(
+            SimpleNamespace(responses=QueueResponses(synthesis_outputs))
+        )
     candidate_compiler = CandidateCompiler(
         storage=storage,
         extractor=SourceExtractor(SimpleNamespace(responses=extraction_responses)),
@@ -267,7 +312,10 @@ def test_build_composes_a_ready_unpublished_candidate_with_typed_bounded_artifac
     assert result.total_metric.input_tokens == 44
     assert result.total_metric.output_tokens == 28
     assert result.total_metric.remote_calls > 0
+    assert next(iter(request.sources[0].anchors)) in candidate_compiler._extractor._client.responses.calls[0]["input"]
     assert any(call[0] == "batch" for call in vector_client.calls)
+    raw_batch = next(call for call in vector_client.calls if call[0] == "batch")
+    assert raw_batch[2]["file_ids"] == [source.revision.remote_file_id for source in request.sources]
     assert len([call for call in vector_client.calls if call[0] == "upload"]) == len(result.orientation_artifacts)
 
 
@@ -302,6 +350,9 @@ def test_nonaffirmative_validation_blocks_candidate_readiness_and_excludes_the_c
     assert any("validation" in failure for failure in result.failures)
     assert len(storage.derived_records(result.snapshot.snapshot_id)) == 1
     assert storage.current_snapshot() is None
+    metrics = {metric.stage: metric for metric in result.stage_metrics}
+    assert metrics["extraction"].record_count == 2
+    assert metrics["validation"].record_count == 1
 
 
 def test_remote_readiness_failure_marks_candidate_failed_without_pointer_mutation(tmp_path):
@@ -326,13 +377,12 @@ def test_nonactive_synthesis_record_never_enters_an_orientation_artifact(tmp_pat
 
     assert result.ready is False
     assert result.snapshot.status == "failed"
-    stale = next(
-        record
+    assert all(
+        record.lifecycle_state == "active"
         for record in storage.derived_records(result.snapshot.snapshot_id, include_stale=True)
-        if record.lifecycle_state == "superseded"
     )
-    assert stale.record_id not in {artifact.record_id for artifact in result.orientation_artifacts}
-    assert all(stale.record_id not in call[2] for call in vector_client.calls if call[0] == "upload")
+    assert result.orientation_artifacts == ()
+    assert not any(call[0] == "upload" for call in vector_client.calls)
 
 
 def test_explicit_stale_revision_invalidation_blocks_artifacts_and_readiness(tmp_path):
@@ -354,3 +404,120 @@ def test_artifact_scope_is_required_and_cannot_be_an_untracked_string(tmp_path):
 
     with pytest.raises(ValueError, match="artifact scope"):
         candidate_compiler.build(replace(request, artifact_scope="pilot"))
+
+
+@pytest.mark.parametrize("change", [
+    {"remote_file_id": "file_substituted"},
+    {"revision_id": "rev_unknown"},
+])
+def test_raw_authority_rejects_noncanonical_request_revisions_before_remote_or_model_calls(tmp_path, change):
+    _storage, candidate_compiler, request, vector_client = compiler(tmp_path)
+    source = request.sources[0]
+    request = replace(
+        request,
+        sources=(replace(source, revision=replace(source.revision, **change)), request.sources[1]),
+    )
+
+    with pytest.raises(ValueError, match="canonical|unknown"):
+        candidate_compiler.build(request)
+
+    assert vector_client.calls == []
+    assert candidate_compiler._extractor._client.responses.calls == []
+
+
+def test_synthesis_cannot_bypass_storage_owned_source_claim_validation(tmp_path):
+    storage, candidate_compiler, request, _ = compiler(
+        tmp_path,
+        synthesizer=RawClaimBypassSynthesizer(),
+    )
+
+    result = candidate_compiler.build(request)
+
+    assert result.ready is False
+    assert result.snapshot.status == "failed"
+    assert any("source synthesis" in failure for failure in result.failures)
+    assert all(record.subject != "Injected" for record in storage.derived_records(result.snapshot.snapshot_id))
+
+
+def test_concrete_reconciliation_stage_builds_typed_provenanced_records_without_network(tmp_path):
+    storage, candidate_compiler, request, _ = compiler(
+        tmp_path,
+        synthesis_outputs=[{"records": [
+            {
+                "family": "relationship",
+                "qualification": "Synthetic relationship synthesis.",
+                "anchors": [],
+                "input_record_ids": [],
+                "source_revision_ids": [],
+                "left": "Synthetic 1",
+                "relation": "supports",
+                "right": "Synthetic 2",
+            },
+            {
+                "family": "evolution",
+                "qualification": "Synthetic evolution synthesis.",
+                "anchors": [],
+                "input_record_ids": [],
+                "source_revision_ids": [],
+                "subject": "Synthetic framework",
+                "previous": "Earlier bounded form",
+                "current": "Later qualified form",
+                "earlier_source_set": [],
+                "later_source_set": [],
+                "classification": "refined",
+                "negative_evidence_state": "positive_teaching",
+                "earlier_coverage_id": "coverage_earlier",
+                "later_coverage_id": "coverage_later",
+                "earlier_observed_years": [2025],
+                "later_observed_years": [2026],
+            },
+            {
+                "family": "conflict_unresolved",
+                "qualification": "Synthetic unresolved synthesis.",
+                "anchors": [],
+                "input_record_ids": [],
+                "source_revision_ids": [],
+                "kind": "unresolved",
+                "subject": "Synthetic context",
+                "alternatives": ["Earlier condition", "Later condition"],
+                "competing_record_ids": [],
+                "reconciliation_state": "unresolved",
+                "relevant_scopes": ["synthetic scope"],
+                "conditions": [],
+                "unresolved_questions": ["Which synthetic condition applies?"],
+            },
+        ]}],
+    )
+
+    result = candidate_compiler.build(request)
+
+    assert result.ready is True
+    synthesized = [record for record in storage.derived_records(result.snapshot.snapshot_id) if record.evidence_state == "cross_source_synthesis"]
+    assert {record.family for record in synthesized} == {"relationship", "evolution", "conflict_unresolved"}
+    assert all(record.compiler_provenance is not None for record in synthesized)
+    assert next(metric for metric in result.stage_metrics if metric.stage == "synthesis").input_tokens == 11
+
+
+def test_partial_remote_setup_is_auditable_and_retry_returns_the_same_failed_run(tmp_path):
+    vector_client = FakeVectorClient(create_failure_at=2)
+    storage, candidate_compiler, request, _ = compiler(tmp_path, vector_client=vector_client)
+
+    first = candidate_compiler.build(request)
+    call_count = len(vector_client.calls)
+    second = candidate_compiler.build(request)
+
+    assert first.ready is second.ready is False
+    assert first.snapshot.snapshot_id == second.snapshot.snapshot_id
+    assert first.snapshot.status == second.snapshot.status == "failed"
+    assert first.snapshot.raw_store_id == "vs_synthetic_1"
+    assert first.snapshot.derived_store_id is None
+    assert storage.compilation_run(request.run.run_id).status == "failed"
+    assert storage.candidate_artifact_scope(first.snapshot.snapshot_id) == "pilot"
+    assert storage.current_snapshot() is None
+    assert len(vector_client.calls) == call_count == 2
+    setup = next(metric for metric in first.stage_metrics if metric.stage == "remote_setup")
+    assert (setup.call_count, setup.remote_calls, setup.failure_count) == (2, 2, 1)
+    assert candidate_compiler._extractor._client.responses.calls == []
+    with pytest.raises(ValueError, match="run ID"):
+        candidate_compiler.build(replace(request, artifact_scope=ArtifactScope.PRODUCTION))
+    assert len(vector_client.calls) == call_count

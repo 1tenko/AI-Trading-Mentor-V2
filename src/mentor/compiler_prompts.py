@@ -1,6 +1,7 @@
 """Versioned, bounded source-extraction request definitions."""
 
 import json
+from typing import Mapping
 
 from mentor.knowledge import SourceRevision
 
@@ -52,12 +53,22 @@ EXTRACTION_RESPONSE_SCHEMA = {
 }
 
 
-def extraction_request(*, revision: SourceRevision, transcript: str, model: str) -> dict[str, object]:
+def extraction_request(
+    *,
+    revision: SourceRevision,
+    transcript: str,
+    model: str,
+    anchor_spans: Mapping[str, str] | None = None,
+) -> dict[str, object]:
+    anchors = dict(anchor_spans or {})
     return {
         "model": model,
         "store": False,
         "instructions": f"Prompt version: {EXTRACTION_PROMPT_VERSION}\n{EXTRACTION_INSTRUCTIONS}",
-        "input": f"Source revision: {revision.revision_id}\n\nTranscript:\n{transcript}",
+        "input": (
+            f"Source revision: {revision.revision_id}\n\nTranscript:\n{transcript}\n\n"
+            f"Candidate anchors:\n{json.dumps(anchors, sort_keys=True, separators=(',', ':'))}"
+        ),
         "text": {
             "format": {
                 "type": "json_schema",

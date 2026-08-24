@@ -5,7 +5,7 @@ from enum import Enum
 import time
 from typing import Any, Callable, Mapping
 
-from mentor.anchors import SourceAnchor, validate_anchor
+from mentor.anchors import SourceAnchor, resolve_anchor_span, validate_anchor
 from mentor.compilation import (
     CallUsage,
     CandidateGateResult,
@@ -17,14 +17,18 @@ from mentor.compilation import (
 from mentor.compiler import ExtractionResult, SourceExtractor
 from mentor.dependencies import DependencyGraph
 from mentor.derived_records import (
+    Claim,
+    CompilerProvenance,
+    ConflictUnresolved,
     DerivedRecord,
+    Evolution,
     ProcedureSequenceHierarchy,
     Relationship,
     validate_record,
 )
 from mentor.knowledge import SourceRevision
 from mentor.orientation import OrientationBudget, render_orientation_artifact
-from mentor.synthesis import ConceptHint, SynthesisCandidate
+from mentor.synthesis import ConceptHint, SynthesisCandidate, SynthesisResult
 
 
 _TERMINAL_REMOTE_FAILURES = frozenset({"cancelled", "expired", "failed"})
@@ -51,13 +55,6 @@ class BuildRequest:
 
 
 @dataclass(frozen=True)
-class SynthesisResult:
-    records: tuple[DerivedRecord, ...]
-    hints: tuple[ConceptHint, ...] = ()
-    usage: CallUsage = CallUsage()
-
-
-@dataclass(frozen=True)
 class OrientationArtifact:
     record_id: str
     concept_id: str
@@ -69,7 +66,7 @@ class OrientationArtifact:
 class RemoteArtifact:
     kind: str
     scope: ArtifactScope
-    store_id: str
+    store_id: str | None
     file_ids: tuple[str, ...]
 
 
@@ -77,7 +74,7 @@ class RemoteArtifact:
 class CandidateBuildResult:
     snapshot: CorpusSnapshot
     ready: bool
-    gate: CandidateGateResult
+    gate: CandidateGateResult | None
     records: tuple[DerivedRecord, ...]
     dependency_graph: DependencyGraph
     orientation_artifacts: tuple[OrientationArtifact, ...]
@@ -124,54 +121,123 @@ class CandidateCompiler:
         self._now = now
 
     def build(self, request: BuildRequest) -> CandidateBuildResult:
-        sources = _validate_request(request)
+        requested_sources = _validate_request(request)
+        sources = _canonical_sources(self._storage, requested_sources)
+        for source in sources:
+            _validate_candidate_source(source)
         revision_ids, _fingerprint, snapshot_id = CorpusSnapshot.identity_for(
             request.run.run_id, [source.revision.revision_id for source in sources]
         )
         scope = request.artifact_scope.value
-        raw_store = self._vector_stores.create_store(
-            f"Phase 3 {scope} raw {request.run.run_id}",
-            {"snapshot_id": snapshot_id, "artifact_scope": scope, "artifact_kind": "raw"},
-        )
-        derived_store = self._vector_stores.create_store(
-            f"Phase 3 {scope} derived {request.run.run_id}",
-            {"snapshot_id": snapshot_id, "artifact_scope": scope, "artifact_kind": "derived"},
-        )
+        existing_run = self._storage.compilation_run(request.run.run_id)
+        if existing_run is not None:
+            existing = self._storage.snapshot(snapshot_id)
+            same_versions = (
+                existing_run.model_version,
+                existing_run.prompt_version,
+                existing_run.schema_version,
+                existing_run.started_at,
+            ) == (
+                request.run.model_version,
+                request.run.prompt_version,
+                request.run.schema_version,
+                request.run.started_at,
+            )
+            same_scope = existing is not None and self._storage.candidate_artifact_scope(
+                existing.snapshot_id
+            ) == scope
+            if existing is not None and existing.status == "failed" and same_versions and same_scope:
+                return self._existing_failed_result(request, existing)
+            raise ValueError("compilation run ID already belongs to another or unfinished candidate")
         snapshot = CorpusSnapshot.create(
             run=request.run,
             selected_revisions=[source.revision for source in sources],
-            raw_store_id=raw_store.store_id,
-            derived_store_id=derived_store.store_id,
+            raw_store_id=None,
+            derived_store_id=None,
             created_at=self._now(),
         )
         if snapshot.selected_revision_ids != revision_ids:
             raise ValueError("candidate revision selection is not canonical")
         self._storage.create_compilation_candidate(request.run, snapshot)
+        self._storage.record_candidate_artifact_scope(snapshot.snapshot_id, scope)
 
         stage_metrics: list[CompilationMetric] = []
         failures: list[str] = []
+        setup_started = self._clock()
+        setup_calls = 0
+        try:
+            setup_calls += 1
+            raw_store = self._vector_stores.create_store(
+                f"Phase 3 {scope} raw {request.run.run_id}",
+                {"snapshot_id": snapshot_id, "artifact_scope": scope, "artifact_kind": "raw"},
+            )
+            snapshot = self._storage.record_candidate_store(snapshot_id, "raw", raw_store.store_id)
+            _reject_failed_store(raw_store)
+            setup_calls += 1
+            derived_store = self._vector_stores.create_store(
+                f"Phase 3 {scope} derived {request.run.run_id}",
+                {"snapshot_id": snapshot_id, "artifact_scope": scope, "artifact_kind": "derived"},
+            )
+            snapshot = self._storage.record_candidate_store(snapshot_id, "derived", derived_store.store_id)
+            _reject_failed_store(derived_store)
+        except Exception as error:
+            failures.append(f"remote setup failed: {error}")
+        stage_metrics.append(
+            self._record_metric(
+                request.run,
+                "remote_setup",
+                len(sources),
+                0,
+                setup_calls,
+                CallUsage(),
+                _elapsed_ms(setup_started, self._clock()),
+                setup_calls,
+                int(bool(failures)),
+            )
+        )
+        empty_graph = DependencyGraph(())
+        empty_raw = RemoteArtifact("raw", request.artifact_scope, snapshot.raw_store_id, ())
+        empty_derived = RemoteArtifact("derived", request.artifact_scope, snapshot.derived_store_id, ())
+        if failures:
+            return self._failed_result(
+                request,
+                None,
+                failures,
+                stage_metrics,
+                empty_graph,
+                (),
+                empty_raw,
+                empty_derived,
+            )
+
         source_results: list[SourceProcessingResult] = []
         extraction_usage = CallUsage()
         validation_usage = CallUsage()
         extraction_calls = validation_calls = 0
         extraction_failures = validation_failures = 0
-        extraction_started = self._clock()
-        validation_latency_ms = 0
+        extracted_candidate_count = extraction_latency_ms = validation_latency_ms = 0
 
         for source in sources:
             accepted = 0
             source_failed = False
             try:
-                _validate_candidate_source(source)
+                extraction_started = self._clock()
                 extraction_calls += 1
                 extracted = self._extractor.extract(
                     revision=source.revision,
                     snapshot_id=snapshot.snapshot_id,
                     transcript=source.transcript,
+                    anchor_spans={
+                        anchor_id: resolve_anchor_span(anchor, source.revision, source.transcript)
+                        for anchor_id, anchor in source.anchors.items()
+                    },
                 )
                 _validate_extraction_result(extracted, source)
                 extraction_usage = _sum_usage(extraction_usage, extracted.usage)
+                extracted_candidate_count += len(extracted.candidates)
+                extraction_latency_ms += _elapsed_ms(extraction_started, self._clock())
             except Exception as error:
+                extraction_latency_ms += _elapsed_ms(extraction_started, self._clock())
                 extraction_failures += 1
                 source_failed = True
                 failures.append(f"extraction failed for {source.revision.revision_id}: {error}")
@@ -217,11 +283,11 @@ class CandidateCompiler:
                 request.run,
                 "extraction",
                 len(sources),
-                sum(result.record_count for result in source_results),
+                extracted_candidate_count,
                 extraction_calls,
                 extraction_usage,
-                _elapsed_ms(extraction_started, self._clock()),
-                extraction_calls,
+                extraction_latency_ms,
+                extraction_calls if self._live_mode else 0,
                 extraction_failures,
             )
         )
@@ -234,14 +300,11 @@ class CandidateCompiler:
                 validation_calls,
                 validation_usage,
                 validation_latency_ms,
-                validation_calls,
+                validation_calls if self._live_mode else 0,
                 validation_failures,
             )
         )
 
-        empty_graph = DependencyGraph(())
-        empty_raw = RemoteArtifact("raw", request.artifact_scope, raw_store.store_id, ())
-        empty_derived = RemoteArtifact("derived", request.artifact_scope, derived_store.store_id, ())
         if failures:
             gate = self._storage.record_candidate_gate(snapshot.snapshot_id, tuple(source_results), checked_at=self._now())
             return self._failed_result(
@@ -257,6 +320,7 @@ class CandidateCompiler:
 
         synthesis_started = self._clock()
         synthesis_usage = CallUsage()
+        synthesized_count = 0
         hints: tuple[ConceptHint, ...] = ()
         try:
             extracted_records = tuple(self._storage.derived_records(snapshot.snapshot_id, include_stale=True))
@@ -264,11 +328,18 @@ class CandidateCompiler:
                 snapshot_id=snapshot.snapshot_id,
                 records=extracted_records,
                 revisions=tuple(source.revision for source in sources),
+                anchor_spans=_source_anchor_spans(sources),
             )
             if not isinstance(synthesized, SynthesisResult):
                 raise ValueError("synthesis stage must return SynthesisResult")
             synthesis_usage = synthesized.usage
-            hints = synthesized.hints
+            synthesized_count = len(synthesized.records)
+            hints = tuple(synthesized.hints)
+            _validate_synthesis_result(
+                synthesized,
+                snapshot.snapshot_id,
+                {anchor_id for source in sources for anchor_id in source.anchors},
+            )
             _validate_candidate_dependencies(
                 extracted_records + synthesized.records,
                 set(snapshot.selected_revision_ids),
@@ -286,7 +357,7 @@ class CandidateCompiler:
                 request.run,
                 "synthesis",
                 len(sources),
-                len(records),
+                synthesized_count,
                 1,
                 synthesis_usage,
                 _elapsed_ms(synthesis_started, self._clock()),
@@ -359,10 +430,10 @@ class CandidateCompiler:
                 "raw_store",
                 len(sources),
                 0,
-                raw_calls + 1,
+                raw_calls,
                 CallUsage(),
                 _elapsed_ms(raw_started, self._clock()),
-                raw_calls + 1,
+                raw_calls,
                 int(bool(failures)),
             )
         )
@@ -380,7 +451,7 @@ class CandidateCompiler:
 
         derived_started = self._clock()
         derived_file_ids: list[str] = []
-        derived_calls = 1
+        derived_calls = 0
         try:
             for artifact in orientation_artifacts:
                 file_id = self._vector_stores.upload_text(
@@ -585,7 +656,7 @@ class CandidateCompiler:
     def _failed_result(
         self,
         request: BuildRequest,
-        gate: CandidateGateResult,
+        gate: CandidateGateResult | None,
         failures: list[str],
         stage_metrics: list[CompilationMetric],
         graph: DependencyGraph,
@@ -594,7 +665,10 @@ class CandidateCompiler:
         derived_artifact: RemoteArtifact,
         excluded_record_ids: tuple[str, ...] = (),
     ) -> CandidateBuildResult:
-        snapshot = self._storage.snapshot(gate.snapshot_id)
+        snapshot_id = gate.snapshot_id if gate is not None else CorpusSnapshot.identity_for(
+            request.run.run_id, [source.revision.revision_id for source in request.sources]
+        )[2]
+        snapshot = self._storage.snapshot(snapshot_id)
         if snapshot.status == "building":
             snapshot = self._storage.transition_snapshot(
                 snapshot.snapshot_id, "validating", transitioned_at=self._now()
@@ -623,6 +697,33 @@ class CandidateCompiler:
             excluded_record_ids,
         )
 
+    def _existing_failed_result(
+        self, request: BuildRequest, snapshot: CorpusSnapshot
+    ) -> CandidateBuildResult:
+        metrics = self._storage.compilation_metrics(snapshot.run_id)
+        stage_metrics = tuple(metric for metric in metrics if metric.stage != "total")
+        total = next((metric for metric in reversed(metrics) if metric.stage == "total"), None)
+        if total is None:
+            total = self._total_metric(request.run, list(stage_metrics))
+        records = tuple(self._storage.derived_records(snapshot.snapshot_id, include_stale=True))
+        try:
+            graph = self._storage.dependency_graph(snapshot.snapshot_id)
+        except ValueError:
+            graph = DependencyGraph(())
+        return CandidateBuildResult(
+            snapshot,
+            False,
+            self._storage.candidate_gate(snapshot.snapshot_id),
+            records,
+            graph,
+            (),
+            RemoteArtifact("raw", request.artifact_scope, snapshot.raw_store_id, ()),
+            RemoteArtifact("derived", request.artifact_scope, snapshot.derived_store_id, ()),
+            stage_metrics,
+            total,
+            (snapshot.failure_reason or "existing candidate failed",),
+        )
+
 
 def _validate_request(request: BuildRequest) -> tuple[CandidateSource, ...]:
     if not isinstance(request, BuildRequest):
@@ -647,6 +748,18 @@ def _validate_request(request: BuildRequest) -> tuple[CandidateSource, ...]:
     return request.sources
 
 
+def _canonical_sources(storage: Any, sources: tuple[CandidateSource, ...]) -> tuple[CandidateSource, ...]:
+    canonical_sources = []
+    for source in sources:
+        canonical = storage.source_revision(source.revision.revision_id)
+        if canonical is None:
+            raise ValueError("unknown source revision")
+        if canonical != source.revision:
+            raise ValueError("requested source revision does not match canonical stored identity")
+        canonical_sources.append(CandidateSource(canonical, source.transcript, source.anchors))
+    return tuple(canonical_sources)
+
+
 def _validate_candidate_source(source: CandidateSource) -> None:
     if source.revision.lifecycle_state != "active":
         raise ValueError("candidate sources must use active revisions")
@@ -660,6 +773,14 @@ def _validate_candidate_source(source: CandidateSource) -> None:
         if anchor_id != getattr(anchor, "anchor_id", None):
             raise ValueError("candidate source anchor key does not match anchor identity")
         validate_anchor(anchor, source.revision, source.transcript)
+
+
+def _source_anchor_spans(sources: tuple[CandidateSource, ...]) -> dict[str, str]:
+    return {
+        anchor_id: resolve_anchor_span(anchor, source.revision, source.transcript)
+        for source in sources
+        for anchor_id, anchor in source.anchors.items()
+    }
 
 
 def _validate_extraction_result(result: ExtractionResult, source: CandidateSource) -> None:
@@ -683,6 +804,30 @@ def _validate_candidate_dependencies(
             raise ValueError("derived record dependency is outside the candidate snapshot")
 
 
+def _validate_synthesis_result(
+    result: SynthesisResult, snapshot_id: str, known_anchor_ids: set[str]
+) -> None:
+    if not isinstance(result.provenance, CompilerProvenance):
+        raise ValueError("source synthesis requires compiler provenance")
+    allowed = (Claim, Relationship, ProcedureSequenceHierarchy, Evolution, ConflictUnresolved)
+    for record in result.records:
+        validate_record(record)
+        if not isinstance(record, allowed):
+            raise ValueError("source synthesis returned an unsupported record family")
+        if record.snapshot_id != snapshot_id or record.validation_state != "validated" or record.lifecycle_state != "active":
+            raise ValueError("source synthesis records must be validated, active, and candidate-owned")
+        if record.evidence_state != "cross_source_synthesis":
+            raise ValueError("source synthesis cannot claim raw authority")
+        if isinstance(record, Claim) and record.derived_kind != "strategy_implication":
+            raise ValueError("source synthesis claims must remain strategy implications")
+        if record.compiler_provenance != result.provenance:
+            raise ValueError("source synthesis records require matching compiler provenance")
+        if not any(dependency.kind == "source_revision" for dependency in record.dependencies):
+            raise ValueError("source synthesis records require source revision provenance")
+        if not set(record.anchors) <= known_anchor_ids:
+            raise ValueError("source synthesis records require canonical source anchors")
+
+
 def _sum_usage(first: CallUsage, second: CallUsage) -> CallUsage:
     if not isinstance(second, CallUsage):
         raise ValueError("compiler stages require typed call usage")
@@ -701,3 +846,8 @@ def _remote_failure(kind: str, result: Any) -> str:
     last_error = getattr(result, "last_error", None)
     message = getattr(last_error, "message", None)
     return f"{kind} failed: {message or getattr(result, 'status', 'unknown')}"
+
+
+def _reject_failed_store(store: Any) -> None:
+    if getattr(store, "status", None) in _TERMINAL_REMOTE_FAILURES:
+        raise ValueError(_remote_failure("store", store))

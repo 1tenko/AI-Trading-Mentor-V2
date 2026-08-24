@@ -1,17 +1,21 @@
 """Candidate-scoped concepts assembled from validated typed records."""
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from hashlib import sha256
 import json
-from typing import Sequence
+from typing import Any, Sequence
+
+from mentor.compilation import CallUsage
 
 from mentor.derived_records import (
     Claim,
+    CompilerProvenance,
     ConflictUnresolved,
     DerivedRecord,
     Evolution,
     ProcedureSequenceHierarchy,
     Relationship,
+    RecordDependency,
     is_legacy_record,
     reject_private_or_raw_text,
     validate_record,
@@ -23,6 +27,258 @@ MAX_ALIASES = 8
 MAX_SCOPE_LENGTH = 160
 MAX_CONDITION_LENGTH = 160
 MAX_JUSTIFICATION_LENGTH = 280
+SYNTHESIS_PROMPT_VERSION = "cross-source-synthesis-v1"
+SYNTHESIS_SCHEMA_VERSION = "cross-source-synthesis-schema-v1"
+SOL_MODEL = "gpt-5.6-sol"
+MAX_SYNTHESIS_RECORDS = 64
+
+
+@dataclass(frozen=True)
+class SynthesisResult:
+    records: tuple[DerivedRecord, ...]
+    provenance: CompilerProvenance
+    usage: CallUsage = CallUsage()
+    hints: tuple[Any, ...] = ()
+
+
+class SynthesisReconciler:
+    """Create typed cross-source records through a caller-owned Responses client."""
+
+    def __init__(self, client: Any, *, model: str = "synthetic-synthesizer", live_mode: bool = False):
+        if model == SOL_MODEL and not live_mode:
+            raise ValueError("GPT-5.6 Sol synthesis requires explicit live mode; use an injected mock otherwise")
+        self._client = client
+        self._provenance = CompilerProvenance(model, SYNTHESIS_PROMPT_VERSION, SYNTHESIS_SCHEMA_VERSION)
+
+    def synthesize(
+        self,
+        *,
+        snapshot_id: str,
+        records: Sequence[DerivedRecord],
+        revisions: Sequence[object],
+        anchor_spans: dict[str, str],
+    ) -> SynthesisResult:
+        record_values = tuple(records)
+        revision_values = tuple(revisions)
+        for record in record_values:
+            validate_record(record)
+            if record.snapshot_id != snapshot_id or record.validation_state != "validated":
+                raise ValueError("synthesis requires validated candidate records")
+        if not record_values:
+            return SynthesisResult((), self._provenance)
+        if not isinstance(anchor_spans, dict) or any(
+            not isinstance(anchor_id, str) or not isinstance(span, str)
+            for anchor_id, span in anchor_spans.items()
+        ):
+            raise ValueError("synthesis anchor spans must be an ID-to-text mapping")
+        response = self._client.responses.create(
+            model=self._provenance.model_version,
+            store=False,
+            instructions=(
+                f"Prompt version: {SYNTHESIS_PROMPT_VERSION}\n"
+                "Return only small typed cross-source relationship, evolution, or conflict records. "
+                "Use only supplied record, anchor, and revision IDs. Preserve uncertainty; do not claim raw authority."
+            ),
+            input=json.dumps(
+                {
+                    "snapshot_id": snapshot_id,
+                    "records": [asdict(record) for record in record_values],
+                    "revision_ids": [getattr(revision, "revision_id", None) for revision in revision_values],
+                    "supporting_spans": anchor_spans,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            text={
+                "format": {
+                    "type": "json_schema",
+                    "name": SYNTHESIS_SCHEMA_VERSION,
+                    "schema": {
+                        "type": "object",
+                        "required": ["records"],
+                        "properties": {
+                            "records": {
+                                "type": "array",
+                                "maxItems": MAX_SYNTHESIS_RECORDS,
+                                "items": {"type": "object"},
+                            }
+                        },
+                    },
+                    "strict": False,
+                }
+            },
+        )
+        output = _synthesis_output(response)
+        known_record_ids = tuple(record.record_id for record in record_values)
+        known_anchor_ids = tuple(dict.fromkeys(anchor for record in record_values for anchor in record.anchors))
+        known_revision_ids = tuple(getattr(revision, "revision_id", "") for revision in revision_values)
+        synthesized = tuple(
+            _synthesis_record(
+                payload,
+                snapshot_id=snapshot_id,
+                provenance=self._provenance,
+                record_ids=known_record_ids,
+                anchor_ids=known_anchor_ids,
+                revision_ids=known_revision_ids,
+            )
+            for payload in output
+        )
+        return SynthesisResult(synthesized, self._provenance, _synthesis_usage(response))
+
+
+def _synthesis_output(response: Any) -> list[object]:
+    output_text = getattr(response, "output_text", None)
+    if not isinstance(output_text, str):
+        raise ValueError("synthesis response requires output_text")
+    try:
+        payload = json.loads(output_text)
+    except json.JSONDecodeError as error:
+        raise ValueError("synthesis response must be JSON") from error
+    if not isinstance(payload, dict) or set(payload) != {"records"} or not isinstance(payload["records"], list):
+        raise ValueError("synthesis response requires only a records list")
+    if len(payload["records"]) > MAX_SYNTHESIS_RECORDS:
+        raise ValueError("too many synthesis records")
+    return payload["records"]
+
+
+def _synthesis_record(
+    payload: object,
+    *,
+    snapshot_id: str,
+    provenance: CompilerProvenance,
+    record_ids: tuple[str, ...],
+    anchor_ids: tuple[str, ...],
+    revision_ids: tuple[str, ...],
+) -> DerivedRecord:
+    if not isinstance(payload, dict) or not isinstance(payload.get("family"), str):
+        raise ValueError("synthesis record must be a typed object")
+    family = payload["family"]
+    anchors = _payload_ids(payload.get("anchors"), anchor_ids)
+    inputs = _payload_ids(payload.get("input_record_ids"), record_ids)
+    sources = _payload_ids(payload.get("source_revision_ids"), revision_ids)
+    common = {
+        "snapshot_id": snapshot_id,
+        "anchors": anchors,
+        "dependencies": tuple(
+            [*(RecordDependency("source_revision", value) for value in sources),
+             *(RecordDependency("derived_record", value) for value in inputs)]
+        ),
+        "validation_state": "validated",
+        "lifecycle_state": "active",
+        "qualification": payload.get("qualification"),
+        "evidence_state": "cross_source_synthesis",
+        "compiler_provenance": provenance,
+    }
+    base_fields = {
+        "family", "qualification", "anchors", "input_record_ids", "source_revision_ids"
+    }
+    if family == "relationship":
+        _allow_synthesis_fields(payload, base_fields | {"left", "relation", "right"})
+        return Relationship.create(
+            **common,
+            left=payload.get("left"),
+            relation=payload.get("relation"),
+            right=payload.get("right"),
+        )
+    if family == "evolution":
+        fields = base_fields | {
+            "subject", "previous", "current", "earlier_source_set", "later_source_set",
+            "classification", "negative_evidence_state", "competing_anchors",
+            "earlier_coverage_id", "later_coverage_id", "earlier_observed_years",
+            "later_observed_years", "deprecation_evidence_anchors",
+        }
+        _allow_synthesis_fields(payload, fields)
+        earlier = _payload_ids(payload.get("earlier_source_set"), revision_ids[:1])
+        later = _payload_ids(payload.get("later_source_set"), revision_ids[1:])
+        dependencies = tuple(dict.fromkeys(common["dependencies"] + tuple(
+            RecordDependency("source_revision", value) for value in earlier + later
+        )))
+        return Evolution.create(
+            **(common | {"dependencies": dependencies}),
+            subject=payload.get("subject"),
+            previous=payload.get("previous"),
+            current=payload.get("current"),
+            earlier_source_set=earlier,
+            later_source_set=later,
+            classification=payload.get("classification"),
+            negative_evidence_state=payload.get("negative_evidence_state"),
+            competing_anchors=_payload_ids(payload.get("competing_anchors"), (), allow_empty=True),
+            earlier_coverage_id=payload.get("earlier_coverage_id"),
+            later_coverage_id=payload.get("later_coverage_id"),
+            earlier_observed_years=_payload_years(payload.get("earlier_observed_years")),
+            later_observed_years=_payload_years(payload.get("later_observed_years")),
+            deprecation_evidence_anchors=_payload_ids(
+                payload.get("deprecation_evidence_anchors"), (), allow_empty=True
+            ),
+        )
+    if family == "conflict_unresolved":
+        fields = base_fields | {
+            "kind", "subject", "alternatives", "competing_record_ids", "reconciliation_state",
+            "relevant_scopes", "conditions", "unresolved_questions",
+        }
+        _allow_synthesis_fields(payload, fields)
+        competing = _payload_ids(payload.get("competing_record_ids"), record_ids[:2])
+        dependencies = tuple(dict.fromkeys(common["dependencies"] + tuple(
+            RecordDependency("derived_record", value) for value in competing
+        )))
+        return ConflictUnresolved.create(
+            **(common | {"dependencies": dependencies}),
+            kind=payload.get("kind"),
+            subject=payload.get("subject"),
+            alternatives=_payload_texts(payload.get("alternatives")),
+            competing_record_ids=competing,
+            reconciliation_state=payload.get("reconciliation_state"),
+            relevant_scopes=_payload_texts(payload.get("relevant_scopes")),
+            conditions=_payload_texts(payload.get("conditions"), allow_empty=True),
+            unresolved_questions=_payload_texts(payload.get("unresolved_questions"), allow_empty=True),
+        )
+    raise ValueError("synthesis may create only relationship, evolution, or conflict records")
+
+
+def _payload_ids(value: object, default: tuple[str, ...], *, allow_empty: bool = False) -> tuple[str, ...]:
+    if value == [] or value is None:
+        values = default
+    elif isinstance(value, list):
+        values = tuple(value)
+    else:
+        raise ValueError("synthesis IDs must be a list")
+    if (not values and not allow_empty) or len(set(values)) != len(values) or any(
+        not isinstance(item, str) or not item for item in values
+    ):
+        raise ValueError("synthesis IDs must be non-empty and unique")
+    return values
+
+
+def _payload_texts(value: object, *, allow_empty: bool = False) -> tuple[str, ...]:
+    if not isinstance(value, list):
+        raise ValueError("synthesis text values must be a list")
+    values = tuple(value)
+    if (not values and not allow_empty) or any(not isinstance(item, str) or not item for item in values):
+        raise ValueError("synthesis text values must be non-empty text")
+    return values
+
+
+def _payload_years(value: object) -> tuple[int, ...]:
+    if not isinstance(value, list):
+        raise ValueError("synthesis years must be a list")
+    return tuple(value)
+
+
+def _allow_synthesis_fields(payload: dict[str, object], allowed: set[str]) -> None:
+    if set(payload).difference(allowed):
+        raise ValueError("synthesis record contains unsupported fields")
+
+
+def _synthesis_usage(response: Any) -> CallUsage:
+    usage = getattr(response, "usage", None)
+    return CallUsage(
+        input_tokens=_usage_int(getattr(usage, "input_tokens", 0)),
+        output_tokens=_usage_int(getattr(usage, "output_tokens", 0)),
+    )
+
+
+def _usage_int(value: object) -> int:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
 
 
 @dataclass(frozen=True)

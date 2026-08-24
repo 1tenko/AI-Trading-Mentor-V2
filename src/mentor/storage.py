@@ -206,6 +206,10 @@ class Storage:
                     snapshot_id TEXT PRIMARY KEY REFERENCES corpus_snapshots(snapshot_id),
                     archived_at REAL NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS candidate_artifact_scopes (
+                    snapshot_id TEXT PRIMARY KEY REFERENCES corpus_snapshots(snapshot_id),
+                    artifact_scope TEXT NOT NULL CHECK(artifact_scope IN ('pilot', 'production'))
+                );
                 CREATE TABLE IF NOT EXISTS snapshot_source_coverage (
                     snapshot_id TEXT NOT NULL REFERENCES corpus_snapshots(snapshot_id),
                     revision_id TEXT NOT NULL REFERENCES source_revisions(revision_id),
@@ -477,6 +481,58 @@ class Storage:
                     snapshot.failure_reason,
                 ),
             )
+
+    def record_candidate_store(self, snapshot_id: str, kind: str, store_id: str) -> CorpusSnapshot:
+        column = {"raw": "raw_store_id", "derived": "derived_store_id"}.get(kind)
+        if column is None or not isinstance(store_id, str) or not store_id.strip():
+            raise ValueError("candidate store requires a valid kind and ID")
+        with self._connect() as connection:
+            row = connection.execute(
+                f"SELECT status, {column} FROM corpus_snapshots WHERE snapshot_id = ?",
+                (snapshot_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError("unknown snapshot")
+            if row[0] != "building":
+                raise ValueError("candidate stores require a building candidate")
+            if row[1] not in (None, store_id):
+                raise ValueError("candidate store identity is immutable")
+            connection.execute(
+                f"UPDATE corpus_snapshots SET {column} = ? WHERE snapshot_id = ? AND {column} IS NULL",
+                (store_id, snapshot_id),
+            )
+        return self.snapshot(snapshot_id)
+
+    def record_candidate_artifact_scope(self, snapshot_id: str, artifact_scope: str) -> None:
+        if artifact_scope not in {"pilot", "production"}:
+            raise ValueError("invalid candidate artifact scope")
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT status FROM corpus_snapshots WHERE snapshot_id = ?", (snapshot_id,)
+            ).fetchone()
+            if row is None:
+                raise ValueError("unknown snapshot")
+            if row[0] != "building":
+                raise ValueError("candidate artifact scope requires a building candidate")
+            existing = connection.execute(
+                "SELECT artifact_scope FROM candidate_artifact_scopes WHERE snapshot_id = ?",
+                (snapshot_id,),
+            ).fetchone()
+            if existing is not None and existing[0] != artifact_scope:
+                raise ValueError("candidate artifact scope is immutable")
+            connection.execute(
+                "INSERT INTO candidate_artifact_scopes(snapshot_id, artifact_scope) VALUES (?, ?) "
+                "ON CONFLICT(snapshot_id) DO NOTHING",
+                (snapshot_id, artifact_scope),
+            )
+
+    def candidate_artifact_scope(self, snapshot_id: str) -> str | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT artifact_scope FROM candidate_artifact_scopes WHERE snapshot_id = ?",
+                (snapshot_id,),
+            ).fetchone()
+        return None if row is None else str(row[0])
 
     def transition_snapshot(
         self,
@@ -808,7 +864,7 @@ class Storage:
 
     def store_derived_record(self, record: DerivedRecord) -> None:
         validate_record(record)
-        if record.compiler_provenance is not None:
+        if isinstance(record, Claim) and record.evidence_state == "raw_taught" and record.compiler_provenance is not None:
             raise ValueError("source-extracted records require a semantic validation result before storage")
         self._store_derived_record(record)
 
