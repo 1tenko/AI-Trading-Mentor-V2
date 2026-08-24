@@ -47,6 +47,7 @@ from mentor.synthesis import (
     ReconciliationCoverage,
     SynthesisCandidate,
     SynthesisResult,
+    record_reaches_any,
     source_coverage,
 )
 
@@ -504,8 +505,6 @@ class CandidateCompiler:
             if not isinstance(synthesized, SynthesisResult):
                 raise ValueError("synthesis stage must return SynthesisResult")
             synthesis_usage = synthesized.usage
-            synthesized_count = len(synthesized.records)
-            hints += tuple(synthesized.hints)
             _validate_synthesis_result(
                 synthesized,
                 snapshot.snapshot_id,
@@ -513,6 +512,9 @@ class CandidateCompiler:
                 source_metadata,
             )
             _validate_reconciliation_coverage(synthesized, synthesis_inputs)
+            synthesized = _filter_synthesis_target_lineage(synthesized, synthesis_inputs)
+            synthesized_count = len(synthesized.records)
+            hints += tuple(synthesized.hints)
             _validate_context_not_regenerated(synthesized.records, reconciliation_context)
             _validate_candidate_dependencies(
                 extracted_records + synthesized.records,
@@ -1398,6 +1400,26 @@ def _validate_context_not_regenerated(
     context_keys = {_semantic_record_key(record) for record in context_records}
     if any(_semantic_record_key(record) in context_keys for record in records):
         raise ValueError("synthesis regenerated an unchanged context record")
+
+
+def _filter_synthesis_target_lineage(
+    result: SynthesisResult, target_records: tuple[DerivedRecord, ...]
+) -> SynthesisResult:
+    """Discard outputs whose explicit derived lineage never reaches a rebuild target."""
+    target_ids = {record.record_id for record in target_records}
+    records_by_id = {
+        record.record_id: record for record in (*target_records, *result.records)
+    }
+    accepted = tuple(
+        record for record in result.records
+        if record_reaches_any(record, target_ids, records_by_id)
+    )
+    accepted_ids = {record.record_id for record in accepted}
+    return replace(
+        result,
+        records=accepted,
+        hints=tuple(hint for hint in result.hints if hint.record_id in accepted_ids),
+    )
 
 
 def _semantic_record_key(record: DerivedRecord) -> str:

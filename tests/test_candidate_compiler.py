@@ -312,6 +312,24 @@ class HierarchicalClusterSynthesizer(ClusterSynthesizer):
         if set(by_cluster) != {"A", "B"}:
             return replace(lower, records=tuple(rebuilt))
         left, right = by_cluster["A"], by_cluster["B"]
+        if context_records:
+            rebuilt.append(Relationship.create(
+                snapshot_id=kwargs["snapshot_id"],
+                anchors=right.anchors,
+                dependencies=tuple(
+                    dependency
+                    for dependency in right.dependencies
+                    if dependency.kind == "source_revision"
+                ) + (RecordDependency("derived_record", right.record_id),),
+                validation_state="validated",
+                lifecycle_state="active",
+                qualification="Paraphrased unchanged context-only relationship.",
+                evidence_state="cross_source_synthesis",
+                compiler_provenance=self.provenance,
+                left="B reformulated framework",
+                relation="supports",
+                right="B-only context",
+            ))
         global_record = Relationship.create(
             snapshot_id=kwargs["snapshot_id"],
             anchors=tuple(dict.fromkeys(left.anchors + right.anchors)),
@@ -564,7 +582,7 @@ def test_replacement_reuses_unaffected_records_and_promotes_only_after_candidate
     assert storage.source_revision(replacement.revision_id).lifecycle_state == "active"
 
 
-def test_selective_rebuild_rebuilds_higher_closure_with_unaffected_synthesis_as_context(tmp_path):
+def test_selective_rebuild_rejects_context_only_paraphrase_and_keeps_valid_higher_synthesis(tmp_path):
     storage = Storage(tmp_path / "mentor.sqlite3", runtime_scope="pilot")
     storage.initialize()
     sources = tuple(

@@ -263,6 +263,93 @@ def test_reconciliation_uses_unchanged_lower_synthesis_as_context_not_primary_ta
     }
 
 
+def test_reconciliation_filters_context_only_paraphrase_and_preserves_selected_summary_lineage():
+    target = claim(
+        subject="Affected claim",
+        anchors=("anc_affected",),
+        dependencies=(RecordDependency("source_revision", "rev_affected"),),
+    )
+    context = relationship(
+        left="Unchanged B cluster",
+        right="Stable conclusion",
+        anchors=("anc_context",),
+        dependencies=(RecordDependency("source_revision", "rev_context"),),
+    )
+    unrelated_context = relationship(
+        left="Gamma island",
+        right="Separate boundary",
+        anchors=("anc_unrelated",),
+        dependencies=(RecordDependency("source_revision", "rev_unrelated"),),
+    )
+
+    def response(request):
+        if request["reconciliation_batch"]["kind"] == "primary":
+            return {"records": [], "concept_hints": []}
+        summaries = request["prior_cluster_summaries"]
+        assert all(summary["summary_id"] for summary in summaries)
+        target_summary = next(
+            summary for summary in summaries if summary["lineage_role"] == "target"
+        )
+        common = {
+            "family": "relationship",
+            "relation": "depends_on",
+        }
+        return {"records": [
+            common | {
+                "qualification": "Paraphrased unchanged B-only conclusion.",
+                "anchors": ["anc_context"],
+                "input_record_ids": [context.record_id],
+                "input_summary_ids": [],
+                "source_revision_ids": ["rev_context"],
+                "left": "Reworded B framework",
+                "right": "B-only context",
+            },
+            common | {
+                "qualification": "Affected A reconciled with unchanged B.",
+                "anchors": ["anc_context"],
+                "input_record_ids": [context.record_id],
+                "input_summary_ids": [target_summary["summary_id"]],
+                "source_revision_ids": ["rev_context"],
+                "left": "Affected A framework",
+                "right": "Unchanged B cluster",
+            },
+        ], "concept_hints": []}
+
+    result = SynthesisReconciler(
+        SimpleNamespace(responses=RecordingResponses(response)), max_records_per_call=3
+    ).synthesize(
+        snapshot_id=SNAPSHOT_ID,
+        records=(target,),
+        context_records=(context, unrelated_context),
+        revisions=(
+            SimpleNamespace(revision_id="rev_affected"),
+            SimpleNamespace(revision_id="rev_context"),
+            SimpleNamespace(revision_id="rev_unrelated"),
+        ),
+        source_metadata=(
+            reconciliation_source("rev_affected", year=2026),
+            reconciliation_source("rev_context", year=2025),
+            reconciliation_source("rev_unrelated", year=2025),
+        ),
+        anchor_spans={
+            "anc_affected": "affected span",
+            "anc_context": "context span",
+            "anc_unrelated": "unrelated span",
+        },
+    )
+
+    assert len(result.records) == 1
+    dependencies = {dependency.identifier for dependency in result.records[0].dependencies}
+    assert dependencies == {
+        target.record_id,
+        context.record_id,
+        "rev_affected",
+        "rev_context",
+    }
+    assert unrelated_context.record_id not in dependencies
+    assert "rev_unrelated" not in dependencies
+
+
 def test_reconciliation_rejects_a_batch_size_that_cannot_compare_records():
     with pytest.raises(ValueError, match="batch size"):
         SynthesisReconciler(
