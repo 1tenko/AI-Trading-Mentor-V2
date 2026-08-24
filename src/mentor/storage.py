@@ -10,7 +10,7 @@ from hashlib import sha256
 from pathlib import Path
 from typing import Mapping
 
-from mentor.anchors import SourceAnchor
+from mentor.anchors import LOCATOR_VERSION, SourceAnchor
 from mentor.compilation import CandidateGateResult, CompilationMetric, CompilationRun, CorpusSnapshot, SourceProcessingResult
 from mentor.dependencies import DependencyEdge, DependencyGraph, DependencyNode
 from mentor.derived_records import (
@@ -2090,20 +2090,23 @@ class Storage:
                     raise ValueError("source anchors must be SourceAnchor values")
                 revision = connection.execute(
                     """
-                    SELECT library_sources.collection_id, source_revisions.source_id, source_revisions.content_sha256
+                    SELECT library_sources.collection_id, source_revisions.source_id,
+                           library_sources.identity_key, source_revisions.content_sha256
                     FROM source_revisions JOIN library_sources USING(source_id)
                     WHERE source_revisions.revision_id = ?
                     """,
                     (anchor.revision_id,),
                 ).fetchone()
-                if revision != (anchor.collection_id, anchor.source_id, anchor.revision_sha256):
+                if revision is None:
+                    raise ValueError("source anchor references an unknown source revision")
+                collection_id, source_id, identity_key, content_sha256 = revision
+                if (anchor.collection_id, anchor.source_id, anchor.revision_sha256) != (
+                    collection_id,
+                    source_id,
+                    content_sha256,
+                ):
                     raise ValueError("source anchor does not match a stored source revision")
-                expected_anchor_id = "anc_" + sha256(
-                    f"{anchor.collection_id}\0{anchor.revision_id}\0{anchor.start_offset}\0"
-                    f"{anchor.end_offset}\0{anchor.locator_version}".encode()
-                ).hexdigest()
-                if anchor.anchor_id != expected_anchor_id:
-                    raise ValueError("source anchor identity is not canonical")
+                _validate_anchor_identity(anchor, identity_key)
                 values = (
                     anchor.anchor_id,
                     anchor.collection_id,
@@ -2149,36 +2152,25 @@ class Storage:
                 f"""
                 SELECT source_anchors.anchor_id, source_anchors.collection_id, source_anchors.source_id,
                        source_anchors.revision_id, source_anchors.revision_sha256,
-                       library_sources.original_filename, library_sources.lesson_title,
+                       library_sources.identity_key, library_sources.original_filename, library_sources.lesson_title,
                        library_sources.author, library_sources.course, library_sources.year,
                        source_anchors.timestamp_start_ms, source_anchors.timestamp_end_ms,
                        source_anchors.start_offset, source_anchors.end_offset,
                        source_anchors.span_fingerprint, source_anchors.locator_version
-                FROM source_anchors JOIN library_sources ON library_sources.source_id = source_anchors.source_id
+                FROM source_anchors
+                JOIN source_revisions ON source_revisions.revision_id = source_anchors.revision_id
+                    AND source_revisions.source_id = source_anchors.source_id
+                    AND source_revisions.content_sha256 = source_anchors.revision_sha256
+                JOIN library_sources ON library_sources.source_id = source_revisions.source_id
+                    AND library_sources.collection_id = source_anchors.collection_id
                 WHERE source_anchors.anchor_id IN ({placeholders})
                 """,
                 anchor_ids,
             ).fetchall()
         by_id = {
-            row[0]: {
-                "anchor_id": row[0],
-                "collection_id": row[1],
-                "source_id": row[2],
-                "revision_id": row[3],
-                "revision_sha256": row[4],
-                "filename": row[5],
-                "lesson_title": row[6],
-                "author": row[7],
-                "course": row[8],
-                "year": row[9],
-                "timestamp_start_ms": row[10],
-                "timestamp_end_ms": row[11],
-                "start_offset": row[12],
-                "end_offset": row[13],
-                "span_fingerprint": row[14],
-                "locator_version": row[15],
-            }
+            metadata["anchor_id"]: metadata
             for row in rows
+            if (metadata := _safe_anchor_metadata(row)) is not None
         }
         return [by_id[anchor_id] for anchor_id in anchor_ids if anchor_id in by_id]
 
@@ -2208,7 +2200,6 @@ class Storage:
             result.append(
                 {
                     "turn_number": turn["turn_number"],
-                    "response_id": _safe_response_id(turn["response_id"]),
                     "knowledge_context": safe_context,
                 }
             )
@@ -2714,8 +2705,113 @@ def _safe_orientation_context(context: dict) -> dict | None:
     }
 
 
-def _safe_response_id(value: object) -> str | None:
-    return value if isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,120}", value) else None
+def _validate_anchor_identity(anchor: SourceAnchor, identity_key: object) -> None:
+    if not isinstance(identity_key, str) or not identity_key or not _is_sha256(anchor.revision_sha256):
+        raise ValueError("source anchor requires canonical source and revision identity")
+    expected_source_id = "src_" + sha256(f"{anchor.collection_id}\0{identity_key}".encode()).hexdigest()
+    expected_revision_id = f"rev_{expected_source_id}_{anchor.revision_sha256}"
+    expected_anchor_id = "anc_" + sha256(
+        f"{anchor.collection_id}\0{expected_revision_id}\0{anchor.start_offset}\0"
+        f"{anchor.end_offset}\0{anchor.locator_version}".encode()
+    ).hexdigest()
+    if (
+        not _nonempty_text(anchor.collection_id)
+        or anchor.source_id != expected_source_id
+        or anchor.revision_id != expected_revision_id
+        or anchor.anchor_id != expected_anchor_id
+        or anchor.locator_version != LOCATOR_VERSION
+        or not _is_sha256(anchor.span_fingerprint)
+        or not _valid_offsets(anchor.start_offset, anchor.end_offset)
+        or not _valid_timestamps(anchor.timestamp_start_ms, anchor.timestamp_end_ms)
+    ):
+        raise ValueError("source anchor identity or locator metadata is invalid")
+
+
+def _safe_anchor_metadata(row: tuple) -> dict | None:
+    (
+        anchor_id,
+        collection_id,
+        source_id,
+        revision_id,
+        revision_sha256,
+        identity_key,
+        original_filename,
+        lesson_title,
+        author,
+        course,
+        year,
+        timestamp_start_ms,
+        timestamp_end_ms,
+        start_offset,
+        end_offset,
+        span_fingerprint,
+        locator_version,
+    ) = row
+    if not all(_nonempty_text(value) for value in (
+        anchor_id, collection_id, source_id, revision_id, identity_key, lesson_title, author, course
+    )):
+        return None
+    if (
+        not _is_sha256(revision_sha256)
+        or not _is_sha256(span_fingerprint)
+        or source_id != "src_" + sha256(f"{collection_id}\0{identity_key}".encode()).hexdigest()
+        or revision_id != f"rev_{source_id}_{revision_sha256}"
+        or anchor_id != "anc_" + sha256(
+            f"{collection_id}\0{revision_id}\0{start_offset}\0{end_offset}\0{locator_version}".encode()
+        ).hexdigest()
+        or locator_version != LOCATOR_VERSION
+        or not _valid_offsets(start_offset, end_offset)
+        or not _valid_timestamps(timestamp_start_ms, timestamp_end_ms)
+        or not isinstance(year, int)
+        or isinstance(year, bool)
+    ):
+        return None
+    filename = _safe_filename(original_filename)
+    if filename is None:
+        return None
+    return {
+        "anchor_id": anchor_id,
+        "collection_id": collection_id,
+        "source_id": source_id,
+        "revision_id": revision_id,
+        "revision_sha256": revision_sha256,
+        "filename": filename,
+        "lesson_title": lesson_title,
+        "author": author,
+        "course": course,
+        "year": year,
+        "timestamp_start_ms": timestamp_start_ms,
+        "timestamp_end_ms": timestamp_end_ms,
+        "start_offset": start_offset,
+        "end_offset": end_offset,
+        "span_fingerprint": span_fingerprint,
+        "locator_version": locator_version,
+    }
+
+
+def _safe_filename(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    filename = value.replace("\\", "/").rsplit("/", 1)[-1]
+    return filename if filename and filename not in {".", ".."} else None
+
+
+def _is_sha256(value: object) -> bool:
+    return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) is not None
+
+
+def _nonempty_text(value: object) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _valid_offsets(start: object, end: object) -> bool:
+    return _nonnegative_int(start) and _nonnegative_int(end) and start < end
+
+
+def _valid_timestamps(start: object, end: object) -> bool:
+    return (start is None and end is None) or (
+        _nonnegative_int(start) and _nonnegative_int(end) and start <= end
+    )
 
 
 def _nonnegative_int(value: object) -> bool:

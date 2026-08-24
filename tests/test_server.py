@@ -9,7 +9,14 @@ import pytest
 from mentor.chat_service import Answer, StreamEvent
 from mentor.anchors import SourceAnchor
 from mentor.compilation import CompilationRun, CorpusSnapshot, SourceProcessingResult
-from mentor.derived_records import Claim, RecordDependency
+from mentor.derived_records import (
+    Claim,
+    ConflictUnresolved,
+    Evolution,
+    ProcedureSequenceHierarchy,
+    RecordDependency,
+    Relationship,
+)
 from mentor.knowledge import Collection, Source as LibrarySource, SourceRevision
 from mentor.server import create_server
 from mentor.storage import SourceChange, Storage
@@ -50,7 +57,7 @@ def request(server, method, path, body=None):
     return result
 
 
-def inspected_snapshot(storage, *, run_id="run_inspector", publish=True):
+def inspected_snapshot(storage, *, run_id="run_inspector", publish=True, persist_anchor=True):
     transcript = "[00:00:01] PRIVATE RAW TRANSCRIPT BODY must never be returned."
     collection = Collection("collection_inspector", "Inspector tests", "trading", True, "test")
     source = LibrarySource.create(
@@ -61,7 +68,7 @@ def inspected_snapshot(storage, *, run_id="run_inspector", publish=True):
         course="Synthetic Course",
         lesson_title="Synthetic lesson",
         year=2026,
-        original_filename="synthetic.txt",
+        original_filename="C:\\private\\synthetic.txt",
         local_provenance="C:/private/synthetic.txt",
     )
     revision = SourceRevision.create(
@@ -91,9 +98,10 @@ def inspected_snapshot(storage, *, run_id="run_inspector", publish=True):
         start_offset=0,
         end_offset=len(transcript),
     )
-    storage.store_source_anchors((anchor,))
-    with pytest.raises(ValueError, match="identity is not canonical"):
-        storage.store_source_anchors((replace(anchor, anchor_id="anc_not_canonical"),))
+    if persist_anchor:
+        storage.store_source_anchors((anchor,))
+        with pytest.raises(ValueError, match="identity or locator metadata is invalid"):
+            storage.store_source_anchors((replace(anchor, anchor_id="anc_not_canonical"),))
     record = Claim.create(
         snapshot_id=snapshot.snapshot_id,
         anchors=(anchor.anchor_id,),
@@ -245,7 +253,6 @@ def test_server_exposes_read_only_inspector_without_raw_or_private_payloads(tmp_
         assert status == 200
         assert json.loads(body) == {"thread_id": thread_id, "turns": [{
             "turn_number": 1,
-            "response_id": "resp_inspector",
             "knowledge_context": {
                 "status": "used",
                 "used": True,
@@ -259,6 +266,8 @@ def test_server_exposes_read_only_inspector_without_raw_or_private_payloads(tmp_
             },
         }]}
         assert b"private_reasoning" not in body
+        assert b"resp_inspector" not in body
+        assert b"resp_private" not in body
         assert b"Private question" not in body
         assert b"Private answer" not in body
 
@@ -267,6 +276,165 @@ def test_server_exposes_read_only_inspector_without_raw_or_private_payloads(tmp_
         assert request(server, "GET", "/api/knowledge/threads/999/orientation")[0] == 404
         assert request(server, "POST", "/api/knowledge", b"{}")[0] == 404
         assert request(server, "DELETE", "/api/knowledge")[0] == 404
+    finally:
+        server.shutdown()
+        worker.join()
+
+
+def test_source_anchor_storage_rejects_malformed_locator_metadata(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    _snapshot, _record, anchor, _source = inspected_snapshot(storage, persist_anchor=False)
+    with pytest.raises(ValueError, match="identity or locator metadata is invalid"):
+        storage.store_source_anchors((replace(anchor, timestamp_start_ms=-1, timestamp_end_ms=-1),))
+    with pytest.raises(ValueError, match="identity or locator metadata is invalid"):
+        storage.store_source_anchors((replace(anchor, span_fingerprint="not-a-sha256"),))
+
+
+def test_server_inspector_omits_malformed_persisted_anchor_metadata(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    snapshot, record, anchor, _source = inspected_snapshot(storage)
+    with storage._connect() as connection:
+        connection.execute(
+            "UPDATE source_anchors SET locator_version = ? WHERE anchor_id = ?",
+            ("unsupported", anchor.anchor_id),
+        )
+    server = create_server(storage, FakeChatService(), port=0)
+    worker = threading.Thread(target=server.serve_forever)
+    worker.start()
+    try:
+        status, _headers, body = request(
+            server, "GET", f"/api/knowledge/snapshots/{snapshot.snapshot_id}/records/{record.record_id}"
+        )
+        assert status == 200
+        assert json.loads(body)["anchors"] == []
+    finally:
+        server.shutdown()
+        worker.join()
+
+
+def test_server_inspector_exposes_pending_failed_stale_and_dependency_state(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    pending, record, anchor, _source = inspected_snapshot(storage, run_id="run_pending", publish=False)
+    storage.mark_stale_for_revisions(pending.snapshot_id, (anchor.revision_id,))
+    failed, _record, failed_anchor, _source = inspected_snapshot(storage, run_id="run_failed_coverage", publish=False)
+    storage.record_candidate_gate(
+        failed.snapshot_id,
+        (SourceProcessingResult(failed_anchor.revision_id, "failed", 0),),
+        checked_at=3.0,
+    )
+    storage.transition_snapshot(failed.snapshot_id, "validating", transitioned_at=3.0)
+    storage.transition_snapshot(failed.snapshot_id, "failed", transitioned_at=4.0, failure_reason="Synthetic.")
+    server = create_server(storage, FakeChatService(), port=0)
+    worker = threading.Thread(target=server.serve_forever)
+    worker.start()
+    try:
+        status, _headers, body = request(server, "GET", "/api/knowledge")
+        assert status == 200
+        assert {item["status"] for item in json.loads(body)["snapshots"]} == {"building", "failed"}
+        status, _headers, body = request(server, "GET", f"/api/knowledge/snapshots/{failed.snapshot_id}")
+        assert status == 200
+        assert json.loads(body)["coverage"] == {"processed": 0, "failed": 1}
+        status, _headers, body = request(
+            server, "GET", f"/api/knowledge/snapshots/{pending.snapshot_id}/records/{record.record_id}"
+        )
+        detail = json.loads(body)
+        assert status == 200
+        assert detail["stale"] is True
+        assert detail["dependencies"] == [{"kind": "source_revision", "identifier": anchor.revision_id}]
+    finally:
+        server.shutdown()
+        worker.join()
+
+
+def test_server_inspector_serializes_each_typed_derived_family_as_derived(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    snapshot, claim, anchor, _source = inspected_snapshot(storage, run_id="run_typed", publish=False)
+    source_dependency = RecordDependency("source_revision", anchor.revision_id)
+    relationship = Relationship.create(
+        snapshot_id=snapshot.snapshot_id,
+        anchors=(anchor.anchor_id,),
+        dependencies=(source_dependency, RecordDependency("derived_record", claim.record_id)),
+        validation_state="validated",
+        lifecycle_state="active",
+        qualification="Synthetic relationship.",
+        left="Synthetic A",
+        relation="supports",
+        right="Synthetic B",
+    )
+    procedure = ProcedureSequenceHierarchy.create(
+        snapshot_id=snapshot.snapshot_id,
+        anchors=(anchor.anchor_id,),
+        dependencies=(source_dependency,),
+        validation_state="validated",
+        lifecycle_state="active",
+        qualification="Synthetic sequence.",
+        kind="sequence",
+        terms=("Observe", "Validate"),
+    )
+    evolution = Evolution.create(
+        snapshot_id=snapshot.snapshot_id,
+        anchors=(anchor.anchor_id,),
+        dependencies=(source_dependency,),
+        validation_state="validated",
+        lifecycle_state="active",
+        qualification="Synthetic evolution.",
+        subject="Synthetic framework",
+        previous="Earlier form",
+        current="Later form",
+        earlier_source_set=(anchor.revision_id,),
+        later_source_set=(anchor.revision_id,),
+        classification="repeated",
+        negative_evidence_state="positive_teaching",
+        earlier_coverage_id="coverage_earlier",
+        later_coverage_id="coverage_later",
+        earlier_observed_years=(2026,),
+        later_observed_years=(2026,),
+    )
+    conflict = ConflictUnresolved.create(
+        snapshot_id=snapshot.snapshot_id,
+        anchors=(anchor.anchor_id,),
+        dependencies=(
+            source_dependency,
+            RecordDependency("derived_record", claim.record_id),
+            RecordDependency("derived_record", relationship.record_id),
+        ),
+        validation_state="validated",
+        lifecycle_state="active",
+        qualification="Synthetic uncertainty.",
+        kind="unresolved",
+        subject="Synthetic context",
+        alternatives=("Condition A", "Condition B"),
+        competing_record_ids=(claim.record_id, relationship.record_id),
+        reconciliation_state="unresolved",
+        relevant_scopes=("synthetic",),
+        unresolved_questions=("Which condition applies?",),
+    )
+    for record in (relationship, procedure, evolution, conflict):
+        storage.store_derived_record(record)
+    server = create_server(storage, FakeChatService(), port=0)
+    worker = threading.Thread(target=server.serve_forever)
+    worker.start()
+    try:
+        expected = {
+            relationship.record_id: ("relationship", {"left": "Synthetic A", "relation": "supports", "right": "Synthetic B"}, "derived; independently validated against raw anchors"),
+            procedure.record_id: ("procedure_sequence_hierarchy", {"kind": "sequence", "terms": ["Observe", "Validate"]}, "derived; independently validated against raw anchors"),
+            evolution.record_id: ("evolution", {"classification": "repeated", "negative_evidence_state": "positive_teaching"}, "derived; cross-source synthesis"),
+            conflict.record_id: ("conflict_unresolved", {"kind": "unresolved", "reconciliation_state": "unresolved"}, "derived; cross-source synthesis"),
+        }
+        for record_id, (family, fields, label) in expected.items():
+            status, _headers, body = request(
+                server, "GET", f"/api/knowledge/snapshots/{snapshot.snapshot_id}/records/{record_id}"
+            )
+            payload = json.loads(body)
+            assert status == 200
+            assert payload["family"] == family
+            assert payload["provenance_label"] == label
+            for name, value in fields.items():
+                assert payload["content"][name] == value
     finally:
         server.shutdown()
         worker.join()
