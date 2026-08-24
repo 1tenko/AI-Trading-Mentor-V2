@@ -1,9 +1,11 @@
 """Deterministic Phase 3 evaluation metrics and isolated pilot runtime."""
 
 from dataclasses import dataclass
+from contextlib import closing
 import math
 from pathlib import Path
 import re
+import shutil
 import sqlite3
 from typing import Callable, Iterable
 from uuid import uuid4
@@ -29,13 +31,15 @@ class EvaluationCase:
 
 @dataclass(frozen=True)
 class EvaluationMetrics:
-    quality_state: str
+    correctness_state: str
+    completeness_state: str
+    source_discipline_state: str
     citation_count: int
     connection_state: str
     evolution_state: str
     correction_state: str
     orientation_calls: int
-    orientation_record_count: int
+    orientation_record_ids: tuple[str, ...]
     raw_search_calls: int
     retrieved_passage_count: int
     input_tokens: int
@@ -45,7 +49,9 @@ class EvaluationMetrics:
 
     def __post_init__(self) -> None:
         for value in (
-            self.quality_state,
+            self.correctness_state,
+            self.completeness_state,
+            self.source_discipline_state,
             self.connection_state,
             self.evolution_state,
             self.correction_state,
@@ -55,7 +61,6 @@ class EvaluationMetrics:
         counts = (
             self.citation_count,
             self.orientation_calls,
-            self.orientation_record_count,
             self.raw_search_calls,
             self.retrieved_passage_count,
             self.input_tokens,
@@ -64,6 +69,16 @@ class EvaluationMetrics:
         )
         if any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in counts):
             raise ValueError("evaluation counts must be non-negative integers")
+        if not isinstance(self.orientation_record_ids, tuple) or any(
+            not isinstance(value, str) or not value.strip()
+            for value in self.orientation_record_ids
+        ):
+            raise ValueError("orientation record IDs must be non-empty text")
+        object.__setattr__(
+            self,
+            "orientation_record_ids",
+            tuple(dict.fromkeys(self.orientation_record_ids)),
+        )
         if (
             isinstance(self.estimated_cost_usd, bool)
             or not isinstance(self.estimated_cost_usd, int | float)
@@ -71,6 +86,10 @@ class EvaluationMetrics:
             or self.estimated_cost_usd < 0
         ):
             raise ValueError("evaluation cost must be a finite non-negative number")
+
+    @property
+    def orientation_record_count(self) -> int:
+        return len(self.orientation_record_ids)
 
 
 @dataclass(frozen=True)
@@ -86,12 +105,15 @@ class EvaluationSummary:
     case_count: int
     completed_count: int
     failed_count: int
-    quality_passed_count: int
+    correctness_passed_count: int
+    completeness_passed_count: int
+    source_discipline_passed_count: int
     citation_count: int
     connection_passed_count: int
     evolution_passed_count: int
     correction_passed_count: int
     orientation_calls: int
+    orientation_record_ids: tuple[str, ...]
     orientation_record_count: int
     raw_search_calls: int
     retrieved_passage_count: int
@@ -153,17 +175,29 @@ def compare_evaluations(
 
 def _summarize(outcomes: tuple[EvaluationOutcome, ...]) -> EvaluationSummary:
     metrics = tuple(item.metrics for item in outcomes if item.metrics is not None)
+    orientation_record_ids = tuple(
+        dict.fromkeys(
+            record_id
+            for item in metrics
+            for record_id in item.orientation_record_ids
+        )
+    )
     return EvaluationSummary(
         case_count=len(outcomes),
         completed_count=len(metrics),
         failed_count=len(outcomes) - len(metrics),
-        quality_passed_count=sum(item.quality_state == "passed" for item in metrics),
+        correctness_passed_count=sum(item.correctness_state == "passed" for item in metrics),
+        completeness_passed_count=sum(item.completeness_state == "passed" for item in metrics),
+        source_discipline_passed_count=sum(
+            item.source_discipline_state == "passed" for item in metrics
+        ),
         citation_count=sum(item.citation_count for item in metrics),
         connection_passed_count=sum(item.connection_state == "passed" for item in metrics),
         evolution_passed_count=sum(item.evolution_state == "passed" for item in metrics),
         correction_passed_count=sum(item.correction_state == "passed" for item in metrics),
         orientation_calls=sum(item.orientation_calls for item in metrics),
-        orientation_record_count=sum(item.orientation_record_count for item in metrics),
+        orientation_record_ids=orientation_record_ids,
+        orientation_record_count=len(orientation_record_ids),
         raw_search_calls=sum(item.raw_search_calls for item in metrics),
         retrieved_passage_count=sum(item.retrieved_passage_count for item in metrics),
         input_tokens=sum(item.input_tokens for item in metrics),
@@ -200,27 +234,42 @@ class PilotRuntime:
         if run_directory.exists():
             raise FileExistsError(run_directory)
         database_path = run_directory / "mentor.sqlite3"
-        with sqlite3.connect(f"{production_database_path.as_uri()}?mode=ro", uri=True) as source:
-            scope = source.execute(
-                "SELECT value FROM settings WHERE key = 'runtime_scope'"
-            ).fetchone()
-            if scope is not None and scope[0] != PRODUCTION_RUNTIME_SCOPE:
-                raise ValueError("pilot source must be a production runtime")
-            if source.execute("PRAGMA quick_check").fetchone() != ("ok",):
-                raise ValueError("production SQLite runtime failed integrity check")
-            run_directory.mkdir(parents=True, exist_ok=False)
-            with sqlite3.connect(database_path) as destination:
-                source.backup(destination)
-                destination.execute(
-                    "UPDATE settings SET value = ? WHERE key = 'runtime_scope'",
-                    (PILOT_RUNTIME_SCOPE,),
-                )
-        output_directory = run_directory / "outputs"
-        trace_directory = run_directory / "traces"
-        output_directory.mkdir()
-        trace_directory.mkdir()
-        storage = Storage(database_path, runtime_scope=PILOT_RUNTIME_SCOPE)
-        storage.initialize()
+        created = False
+        try:
+            with closing(
+                sqlite3.connect(f"{production_database_path.as_uri()}?mode=ro", uri=True)
+            ) as source:
+                scope = source.execute(
+                    "SELECT value FROM settings WHERE key = 'runtime_scope'"
+                ).fetchone()
+                if scope is not None and scope[0] != PRODUCTION_RUNTIME_SCOPE:
+                    raise ValueError("pilot source must be a production runtime")
+                if source.execute("PRAGMA quick_check").fetchone() != ("ok",):
+                    raise ValueError("production SQLite runtime failed integrity check")
+                run_directory.mkdir(parents=True, exist_ok=False)
+                created = True
+                with closing(sqlite3.connect(database_path)) as destination:
+                    source.backup(destination)
+                    with destination:
+                        destination.execute(
+                            "DELETE FROM settings WHERE key IN "
+                            "('current_snapshot_id', 'active_raw_store_id', 'active_derived_store_id')"
+                        )
+                        destination.execute(
+                            "INSERT INTO settings(key, value) VALUES ('runtime_scope', ?) "
+                            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                            (PILOT_RUNTIME_SCOPE,),
+                        )
+            output_directory = run_directory / "outputs"
+            trace_directory = run_directory / "traces"
+            output_directory.mkdir()
+            trace_directory.mkdir()
+            storage = Storage(database_path, runtime_scope=PILOT_RUNTIME_SCOPE)
+            storage.initialize()
+        except Exception:
+            if created:
+                shutil.rmtree(run_directory)
+            raise
         return cls(
             run_id,
             run_directory,

@@ -31,11 +31,12 @@ no private corpus text.
 
 ## Evaluation metric contract
 
-Each baseline or assimilated case records explicit quality states for overall
-quality, conceptual connections, evolution, and correction behavior, plus:
+Each baseline or assimilated case records separate categorical states for
+correctness, completeness, source discipline, conceptual connections,
+evolution, and correction behavior, plus:
 
 - native citation count;
-- orientation calls and admitted record count;
+- orientation calls and deduplicated admitted record IDs/count;
 - raw File Search calls and retrieved passage count;
 - input/output tokens;
 - latency; and
@@ -49,12 +50,17 @@ case IDs/categories on both sides.
 
 `PilotRuntime.create` uses SQLite's backup API to make a transactionally
 consistent copy under ignored `data/pilots/<run-id>/`. The copied database is
-marked `pilot`; outputs and traces stay inside the same per-run directory.
+marked `pilot` and its inherited current/raw/derived pointers are cleared in
+one local transaction; outputs and traces stay inside the same per-run
+directory. SQLite connections are explicitly closed on every path. Failed copy
+setup removes only the new per-run directory.
 
 Only a pilot-scoped candidate may publish through the pilot runtime. Normal
 production storage rejects pilot-scoped publication and excludes pilot-scoped
-current pointers from resolution. A pilot server also rejects a chat service
-bound to a different database/runtime scope.
+current pointers from resolution. Candidate compilation rejects a mismatched
+runtime/artifact scope before reserving local state or making model/vector
+calls. A pilot server also rejects a chat service bound to a different
+database/runtime scope.
 
 The harness has no copy-back or automatic remote-cleanup operation. Pilot
 database rows, outputs, and traces remain local to the ignored run directory;

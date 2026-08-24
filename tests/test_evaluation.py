@@ -1,5 +1,6 @@
 from hashlib import sha256
 from pathlib import Path
+import sqlite3
 
 import pytest
 
@@ -81,13 +82,15 @@ def _production_runtime(database_path: Path) -> tuple[Storage, SourceRevision, C
 
 def _metrics(**changes) -> EvaluationMetrics:
     values = {
-        "quality_state": "passed",
+        "correctness_state": "passed",
+        "completeness_state": "passed",
+        "source_discipline_state": "passed",
         "citation_count": 1,
         "connection_state": "passed",
         "evolution_state": "not_scored",
         "correction_state": "not_scored",
         "orientation_calls": 1,
-        "orientation_record_count": 2,
+        "orientation_record_ids": ("rec_alpha", "rec_beta"),
         "raw_search_calls": 1,
         "retrieved_passage_count": 3,
         "input_tokens": 100,
@@ -132,11 +135,13 @@ def test_baseline_comparison_requires_matching_cases_and_preserves_quality_dimen
         "baseline",
         cases,
         lambda _case: _metrics(
-            quality_state="failed",
+            correctness_state="failed",
+            completeness_state="failed",
+            source_discipline_state="failed",
             citation_count=0,
             connection_state="failed",
             orientation_calls=0,
-            orientation_record_count=0,
+            orientation_record_ids=(),
             raw_search_calls=3,
         ),
     )
@@ -144,8 +149,12 @@ def test_baseline_comparison_requires_matching_cases_and_preserves_quality_dimen
 
     comparison = compare_evaluations(baseline, assimilated)
 
-    assert comparison.baseline.quality_passed_count == 0
-    assert comparison.assimilated.quality_passed_count == 1
+    assert comparison.baseline.correctness_passed_count == 0
+    assert comparison.assimilated.correctness_passed_count == 1
+    assert comparison.baseline.completeness_passed_count == 0
+    assert comparison.assimilated.completeness_passed_count == 1
+    assert comparison.baseline.source_discipline_passed_count == 0
+    assert comparison.assimilated.source_discipline_passed_count == 1
     assert comparison.baseline.connection_passed_count == 0
     assert comparison.assimilated.connection_passed_count == 1
     assert comparison.baseline.orientation_calls == 0
@@ -160,6 +169,30 @@ def test_baseline_comparison_requires_matching_cases_and_preserves_quality_dimen
     )
     with pytest.raises(ValueError, match="same cases"):
         compare_evaluations(baseline, wrong)
+
+
+def test_evaluation_deduplicates_orientation_record_ids_per_case_and_summary():
+    cases = (
+        EvaluationCase("case_one", "orientation", "First synthetic case"),
+        EvaluationCase("case_two", "orientation", "Second synthetic case"),
+    )
+
+    report = run_evaluation(
+        "assimilated",
+        cases,
+        lambda case: _metrics(
+            orientation_record_ids=(
+                ("rec_alpha", "rec_alpha", "rec_beta")
+                if case.case_id == "case_one"
+                else ("rec_beta", "rec_gamma")
+            )
+        ),
+    )
+
+    assert report.outcomes[0].metrics.orientation_record_ids == ("rec_alpha", "rec_beta")
+    assert report.outcomes[0].metrics.orientation_record_count == 2
+    assert report.summary.orientation_record_ids == ("rec_alpha", "rec_beta", "rec_gamma")
+    assert report.summary.orientation_record_count == 3
 
 
 def test_pilot_runtime_copies_sqlite_and_publishes_only_inside_the_copy(tmp_path):
@@ -177,6 +210,12 @@ def test_pilot_runtime_copies_sqlite_and_publishes_only_inside_the_copy(tmp_path
     assert pilot.database_path != production_path
     assert pilot.storage.runtime_scope == "pilot"
     assert pilot.storage.current_snapshot() is None
+    with pilot.storage._connect() as connection:
+        inherited_pointers = connection.execute(
+            "SELECT key FROM settings WHERE key IN "
+            "('current_snapshot_id', 'active_raw_store_id', 'active_derived_store_id')"
+        ).fetchall()
+    assert inherited_pointers == []
     with pytest.raises(ValueError, match="database runtime scope"):
         Storage(pilot.database_path).initialize()
     pilot_snapshot = _candidate(
@@ -248,6 +287,51 @@ def test_pilot_copy_rejects_a_pilot_database_without_leaving_a_partial_run(tmp_p
         PilotRuntime.create(first.database_path, pilot_root, run_id="invalid-nested-pilot")
 
     assert not pilot_root.joinpath("invalid-nested-pilot").exists()
+    assert production.current_snapshot() == production_snapshot
+
+
+def test_pilot_copy_closes_sqlite_and_removes_only_its_run_on_destination_failure(
+    tmp_path, monkeypatch
+):
+    production_path = tmp_path / "production" / "mentor.sqlite3"
+    production, _revision_value, production_snapshot = _production_runtime(production_path)
+    pilot_root = tmp_path / "data" / "pilots"
+    real_connect = sqlite3.connect
+    closed = []
+    calls = 0
+
+    class SourceConnection(sqlite3.Connection):
+        def backup(self, _destination, **_kwargs):
+            raise sqlite3.OperationalError("synthetic destination failure")
+
+        def close(self):
+            closed.append("source")
+            super().close()
+
+    class DestinationConnection(sqlite3.Connection):
+        def close(self):
+            closed.append("destination")
+            super().close()
+
+    def failing_connect(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        factory = SourceConnection if calls == 1 else DestinationConnection
+        return real_connect(*args, **kwargs, factory=factory)
+
+    monkeypatch.setattr("mentor.evaluation.sqlite3.connect", failing_connect)
+
+    with pytest.raises(sqlite3.OperationalError, match="synthetic destination failure"):
+        PilotRuntime.create(
+            production_path,
+            pilot_root,
+            run_id="pilot-destination-failure",
+        )
+
+    assert closed == ["destination", "source"]
+    assert not pilot_root.joinpath("pilot-destination-failure").exists()
+    with real_connect(production_path, timeout=0.1) as connection:
+        assert connection.execute("PRAGMA quick_check").fetchone() == ("ok",)
     assert production.current_snapshot() == production_snapshot
 
 

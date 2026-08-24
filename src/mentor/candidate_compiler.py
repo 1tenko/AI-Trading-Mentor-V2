@@ -122,13 +122,15 @@ class CandidateCompiler:
 
     def build(self, request: BuildRequest) -> CandidateBuildResult:
         requested_sources = _validate_request(request)
+        scope = request.artifact_scope.value
+        if getattr(self._storage, "runtime_scope", None) != scope:
+            raise ValueError("candidate artifact scope does not match runtime scope")
         sources = _canonical_sources(self._storage, requested_sources)
         for source in sources:
             _validate_candidate_source(source)
         revision_ids, _fingerprint, snapshot_id = CorpusSnapshot.identity_for(
             request.run.run_id, [source.revision.revision_id for source in sources]
         )
-        scope = request.artifact_scope.value
         existing_run = self._storage.compilation_run(request.run.run_id)
         if existing_run is not None:
             existing = self._storage.snapshot(snapshot_id)

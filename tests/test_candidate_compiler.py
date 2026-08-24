@@ -299,8 +299,10 @@ def compiler(
     synthesis_outputs=None,
     vector_client=None,
     synthesizer=None,
+    runtime_scope="pilot",
+    artifact_scope=ArtifactScope.PILOT,
 ):
-    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage = Storage(tmp_path / "mentor.sqlite3", runtime_scope=runtime_scope)
     storage.initialize()
     sources = (
         source_bundle(storage, "earlier", 2025),
@@ -343,7 +345,7 @@ def compiler(
     request = BuildRequest(
         run=CompilationRun("run_candidate", "synthetic", "prompt-v1", "schema-v1", 1.0),
         sources=sources,
-        artifact_scope=ArtifactScope.PILOT,
+        artifact_scope=artifact_scope,
     )
     return storage, candidate_compiler, request, vector_client
 
@@ -475,6 +477,31 @@ def test_artifact_scope_is_required_and_cannot_be_an_untracked_string(tmp_path):
         candidate_compiler.build(replace(request, artifact_scope="pilot"))
 
 
+@pytest.mark.parametrize(
+    ("runtime_scope", "artifact_scope"),
+    (
+        ("production", ArtifactScope.PILOT),
+        ("pilot", ArtifactScope.PRODUCTION),
+    ),
+)
+def test_candidate_scope_must_match_runtime_before_reservation_or_remote_calls(
+    tmp_path, runtime_scope, artifact_scope
+):
+    storage, candidate_compiler, request, vector_client = compiler(
+        tmp_path,
+        runtime_scope=runtime_scope,
+        artifact_scope=artifact_scope,
+    )
+
+    with pytest.raises(ValueError, match="runtime scope"):
+        candidate_compiler.build(request)
+
+    assert storage.compilation_run(request.run.run_id) is None
+    assert storage.snapshots() == []
+    assert vector_client.calls == []
+    assert candidate_compiler._extractor._client.responses.calls == []
+
+
 @pytest.mark.parametrize("change", [
     {"remote_file_id": "file_substituted"},
     {"revision_id": "rev_unknown"},
@@ -564,7 +591,7 @@ def test_partial_remote_setup_is_auditable_and_retry_returns_the_same_failed_run
     setup = next(metric for metric in first.stage_metrics if metric.stage == "remote_setup")
     assert (setup.call_count, setup.remote_calls, setup.failure_count) == (2, 2, 1)
     assert len(candidate_compiler._extractor._client.responses.calls) == 2
-    with pytest.raises(ValueError, match="run ID"):
+    with pytest.raises(ValueError, match="runtime scope"):
         candidate_compiler.build(replace(request, artifact_scope=ArtifactScope.PRODUCTION))
     assert len(vector_client.calls) == call_count
 
