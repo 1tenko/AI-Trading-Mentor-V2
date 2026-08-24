@@ -19,7 +19,7 @@ from mentor.derived_records import (
 )
 from mentor.knowledge import Collection, Source as LibrarySource, SourceRevision
 from mentor.server import create_server
-from mentor.storage import SourceChange, Storage
+from mentor.storage import SourceChange, Storage, _safe_filename
 
 
 class FakeChatService:
@@ -55,6 +55,18 @@ def request(server, method, path, body=None):
     result = (response.status, dict(response.getheaders()), response.read())
     connection.close()
     return result
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("C:private.txt", "private.txt"),
+        ("C:\\private\\synthetic.txt", "synthetic.txt"),
+        ("../../private/synthetic.txt", "synthetic.txt"),
+    ],
+)
+def test_inspector_filename_sanitizer_uses_cross_platform_basenames(value, expected):
+    assert _safe_filename(value) == expected
 
 
 def inspected_snapshot(storage, *, run_id="run_inspector", publish=True, persist_anchor=True):

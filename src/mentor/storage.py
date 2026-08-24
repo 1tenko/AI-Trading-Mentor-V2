@@ -1,6 +1,7 @@
 """Small SQLite store for private Trading Mentor state."""
 
 import json
+import ntpath
 import re
 import sqlite3
 import time
@@ -2792,7 +2793,7 @@ def _safe_anchor_metadata(row: tuple) -> dict | None:
 def _safe_filename(value: object) -> str | None:
     if not isinstance(value, str):
         return None
-    filename = value.replace("\\", "/").rsplit("/", 1)[-1]
+    filename = ntpath.basename(value.replace("/", "\\"))
     return filename if filename and filename not in {".", ".."} else None
 
 
