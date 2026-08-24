@@ -5,6 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import mentor.gate1 as gate1_module
 
 from mentor.compilation import CompilationRun, CorpusSnapshot, SourceProcessingResult, TokenPricing
 from mentor.derived_records import Claim, RecordDependency
@@ -134,7 +135,6 @@ def test_gate1_preflight_blocks_an_over_ceiling_dry_run_without_creating_a_pilot
             production_database_path=database_path,
             manifest_path=manifest_path,
             pilot_root=pilot_root,
-            spend_limit_usd=6.20,
             client_factory=lambda: client_calls.append("called"),
             today=lambda: GATE1_PRICING_CHECKED_ON,
             expected_manifest_sha256=_manifest_hash(manifest_path),
@@ -155,7 +155,6 @@ def test_gate1_stops_before_runtime_or_client_when_estimate_exceeds_limit(tmp_pa
             production_database_path=database_path,
             manifest_path=manifest_path,
             pilot_root=pilot_root,
-            spend_limit_usd=6.20,
             client_factory=lambda: client_calls.append("called"),
             today=lambda: GATE1_PRICING_CHECKED_ON,
             expected_manifest_sha256=_manifest_hash(manifest_path),
@@ -184,7 +183,8 @@ def test_gate1_rejects_manifest_metadata_drift_instead_of_substituting(tmp_path)
     assert production.current_snapshot() == production_snapshot
 
 
-def test_execute_builds_and_publishes_only_in_pilot_then_runs_evaluation(tmp_path):
+def test_execute_builds_and_publishes_only_in_pilot_then_runs_evaluation(tmp_path, monkeypatch):
+    monkeypatch.setattr(gate1_module, "GATE1_PRIOR_SPEND_USD", 0.0)
     database_path, manifest_path, production, production_snapshot = _production_runtime(tmp_path)
     observed = {}
 
@@ -365,11 +365,11 @@ def test_budgeted_client_records_transport_versions_and_conservatively_charges_u
 
 
 def test_spend_ledger_counts_a_prior_gate1_run_against_the_same_hard_ceiling():
-    assert GATE1_PRIOR_SPEND_USD == pytest.approx(6.164435)
+    assert GATE1_PRIOR_SPEND_USD == pytest.approx(8.502370)
     assert HARD_SPEND_CEILING_USD == pytest.approx(25.0)
     ledger = SpendLedger(HARD_SPEND_CEILING_USD, CONSERVATIVE_SOL_PRICING, prior_spend_usd=GATE1_PRIOR_SPEND_USD)
 
-    assert ledger.spent_usd == pytest.approx(6.164435)
+    assert ledger.spent_usd == pytest.approx(8.502370)
     with pytest.raises(RuntimeError, match="spend ceiling"):
         ledger.ensure("extraction", 18.835566)
 
@@ -396,7 +396,8 @@ def test_budgeted_client_enforces_stage_budget_before_a_paid_call():
     assert calls == []
 
 
-def test_execute_rejects_stale_pricing_before_any_paid_client(tmp_path):
+def test_execute_rejects_stale_pricing_before_any_paid_client(tmp_path, monkeypatch):
+    monkeypatch.setattr(gate1_module, "GATE1_PRIOR_SPEND_USD", 0.0)
     database_path, manifest_path, production, production_snapshot = _production_runtime(tmp_path)
     client_calls = []
 

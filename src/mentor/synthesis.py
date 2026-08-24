@@ -1,5 +1,7 @@
 """Candidate-scoped concepts assembled from validated typed records."""
 
+from __future__ import annotations
+
 from dataclasses import asdict, dataclass
 from hashlib import sha256
 import json
@@ -30,13 +32,13 @@ from mentor.derived_records import (
 )
 
 
-MAX_LABEL_LENGTH = 120
+MAX_LABEL_LENGTH = MAX_TYPED_CONTENT_LENGTH
 MAX_ALIASES = 8
 MAX_SCOPE_LENGTH = 160
 MAX_CONDITION_LENGTH = 160
 MAX_JUSTIFICATION_LENGTH = 280
-SYNTHESIS_PROMPT_VERSION = "cross-source-synthesis-v6"
-SYNTHESIS_SCHEMA_VERSION = "cross-source-synthesis-schema-v7"
+SYNTHESIS_PROMPT_VERSION = "cross-source-synthesis-v7"
+SYNTHESIS_SCHEMA_VERSION = "cross-source-synthesis-schema-v8"
 SOL_MODEL = "gpt-5.6-sol"
 MAX_SYNTHESIS_RECORDS_PER_CALL = 64
 MAX_SYNTHESIS_RECORDS_PER_CANDIDATE = 4_096
@@ -61,8 +63,21 @@ _SYNTHESIS_TEXT_SCHEMA = {
 _SYNTHESIS_TERM_SCHEMA = {
     "type": "string", "minLength": 1, "maxLength": MAX_LABEL_LENGTH,
 }
+_SYNTHESIS_OCCURRENCE_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["text", "aliases", "scope"],
+    "properties": {
+        "text": _SYNTHESIS_TERM_SCHEMA,
+        "aliases": {
+            "type": "array", "maxItems": MAX_ALIASES,
+            "items": _SYNTHESIS_TERM_SCHEMA,
+        },
+        "scope": {"type": ["string", "null"], "maxLength": MAX_SCOPE_LENGTH},
+    },
+}
 _SYNTHESIS_TERM_LIST_SCHEMA = {
-    "type": "array", "maxItems": MAX_TERMS, "items": _SYNTHESIS_TERM_SCHEMA,
+    "type": "array", "maxItems": MAX_TERMS, "items": _SYNTHESIS_OCCURRENCE_SCHEMA,
 }
 _SYNTHESIS_TEXT_LIST_SCHEMA = {
     "type": "array", "maxItems": MAX_TERMS, "items": _SYNTHESIS_TEXT_SCHEMA,
@@ -96,7 +111,7 @@ def _synthesis_family_schema(family: str, **properties: object) -> dict[str, obj
 SYNTHESIS_RESPONSE_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
-    "required": ["records", "concept_hints"],
+    "required": ["records"],
     "properties": {
         "records": {
             "type": "array",
@@ -105,9 +120,9 @@ SYNTHESIS_RESPONSE_SCHEMA = {
                 "anyOf": [
                     _synthesis_family_schema(
                         "relationship",
-                        left=_SYNTHESIS_TERM_SCHEMA,
+                        left=_SYNTHESIS_OCCURRENCE_SCHEMA,
                         relation={"enum": sorted(RELATIONSHIP_TYPES)},
-                        right=_SYNTHESIS_TERM_SCHEMA,
+                        right=_SYNTHESIS_OCCURRENCE_SCHEMA,
                     ),
                     _synthesis_family_schema(
                         "procedure_sequence_hierarchy",
@@ -134,9 +149,9 @@ SYNTHESIS_RESPONSE_SCHEMA = {
                     ),
                     _synthesis_family_schema(
                         "evolution",
-                        subject=_SYNTHESIS_TEXT_SCHEMA,
-                        previous=_SYNTHESIS_TEXT_SCHEMA,
-                        current=_SYNTHESIS_TEXT_SCHEMA,
+                        subject=_SYNTHESIS_OCCURRENCE_SCHEMA,
+                        previous=_SYNTHESIS_OCCURRENCE_SCHEMA,
+                        current=_SYNTHESIS_OCCURRENCE_SCHEMA,
                         earlier_source_set=_SYNTHESIS_INPUT_IDS_SCHEMA | {"minItems": 1},
                         later_source_set=_SYNTHESIS_INPUT_IDS_SCHEMA | {"minItems": 1},
                         classification={"enum": sorted(EVOLUTION_CLASSIFICATIONS)},
@@ -147,8 +162,8 @@ SYNTHESIS_RESPONSE_SCHEMA = {
                     _synthesis_family_schema(
                         "conflict_unresolved",
                         kind={"enum": ["conflict", "unresolved"]},
-                        subject=_SYNTHESIS_TEXT_SCHEMA,
-                        alternatives=_SYNTHESIS_TEXT_LIST_SCHEMA | {"minItems": 2},
+                        subject=_SYNTHESIS_OCCURRENCE_SCHEMA,
+                        alternatives=_SYNTHESIS_TERM_LIST_SCHEMA | {"minItems": 2},
                         competing_record_ids=_SYNTHESIS_INPUT_IDS_SCHEMA | {"minItems": 2, "maxItems": MAX_TERMS},
                         reconciliation_state={"enum": sorted(RECONCILIATION_STATES)},
                         relevant_scopes=_SYNTHESIS_TEXT_LIST_SCHEMA | {"minItems": 1},
@@ -156,29 +171,6 @@ SYNTHESIS_RESPONSE_SCHEMA = {
                         unresolved_questions=_SYNTHESIS_TEXT_LIST_SCHEMA,
                     ),
                 ]
-            },
-        },
-        "concept_hints": {
-            "type": "array",
-            "maxItems": MAX_SYNTHESIS_RECORDS_PER_CALL,
-            "items": {
-                "type": "object",
-                "additionalProperties": False,
-                "required": ["record_index", "label", "aliases", "scope", "role", "position"],
-                "properties": {
-                    "record_index": {
-                        "type": "integer", "minimum": 0,
-                        "maximum": MAX_SYNTHESIS_RECORDS_PER_CALL - 1,
-                    },
-                    "label": _SYNTHESIS_TERM_SCHEMA,
-                    "aliases": {
-                        "type": "array", "maxItems": MAX_ALIASES,
-                        "items": _SYNTHESIS_TERM_SCHEMA,
-                    },
-                    "scope": {"type": ["string", "null"], "maxLength": MAX_SCOPE_LENGTH},
-                    "role": {"type": ["string", "null"], "maxLength": MAX_LABEL_LENGTH},
-                    "position": {"type": ["integer", "null"], "minimum": 0},
-                },
             },
         },
     },
@@ -394,9 +386,10 @@ class SynthesisReconciler:
                 instructions=(
                     f"Prompt version: {SYNTHESIS_PROMPT_VERSION}\n"
                     "Return only small typed cross-source relationship, procedure/sequence/hierarchy, "
-                    "evolution, or conflict records plus explicit alias-aware concept hints. "
-                    "Every record must use exactly one supplied family shape; include every required "
-                    "lineage field and return an empty concept_hints list when there are no hints. "
+                    "evolution, or conflict records. Every concept-bearing field is an inline object with "
+                    "text, aliases, and scope; do not return a separate concept selector or record reference. "
+                    "Every record must use exactly one supplied family shape and include every required "
+                    "lineage field. "
                     "Keep procedure prerequisites, conditions, and conditional branches structured. "
                     "Use only supplied record, anchor, and revision IDs. Preserve uncertainty; do not claim raw authority. "
                     "Prior cluster summaries contain independently addressable validated conclusions. Connect them "
@@ -438,8 +431,8 @@ class SynthesisReconciler:
                     }
                 },
             )
-            output, hint_payloads = _synthesis_output(response, allow_synthetic=not self._live_mode)
-            parsed_records = tuple(
+            output, legacy_hint_payloads = _synthesis_output(response, allow_synthetic=not self._live_mode)
+            parsed = tuple(
                 _synthesis_record(
                     payload,
                     snapshot_id=snapshot_id,
@@ -447,13 +440,19 @@ class SynthesisReconciler:
                     records_by_id={record.record_id: record for record in batch},
                     summary_records_by_id=summary_records_by_id,
                     source_metadata=canonical_sources,
+                    allow_legacy=not self._live_mode,
                 )
                 for payload in output
             )
+            parsed_records = tuple(record for record, _hints in parsed)
             lineage_records_by_id = input_records_by_id | synthesized_by_id | {
                 record.record_id: record for record in parsed_records
             }
-            parsed_hints = _synthesis_hints(hint_payloads, parsed_records)
+            parsed_hints = tuple(hint for _record, record_hints in parsed for hint in record_hints)
+            if legacy_hint_payloads:
+                parsed_hints = _replace_legacy_synthesis_hints(
+                    parsed_hints, _legacy_synthesis_hints(legacy_hint_payloads, parsed_records)
+                )
             batch_records = tuple(
                 record for record in parsed_records
                 if record_reaches_any(record, target_record_ids, lineage_records_by_id)
@@ -473,7 +472,7 @@ class SynthesisReconciler:
             return batch_records, tuple(
                 hint for hint in parsed_hints
                 if hint.record_id in {record.record_id for record in batch_records}
-            ) if hint_payloads else ()
+            )
 
         summaries: list[_ClusterSummary] = []
         for planned_batch in primary_batches:
@@ -526,7 +525,9 @@ def _synthesis_output(response: Any, *, allow_synthetic: bool = False) -> tuple[
         or not isinstance(payload["records"], list)
         or not isinstance(payload.get("concept_hints", []), list)
     ):
-        raise ValueError("synthesis response requires records and optional concept hints")
+        raise ValueError("synthesis response requires a records list")
+    if "concept_hints" in payload and not allow_synthetic:
+        raise ValueError("synthesis response must not contain detached concept selectors")
     if len(payload["records"]) > MAX_SYNTHESIS_RECORDS_PER_CALL:
         raise ValueError("too many synthesis records")
     return payload["records"], payload.get("concept_hints", [])
@@ -540,7 +541,8 @@ def _synthesis_record(
     records_by_id: Mapping[str, DerivedRecord],
     summary_records_by_id: Mapping[str, DerivedRecord],
     source_metadata: dict[str, ReconciliationSource],
-) -> DerivedRecord:
+    allow_legacy: bool = False,
+) -> tuple[DerivedRecord, tuple[ConceptHint, ...]]:
     if not isinstance(payload, dict) or not isinstance(payload.get("family"), str):
         raise ValueError("synthesis record must be a typed object")
     family = payload["family"]
@@ -597,25 +599,36 @@ def _synthesis_record(
     }
     if family == "relationship":
         _allow_synthesis_fields(payload, base_fields | {"left", "relation", "right"})
-        return Relationship.create(
+        left, left_hint = _synthesis_occurrence(payload.get("left"), "left", allow_legacy=allow_legacy)
+        right, right_hint = _synthesis_occurrence(payload.get("right"), "right", allow_legacy=allow_legacy)
+        record = Relationship.create(
             **common,
-            left=payload.get("left"),
+            left=left,
             relation=payload.get("relation"),
-            right=payload.get("right"),
+            right=right,
         )
+        return record, _record_concept_hints(record, (left_hint, right_hint))
     if family == "procedure_sequence_hierarchy":
         _allow_synthesis_fields(
             payload,
             base_fields | {"kind", "terms", "prerequisites", "conditions", "branches"},
         )
-        return ProcedureSequenceHierarchy.create(
+        terms, term_hints = _synthesis_occurrences(payload.get("terms"), "term", allow_legacy=allow_legacy)
+        prerequisites, prerequisite_hints = _synthesis_occurrences(
+            payload.get("prerequisites", []), "prerequisite", allow_empty=True, allow_legacy=allow_legacy
+        )
+        branches, branch_hints = _synthesis_procedure_branches(
+            payload.get("branches", []), allow_legacy=allow_legacy
+        )
+        record = ProcedureSequenceHierarchy.create(
             **common,
             kind=payload.get("kind"),
-            terms=_payload_texts(payload.get("terms")),
-            prerequisites=_payload_texts(payload.get("prerequisites", []), allow_empty=True),
+            terms=terms,
+            prerequisites=prerequisites,
             conditions=_payload_texts(payload.get("conditions", []), allow_empty=True),
-            branches=_payload_procedure_branches(payload.get("branches", [])),
+            branches=branches,
         )
+        return record, _record_concept_hints(record, (*term_hints, *prerequisite_hints, *branch_hints))
     if family == "evolution":
         fields = base_fields | {
             "subject", "previous", "current", "earlier_source_set", "later_source_set",
@@ -640,11 +653,14 @@ def _synthesis_record(
         dependencies = tuple(dict.fromkeys(common["dependencies"] + tuple(
             RecordDependency("source_revision", value) for value in earlier + later
         )))
-        return Evolution.create(
+        subject, subject_hint = _synthesis_occurrence(payload.get("subject"), "subject", allow_legacy=allow_legacy)
+        previous, previous_hint = _synthesis_occurrence(payload.get("previous"), "previous", allow_legacy=allow_legacy)
+        current, current_hint = _synthesis_occurrence(payload.get("current"), "current", allow_legacy=allow_legacy)
+        record = Evolution.create(
             **(common | {"dependencies": dependencies}),
-            subject=payload.get("subject"),
-            previous=payload.get("previous"),
-            current=payload.get("current"),
+            subject=subject,
+            previous=previous,
+            current=current,
             earlier_source_set=earlier,
             later_source_set=later,
             classification=payload.get("classification"),
@@ -660,6 +676,7 @@ def _synthesis_record(
                 payload, "deprecation_evidence_anchors", lineage_anchor_ids
             ),
         )
+        return record, _record_concept_hints(record, (subject_hint, previous_hint, current_hint))
     if family == "conflict_unresolved":
         fields = base_fields | {
             "kind", "subject", "alternatives", "competing_record_ids", "reconciliation_state",
@@ -672,17 +689,22 @@ def _synthesis_record(
         dependencies = tuple(dict.fromkeys(common["dependencies"] + tuple(
             RecordDependency("derived_record", value) for value in competing
         )))
-        return ConflictUnresolved.create(
+        subject, subject_hint = _synthesis_occurrence(payload.get("subject"), "subject", allow_legacy=allow_legacy)
+        alternatives, alternative_hints = _synthesis_occurrences(
+            payload.get("alternatives"), "alternative", allow_legacy=allow_legacy
+        )
+        record = ConflictUnresolved.create(
             **(common | {"dependencies": dependencies}),
             kind=payload.get("kind"),
-            subject=payload.get("subject"),
-            alternatives=_payload_texts(payload.get("alternatives")),
+            subject=subject,
+            alternatives=alternatives,
             competing_record_ids=competing,
             reconciliation_state=payload.get("reconciliation_state"),
             relevant_scopes=_payload_texts(payload.get("relevant_scopes")),
             conditions=_payload_texts(payload.get("conditions"), allow_empty=True),
             unresolved_questions=_payload_texts(payload.get("unresolved_questions"), allow_empty=True),
         )
+        return record, _record_concept_hints(record, (subject_hint, *alternative_hints))
     raise ValueError("synthesis returned an unsupported typed family")
 
 
@@ -742,7 +764,91 @@ def source_coverage(
     return _source_coverage(revision_ids, source_map)
 
 
-def _synthesis_hints(
+@dataclass(frozen=True)
+class _InlineSynthesisOccurrence:
+    aliases: tuple[str, ...]
+    scope: str | None
+    role: str
+    position: int | None
+
+
+def _synthesis_occurrence(
+    value: object, role: str, position: int | None = None, *, allow_legacy: bool = False,
+) -> tuple[str, _InlineSynthesisOccurrence]:
+    if isinstance(value, str) and allow_legacy:
+        text, aliases, scope = value, (), None
+    elif isinstance(value, dict) and set(value) == {"text", "aliases", "scope"}:
+        text, aliases, scope = value["text"], value["aliases"], value["scope"]
+    else:
+        raise ValueError("synthesis concept occurrence must be inline and typed")
+    if (
+        not isinstance(text, str)
+        or not text.strip()
+        or not isinstance(aliases, (list, tuple))
+        or len(aliases) > MAX_ALIASES
+        or any(not isinstance(alias, str) or not alias.strip() for alias in aliases)
+        or (scope is not None and not isinstance(scope, str))
+    ):
+        raise ValueError("synthesis concept occurrence is invalid")
+    return text, _InlineSynthesisOccurrence(tuple(aliases), scope, _role_key(role), position)
+
+
+def _synthesis_occurrences(
+    value: object,
+    role: str,
+    *,
+    allow_empty: bool = False,
+    start_position: int = 0,
+    allow_legacy: bool = False,
+) -> tuple[tuple[str, ...], tuple[_InlineSynthesisOccurrence, ...]]:
+    if not isinstance(value, list) or len(value) > MAX_TERMS or (not value and not allow_empty):
+        raise ValueError("synthesis concept occurrences must be a bounded ordered list")
+    parsed = tuple(
+        _synthesis_occurrence(item, role, start_position + position, allow_legacy=allow_legacy)
+        for position, item in enumerate(value)
+    )
+    return tuple(text for text, _hint in parsed), tuple(hint for _text, hint in parsed)
+
+
+def _synthesis_procedure_branches(
+    value: object, *, allow_legacy: bool = False,
+) -> tuple[tuple[ProcedureRecordBranch, ...], tuple[_InlineSynthesisOccurrence, ...]]:
+    if not isinstance(value, list) or len(value) > MAX_TERMS:
+        raise ValueError("synthesis procedure branches must be a bounded list")
+    branches = []
+    hints = []
+    position = 0
+    for item in value:
+        if not isinstance(item, dict) or set(item) != {"condition", "steps"}:
+            raise ValueError("synthesis procedure branches must be structured")
+        condition = item["condition"]
+        if not isinstance(condition, str) or not condition.strip():
+            raise ValueError("synthesis procedure branch condition must be non-empty text")
+        steps, step_hints = _synthesis_occurrences(
+            item["steps"], "branch_step", start_position=position, allow_legacy=allow_legacy
+        )
+        branches.append(ProcedureRecordBranch(condition, steps))
+        hints.extend(step_hints)
+        position += len(steps)
+    return tuple(branches), tuple(hints)
+
+
+def _record_concept_hints(
+    record: DerivedRecord, occurrences: Sequence[_InlineSynthesisOccurrence],
+) -> tuple[ConceptHint, ...]:
+    return tuple(
+        concept_hint_from_record_selector(
+            record,
+            aliases=occurrence.aliases,
+            scope=occurrence.scope,
+            role=occurrence.role,
+            position=occurrence.position,
+        )
+        for occurrence in occurrences
+    )
+
+
+def _legacy_synthesis_hints(
     payloads: list[object], records: tuple[DerivedRecord, ...]
 ) -> tuple[ConceptHint, ...]:
     if len(payloads) > MAX_SYNTHESIS_RECORDS_PER_CALL:
@@ -771,16 +877,30 @@ def _synthesis_hints(
         ):
             raise ValueError("synthesis concept hints are invalid")
         result.append(
-            ConceptHint(
-                records[index].record_id,
-                payload["label"],
-                tuple(aliases),
-                payload["scope"],
-                payload["role"],
-                position,
+            concept_hint_from_record_selector(
+                records[index],
+                aliases=tuple(aliases),
+                scope=payload["scope"],
+                role=payload["role"],
+                position=position,
             )
         )
     return tuple(result)
+
+
+def _replace_legacy_synthesis_hints(
+    inline_hints: tuple[ConceptHint, ...], legacy_hints: tuple[ConceptHint, ...],
+) -> tuple[ConceptHint, ...]:
+    replacements: dict[tuple[str, str | None, int | None], ConceptHint] = {}
+    for hint in legacy_hints:
+        key = (hint.record_id, hint.role, hint.position)
+        if key in replacements:
+            raise ValueError("duplicate legacy synthesis selector")
+        replacements[key] = hint
+    return tuple(
+        replacements.get((hint.record_id, hint.role, hint.position), hint)
+        for hint in inline_hints
+    )
 
 
 def _reconciliation_batches(
@@ -1182,6 +1302,51 @@ def concept_hint_from_record_selector(
     return ConceptHint(record.record_id, label, aliases, scope, role_key, position)
 
 
+def validate_concept_hint_integrity(
+    records: Sequence[DerivedRecord],
+    hints: Sequence[ConceptHint],
+    *,
+    require_active: bool = False,
+) -> None:
+    """Reject dangling or ambiguous metadata before concept clustering."""
+    record_map = {record.record_id: record for record in records}
+    if len(record_map) != len(tuple(records)):
+        raise ValueError("concept hints require unique candidate records")
+    seen: set[tuple[str, str, int | None]] = set()
+    for hint in hints:
+        record = record_map.get(getattr(hint, "record_id", None))
+        if not isinstance(hint, ConceptHint):
+            raise ValueError("concept hints require candidate-owned records")
+        if record is None:
+            if require_active:
+                raise ValueError("concept hints require candidate-owned records")
+            continue
+        if record.validation_state != "validated" or (require_active and record.lifecycle_state != "active"):
+            raise ValueError("concept hints require active validated candidate records")
+        if hint.role is None and not require_active:
+            matches = [
+                (role, position)
+                for role, position, label in _record_occurrence_terms(record)
+                if _label_key(label) == _label_key(hint.label)
+            ]
+            if len(matches) != 1:
+                raise ValueError("concept hint is ambiguous; role or position is required")
+            continue
+        resolved = concept_hint_from_record_selector(
+            record,
+            aliases=hint.aliases,
+            scope=hint.scope,
+            role=hint.role,
+            position=hint.position,
+        )
+        if resolved != hint:
+            raise ValueError("concept hint label does not match its typed occurrence")
+        key = (hint.record_id, resolved.role or "", resolved.position)
+        if key in seen:
+            raise ValueError("duplicate concept hint")
+        seen.add(key)
+
+
 @dataclass(frozen=True)
 class ConceptOccurrence:
     record_id: str
@@ -1282,6 +1447,7 @@ class SynthesisCandidate:
                 if not required_anchors <= set(record.anchors):
                     raise ValueError("conflict anchors must include competing record anchors")
         ordered_records = tuple(sorted(record_map.values(), key=lambda record: record.record_id))
+        validate_concept_hint_integrity(ordered_records, hints)
         concepts, occurrences = _cluster_concepts(snapshot_id, ordered_records, hints)
         ordered_concepts = tuple(sorted(concepts, key=lambda concept: concept.concept_id))
         _validate_concepts(snapshot_id, ordered_concepts, record_map)
@@ -1340,6 +1506,8 @@ class SynthesisCandidate:
         if not isinstance(record, Relationship):
             raise ValueError("relationship synthesis requires a relationship record")
         inputs = self._supporting_records(record)
+        left_scope = self._occurrence_scope(record.record_id, "left", None) if left_scope is None else left_scope
+        right_scope = self._occurrence_scope(record.record_id, "right", None) if right_scope is None else right_scope
         left_concept_id = self._concept_id_for_occurrence(
             record.record_id, "left", None, record.left, scope=left_scope
         )
@@ -1384,14 +1552,18 @@ class SynthesisCandidate:
         if not prerequisite_concept_ids and record.prerequisites:
             prerequisite_concept_ids = tuple(
                 self._concept_id_for_occurrence(
-                    record.record_id, "prerequisite", position, prerequisite, scope=None
+                    record.record_id, "prerequisite", position, prerequisite,
+                    scope=self._occurrence_scope(record.record_id, "prerequisite", position)
                 )
                 for position, prerequisite in enumerate(record.prerequisites)
             )
         _require_concept_ids(prerequisite_concept_ids, self.concepts, allow_empty=True)
         if not isinstance(step_scopes, tuple) or (step_scopes and len(step_scopes) != len(record.terms)):
             raise ValueError("procedure step scopes must match ordered steps")
-        step_scopes = step_scopes or (None,) * len(record.terms)
+        step_scopes = step_scopes or tuple(
+            self._occurrence_scope(record.record_id, "term", position)
+            for position in range(len(record.terms))
+        )
         conditions = self._procedure_conditions(record)
         if not branches and record.branches:
             flat_position = 0
@@ -1405,7 +1577,7 @@ class SynthesisCandidate:
                             "branch_step",
                             flat_position,
                             step,
-                            scope=None,
+                            scope=self._occurrence_scope(record.record_id, "branch_step", flat_position),
                         )
                     )
                     flat_position += 1
@@ -1536,6 +1708,18 @@ class SynthesisCandidate:
             raise ValueError("scope does not match this record occurrence")
         return occurrence.concept_id
 
+    def _occurrence_scope(self, record_id: str, role: str, position: int | None) -> str | None:
+        matches = [
+            occurrence.scope
+            for occurrence in self.concept_occurrences
+            if occurrence.record_id == record_id
+            and occurrence.role == _role_key(role)
+            and occurrence.position == position
+        ]
+        if len(matches) != 1:
+            raise ValueError("record occurrence does not resolve to one concept scope")
+        return matches[0]
+
     def _procedure_conditions(self, record: ProcedureSequenceHierarchy) -> tuple[str, ...]:
         conditions = tuple(dict.fromkeys((
             *record.conditions,
@@ -1639,6 +1823,7 @@ def _validate_concept_occurrences(
 def _cluster_concepts(
     snapshot_id: str, records: Sequence[DerivedRecord], hints: Sequence[ConceptHint]
 ) -> tuple[tuple[Concept, ...], tuple[ConceptOccurrence, ...]]:
+    validate_concept_hint_integrity(records, hints)
     occurrences: dict[
         tuple[str, str, int | None], tuple[DerivedRecord, str, int | None, str, str | None, tuple[str, ...]]
     ] = {}

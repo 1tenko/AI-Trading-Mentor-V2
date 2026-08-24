@@ -367,19 +367,19 @@ def _concept_summaries(
     for concept in concepts:
         if getattr(concept, "concept_id", None) not in wanted:
             continue
-        canonical_label = _safe_concept_text(getattr(concept, "canonical_label", None), 120)
+        canonical_label = _safe_concept_text(getattr(concept, "canonical_label", None), 240)
         if canonical_label is None:
             continue
         aliases = tuple(
             alias
             for value in getattr(concept, "aliases", ())
-            if (alias := _safe_concept_text(value, 120)) is not None
+            if (alias := _safe_concept_text(value, 240)) is not None
         )
         scope = _safe_concept_text(getattr(concept, "scope", None), 160)
         concept_occurrences = []
         for occurrence in occurrences_by_concept.get(concept.concept_id, ()):
             role = _safe_concept_text(getattr(occurrence, "role", None), 120)
-            label = _safe_concept_text(getattr(occurrence, "label_key", None), 120)
+            label = _safe_concept_text(getattr(occurrence, "label_key", None), 240)
             position = getattr(occurrence, "position", None)
             if role is None or label is None or (
                 position is not None

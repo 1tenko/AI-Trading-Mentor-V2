@@ -29,6 +29,7 @@ from mentor.structured_response import structured_json_payload
 
 
 SOL_MODEL = "gpt-5.6-sol"
+MAX_EXTRACTION_OCCURRENCE_LENGTH = 120
 _SELF_VALIDATION_FIELDS = frozenset(
     {
         "approved",
@@ -221,14 +222,17 @@ def _inline_occurrence(value: object, role: str, position: int | None = None) ->
     if not isinstance(value, dict) or set(value) != {"text", "aliases", "scope"}:
         raise ValueError("inline concept occurrence must be typed")
     text, aliases, scope = value["text"], value["aliases"], value["scope"]
-    if (
-        not isinstance(text, str)
-        or not text.strip()
-        or not isinstance(aliases, list)
-        or len(aliases) > 8
-        or any(not isinstance(alias, str) or not alias.strip() for alias in aliases)
-        or (scope is not None and not isinstance(scope, str))
-    ):
+    if not isinstance(text, str) or not text.strip():
+        raise ValueError("inline concept occurrence is invalid")
+    if len(text) > MAX_EXTRACTION_OCCURRENCE_LENGTH:
+        raise ValueError("concept label exceeds its maximum length")
+    if not isinstance(aliases, list) or len(aliases) > 8:
+        raise ValueError("inline concept occurrence is invalid")
+    if any(not isinstance(alias, str) or not alias.strip() for alias in aliases):
+        raise ValueError("inline concept occurrence is invalid")
+    if any(len(alias) > MAX_EXTRACTION_OCCURRENCE_LENGTH for alias in aliases):
+        raise ValueError("concept label exceeds its maximum length")
+    if scope is not None and not isinstance(scope, str):
         raise ValueError("inline concept occurrence is invalid")
     return text, _InlineHint(tuple(aliases), scope, role, position)
 

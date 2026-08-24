@@ -48,8 +48,10 @@ from mentor.synthesis import (
     ReconciliationCoverage,
     SynthesisCandidate,
     SynthesisResult,
+    concept_hint_from_record_selector,
     record_reaches_any,
     source_coverage,
+    validate_concept_hint_integrity,
 )
 
 
@@ -293,7 +295,7 @@ class CandidateCompiler:
                 stale_revision_ids=stale_predecessor_revisions,
             )
             reused_hints = _remapped_concept_hints(
-                self._storage, previous_snapshot.snapshot_id, record_mapping
+                self._storage, previous_snapshot.snapshot_id, record_mapping, reused_records
             )
             reconciliation_context = _selective_reconciliation_context(
                 self._storage,
@@ -515,8 +517,10 @@ class CandidateCompiler:
             synthesized_count = len(synthesized.records)
             hints += tuple(synthesized.hints)
             _validate_context_not_regenerated(synthesized.records, reconciliation_context)
+            candidate_records = extracted_records + synthesized.records
+            validate_concept_hint_integrity(candidate_records, hints, require_active=True)
             _validate_candidate_dependencies(
-                extracted_records + synthesized.records,
+                candidate_records,
                 set(snapshot.selected_revision_ids),
             )
             for record in synthesized.records:
@@ -1265,13 +1269,17 @@ def _selective_reconciliation_context(
 
 
 def _remapped_concept_hints(
-    storage: Any, previous_snapshot_id: str, record_id_mapping: Mapping[str, str]
+    storage: Any,
+    previous_snapshot_id: str,
+    record_id_mapping: Mapping[str, str],
+    reused_records: tuple[DerivedRecord, ...],
 ) -> tuple[ConceptHint, ...]:
     if not record_id_mapping:
         return ()
     concepts = {
         concept.concept_id: concept for concept in storage.orientation_concepts(previous_snapshot_id)
     }
+    records = {record.record_id: record for record in reused_records}
     hints = []
     for occurrence in storage.orientation_concept_occurrences(previous_snapshot_id):
         record_id = record_id_mapping.get(occurrence.record_id)
@@ -1282,12 +1290,16 @@ def _remapped_concept_hints(
             label for label in (concept.canonical_label, *concept.aliases)
             if _hint_label_key(label) != occurrence.label_key
         )
-        hints.append(
-            ConceptHint(
-                record_id, occurrence.label_key, aliases, occurrence.scope,
-                occurrence.role, occurrence.position,
-            )
-        )
+        record = records.get(record_id)
+        if record is None:
+            raise ValueError("reused concept occurrence has no cloned record")
+        hints.append(concept_hint_from_record_selector(
+            record,
+            aliases=aliases,
+            scope=occurrence.scope,
+            role=occurrence.role,
+            position=occurrence.position,
+        ))
     return tuple(hints)
 
 

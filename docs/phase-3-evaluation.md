@@ -278,3 +278,7 @@ A one-call synthetic envelope probe then confirmed the installed SDK returned a
 completed message with one output-text item and a parseable strict JSON object.
 It used no corpus, files, vector stores, or server-side response storage and
 cost `$0.000815`, bringing cumulative Gate 1 spend to `$6.164435`.
+
+The subsequent captured six-source replay attempt brought cumulative Gate 1
+spend to `$8.502370`. The runner ledger must retain that actual cumulative
+amount; it must not reset to the earlier envelope-probe total.

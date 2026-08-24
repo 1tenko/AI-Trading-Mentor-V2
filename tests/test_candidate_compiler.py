@@ -29,6 +29,7 @@ from mentor.derived_records import (
 from mentor.knowledge import Collection, Source, SourceRevision
 from mentor.orientation import OrientationBudget
 from mentor.storage import Storage
+from mentor.synthesis import ConceptHint
 from mentor.vector_stores import VectorStoreAdapter
 
 
@@ -211,6 +212,15 @@ class IncompleteCoverageSynthesizer(SyntheticSynthesizer):
     def synthesize(self, **kwargs):
         result = super().synthesize(**kwargs)
         return replace(result, coverage=None)
+
+
+class OrphanHintSynthesizer(SyntheticSynthesizer):
+    def synthesize(self, **kwargs):
+        result = super().synthesize(**kwargs)
+        return replace(
+            result,
+            hints=(ConceptHint(result.records[0].record_id, "Synthetic orphan", role="left"),),
+        )
 
 
 class ClusterSynthesizer:
@@ -1376,6 +1386,20 @@ def test_candidate_compiler_rejects_an_exposed_conclusion_with_ambiguous_lineage
 
     assert result.ready is False
     assert any("lineage" in failure for failure in result.failures)
+    assert result.orientation_artifacts == ()
+    assert vector_client.calls == []
+    assert storage.current_snapshot() is None
+
+
+def test_candidate_compiler_rejects_orphan_synthesis_hints_before_orientation_or_remote_setup(tmp_path):
+    storage, candidate_compiler, request, vector_client = compiler(
+        tmp_path, synthesizer=OrphanHintSynthesizer()
+    )
+
+    result = candidate_compiler.build(request)
+
+    assert result.ready is False
+    assert any("concept hint label does not match" in failure for failure in result.failures)
     assert result.orientation_artifacts == ()
     assert vector_client.calls == []
     assert storage.current_snapshot() is None

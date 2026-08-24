@@ -21,10 +21,17 @@ from mentor.synthesis import (
     SynthesisCandidate,
     SynthesisReconciler,
     SYNTHESIS_RESPONSE_SCHEMA,
+    _replace_legacy_synthesis_hints,
+    concept_hint_from_record_selector,
+    validate_concept_hint_integrity,
 )
 
 
 SNAPSHOT_ID = "snap_synthetic"
+
+
+def synthesis_occurrence(text: str, *, aliases: tuple[str, ...] = (), scope: str | None = None) -> dict[str, object]:
+    return {"text": text, "aliases": list(aliases), "scope": scope}
 
 
 def claim(
@@ -139,35 +146,121 @@ def test_synthesis_response_schema_closes_family_and_concept_hint_shapes():
     assert "kind" not in relationship_schema["properties"]
     assert relationship_schema["additionalProperties"] is False
 
-    hint_schema = SYNTHESIS_RESPONSE_SCHEMA["properties"]["concept_hints"]["items"]
-    assert hint_schema["additionalProperties"] is False
-    assert set(hint_schema["required"]) == {
-        "record_index", "label", "aliases", "scope", "role", "position"
+    assert "concept_hints" not in SYNTHESIS_RESPONSE_SCHEMA["properties"]
+    occurrence_schema = relationship_schema["properties"]["left"]
+    assert occurrence_schema["additionalProperties"] is False
+    assert set(occurrence_schema["required"]) == {"text", "aliases", "scope"}
+
+
+def test_synthesis_inline_occurrences_attach_aliases_to_typed_record_terms():
+    first = claim(
+        subject="First", anchors=("anc_earlier",),
+        dependencies=(RecordDependency("source_revision", "rev_earlier"),),
+    )
+    second = claim(
+        subject="Second", anchors=("anc_later",),
+        dependencies=(RecordDependency("source_revision", "rev_later"),),
+    )
+    occurrence = lambda text, aliases=(): {"text": text, "aliases": list(aliases), "scope": None}
+    payload = {
+        "records": [{
+            "family": "procedure_sequence_hierarchy",
+            "qualification": "Synthetic bounded reconciliation.",
+            "anchors": ["anc_earlier", "anc_later"],
+            "input_record_ids": [first.record_id, second.record_id],
+            "input_conclusion_ids": [],
+            "source_revision_ids": ["rev_earlier", "rev_later"],
+            "kind": "procedure",
+            "terms": [occurrence("Observe", ("Inspect",)), occurrence("Act")],
+            "prerequisites": [occurrence("Context")],
+            "conditions": ["Only after confirmation."],
+            "branches": [{"condition": "If confirmation fails", "steps": [occurrence("Observe again")]}],
+        }]
     }
-    assert hint_schema["properties"]["scope"]["type"] == ["string", "null"]
-    assert hint_schema["properties"]["position"]["type"] == ["integer", "null"]
+    responses = RecordingResponses(lambda _request: payload)
+
+    result = SynthesisReconciler(SimpleNamespace(responses=responses)).synthesize(
+        snapshot_id=SNAPSHOT_ID,
+        records=(first, second),
+        revisions=(SimpleNamespace(revision_id="rev_earlier"), SimpleNamespace(revision_id="rev_later")),
+        source_metadata=(
+            reconciliation_source("rev_earlier", year=2025),
+            reconciliation_source("rev_later", year=2026),
+        ),
+        anchor_spans={"anc_earlier": "earlier span", "anc_later": "later span"},
+    )
+
+    record = result.records[0]
+    assert result.hints == (
+        ConceptHint(record.record_id, "Observe", ("Inspect",), None, "term", 0),
+        ConceptHint(record.record_id, "Act", (), None, "term", 1),
+        ConceptHint(record.record_id, "Context", (), None, "prerequisite", 0),
+        ConceptHint(record.record_id, "Observe again", (), None, "branch_step", 0),
+    )
+
+
+def test_candidate_hint_integrity_rejects_dangling_invalid_and_duplicate_selectors():
+    record = Relationship.create(
+        snapshot_id=SNAPSHOT_ID,
+        anchors=("anc_integrity",),
+        dependencies=(RecordDependency("source_revision", "rev_synthetic"),),
+        validation_state="validated",
+        lifecycle_state="active",
+        qualification="Synthetic support.",
+        left="Left term",
+        relation="supports",
+        right="Right term",
+    )
+    valid = concept_hint_from_record_selector(
+        record, aliases=("Left alias",), scope=None, role="left", position=None
+    )
+    validate_concept_hint_integrity((record,), (valid,), require_active=True)
+
+    with pytest.raises(ValueError, match="candidate-owned"):
+        validate_concept_hint_integrity(
+            (record,), (replace(valid, record_id="rec_missing"),), require_active=True
+        )
+    with pytest.raises(ValueError, match="does not identify"):
+        validate_concept_hint_integrity(
+            (record,), (replace(valid, role="subject"),), require_active=True
+        )
+    with pytest.raises(ValueError, match="does not identify"):
+        validate_concept_hint_integrity(
+            (record,), (replace(valid, position=0),), require_active=True
+        )
+    with pytest.raises(ValueError, match="duplicate"):
+        validate_concept_hint_integrity((record,), (valid, valid), require_active=True)
+
+
+def test_legacy_hint_replacement_rejects_conflicting_duplicate_selectors():
+    inline = ConceptHint("rec_synthetic", "Term", (), None, "term", 0)
+    first = ConceptHint("rec_synthetic", "Term", ("First alias",), None, "term", 0)
+    second = ConceptHint("rec_synthetic", "Term", ("Second alias",), None, "term", 0)
+
+    with pytest.raises(ValueError, match="duplicate legacy synthesis selector"):
+        _replace_legacy_synthesis_hints((inline,), (first, second))
 
 
 @pytest.mark.parametrize(
     "family_payload",
     [
         lambda first, second: {
-            "family": "relationship", "left": "First", "relation": "supports", "right": "Second",
+            "family": "relationship", "left": synthesis_occurrence("First"), "relation": "supports", "right": synthesis_occurrence("Second"),
         },
         lambda first, second: {
             "family": "procedure_sequence_hierarchy", "kind": "sequence",
-            "terms": ["First", "Second"], "prerequisites": [], "conditions": [], "branches": [],
+            "terms": [synthesis_occurrence("First"), synthesis_occurrence("Second")], "prerequisites": [], "conditions": [], "branches": [],
         },
         lambda first, second: {
-            "family": "evolution", "subject": "Synthetic concept", "previous": "Earlier form",
-            "current": "Later form", "earlier_source_set": ["rev_earlier"],
+            "family": "evolution", "subject": synthesis_occurrence("Synthetic concept"), "previous": synthesis_occurrence("Earlier form"),
+            "current": synthesis_occurrence("Later form"), "earlier_source_set": ["rev_earlier"],
             "later_source_set": ["rev_later"], "classification": "refined",
             "negative_evidence_state": "positive_teaching", "competing_anchors": [],
             "deprecation_evidence_anchors": [],
         },
         lambda first, second: {
-            "family": "conflict_unresolved", "kind": "unresolved", "subject": "Synthetic question",
-            "alternatives": ["First statement", "Second statement"],
+            "family": "conflict_unresolved", "kind": "unresolved", "subject": synthesis_occurrence("Synthetic question"),
+            "alternatives": [synthesis_occurrence("First statement"), synthesis_occurrence("Second statement")],
             "competing_record_ids": [first.record_id, second.record_id],
             "reconciliation_state": "unresolved", "relevant_scopes": ["Synthetic scope"],
             "conditions": [], "unresolved_questions": ["Which scope applies?"],
@@ -713,6 +806,9 @@ def test_concrete_reconciliation_emits_structured_procedure_and_alias_hint():
             role="term",
             position=0,
         ),
+        ConceptHint(result.records[0].record_id, "Act", (), None, "term", 1),
+        ConceptHint(result.records[0].record_id, "Context", (), None, "prerequisite", 0),
+        ConceptHint(result.records[0].record_id, "Observe", (), None, "branch_step", 0),
     )
 
 
@@ -862,9 +958,9 @@ def test_explicit_alias_hints_cluster_only_the_supported_scoped_references():
     assert candidate.concept_id_for("Floor", scope="range") == candidate.concept_id_for("Support", scope="range")
     with pytest.raises(ValueError, match="scope"):
         candidate.concept_id_for("Floor")
-    with pytest.raises(ValueError, match="scope"):
-        candidate.synthesize_relationship(support.record_id)
+    automatic = candidate.synthesize_relationship(support.record_id)
     synthesis = candidate.synthesize_relationship(support.record_id, left_scope="range")
+    assert automatic.left_concept_id == candidate.concept_id_for("Support", scope="range")
     assert synthesis.left_concept_id == candidate.concept_id_for("Support", scope="range")
     assert synthesis.left_scope == "range"
 
@@ -1112,7 +1208,7 @@ def test_ordered_procedure_and_branch_steps_allow_repeated_concept_ids_with_posi
         )
 
 
-def test_procedure_synthesis_requires_explicit_scope_for_scoped_terms():
+def test_procedure_synthesis_uses_the_recorded_scope_for_scoped_terms():
     record = procedure(dependencies=(RecordDependency("source_revision", "rev_synthetic"),), terms=("Signal", "Enter"))
     candidate = SynthesisCandidate.from_records(
         snapshot_id=SNAPSHOT_ID,
@@ -1120,8 +1216,9 @@ def test_procedure_synthesis_requires_explicit_scope_for_scoped_terms():
         hints=(ConceptHint(record.record_id, "Signal", scope="entry"),),
     )
 
-    with pytest.raises(ValueError, match="scope"):
-        candidate.synthesize_procedure(record.record_id)
+    automatic = candidate.synthesize_procedure(record.record_id)
+    assert automatic.steps[0].concept_id == candidate.concept_id_for("Signal", scope="entry")
+    assert automatic.step_scopes == ("entry", None)
     synthesis = candidate.synthesize_procedure(record.record_id, step_scopes=("entry", None))
     assert synthesis.steps[0].concept_id == candidate.concept_id_for("Signal", scope="entry")
     assert synthesis.step_scopes == ("entry", None)
@@ -1150,17 +1247,17 @@ def test_synthesis_preserves_scoped_record_occurrences_over_global_label_lookup(
         ),
     )
 
-    with pytest.raises(ValueError, match="scope"):
-        candidate.synthesize_relationship(scoped_relationship.record_id)
+    automatic_relationship = candidate.synthesize_relationship(scoped_relationship.record_id)
     with pytest.raises(ValueError, match="scope"):
         candidate.synthesize_relationship(scoped_relationship.record_id, left_scope="exit")
-    with pytest.raises(ValueError, match="scope"):
-        candidate.synthesize_procedure(scoped_procedure.record_id)
+    automatic_procedure = candidate.synthesize_procedure(scoped_procedure.record_id)
     with pytest.raises(ValueError, match="scope"):
         candidate.synthesize_procedure(scoped_procedure.record_id, step_scopes=("exit", None))
 
     relationship_synthesis = candidate.synthesize_relationship(scoped_relationship.record_id, left_scope="entry")
     procedure_synthesis = candidate.synthesize_procedure(scoped_procedure.record_id, step_scopes=("entry", None))
+    assert automatic_relationship.left_concept_id == candidate.concept_id_for("Signal", scope="entry")
+    assert automatic_procedure.steps[0].concept_id == candidate.concept_id_for("Signal", scope="entry")
     assert relationship_synthesis.left_concept_id == candidate.concept_id_for("Signal", scope="entry")
     assert procedure_synthesis.steps[0].concept_id == candidate.concept_id_for("Signal", scope="entry")
 
