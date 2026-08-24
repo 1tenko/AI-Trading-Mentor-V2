@@ -273,3 +273,8 @@ paid attempt: stage/call/model/version metadata, status, error or incomplete
 details, item types, refusal, usage, response ID, and structured payload. It
 does not retain reasoning content or enable server-side storage. Cumulative
 spend after the stopped run is `$6.163620` of the fixed `$25.00` ceiling.
+
+A one-call synthetic envelope probe then confirmed the installed SDK returned a
+completed message with one output-text item and a parseable strict JSON object.
+It used no corpus, files, vector stores, or server-side response storage and
+cost `$0.000815`, bringing cumulative Gate 1 spend to `$6.164435`.
