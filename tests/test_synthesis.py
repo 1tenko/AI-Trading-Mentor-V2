@@ -350,6 +350,125 @@ def test_reconciliation_filters_context_only_paraphrase_and_preserves_selected_s
     assert "rev_unrelated" not in dependencies
 
 
+def test_reconciliation_does_not_expose_an_omitted_child_conclusion_without_its_lineage():
+    target = claim(
+        subject="Affected target",
+        anchors=("anc_target",),
+        dependencies=(RecordDependency("source_revision", "rev_target"),),
+    )
+    contexts = tuple(
+        claim(
+            subject=f"Context {index}",
+            anchors=(f"anc_context_{index}",),
+            dependencies=(RecordDependency("source_revision", f"rev_context_{index}"),),
+        )
+        for index in range(3)
+    )
+    records_by_conclusion = {
+        f"{record.subject} | meaning": record for record in contexts
+    }
+    omitted_conclusion = None
+    selected_context = None
+
+    def response(request):
+        nonlocal omitted_conclusion, selected_context
+        if request["reconciliation_batch"]["kind"] == "primary":
+            return {"records": [], "concept_hints": []}
+        summaries = request["prior_cluster_summaries"]
+        target_summary = next(
+            summary for summary in summaries if summary["lineage_role"] == "target"
+        )
+        if request["reconciliation_batch"]["kind"] == "hierarchical_reduction_1":
+            context_summaries = [
+                summary for summary in summaries if summary["lineage_role"] == "context"
+            ]
+            selected_conclusion = context_summaries[0]["conclusions"][0]
+            omitted_conclusion = context_summaries[1]["conclusions"][0]
+            selected_context = records_by_conclusion[selected_conclusion]
+            selected_index = contexts.index(selected_context)
+            return {"records": [{
+                "family": "relationship",
+                "qualification": "Affected target reconciled with selected context.",
+                "anchors": [selected_context.anchors[0]],
+                "input_record_ids": [selected_context.record_id],
+                "input_summary_ids": [target_summary["summary_id"]],
+                "source_revision_ids": [f"rev_context_{selected_index}"],
+                "left": "Affected target",
+                "relation": "depends_on",
+                "right": selected_context.subject,
+            }], "concept_hints": []}
+
+        assert omitted_conclusion is not None
+        if omitted_conclusion in target_summary["conclusions"]:
+            tail_conclusion = next(
+                summary["conclusions"][0]
+                for summary in summaries
+                if summary["summary_id"] != target_summary["summary_id"]
+            )
+            tail = records_by_conclusion[tail_conclusion]
+            tail_index = contexts.index(tail)
+            omitted = records_by_conclusion[omitted_conclusion]
+            return {"records": [{
+                "family": "relationship",
+                "qualification": "Illegitimate use of an untraced child conclusion.",
+                "anchors": [tail.anchors[0]],
+                "input_record_ids": [tail.record_id],
+                "input_summary_ids": [target_summary["summary_id"]],
+                "source_revision_ids": [f"rev_context_{tail_index}"],
+                "left": omitted.subject,
+                "relation": "depends_on",
+                "right": "Leaked conclusion",
+            }], "concept_hints": []}
+        return {"records": [], "concept_hints": []}
+
+    responses = RecordingResponses(response)
+    result = SynthesisReconciler(
+        SimpleNamespace(responses=responses), max_records_per_call=3
+    ).synthesize(
+        snapshot_id=SNAPSHOT_ID,
+        records=(target,),
+        context_records=contexts,
+        revisions=(
+            SimpleNamespace(revision_id="rev_target"),
+            *(SimpleNamespace(revision_id=f"rev_context_{index}") for index in range(3)),
+        ),
+        source_metadata=(
+            reconciliation_source("rev_target", year=2026),
+            *(reconciliation_source(f"rev_context_{index}", year=2025) for index in range(3)),
+        ),
+        anchor_spans={
+            "anc_target": "target span",
+            **{f"anc_context_{index}": f"context span {index}" for index in range(3)},
+        },
+    )
+
+    reduction_requests = [
+        json.loads(call["input"])
+        for call in responses.calls
+        if json.loads(call["input"])["reconciliation_batch"]["kind"].startswith(
+            "hierarchical_reduction"
+        )
+    ]
+    assert len(reduction_requests) == 2
+    final_target_summary = next(
+        summary
+        for summary in reduction_requests[-1]["prior_cluster_summaries"]
+        if summary["lineage_role"] == "target"
+    )
+    assert omitted_conclusion not in final_target_summary["conclusions"]
+    assert selected_context is not None
+    assert f"{selected_context.subject} | meaning" in final_target_summary["conclusions"]
+    assert len(result.records) == 1
+    assert result.records[0].right == selected_context.subject
+    selected_index = contexts.index(selected_context)
+    assert {dependency.identifier for dependency in result.records[0].dependencies} == {
+        target.record_id,
+        selected_context.record_id,
+        "rev_target",
+        f"rev_context_{selected_index}",
+    }
+
+
 def test_reconciliation_rejects_a_batch_size_that_cannot_compare_records():
     with pytest.raises(ValueError, match="batch size"):
         SynthesisReconciler(

@@ -29,7 +29,7 @@ MAX_SCOPE_LENGTH = 160
 MAX_CONDITION_LENGTH = 160
 MAX_JUSTIFICATION_LENGTH = 280
 SYNTHESIS_PROMPT_VERSION = "cross-source-synthesis-v4"
-SYNTHESIS_SCHEMA_VERSION = "cross-source-synthesis-schema-v4"
+SYNTHESIS_SCHEMA_VERSION = "cross-source-synthesis-schema-v5"
 SOL_MODEL = "gpt-5.6-sol"
 MAX_SYNTHESIS_RECORDS_PER_CALL = 64
 MAX_SYNTHESIS_RECORDS_PER_CANDIDATE = 4_096
@@ -727,13 +727,30 @@ def _merged_cluster_summary(
     covered = tuple(dict.fromkeys(
         record for child in children for record in child.covered_records
     ))
-    conclusions = _bounded_unique_strings((
-        *(_compact_conclusions(outputs)),
-        *(conclusion for child in children for conclusion in child.conclusions),
-    ))
-    lineage_records = outputs or tuple(dict.fromkeys(
-        record for child in children for record in child.lineage_records
-    ))
+    if outputs:
+        selected_record_ids = {
+            dependency.identifier
+            for output in outputs
+            for dependency in output.dependencies
+            if dependency.kind == "derived_record"
+        }
+        selected_children = tuple(
+            child
+            for child in children
+            if {record.record_id for record in child.lineage_records} <= selected_record_ids
+        )
+        conclusions = _bounded_unique_strings((
+            *(_compact_conclusions(outputs)),
+            *(conclusion for child in selected_children for conclusion in child.conclusions),
+        ))
+        lineage_records = outputs
+    else:
+        conclusions = _bounded_unique_strings(tuple(
+            conclusion for child in children for conclusion in child.conclusions
+        ))
+        lineage_records = tuple(dict.fromkeys(
+            record for child in children for record in child.lineage_records
+        ))
     return _ClusterSummary(
         children[0].representative, covered, lineage_records, conclusions
     )
