@@ -160,6 +160,9 @@ class CandidateCompiler:
             raise ValueError("candidate revision selection is not canonical")
         self._storage.create_compilation_candidate(request.run, snapshot)
         self._storage.record_candidate_artifact_scope(snapshot.snapshot_id, scope)
+        self._storage.store_source_anchors(
+            tuple(anchor for source in sources for anchor in source.anchors.values())
+        )
 
         stage_metrics: list[CompilationMetric] = []
         failures: list[str] = []

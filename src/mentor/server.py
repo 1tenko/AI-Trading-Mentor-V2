@@ -10,6 +10,14 @@ from typing import Any
 from urllib.parse import unquote, urlparse
 
 from mentor.chat_service import Answer, EvaluationConfig, StreamEvent
+from mentor.derived_records import (
+    Claim,
+    ConflictUnresolved,
+    Evolution,
+    ProcedureSequenceHierarchy,
+    Relationship,
+)
+from mentor.knowledge import derived_provenance_label
 from mentor.storage import Storage
 
 LOGGER = logging.getLogger(__name__)
@@ -52,6 +60,33 @@ class _Handler(BaseHTTPRequestHandler):
                 HTTPStatus.OK,
                 {"threads": [thread.__dict__ for thread in self.storage.threads()]},
             )
+            return
+        if path == "/api/knowledge":
+            self._send_json(HTTPStatus.OK, _knowledge_overview(self.storage))
+            return
+        match = re.fullmatch(r"/api/knowledge/snapshots/([A-Za-z0-9_-]+)", path)
+        if match:
+            detail = _snapshot_detail(self.storage, match.group(1))
+            if detail is None:
+                self._send_json(HTTPStatus.NOT_FOUND, {"error": "Knowledge snapshot not found."})
+                return
+            self._send_json(HTTPStatus.OK, detail)
+            return
+        match = re.fullmatch(r"/api/knowledge/snapshots/([A-Za-z0-9_-]+)/records/([A-Za-z0-9_-]+)", path)
+        if match:
+            detail = _record_detail(self.storage, match.group(1), match.group(2))
+            if detail is None:
+                self._send_json(HTTPStatus.NOT_FOUND, {"error": "Knowledge record not found."})
+                return
+            self._send_json(HTTPStatus.OK, detail)
+            return
+        match = re.fullmatch(r"/api/knowledge/threads/(\d+)/orientation", path)
+        if match:
+            audits = self.storage.orientation_audits(int(match.group(1)))
+            if audits is None:
+                self._send_json(HTTPStatus.NOT_FOUND, {"error": "Conversation not found."})
+                return
+            self._send_json(HTTPStatus.OK, {"thread_id": int(match.group(1)), "turns": audits})
             return
         match = re.fullmatch(r"/api/threads/(\d+)", path)
         if match:
@@ -215,3 +250,171 @@ def _evaluation(value: object) -> EvaluationConfig:
     if not isinstance(effort, str) or not isinstance(mode, str) or not isinstance(research_depth, str):
         raise ValueError("Evaluation settings must be text.")
     return EvaluationConfig(effort, mode, research_depth)
+
+
+def _knowledge_overview(storage: Storage) -> dict:
+    current = storage.current_snapshot()
+    return {
+        "collections": [
+            {
+                "collection_id": collection.collection_id,
+                "display_name": collection.display_name,
+                "domain": collection.domain,
+                "enabled": collection.enabled,
+                "scope": collection.scope,
+            }
+            for collection in storage.collections()
+        ],
+        "current_snapshot": None if current is None else _snapshot_summary(current),
+        "snapshots": [_snapshot_summary(snapshot) for snapshot in storage.snapshots()],
+        "pending_source_changes": [
+            {
+                "source_id": change.source_id,
+                "lifecycle_state": change.lifecycle_state,
+                "revision_id": change.revision_id,
+                "observed_at": change.observed_at,
+            }
+            for change in storage.source_changes()
+        ],
+    }
+
+
+def _snapshot_detail(storage: Storage, snapshot_id: str) -> dict | None:
+    snapshot = storage.snapshot(snapshot_id)
+    if snapshot is None:
+        return None
+    records = storage.derived_records(snapshot_id, include_stale=True)
+    stale_ids = set(storage.stale_record_ids(snapshot_id))
+    coverage = storage.snapshot_source_coverage(snapshot_id)
+    gate = storage.candidate_gate(snapshot_id)
+    return {
+        "snapshot": _snapshot_summary(snapshot),
+        "compiler": {
+            "model_version": snapshot.model_version,
+            "prompt_version": snapshot.prompt_version,
+            "schema_version": snapshot.schema_version,
+        },
+        "coverage": {
+            "processed": sum(result.status == "processed" for result in coverage),
+            "failed": sum(result.status == "failed" for result in coverage),
+        },
+        "candidate_gate": None if gate is None else {
+            "status": gate.status,
+            "checked_at": gate.checked_at,
+            "has_failure_reason": gate.failure_reason is not None,
+        },
+        "metrics": [_metric_json(metric) for metric in storage.compilation_metrics(snapshot.run_id)],
+        "records": [_record_summary(record, record.record_id in stale_ids) for record in records],
+        "stale_record_ids": sorted(stale_ids),
+    }
+
+
+def _record_detail(storage: Storage, snapshot_id: str, record_id: str) -> dict | None:
+    if storage.snapshot(snapshot_id) is None:
+        return None
+    records = storage.derived_records(snapshot_id, include_stale=True)
+    record = next((value for value in records if value.record_id == record_id), None)
+    if record is None:
+        return None
+    return {
+        **_record_summary(record, record_id in storage.stale_record_ids(snapshot_id)),
+        "qualification": record.qualification,
+        "facets": [{"name": facet.name, "value": facet.value} for facet in record.facets],
+        "compiler_provenance": None if record.compiler_provenance is None else {
+            "model_version": record.compiler_provenance.model_version,
+            "prompt_version": record.compiler_provenance.prompt_version,
+            "schema_version": record.compiler_provenance.schema_version,
+        },
+        "content": _typed_record_content(record),
+        "anchors": storage.source_anchor_metadata(record.anchors),
+        "dependencies": [
+            {"kind": dependency.kind, "identifier": dependency.identifier}
+            for dependency in record.dependencies
+        ],
+        "concept_id": storage.orientation_concept_ids(snapshot_id).get(record_id),
+    }
+
+
+def _snapshot_summary(snapshot: Any) -> dict:
+    return {
+        "snapshot_id": snapshot.snapshot_id,
+        "run_id": snapshot.run_id,
+        "selected_revision_fingerprint": snapshot.selected_revision_fingerprint,
+        "source_count": len(snapshot.selected_revision_ids),
+        "status": snapshot.status,
+        "created_at": snapshot.created_at,
+        "validated_at": snapshot.validated_at,
+        "published_at": snapshot.published_at,
+        "failed_at": snapshot.failed_at,
+        "has_failure_reason": snapshot.failure_reason is not None,
+        "raw_store_ready": snapshot.raw_store_id is not None,
+        "derived_store_ready": snapshot.derived_store_id is not None,
+    }
+
+
+def _record_summary(record: Any, stale: bool) -> dict:
+    return {
+        "record_id": record.record_id,
+        "family": record.family,
+        "derived_kind": record.derived_kind,
+        "evidence_state": record.evidence_state,
+        "validation_state": record.validation_state,
+        "lifecycle_state": record.lifecycle_state,
+        "provenance_label": derived_provenance_label(
+            evidence_state=record.evidence_state, validation_state=record.validation_state
+        ),
+        "stale": stale,
+    }
+
+
+def _typed_record_content(record: Any) -> dict:
+    if isinstance(record, Claim):
+        return {"subject": record.subject, "predicate": record.predicate, "object": record.object}
+    if isinstance(record, Relationship):
+        return {"left": record.left, "relation": record.relation, "right": record.right}
+    if isinstance(record, ProcedureSequenceHierarchy):
+        return {"kind": record.kind, "terms": list(record.terms)}
+    if isinstance(record, Evolution):
+        return {
+            "subject": record.subject,
+            "previous": record.previous,
+            "current": record.current,
+            "classification": record.classification,
+            "negative_evidence_state": record.negative_evidence_state,
+            "earlier_source_set": list(record.earlier_source_set),
+            "later_source_set": list(record.later_source_set),
+            "earlier_observed_years": list(record.earlier_observed_years),
+            "later_observed_years": list(record.later_observed_years),
+            "competing_anchor_ids": list(record.competing_anchors),
+            "deprecation_evidence_anchor_ids": list(record.deprecation_evidence_anchors),
+        }
+    if isinstance(record, ConflictUnresolved):
+        return {
+            "kind": record.kind,
+            "subject": record.subject,
+            "alternatives": list(record.alternatives),
+            "competing_record_ids": list(record.competing_record_ids),
+            "reconciliation_state": record.reconciliation_state,
+            "relevant_scopes": list(record.relevant_scopes),
+            "conditions": list(record.conditions),
+            "unresolved_questions": list(record.unresolved_questions),
+        }
+    raise ValueError("unknown derived record family")
+
+
+def _metric_json(metric: Any) -> dict:
+    return {
+        "stage": metric.stage,
+        "source_count": metric.source_count,
+        "record_count": metric.record_count,
+        "call_count": metric.call_count,
+        "input_tokens": metric.input_tokens,
+        "output_tokens": metric.output_tokens,
+        "latency_ms": metric.latency_ms,
+        "cost_usd": metric.cost_usd,
+        "remote_calls": metric.remote_calls,
+        "failure_count": metric.failure_count,
+        "model_version": metric.model_version,
+        "prompt_version": metric.prompt_version,
+        "schema_version": metric.schema_version,
+    }

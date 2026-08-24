@@ -292,6 +292,19 @@ class Storage:
                     anchor_id TEXT NOT NULL,
                     PRIMARY KEY(record_id, position)
                 );
+                CREATE TABLE IF NOT EXISTS source_anchors (
+                    anchor_id TEXT PRIMARY KEY,
+                    collection_id TEXT NOT NULL REFERENCES collections(collection_id),
+                    source_id TEXT NOT NULL REFERENCES library_sources(source_id),
+                    revision_id TEXT NOT NULL REFERENCES source_revisions(revision_id),
+                    revision_sha256 TEXT NOT NULL,
+                    start_offset INTEGER NOT NULL CHECK(start_offset >= 0),
+                    end_offset INTEGER NOT NULL CHECK(end_offset > start_offset),
+                    timestamp_start_ms INTEGER,
+                    timestamp_end_ms INTEGER,
+                    span_fingerprint TEXT NOT NULL,
+                    locator_version TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS derived_record_dependencies (
                     record_id TEXT NOT NULL REFERENCES derived_records(record_id),
                     position INTEGER NOT NULL,
@@ -774,6 +787,20 @@ class Storage:
             ).fetchone()
         return None if row is None else _snapshot_from_row(row)
 
+    def snapshots(self) -> list[CorpusSnapshot]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                _SNAPSHOT_QUERY + " ORDER BY corpus_snapshots.created_at DESC, corpus_snapshots.snapshot_id"
+            ).fetchall()
+        return [_snapshot_from_row(row) for row in rows]
+
+    def collections(self) -> list[Collection]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT collection_id, display_name, domain, enabled, scope FROM collections ORDER BY collection_id"
+            ).fetchall()
+        return [Collection(row[0], row[1], row[2], bool(row[3]), row[4]) for row in rows]
+
     def compilation_run(self, run_id: str) -> CompilationRun | None:
         with self._connect() as connection:
             row = connection.execute(
@@ -915,6 +942,17 @@ class Storage:
                 (snapshot_id,),
             ).fetchone()
         return None if row is None else CandidateGateResult(*row)
+
+    def snapshot_source_coverage(self, snapshot_id: str) -> list[SourceProcessingResult]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT revision_id, status, record_count FROM snapshot_source_coverage
+                WHERE snapshot_id = ? ORDER BY revision_id
+                """,
+                (snapshot_id,),
+            ).fetchall()
+        return [SourceProcessingResult(*row) for row in rows]
 
     def _candidate_gate_failure(
         self,
@@ -2042,6 +2080,140 @@ class Storage:
             ).fetchone()
         return None if row is None else SourceRevision(*row)
 
+    def store_source_anchors(self, anchors: tuple[SourceAnchor, ...]) -> None:
+        """Persist immutable anchor metadata only; transcript text is never stored here."""
+        if not anchors:
+            return
+        with self._connect() as connection:
+            for anchor in anchors:
+                if not isinstance(anchor, SourceAnchor):
+                    raise ValueError("source anchors must be SourceAnchor values")
+                revision = connection.execute(
+                    """
+                    SELECT library_sources.collection_id, source_revisions.source_id, source_revisions.content_sha256
+                    FROM source_revisions JOIN library_sources USING(source_id)
+                    WHERE source_revisions.revision_id = ?
+                    """,
+                    (anchor.revision_id,),
+                ).fetchone()
+                if revision != (anchor.collection_id, anchor.source_id, anchor.revision_sha256):
+                    raise ValueError("source anchor does not match a stored source revision")
+                expected_anchor_id = "anc_" + sha256(
+                    f"{anchor.collection_id}\0{anchor.revision_id}\0{anchor.start_offset}\0"
+                    f"{anchor.end_offset}\0{anchor.locator_version}".encode()
+                ).hexdigest()
+                if anchor.anchor_id != expected_anchor_id:
+                    raise ValueError("source anchor identity is not canonical")
+                values = (
+                    anchor.anchor_id,
+                    anchor.collection_id,
+                    anchor.source_id,
+                    anchor.revision_id,
+                    anchor.revision_sha256,
+                    anchor.start_offset,
+                    anchor.end_offset,
+                    anchor.timestamp_start_ms,
+                    anchor.timestamp_end_ms,
+                    anchor.span_fingerprint,
+                    anchor.locator_version,
+                )
+                existing = connection.execute(
+                    """
+                    SELECT anchor_id, collection_id, source_id, revision_id, revision_sha256,
+                           start_offset, end_offset, timestamp_start_ms, timestamp_end_ms,
+                           span_fingerprint, locator_version
+                    FROM source_anchors WHERE anchor_id = ?
+                    """,
+                    (anchor.anchor_id,),
+                ).fetchone()
+                if existing is not None and existing != values:
+                    raise ValueError("stored source anchor is immutable")
+                connection.execute(
+                    """
+                    INSERT INTO source_anchors(
+                        anchor_id, collection_id, source_id, revision_id, revision_sha256,
+                        start_offset, end_offset, timestamp_start_ms, timestamp_end_ms,
+                        span_fingerprint, locator_version
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(anchor_id) DO NOTHING
+                    """,
+                    values,
+                )
+
+    def source_anchor_metadata(self, anchor_ids: tuple[str, ...]) -> list[dict]:
+        """Return anchor identity and display metadata without raw text or source locations."""
+        if not anchor_ids:
+            return []
+        placeholders = ",".join("?" for _ in anchor_ids)
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT source_anchors.anchor_id, source_anchors.collection_id, source_anchors.source_id,
+                       source_anchors.revision_id, source_anchors.revision_sha256,
+                       library_sources.original_filename, library_sources.lesson_title,
+                       library_sources.author, library_sources.course, library_sources.year,
+                       source_anchors.timestamp_start_ms, source_anchors.timestamp_end_ms,
+                       source_anchors.start_offset, source_anchors.end_offset,
+                       source_anchors.span_fingerprint, source_anchors.locator_version
+                FROM source_anchors JOIN library_sources ON library_sources.source_id = source_anchors.source_id
+                WHERE source_anchors.anchor_id IN ({placeholders})
+                """,
+                anchor_ids,
+            ).fetchall()
+        by_id = {
+            row[0]: {
+                "anchor_id": row[0],
+                "collection_id": row[1],
+                "source_id": row[2],
+                "revision_id": row[3],
+                "revision_sha256": row[4],
+                "filename": row[5],
+                "lesson_title": row[6],
+                "author": row[7],
+                "course": row[8],
+                "year": row[9],
+                "timestamp_start_ms": row[10],
+                "timestamp_end_ms": row[11],
+                "start_offset": row[12],
+                "end_offset": row[13],
+                "span_fingerprint": row[14],
+                "locator_version": row[15],
+            }
+            for row in rows
+        }
+        return [by_id[anchor_id] for anchor_id in anchor_ids if anchor_id in by_id]
+
+    def source_changes(self) -> list[SourceChange]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT source_id, lifecycle_state, revision_id, local_locator, observed_at
+                FROM source_changes ORDER BY source_id
+                """
+            ).fetchall()
+        return [SourceChange(*row) for row in rows]
+
+    def orientation_audits(self, thread_id: int) -> list[dict] | None:
+        if not self.has_thread(thread_id):
+            return None
+        turns = self.display_turns(thread_id)
+        result: list[dict] = []
+        for turn in turns:
+            diagnostic = turn.get("diagnostics") or {}
+            context = diagnostic.get("knowledge_context")
+            if not isinstance(context, dict):
+                continue
+            safe_context = _safe_orientation_context(context)
+            if safe_context is None:
+                continue
+            result.append(
+                {
+                    "turn_number": turn["turn_number"],
+                    "response_id": _safe_response_id(turn["response_id"]),
+                    "knowledge_context": safe_context,
+                }
+            )
+        return result
+
     def source_revisions(self, source_id: str) -> list[SourceRevision]:
         with self._connect() as connection:
             rows = connection.execute(
@@ -2508,6 +2680,46 @@ def _decode_sqlite_text(value: object) -> str:
     if isinstance(value, str):
         return value
     raise TypeError("expected SQLite text")
+
+
+def _safe_orientation_context(context: dict) -> dict | None:
+    record_ids = context.get("record_ids")
+    budget = context.get("budget")
+    snapshot_id = context.get("snapshot_id")
+    schema_version = context.get("snapshot_schema_version")
+    if (
+        context.get("status") not in {"used", "unavailable"}
+        or not isinstance(context.get("used"), bool)
+        or not isinstance(record_ids, list)
+        or any(not isinstance(record_id, str) or re.fullmatch(r"rec_[0-9a-f]{64}", record_id) is None for record_id in record_ids)
+        or not isinstance(budget, dict)
+        or not _nonnegative_int(budget.get("max_records"))
+        or not _nonnegative_int(budget.get("max_tokens"))
+        or not _nonnegative_int(context.get("used_tokens"))
+        or not isinstance(context.get("truncated"), bool)
+        or (snapshot_id is not None and (not isinstance(snapshot_id, str) or re.fullmatch(r"snap_[0-9a-f]{64}", snapshot_id) is None))
+        or (schema_version is not None and (not isinstance(schema_version, str) or not 0 < len(schema_version) <= 120))
+    ):
+        return None
+    return {
+        "status": context["status"],
+        "used": context["used"],
+        "snapshot_id": snapshot_id,
+        "snapshot_schema_version": schema_version,
+        "record_ids": record_ids,
+        "record_count": len(record_ids),
+        "budget": {"max_records": budget["max_records"], "max_tokens": budget["max_tokens"]},
+        "used_tokens": context["used_tokens"],
+        "truncated": context["truncated"],
+    }
+
+
+def _safe_response_id(value: object) -> str | None:
+    return value if isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,120}", value) else None
+
+
+def _nonnegative_int(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
 
 
 def _display_content(items: list[dict]) -> tuple[str, list[dict], list[dict]]:

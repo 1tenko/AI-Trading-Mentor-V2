@@ -4,6 +4,15 @@ from dataclasses import dataclass
 from hashlib import sha256
 
 
+def derived_provenance_label(*, evidence_state: str, validation_state: str) -> str:
+    """Describe derived records without presenting them as raw teaching."""
+    if evidence_state == "raw_taught" and validation_state == "validated":
+        return "derived; independently validated against raw anchors"
+    if evidence_state == "cross_source_synthesis":
+        return "derived; cross-source synthesis"
+    return "derived; qualification required"
+
+
 @dataclass(frozen=True)
 class Collection:
     collection_id: str

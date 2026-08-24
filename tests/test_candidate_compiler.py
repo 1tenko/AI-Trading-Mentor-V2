@@ -372,6 +372,13 @@ def test_build_composes_a_ready_unpublished_candidate_with_typed_bounded_artifac
     assert result.total_metric.output_tokens == 28
     assert result.total_metric.remote_calls > 0
     assert next(iter(request.sources[0].anchors)) in candidate_compiler._extractor._client.responses.calls[0]["input"]
+    stored_anchors = storage.source_anchor_metadata(
+        tuple(anchor_id for source in request.sources for anchor_id in source.anchors)
+    )
+    assert {anchor["anchor_id"] for anchor in stored_anchors} == {
+        anchor_id for source in request.sources for anchor_id in source.anchors
+    }
+    assert all("Synthetic earlier teaching" not in str(anchor) for anchor in stored_anchors)
     assert any(call[0] == "batch" for call in vector_client.calls)
     raw_batch = next(call for call in vector_client.calls if call[0] == "batch")
     assert raw_batch[2]["file_ids"] == [source.revision.remote_file_id for source in request.sources]
