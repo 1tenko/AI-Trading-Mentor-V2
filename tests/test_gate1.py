@@ -135,6 +135,7 @@ def test_gate1_preflight_blocks_an_over_ceiling_dry_run_without_creating_a_pilot
             production_database_path=database_path,
             manifest_path=manifest_path,
             pilot_root=pilot_root,
+            spend_limit_usd=25.0,
             client_factory=lambda: client_calls.append("called"),
             today=lambda: GATE1_PRICING_CHECKED_ON,
             expected_manifest_sha256=_manifest_hash(manifest_path),
@@ -155,6 +156,7 @@ def test_gate1_stops_before_runtime_or_client_when_estimate_exceeds_limit(tmp_pa
             production_database_path=database_path,
             manifest_path=manifest_path,
             pilot_root=pilot_root,
+            spend_limit_usd=25.0,
             client_factory=lambda: client_calls.append("called"),
             today=lambda: GATE1_PRICING_CHECKED_ON,
             expected_manifest_sha256=_manifest_hash(manifest_path),
@@ -366,12 +368,12 @@ def test_budgeted_client_records_transport_versions_and_conservatively_charges_u
 
 def test_spend_ledger_counts_a_prior_gate1_run_against_the_same_hard_ceiling():
     assert GATE1_PRIOR_SPEND_USD == pytest.approx(8.502370)
-    assert HARD_SPEND_CEILING_USD == pytest.approx(25.0)
+    assert HARD_SPEND_CEILING_USD == pytest.approx(30.0)
     ledger = SpendLedger(HARD_SPEND_CEILING_USD, CONSERVATIVE_SOL_PRICING, prior_spend_usd=GATE1_PRIOR_SPEND_USD)
 
     assert ledger.spent_usd == pytest.approx(8.502370)
     with pytest.raises(RuntimeError, match="spend ceiling"):
-        ledger.ensure("extraction", 18.835566)
+        ledger.ensure("extraction", 21.497631)
 
 
 def test_budgeted_client_enforces_stage_budget_before_a_paid_call():
