@@ -4,8 +4,7 @@
 
 Task 18 provides a deterministic, synthetic evaluation harness and the isolated
 pilot runtime. No Jacob transcript is read, no OpenAI request is made, and no
-paid pilot is run by this task. Task 19 will define the private six-source
-manifest and measured-cost protocol separately.
+paid pilot is run by this task.
 
 ## Deterministic gates
 
@@ -65,3 +64,42 @@ database/runtime scope.
 The harness has no copy-back or automatic remote-cleanup operation. Pilot
 database rows, outputs, and traces remain local to the ignored run directory;
 remote cleanup is an explicit later action.
+
+## Gate 1 manifest boundary
+
+The Gate 1 manifest is a private, ignored artifact containing exactly six
+**real active `SourceRevision` IDs**, each tagged with one or more structural
+roles. The deterministic `PilotManifest` contract rejects any manifest that
+does not have six unique revisions or lacks coverage for foundation,
+procedure, 2025/2026 comparison, exception/condition, synthesis/evolution,
+and conflict/uncertainty material.
+
+The manifest must be selected from the migrated `SourceRevision` inventory;
+lesson filenames or legacy upload IDs are not substitutes. The current local
+runtime still has only the legacy source registrations, so it has no eligible
+revision inventory from which to create that artifact. It remains intentionally
+absent until a separately authorized migration can establish the immutable
+revision identities. No raw transcript was opened to work around this boundary.
+
+## Measured-cost protocol
+
+After Theo explicitly authorizes Gate 1, run the six-source candidate only in
+the isolated pilot runtime. Keep the following per-stage and total data in
+ignored pilot artifacts, never in Git:
+
+- model, compiler prompt, and schema versions;
+- selected revision IDs and candidate/source processing outcomes;
+- extraction, validation, reconciliation, vector-store, and audit call counts;
+- input, output, and reasoning-token usage where the API supplies it;
+- wall-clock latency per call and per stage;
+- provider-reported or reproducibly calculated cost by model/stage;
+- raw and derived remote-store/file counts plus cleanup status;
+- candidate record counts by family, anchor-validation/audit results, and
+  baseline-versus-assimilated evaluation metrics.
+
+Do not guess a full-corpus price before the pilot. Derive its local forecast
+from the measured fixed setup cost plus the observed per-source/per-stage cost,
+call, token, and latency distribution; record the active source count and the
+explicit extrapolation assumptions. Keep uncertainty as a range or scenario
+table rather than inventing a single precise number. The pilot result still
+requires Theo's separate review before any full-corpus assimilation.

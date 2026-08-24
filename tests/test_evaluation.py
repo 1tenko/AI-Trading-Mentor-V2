@@ -8,6 +8,8 @@ from mentor.compilation import CompilationRun, CorpusSnapshot, SourceProcessingR
 from mentor.evaluation import (
     EvaluationCase,
     EvaluationMetrics,
+    PilotManifest,
+    PilotManifestEntry,
     PilotRuntime,
     compare_evaluations,
     run_evaluation,
@@ -193,6 +195,32 @@ def test_evaluation_deduplicates_orientation_record_ids_per_case_and_summary():
     assert report.outcomes[0].metrics.orientation_record_count == 2
     assert report.summary.orientation_record_ids == ("rec_alpha", "rec_beta", "rec_gamma")
     assert report.summary.orientation_record_count == 3
+
+
+def test_pilot_manifest_requires_six_unique_revisions_and_all_structural_roles():
+    entries = (
+        PilotManifestEntry("rev_foundation", ("foundation", "synthesis_evolution")),
+        PilotManifestEntry("rev_procedure", ("procedure",)),
+        PilotManifestEntry("rev_2025", ("cross_year_2025", "conflict_uncertainty")),
+        PilotManifestEntry("rev_2026", ("cross_year_2026",)),
+        PilotManifestEntry("rev_exception", ("exception_condition",)),
+        PilotManifestEntry("rev_additional", ("foundation",)),
+    )
+
+    manifest = PilotManifest(entries)
+
+    assert manifest.revision_ids == tuple(entry.revision_id for entry in entries)
+    with pytest.raises(ValueError, match="exactly six"):
+        PilotManifest(entries[:-1])
+    with pytest.raises(ValueError, match="unique"):
+        PilotManifest(entries[:-1] + (entries[0],))
+    with pytest.raises(ValueError, match="structural roles"):
+        PilotManifest(
+            tuple(
+                PilotManifestEntry(entry.revision_id, ("foundation",))
+                for entry in entries
+            )
+        )
 
 
 def test_pilot_runtime_copies_sqlite_and_publishes_only_inside_the_copy(tmp_path):

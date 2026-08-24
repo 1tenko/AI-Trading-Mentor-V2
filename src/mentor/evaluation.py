@@ -16,6 +16,17 @@ from mentor.storage import Storage
 
 _QUALITY_STATES = frozenset({"passed", "failed", "not_scored"})
 _RUN_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$")
+_PILOT_STRUCTURAL_ROLES = frozenset(
+    {
+        "foundation",
+        "procedure",
+        "cross_year_2025",
+        "cross_year_2026",
+        "exception_condition",
+        "synthesis_evolution",
+        "conflict_uncertainty",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -134,6 +145,43 @@ class EvaluationReport:
 class EvaluationComparison:
     baseline: EvaluationSummary
     assimilated: EvaluationSummary
+
+
+@dataclass(frozen=True)
+class PilotManifestEntry:
+    revision_id: str
+    structural_roles: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.revision_id, str) or not self.revision_id.strip():
+            raise ValueError("pilot manifest revision IDs must be non-empty text")
+        if (
+            not isinstance(self.structural_roles, tuple)
+            or not self.structural_roles
+            or any(role not in _PILOT_STRUCTURAL_ROLES for role in self.structural_roles)
+        ):
+            raise ValueError("pilot manifest structural roles are invalid")
+
+
+@dataclass(frozen=True)
+class PilotManifest:
+    entries: tuple[PilotManifestEntry, ...]
+
+    def __post_init__(self) -> None:
+        if len(self.entries) != 6 or any(
+            not isinstance(entry, PilotManifestEntry) for entry in self.entries
+        ):
+            raise ValueError("pilot manifest requires exactly six typed source revisions")
+        revision_ids = self.revision_ids
+        if len(set(revision_ids)) != len(revision_ids):
+            raise ValueError("pilot manifest source revisions must be unique")
+        covered_roles = {role for entry in self.entries for role in entry.structural_roles}
+        if not _PILOT_STRUCTURAL_ROLES <= covered_roles:
+            raise ValueError("pilot manifest is missing required structural roles")
+
+    @property
+    def revision_ids(self) -> tuple[str, ...]:
+        return tuple(entry.revision_id for entry in self.entries)
 
 
 def run_evaluation(
