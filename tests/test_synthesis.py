@@ -205,6 +205,64 @@ def test_concrete_reconciliation_batches_every_record_and_filters_anchor_spans()
     ) <= 16
 
 
+def test_reconciliation_uses_unchanged_lower_synthesis_as_context_not_primary_target():
+    target = claim(
+        subject="Affected claim",
+        anchors=("anc_affected",),
+        dependencies=(RecordDependency("source_revision", "rev_affected"),),
+    )
+    context = relationship(
+        left="Unchanged cluster",
+        right="Stable conclusion",
+        anchors=("anc_context",),
+        dependencies=(RecordDependency("source_revision", "rev_context"),),
+    )
+
+    def response(request):
+        if request["reconciliation_batch"]["kind"] == "primary":
+            return {"records": [], "concept_hints": []}
+        return {"records": [{
+            "family": "relationship",
+            "qualification": "Synthetic rebuilt higher relationship.",
+            "anchors": ["anc_affected", "anc_context"],
+            "input_record_ids": [target.record_id, context.record_id],
+            "source_revision_ids": ["rev_affected", "rev_context"],
+            "left": "Affected claim",
+            "relation": "depends_on",
+            "right": "Unchanged cluster",
+        }]}
+
+    responses = RecordingResponses(response)
+    result = SynthesisReconciler(
+        SimpleNamespace(responses=responses), max_records_per_call=2
+    ).synthesize(
+        snapshot_id=SNAPSHOT_ID,
+        records=(target,),
+        context_records=(context,),
+        revisions=(
+            SimpleNamespace(revision_id="rev_affected"),
+            SimpleNamespace(revision_id="rev_context"),
+        ),
+        source_metadata=(
+            reconciliation_source("rev_affected", year=2026),
+            reconciliation_source("rev_context", year=2025),
+        ),
+        anchor_spans={"anc_affected": "affected span", "anc_context": "context span"},
+    )
+
+    requests = [json.loads(call["input"]) for call in responses.calls]
+    primary = next(
+        request for request in requests if request["reconciliation_batch"]["kind"] == "primary"
+    )
+    assert [record["record_id"] for record in primary["records"]] == [target.record_id]
+    assert result.coverage.covered_record_ids == (target.record_id,)
+    assert result.coverage.input_record_count == 1
+    assert len(result.records) == 1
+    assert {dependency.identifier for dependency in result.records[0].dependencies} >= {
+        target.record_id, context.record_id, "rev_affected", "rev_context"
+    }
+
+
 def test_reconciliation_rejects_a_batch_size_that_cannot_compare_records():
     with pytest.raises(ValueError, match="batch size"):
         SynthesisReconciler(

@@ -1,6 +1,6 @@
 """End-to-end construction of validated, unpublished Phase 3 candidates."""
 
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from enum import Enum
 from hashlib import sha256
 import json
@@ -271,6 +271,7 @@ class CandidateCompiler:
         source_results: list[SourceProcessingResult] = []
         reused_records: tuple[DerivedRecord, ...] = ()
         reused_hints: tuple[ConceptHint, ...] = ()
+        reconciliation_context: tuple[DerivedRecord, ...] = ()
         reused_revision_ids: set[str] = set()
         reconciliation_revision_ids = set(snapshot.selected_revision_ids)
         if previous_snapshot is not None and _compiler_config_matches(previous_snapshot, request.run):
@@ -291,6 +292,13 @@ class CandidateCompiler:
             )
             reused_hints = _remapped_concept_hints(
                 self._storage, previous_snapshot.snapshot_id, record_mapping
+            )
+            reconciliation_context = _selective_reconciliation_context(
+                self._storage,
+                previous_snapshot,
+                stale_predecessor_revisions,
+                record_mapping,
+                reused_records,
             )
             for record in reused_records:
                 if record.derived_kind != "source_extracted_claim":
@@ -466,13 +474,19 @@ class CandidateCompiler:
                 )
             else:
                 synthesis_invoked = True
+                synthesis_revision_ids = reconciliation_revision_ids | {
+                    dependency.identifier
+                    for record in reconciliation_context
+                    for dependency in record.dependencies
+                    if dependency.kind == "source_revision"
+                }
                 synthesis_sources = tuple(
                     source for source in sources
-                    if source.revision.revision_id in reconciliation_revision_ids
+                    if source.revision.revision_id in synthesis_revision_ids
                 )
                 synthesis_metadata = tuple(
                     item for item in source_metadata
-                    if item.revision_id in reconciliation_revision_ids
+                    if item.revision_id in synthesis_revision_ids
                 )
                 synthesis_hints = tuple(
                     hint for hint in hints
@@ -485,6 +499,7 @@ class CandidateCompiler:
                     source_metadata=synthesis_metadata,
                     anchor_spans=_source_anchor_spans(synthesis_sources),
                     hints=synthesis_hints,
+                    context_records=reconciliation_context,
                 )
             if not isinstance(synthesized, SynthesisResult):
                 raise ValueError("synthesis stage must return SynthesisResult")
@@ -498,6 +513,7 @@ class CandidateCompiler:
                 source_metadata,
             )
             _validate_reconciliation_coverage(synthesized, synthesis_inputs)
+            _validate_context_not_regenerated(synthesized.records, reconciliation_context)
             _validate_candidate_dependencies(
                 extracted_records + synthesized.records,
                 set(snapshot.selected_revision_ids),
@@ -1211,25 +1227,37 @@ def _selective_reconciliation_revision_ids(
         for revision_id in stale_revision_ids
         if (revision := storage.source_revision(revision_id)) is not None
     }
-    if stale_revision_ids:
-        affected_record_ids = set(
-            storage.rebuild_record_ids(previous_snapshot.snapshot_id, stale_revision_ids)
-        )
-        for record in storage.derived_records(previous_snapshot.snapshot_id, include_stale=True):
-            if record.record_id not in affected_record_ids:
-                continue
-            for dependency in record.dependencies:
-                if dependency.kind != "source_revision":
-                    continue
-                revision = storage.source_revision(dependency.identifier)
-                if revision is None:
-                    raise ValueError("affected synthesis references an unknown source revision")
-                affected_source_ids.add(revision.source_id)
     return {
         revision_id
         for source_id, revision_id in current_by_source.items()
         if source_id in affected_source_ids
     }
+
+
+def _selective_reconciliation_context(
+    storage: Any,
+    previous_snapshot: CorpusSnapshot,
+    stale_revision_ids: tuple[str, ...],
+    record_id_mapping: Mapping[str, str],
+    reused_records: tuple[DerivedRecord, ...],
+) -> tuple[DerivedRecord, ...]:
+    """Return the cloned dependency frontier around the affected predecessor closure."""
+    if not stale_revision_ids or not record_id_mapping:
+        return ()
+    affected = set(storage.rebuild_record_ids(previous_snapshot.snapshot_id, stale_revision_ids))
+    boundary_ids = {
+        record_id_mapping[dependency.identifier]
+        for record in storage.derived_records(previous_snapshot.snapshot_id, include_stale=True)
+        if record.record_id in affected
+        for dependency in record.dependencies
+        if (
+            dependency.kind == "derived_record"
+            and dependency.identifier not in affected
+            and dependency.identifier in record_id_mapping
+        )
+    }
+    reused_by_id = {record.record_id: record for record in reused_records}
+    return tuple(reused_by_id[record_id] for record_id in sorted(boundary_ids))
 
 
 def _remapped_concept_hints(
@@ -1362,6 +1390,24 @@ def _validate_candidate_dependencies(
             raise ValueError("derived record dependency is outside the candidate raw snapshot")
         if edge.dependency.kind == "derived_record" and edge.dependency.identifier not in record_ids:
             raise ValueError("derived record dependency is outside the candidate snapshot")
+
+
+def _validate_context_not_regenerated(
+    records: tuple[DerivedRecord, ...], context_records: tuple[DerivedRecord, ...]
+) -> None:
+    context_keys = {_semantic_record_key(record) for record in context_records}
+    if any(_semantic_record_key(record) in context_keys for record in records):
+        raise ValueError("synthesis regenerated an unchanged context record")
+
+
+def _semantic_record_key(record: DerivedRecord) -> str:
+    values = asdict(record)
+    for field in (
+        "record_id", "snapshot_id", "anchors", "dependencies", "validation_state",
+        "lifecycle_state", "qualification", "compiler_provenance",
+    ):
+        values.pop(field, None)
+    return json.dumps(values, sort_keys=True, separators=(",", ":"))
 
 
 def _validate_synthesis_result(

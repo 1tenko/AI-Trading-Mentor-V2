@@ -154,20 +154,26 @@ class SynthesisReconciler:
         source_metadata: Sequence[ReconciliationSource],
         anchor_spans: dict[str, str],
         hints: Sequence[ConceptHint] = (),
+        context_records: Sequence[DerivedRecord] = (),
     ) -> SynthesisResult:
         record_values = tuple(records)
+        context_values = tuple(context_records)
         hint_values = tuple(hints)
         revision_values = tuple(revisions)
-        for record in record_values:
+        for record in (*record_values, *context_values):
             validate_record(record)
             if record.snapshot_id != snapshot_id or record.validation_state != "validated":
                 raise ValueError("synthesis requires validated candidate records")
+        if {record.record_id for record in record_values} & {
+            record.record_id for record in context_values
+        }:
+            raise ValueError("synthesis targets and context must be distinct")
         if not record_values:
             return SynthesisResult(
                 (), self._provenance,
                 coverage=ReconciliationCoverage(0, (), 0, 0),
             )
-        if len(record_values) > self._max_total_records:
+        if len(record_values) + len(context_values) > self._max_total_records:
             raise ValueError("reconciliation input exceeds the candidate safety limit")
         _validate_reconciliation_hints(record_values, hint_values)
         if not isinstance(anchor_spans, dict) or any(
@@ -186,7 +192,16 @@ class SynthesisReconciler:
         primary_batches = _reconciliation_batches(
             record_values, self._max_records_per_call, hint_values
         )
-        if _hierarchical_call_count(len(primary_batches), self._max_records_per_call) > self._max_calls:
+        context_batches = _reconciliation_batches(
+            context_values, self._max_records_per_call
+        ) if context_values else ()
+        summary_count = len(primary_batches) + len(context_batches)
+        planned_calls = (
+            len(primary_batches)
+            + _hierarchical_call_count(summary_count, self._max_records_per_call)
+            - summary_count
+        )
+        if planned_calls > self._max_calls:
             raise ValueError("reconciliation call plan exceeds the bounded safety limit")
         synthesized_by_id: dict[str, DerivedRecord] = {}
         hints: list[ConceptHint] = []
@@ -239,7 +254,9 @@ class SynthesisReconciler:
                     "Return only small typed cross-source relationship, procedure/sequence/hierarchy, "
                     "evolution, or conflict records plus explicit alias-aware concept hints. "
                     "Keep procedure prerequisites, conditions, and conditional branches structured. "
-                    "Use only supplied record, anchor, and revision IDs. Preserve uncertainty; do not claim raw authority."
+                    "Use only supplied record, anchor, and revision IDs. Preserve uncertainty; do not claim raw authority. "
+                    "Prior cluster summaries may contain unchanged validated context: connect them when relevant, "
+                    "but do not restate their lower-level conclusions."
                 ),
                 input=json.dumps(
                     {
@@ -318,6 +335,9 @@ class SynthesisReconciler:
         for planned_batch in primary_batches:
             batch_records, _batch_hints = reconcile_batch(planned_batch)
             summaries.append(_cluster_summary(planned_batch.records, batch_records))
+        summaries.extend(
+            _cluster_summary(planned_batch.records, ()) for planned_batch in context_batches
+        )
 
         reduction_round = 0
         bridge_call_count = 0
@@ -338,9 +358,7 @@ class SynthesisReconciler:
                 bridge_call_count += 1
             summaries = reduced
 
-        covered_record_ids = tuple(sorted({
-            record.record_id for batch in primary_batches for record in batch.records
-        }))
+        covered_record_ids = tuple(sorted(record.record_id for record in record_values))
         coverage = ReconciliationCoverage(
             len(record_values), covered_record_ids, len(primary_batches), bridge_call_count
         )

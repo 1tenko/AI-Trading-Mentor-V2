@@ -140,7 +140,10 @@ class SyntheticSynthesizer:
             "synthetic-synthesizer", "synthesis-prompt-v1", "synthesis-schema-v1"
         )
 
-    def synthesize(self, *, snapshot_id, records, revisions, source_metadata, anchor_spans, hints=()):
+    def synthesize(
+        self, *, snapshot_id, records, revisions, source_metadata, anchor_spans,
+        hints=(), context_records=(),
+    ):
         self.calls.append((snapshot_id, tuple(record.record_id for record in records)))
         assert anchor_spans
         provenance = self.provenance
@@ -253,6 +256,86 @@ class ClusterSynthesizer:
             len(records), tuple(sorted(record.record_id for record in records)), 1, 0
         )
         return SynthesisResult(tuple(outputs), self.provenance, coverage=coverage)
+
+
+class HierarchicalClusterSynthesizer(ClusterSynthesizer):
+    def __init__(self):
+        super().__init__()
+        self.context_calls = []
+
+    def synthesize(self, *, context_records=(), **kwargs):
+        self.context_calls.append(tuple(record.record_id for record in context_records))
+        lower = super().synthesize(**kwargs)
+        target_ids = {record.record_id for record in kwargs["records"]}
+        grouped_claims = {}
+        for record in (*kwargs["records"], *context_records):
+            if isinstance(record, Claim):
+                grouped_claims.setdefault(record.subject[0], []).append(record)
+        rebuilt = list(lower.records)
+        existing_clusters = {
+            record.left[0] for record in rebuilt if isinstance(record, Relationship)
+        }
+        for cluster, members in grouped_claims.items():
+            if cluster in existing_clusters:
+                continue
+            if len(members) < 2 or not target_ids.intersection(record.record_id for record in members):
+                continue
+            left, right = members[:2]
+            revision_ids = tuple(dict.fromkeys(
+                dependency.identifier
+                for record in (left, right)
+                for dependency in record.dependencies
+                if dependency.kind == "source_revision"
+            ))
+            rebuilt.append(Relationship.create(
+                snapshot_id=kwargs["snapshot_id"],
+                anchors=tuple(dict.fromkeys(left.anchors + right.anchors)),
+                dependencies=tuple(
+                    [*(RecordDependency("source_revision", revision_id) for revision_id in revision_ids),
+                     RecordDependency("derived_record", left.record_id),
+                     RecordDependency("derived_record", right.record_id)]
+                ),
+                validation_state="validated",
+                lifecycle_state="active",
+                qualification="Synthetic rebuilt cluster relationship.",
+                evidence_state="cross_source_synthesis",
+                compiler_provenance=self.provenance,
+                left=left.subject,
+                relation="supports",
+                right=right.subject,
+            ))
+        relationships = tuple(
+            record for record in (*rebuilt, *context_records)
+            if isinstance(record, Relationship) and record.left[:1] in {"A", "B"}
+        )
+        by_cluster = {record.left[0]: record for record in relationships}
+        if set(by_cluster) != {"A", "B"}:
+            return replace(lower, records=tuple(rebuilt))
+        left, right = by_cluster["A"], by_cluster["B"]
+        global_record = Relationship.create(
+            snapshot_id=kwargs["snapshot_id"],
+            anchors=tuple(dict.fromkeys(left.anchors + right.anchors)),
+            dependencies=tuple(
+                dict.fromkeys(
+                    dependency
+                    for record in (left, right)
+                    for dependency in record.dependencies
+                    if dependency.kind == "source_revision"
+                )
+            ) + (
+                RecordDependency("derived_record", left.record_id),
+                RecordDependency("derived_record", right.record_id),
+            ),
+            validation_state="validated",
+            lifecycle_state="active",
+            qualification="Synthetic global relationship.",
+            evidence_state="cross_source_synthesis",
+            compiler_provenance=self.provenance,
+            left="Global framework",
+            relation="depends_on",
+            right="A and B clusters",
+        )
+        return replace(lower, records=tuple(rebuilt) + (global_record,))
 
 
 class MissingPricingSynthesizer(SyntheticSynthesizer):
@@ -481,7 +564,7 @@ def test_replacement_reuses_unaffected_records_and_promotes_only_after_candidate
     assert storage.source_revision(replacement.revision_id).lifecycle_state == "active"
 
 
-def test_selective_rebuild_reconciles_only_affected_cluster_and_keeps_unaffected_synthesis_once(tmp_path):
+def test_selective_rebuild_rebuilds_higher_closure_with_unaffected_synthesis_as_context(tmp_path):
     storage = Storage(tmp_path / "mentor.sqlite3", runtime_scope="pilot")
     storage.initialize()
     sources = tuple(
@@ -499,7 +582,7 @@ def test_selective_rebuild_reconciles_only_affected_cluster_and_keeps_unaffected
     # Stable explicit labels keep the test independent of source ID encoding.
     for output, label in zip(extraction_outputs, ("A one", "A two", "B one", "B two")):
         output["candidates"][0]["subject"] = label
-    first_synthesizer = ClusterSynthesizer()
+    first_synthesizer = HierarchicalClusterSynthesizer()
     first_compiler = CandidateCompiler(
         storage=storage,
         extractor=SourceExtractor(SimpleNamespace(responses=QueueResponses(extraction_outputs))),
@@ -538,7 +621,7 @@ def test_selective_rebuild_reconciles_only_affected_cluster_and_keeps_unaffected
         revision=replacement, transcript=replacement_text,
         start_offset=0, end_offset=len(replacement_text),
     )
-    second_synthesizer = ClusterSynthesizer()
+    second_synthesizer = HierarchicalClusterSynthesizer()
     second_compiler = CandidateCompiler(
         storage=storage,
         extractor=SourceExtractor(SimpleNamespace(responses=QueueResponses([{"candidates": [{
@@ -570,13 +653,31 @@ def test_selective_rebuild_reconciles_only_affected_cluster_and_keeps_unaffected
     ))
 
     assert second.ready is True
-    assert set(second_synthesizer.calls[0]) == {"A replacement", "A two"}
+    assert second_synthesizer.calls == [("A replacement",)]
     b_relationships = [
         record for record in second.records
         if isinstance(record, Relationship) and record.left.startswith("B ")
     ]
     assert len(b_relationships) == 1
     assert b_relationships[0].record_id in storage.derived_record_reuse(second.snapshot.snapshot_id)
+    context_records = {
+        record.record_id: record for record in second.records
+        if record.record_id in second_synthesizer.context_calls[0]
+    }
+    assert set(context_records) == set(second_synthesizer.context_calls[0])
+    assert b_relationships[0].record_id in context_records
+    assert any(
+        isinstance(record, Claim) and record.subject == "A two"
+        for record in context_records.values()
+    )
+    global_relationships = [
+        record for record in second.records
+        if isinstance(record, Relationship) and record.left == "Global framework"
+    ]
+    assert len(global_relationships) == 1
+    assert global_relationships[0].record_id not in storage.derived_record_reuse(
+        second.snapshot.snapshot_id
+    )
 
 
 def test_candidate_rejects_two_revisions_of_the_same_logical_source_before_any_stage_call(tmp_path):
