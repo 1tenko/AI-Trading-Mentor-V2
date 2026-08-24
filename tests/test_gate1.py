@@ -9,6 +9,7 @@ import pytest
 from mentor.compilation import CompilationRun, CorpusSnapshot, SourceProcessingResult, TokenPricing
 from mentor.gate1 import (
     CONSERVATIVE_SOL_PRICING,
+    GATE1_PRIOR_SPEND_USD,
     GATE1_PRICING_CHECKED_ON,
     BudgetedOpenAIClient,
     Gate1Runner,
@@ -131,6 +132,20 @@ def test_gate1_defaults_to_offline_dry_run_without_creating_a_pilot(tmp_path):
     assert production.current_snapshot() == production_snapshot
 
 
+def test_gate1_default_run_reserves_the_first_pilot_spend_from_the_cumulative_ceiling(tmp_path):
+    database_path, manifest_path, _production, _production_snapshot = _production_runtime(tmp_path)
+
+    report = Gate1Runner(
+        production_database_path=database_path,
+        manifest_path=manifest_path,
+        pilot_root=tmp_path / "private-pilots",
+        today=lambda: GATE1_PRICING_CHECKED_ON,
+        expected_manifest_sha256=_manifest_hash(manifest_path),
+    ).run()
+
+    assert report.spent_usd == pytest.approx(GATE1_PRIOR_SPEND_USD)
+
+
 def test_gate1_stops_before_runtime_or_client_when_estimate_exceeds_limit(tmp_path):
     database_path, manifest_path, production, production_snapshot = _production_runtime(tmp_path)
     client_calls = []
@@ -141,7 +156,7 @@ def test_gate1_stops_before_runtime_or_client_when_estimate_exceeds_limit(tmp_pa
             production_database_path=database_path,
             manifest_path=manifest_path,
             pilot_root=pilot_root,
-            spend_limit_usd=0.01,
+            spend_limit_usd=1.00,
             client_factory=lambda: client_calls.append("called"),
             today=lambda: GATE1_PRICING_CHECKED_ON,
             expected_manifest_sha256=_manifest_hash(manifest_path),
@@ -275,6 +290,14 @@ def test_budgeted_client_caps_output_and_accounts_actual_usage_before_next_call(
     with pytest.raises(RuntimeError, match="spend ceiling"):
         blocked.responses.create(model="gpt-5.6-sol", input="Synthetic request")
     assert len(calls) == 1
+
+
+def test_spend_ledger_counts_a_prior_gate1_run_against_the_same_hard_ceiling():
+    ledger = SpendLedger(20.0, CONSERVATIVE_SOL_PRICING, prior_spend_usd=0.951195)
+
+    assert ledger.spent_usd == pytest.approx(0.951195)
+    with pytest.raises(RuntimeError, match="spend ceiling"):
+        ledger.ensure("extraction", 19.048806)
 
 
 def test_budgeted_client_enforces_stage_budget_before_a_paid_call():

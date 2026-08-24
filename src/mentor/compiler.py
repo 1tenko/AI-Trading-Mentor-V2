@@ -23,7 +23,7 @@ from mentor.derived_records import (
     Relationship,
 )
 from mentor.knowledge import SourceRevision
-from mentor.synthesis import ConceptHint
+from mentor.synthesis import ConceptHint, concept_hint_from_record_selector, validate_record_concept_terms
 
 
 SOL_MODEL = "gpt-5.6-sol"
@@ -132,7 +132,8 @@ def _parse_candidates(
             payload, revision=revision, snapshot_id=snapshot_id, provenance=provenance
         )
         records.append(record)
-        hints.extend(_concept_hints(payload.get("concept_hints", []), record.record_id))
+        validate_record_concept_terms(record)
+        hints.extend(_concept_hints(payload.get("concept_hints", []), record))
     return tuple(records), tuple(hints)
 
 
@@ -198,19 +199,17 @@ def _candidate_from_payload(
     raise ValueError("unknown derived record family")
 
 
-def _concept_hints(payload: object, record_id: str) -> tuple[ConceptHint, ...]:
+def _concept_hints(payload: object, record: DerivedRecord) -> tuple[ConceptHint, ...]:
     if not isinstance(payload, list) or len(payload) > 8:
         raise ValueError("candidate concept hints must be a bounded list")
     result = []
     for item in payload:
-        if not isinstance(item, dict) or set(item) != {"label", "aliases", "scope", "role", "position"}:
+        if not isinstance(item, dict) or set(item) != {"aliases", "scope", "role", "position"}:
             raise ValueError("candidate concept hints must be typed")
         aliases = item["aliases"]
         position = item["position"]
         if (
-            not isinstance(item["label"], str)
-            or not item["label"].strip()
-            or not isinstance(aliases, list)
+            not isinstance(aliases, list)
             or len(aliases) > 8
             or any(not isinstance(alias, str) or not alias.strip() for alias in aliases)
             or (item["scope"] is not None and not isinstance(item["scope"], str))
@@ -218,16 +217,13 @@ def _concept_hints(payload: object, record_id: str) -> tuple[ConceptHint, ...]:
             or (position is not None and (not isinstance(position, int) or isinstance(position, bool) or position < 0))
         ):
             raise ValueError("candidate concept hints are invalid")
-        result.append(
-            ConceptHint(
-                record_id,
-                item["label"],
-                tuple(aliases),
-                item["scope"],
-                item["role"],
-                position,
-            )
-        )
+        result.append(concept_hint_from_record_selector(
+            record,
+            aliases=tuple(aliases),
+            scope=item["scope"],
+            role=item["role"],
+            position=position,
+        ))
     return tuple(result)
 
 

@@ -147,8 +147,7 @@ def test_concrete_extraction_emits_relationship_procedure_and_alias_hints():
                 "right": "Context filter",
                 "concept_hints": [
                     {
-                        "label": "Primary signal",
-                        "aliases": ["PS"],
+                            "aliases": ["PS"],
                         "scope": "entry",
                         "role": "left",
                         "position": None,
@@ -168,8 +167,7 @@ def test_concrete_extraction_emits_relationship_procedure_and_alias_hints():
                 ],
                 "concept_hints": [
                     {
-                        "label": "Validate",
-                        "aliases": ["Confirm"],
+                            "aliases": ["Confirm"],
                         "scope": None,
                         "role": "term",
                         "position": 1,
@@ -199,6 +197,79 @@ def test_concrete_extraction_emits_relationship_procedure_and_alias_hints():
     assert result.hints[0].aliases == ("PS",)
     assert result.hints[1].role == "term"
     assert result.hints[1].position == 1
+
+
+def test_extraction_derives_a_hint_label_from_its_typed_record_selector():
+    payload = {
+        "candidates": [{
+            "family": "claim",
+            "anchors": ["anc_selector"],
+            "qualification": "Synthetic selector claim.",
+            "subject": "Compact concept",
+            "predicate": "guides",
+            "object": "bounded context",
+            "semantic_subtype": "statement",
+            "concept_hints": [{
+                "aliases": ["CC"],
+                "scope": "entry",
+                "role": "subject",
+                "position": None,
+            }],
+        }]
+    }
+    extractor, _responses = extractor_for(payload)
+
+    result = extractor.extract(
+        revision=revision_for(), snapshot_id="snap_synthetic", transcript="Synthetic source text."
+    )
+
+    assert len(result.hints) == 1
+    assert result.hints[0].label == "Compact concept"
+    assert result.hints[0].role == "subject"
+    assert result.hints[0].position is None
+
+
+def test_extraction_rejects_a_hint_selector_outside_the_typed_record_shape():
+    payload = {
+        "candidates": [{
+            "family": "claim",
+            "anchors": ["anc_selector"],
+            "qualification": "Synthetic selector claim.",
+            "subject": "Compact concept",
+            "predicate": "guides",
+            "object": "bounded context",
+            "semantic_subtype": "statement",
+            "concept_hints": [{
+                "aliases": [],
+                "scope": None,
+                "role": "term",
+                "position": 0,
+            }],
+        }]
+    }
+    extractor, _responses = extractor_for(payload)
+
+    with pytest.raises(ValueError, match="concept hint selector does not identify one typed record occurrence"):
+        extractor.extract(revision=revision_for(), snapshot_id="snap_synthetic", transcript="Synthetic source text.")
+
+
+def test_extraction_rejects_an_overlong_record_term_before_semantic_validation():
+    payload = {
+        "candidates": [{
+            "family": "claim",
+            "anchors": ["anc_selector"],
+            "qualification": "Synthetic selector claim.",
+            "subject": "x" * 121,
+            "predicate": "guides",
+            "object": "bounded context",
+            "semantic_subtype": "statement",
+            "concept_hints": [],
+        }]
+    }
+    extractor, _responses = extractor_for(payload)
+
+    with pytest.raises(ValueError, match="concept label exceeds its maximum length"):
+        extractor.extract(revision=revision_for(), snapshot_id="snap_synthetic", transcript="Synthetic source text.")
 
 
 def test_allows_a_source_to_yield_zero_candidates():

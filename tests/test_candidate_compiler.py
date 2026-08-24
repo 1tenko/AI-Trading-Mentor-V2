@@ -417,6 +417,9 @@ def synthesis_response(request):
     record_ids = [record["record_id"] for record in records]
     anchor_ids = list(dict.fromkeys(anchor for record in records for anchor in record["anchors"]))
     revision_ids = supplied["revision_ids"]
+    revision_years = {source["revision_id"]: source["year"] for source in supplied["sources"]}
+    earlier_revisions = [revision_id for revision_id in revision_ids if revision_years[revision_id] == 2025]
+    later_revisions = [revision_id for revision_id in revision_ids if revision_years[revision_id] == 2026]
     common = {
         "qualification": "Synthetic reconciled evidence.",
         "anchors": anchor_ids,
@@ -435,8 +438,8 @@ def synthesis_response(request):
             "subject": "Synthetic framework",
             "previous": "Earlier bounded form",
             "current": "Later qualified form",
-            "earlier_source_set": revision_ids[:1],
-            "later_source_set": revision_ids[1:],
+            "earlier_source_set": earlier_revisions,
+            "later_source_set": later_revisions,
             "classification": "refined",
             "negative_evidence_state": "positive_teaching",
             "earlier_coverage_id": "coverage_earlier",
@@ -865,7 +868,6 @@ def test_validated_concept_aliases_are_searchable_in_bounded_derived_artifacts(t
             "predicate": "guides",
             "object": "bounded context",
             "concept_hints": [{
-                "label": f"Canonical topic {index}",
                 "aliases": [f"Search alias {index}"],
                 "scope": "synthetic scope",
                 "role": "subject",
@@ -905,6 +907,42 @@ def test_validated_concept_aliases_are_searchable_in_bounded_derived_artifacts(t
         for concept in payload["concepts"]
     )
     assert all("record_id" not in payload and "anchor_ids" not in payload for payload in artifact_payloads)
+
+
+def test_overlong_concept_term_is_rejected_during_extraction_before_a_validation_attempt(tmp_path):
+    def claim_payload(subject, qualification):
+        def response(request):
+            anchors = json.loads(request["input"].split("Candidate anchors:\n", 1)[1])
+            return {"candidates": [{
+                "family": "claim",
+                "anchors": [next(iter(anchors))],
+                "qualification": qualification,
+                "subject": subject,
+                "predicate": "guides",
+                "object": "bounded context",
+                "semantic_subtype": "statement",
+                "concept_hints": [],
+            }]}
+        return response
+
+    storage, candidate_compiler, request, _vector_client = compiler(
+        tmp_path,
+        extraction_outputs=[
+            claim_payload("x" * 121, "Synthetic malformed candidate."),
+            claim_payload("Compact concept", "Synthetic valid candidate."),
+        ],
+        validation_outputs=[
+            {"outcome": "affirmatively_supported", "audit": "Synthetic span supports the claim."},
+        ],
+    )
+
+    result = candidate_compiler.build(request)
+
+    validation_metric = next(metric for metric in result.stage_metrics if metric.stage == "validation")
+    assert result.ready is False
+    assert validation_metric.call_count == 1
+    assert len(candidate_compiler._validation_client.responses.calls) == 1
+    assert storage.current_snapshot() is None
 
 
 def compiler(

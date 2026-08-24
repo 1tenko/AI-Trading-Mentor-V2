@@ -37,6 +37,7 @@ APPROVED_GATE1_MANIFEST_SHA256 = "3798d537cd486f782449d9833b5fc06dd28fa93aed4564
 # Standard short-context rates are deliberately higher than the current model-page promotion.
 CONSERVATIVE_SOL_PRICING = TokenPricing(5.0, 30.0, 30.0)
 HARD_SPEND_CEILING_USD = 20.0
+GATE1_PRIOR_SPEND_USD = 0.951195
 _PRICING_MAX_AGE_DAYS = 7
 _OUTPUT_CAPS = {
     "extraction": 8_000,
@@ -127,7 +128,7 @@ class _ProductionPointers:
 class SpendLedger:
     """Sequential hard ceiling checked before every paid Responses call."""
 
-    def __init__(self, limit_usd: float, pricing: TokenPricing):
+    def __init__(self, limit_usd: float, pricing: TokenPricing, *, prior_spend_usd: float = 0.0):
         if (
             isinstance(limit_usd, bool)
             or not isinstance(limit_usd, int | float)
@@ -135,10 +136,19 @@ class SpendLedger:
             or not 0 < limit_usd <= HARD_SPEND_CEILING_USD
         ):
             raise ValueError("Gate 1 spend limit must be positive and no more than $20")
+        if (
+            isinstance(prior_spend_usd, bool)
+            or not isinstance(prior_spend_usd, int | float)
+            or not math.isfinite(prior_spend_usd)
+            or prior_spend_usd < 0
+            or prior_spend_usd > limit_usd
+        ):
+            raise ValueError("prior Gate 1 spend must be finite and within the cumulative ceiling")
         pricing.require_complete("Gate 1")
         self.limit_usd = float(limit_usd)
         self.pricing = pricing
-        self.spent_usd = 0.0
+        self.prior_spend_usd = float(prior_spend_usd)
+        self.spent_usd = self.prior_spend_usd
         self._reservations: dict[int, tuple[str, float]] = {}
         self._stage_limits: dict[str, float] = {}
         self._stage_spend: dict[str, float] = {}
@@ -167,7 +177,7 @@ class SpendLedger:
             raise RuntimeError(f"Gate 1 {stage} stage budget is exhausted")
 
     def set_stage_limits(self, limits: dict[str, float]) -> None:
-        if self.spent_usd or self._reservations:
+        if self._stage_spend or self._reservations:
             raise RuntimeError("Gate 1 stage budgets must be fixed before paid work")
         if any(cost <= 0 or not math.isfinite(cost) for cost in limits.values()):
             raise ValueError("Gate 1 stage budgets must be finite and positive")
@@ -287,7 +297,9 @@ class Gate1Runner:
         self.run_id = run_id or datetime.now(timezone.utc).strftime(
             "gate1-%Y%m%dT%H%M%SZ-"
         ) + uuid4().hex[:8]
-        self.ledger = SpendLedger(spend_limit_usd, pricing)
+        self.ledger = SpendLedger(
+            spend_limit_usd, pricing, prior_spend_usd=GATE1_PRIOR_SPEND_USD
+        )
         self.pricing = pricing
         self._client_factory = client_factory or _live_openai_client
         self._compiler_factory = compiler_factory or _live_compiler
@@ -302,10 +314,10 @@ class Gate1Runner:
             self.manifest_path, production, self._expected_manifest_sha256
         )
         plan = estimate_gate1_cost(sources, self.pricing)
-        if plan.estimated_upper_bound_usd > self.ledger.limit_usd:
+        if self.ledger.spent_usd + plan.estimated_upper_bound_usd > self.ledger.limit_usd:
             raise ValueError(
-                f"estimated Gate 1 cost ${plan.estimated_upper_bound_usd:.4f} exceeds "
-                f"the ${self.ledger.limit_usd:.2f} limit"
+                f"estimated Gate 1 cost ${plan.estimated_upper_bound_usd:.4f} plus prior spend "
+                f"${self.ledger.prior_spend_usd:.4f} exceeds the ${self.ledger.limit_usd:.2f} cumulative limit"
             )
         self.ledger.set_stage_limits({stage.stage: stage.cost_usd for stage in plan.stages})
         if not execute:
@@ -317,7 +329,7 @@ class Gate1Runner:
                 len(sources),
                 manifest.revision_ids,
                 plan.estimated_upper_bound_usd,
-                0.0,
+                self.ledger.spent_usd,
             )
         _require_fresh_pricing(self._today())
         pilot = PilotRuntime.create(
@@ -371,6 +383,7 @@ class Gate1Runner:
                 "evaluation": evaluation,
                 "spend": {
                     "limit_usd": self.ledger.limit_usd,
+                    "prior_spend_usd": self.ledger.prior_spend_usd,
                     "spent_usd": self.ledger.spent_usd,
                     "events": self.ledger.events,
                 },

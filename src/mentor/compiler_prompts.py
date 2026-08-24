@@ -7,8 +7,8 @@ from mentor.derived_records import RELATIONSHIP_TYPES
 from mentor.knowledge import SourceRevision
 
 
-EXTRACTION_PROMPT_VERSION = "source-extraction-v3"
-EXTRACTION_SCHEMA_VERSION = "source-extraction-schema-v3"
+EXTRACTION_PROMPT_VERSION = "source-extraction-v4"
+EXTRACTION_SCHEMA_VERSION = "source-extraction-schema-v4"
 SEMANTIC_VALIDATION_PROMPT_VERSION = "source-semantic-validation-v3"
 SEMANTIC_VALIDATION_SCHEMA_VERSION = "source-semantic-validation-schema-v1"
 MAX_CANDIDATES_PER_SOURCE = 12
@@ -17,6 +17,7 @@ MAX_ANCHOR_ID_LENGTH = 128
 
 EXTRACTION_INSTRUCTIONS = """Extract at most 12 compact claim, relationship, or procedure/sequence/hierarchy records from this one source revision.
 Use only proposed anchor IDs already supplied by the source-processing pipeline. Include an empty concept_hints list when no explicit alias or scope is present.
+Each concept hint selects one actual typed record occurrence: provide its role and, only for ordered fields, its zero-based position. Do not write a label, restate a claim, or name a concept that is not an exact record occurrence; the compiler derives the label from the selected typed term.
 Represent procedure prerequisites, conditions, and conditional branches structurally rather than folding them into prose.
 Use strategy_implication only when the raw passage explicitly teaches that implication; otherwise leave it for cross-source synthesis.
 An empty candidate list is valid. Do not approve, validate, score, or explain candidates.
@@ -34,9 +35,8 @@ _CONCEPT_HINT_SCHEMA = {
     "items": {
         "type": "object",
         "additionalProperties": False,
-        "required": ["label", "aliases", "scope", "role", "position"],
+        "required": ["aliases", "scope", "role", "position"],
         "properties": {
-            "label": {"type": "string", "minLength": 1, "maxLength": 120},
             "aliases": {
                 "type": "array",
                 "maxItems": 8,
@@ -53,6 +53,11 @@ _TEXT_LIST_SCHEMA = {
     "maxItems": 8,
     "items": {"type": "string", "minLength": 1, "maxLength": 240},
 }
+_CONCEPT_TERM_LIST_SCHEMA = {
+    "type": "array",
+    "maxItems": 8,
+    "items": {"type": "string", "minLength": 1, "maxLength": 120},
+}
 _PROCEDURE_BRANCH_SCHEMA = {
     "type": "array",
     "maxItems": 8,
@@ -62,7 +67,7 @@ _PROCEDURE_BRANCH_SCHEMA = {
         "required": ["condition", "steps"],
         "properties": {
             "condition": {"type": "string", "minLength": 1, "maxLength": 160},
-            "steps": _TEXT_LIST_SCHEMA | {"minItems": 1},
+            "steps": _CONCEPT_TERM_LIST_SCHEMA | {"minItems": 1},
         },
     },
 }
@@ -88,9 +93,9 @@ EXTRACTION_RESPONSE_SCHEMA = {
                             "family": {"enum": ["claim"]},
                             "anchors": _ANCHORS_SCHEMA,
                             "qualification": {"type": "string", "minLength": 1, "maxLength": 280},
-                            "subject": {"type": "string", "minLength": 1, "maxLength": 240},
-                            "predicate": {"type": "string", "minLength": 1, "maxLength": 240},
-                            "object": {"type": "string", "minLength": 1, "maxLength": 240},
+                            "subject": {"type": "string", "minLength": 1, "maxLength": 120},
+                            "predicate": {"type": "string", "minLength": 1, "maxLength": 120},
+                            "object": {"type": "string", "minLength": 1, "maxLength": 120},
                             "semantic_subtype": {
                                 "enum": ["statement", "definition", "recommendation", "strategy_implication"]
                             },
@@ -108,9 +113,9 @@ EXTRACTION_RESPONSE_SCHEMA = {
                             "family": {"enum": ["relationship"]},
                             "anchors": _ANCHORS_SCHEMA,
                             "qualification": {"type": "string", "minLength": 1, "maxLength": 280},
-                            "left": {"type": "string", "minLength": 1, "maxLength": 240},
+                            "left": {"type": "string", "minLength": 1, "maxLength": 120},
                             "relation": {"enum": sorted(RELATIONSHIP_TYPES)},
-                            "right": {"type": "string", "minLength": 1, "maxLength": 240},
+                            "right": {"type": "string", "minLength": 1, "maxLength": 120},
                             "concept_hints": _CONCEPT_HINT_SCHEMA,
                         },
                     },
@@ -126,8 +131,8 @@ EXTRACTION_RESPONSE_SCHEMA = {
                             "anchors": _ANCHORS_SCHEMA,
                             "qualification": {"type": "string", "minLength": 1, "maxLength": 280},
                             "kind": {"enum": ["procedure", "sequence", "hierarchy"]},
-                            "terms": _TEXT_LIST_SCHEMA | {"minItems": 2},
-                            "prerequisites": _TEXT_LIST_SCHEMA,
+                            "terms": _CONCEPT_TERM_LIST_SCHEMA | {"minItems": 2},
+                            "prerequisites": _CONCEPT_TERM_LIST_SCHEMA,
                             "conditions": _TEXT_LIST_SCHEMA,
                             "branches": _PROCEDURE_BRANCH_SCHEMA,
                             "concept_hints": _CONCEPT_HINT_SCHEMA,

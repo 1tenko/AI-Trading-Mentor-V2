@@ -1012,6 +1012,40 @@ class ConceptHint:
     position: int | None = None
 
 
+def validate_record_concept_terms(record: DerivedRecord) -> None:
+    """Require every term that can become a concept to satisfy the concept contract."""
+    for _role, _position, label in _record_occurrence_terms(record):
+        _label_key(label)
+
+
+def concept_hint_from_record_selector(
+    record: DerivedRecord,
+    *,
+    aliases: tuple[str, ...],
+    scope: str | None,
+    role: str | None,
+    position: int | None,
+) -> ConceptHint:
+    """Resolve a source-extraction selector without accepting model-authored labels."""
+    if role is None:
+        raise ValueError("concept hint selector requires a typed record role")
+    role_key = _role_key(role)
+    _require_position(position)
+    matches = [
+        (term_role, term_position, label)
+        for term_role, term_position, label in _record_occurrence_terms(record)
+        if term_role == role_key and term_position == position
+    ]
+    if len(matches) != 1:
+        raise ValueError("concept hint selector does not identify one typed record occurrence")
+    _term_role, _term_position, label = matches[0]
+    _label_key(label)
+    _require_labels(aliases, _label_key(label))
+    if scope is not None:
+        _scope_key(scope)
+    return ConceptHint(record.record_id, label, aliases, scope, role_key, position)
+
+
 @dataclass(frozen=True)
 class ConceptOccurrence:
     record_id: str
