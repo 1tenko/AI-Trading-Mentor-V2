@@ -210,6 +210,8 @@ def test_pilot_manifest_requires_six_unique_revisions_and_all_structural_roles()
     manifest = PilotManifest(entries)
 
     assert manifest.revision_ids == tuple(entry.revision_id for entry in entries)
+    with pytest.raises(ValueError, match="immutable tuple"):
+        PilotManifest(list(entries))
     with pytest.raises(ValueError, match="exactly six"):
         PilotManifest(entries[:-1])
     with pytest.raises(ValueError, match="unique"):

@@ -168,6 +168,8 @@ class PilotManifest:
     entries: tuple[PilotManifestEntry, ...]
 
     def __post_init__(self) -> None:
+        if not isinstance(self.entries, tuple):
+            raise ValueError("pilot manifest entries must be an immutable tuple")
         if len(self.entries) != 6 or any(
             not isinstance(entry, PilotManifestEntry) for entry in self.entries
         ):
