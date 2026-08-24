@@ -81,9 +81,9 @@ migration was proven on an ignored runtime copy before being applied to the
 normal local database: all 150 legacy registrations remained intact, all 150
 mapped to one active immutable revision with preserved remote linkage, no
 exceptions or duplicates were found, and a second run was idempotent. Phase 2
-conversation, replay, display, citation/evidence, diagnostic, and settings data
-remained byte-for-byte unchanged. A socket-level guard recorded zero network
-attempts and the OpenAI SDK was not imported.
+conversation, replay, display, citation/evidence, diagnostic, and settings row
+counts and content fingerprints remained unchanged. A socket-level guard
+recorded zero network attempts and the OpenAI SDK was not imported.
 
 The resulting six-revision Gate 1 manifest validated successfully and remains
 private under the ignored `data/pilots/` tree. It contains no transcript bodies
