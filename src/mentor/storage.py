@@ -1153,6 +1153,8 @@ class Storage:
         ).fetchall()
         record_ids = tuple(row[0] for row in rows)
         fingerprint = sha256("\n".join(record_ids).encode()).hexdigest()
+        if not rows:
+            return _CANDIDATE_GATE_STRUCTURE_VERSION, 0, fingerprint, "candidate contains no validated derived records"
         if any(finalized != 1 or validation_state != "validated" for _, finalized, validation_state in rows):
             return _CANDIDATE_GATE_STRUCTURE_VERSION, len(rows), fingerprint, "candidate records must be finalized and validated"
         if connection.execute(
@@ -1398,6 +1400,44 @@ class Storage:
                 """,
                 (snapshot_id,),
             ).fetchall()
+
+    def validation_audit_counts(self, snapshot_id: str) -> dict[str, int]:
+        """Return audit-visible record outcomes; rejected candidates are excluded, not unresolved."""
+        outcomes = {
+            "affirmatively_supported": 0,
+            "partially_supported": 0,
+            "ambiguous": 0,
+            "unsupported": 0,
+            "needs_broader_context": 0,
+        }
+        with self._connect() as connection:
+            outcomes.update(dict(connection.execute(
+                """
+                SELECT outcome, COUNT(*) FROM candidate_validation_audits
+                WHERE snapshot_id = ? GROUP BY outcome
+                """,
+                (snapshot_id,),
+            ).fetchall()))
+            extracted = connection.execute(
+                """
+                SELECT compilation_metrics.record_count
+                FROM corpus_snapshots JOIN compilation_metrics
+                    ON compilation_metrics.run_id = corpus_snapshots.run_id
+                WHERE corpus_snapshots.snapshot_id = ? AND compilation_metrics.stage = 'extraction'
+                """,
+                (snapshot_id,),
+            ).fetchone()
+        excluded = sum(count for outcome, count in outcomes.items() if outcome != "affirmatively_supported")
+        return {
+            "extracted": sum(outcomes.values()) if extracted is None else extracted[0],
+            "affirmative": outcomes["affirmatively_supported"],
+            "partial": outcomes["partially_supported"],
+            "ambiguous": outcomes["ambiguous"],
+            "unsupported": outcomes["unsupported"],
+            "needs_broader_context": outcomes["needs_broader_context"],
+            "excluded": excluded,
+            "unresolved": 0,
+        }
 
     def dependency_graph(self, snapshot_id: str) -> DependencyGraph:
         with self._connect() as connection:

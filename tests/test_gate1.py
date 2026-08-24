@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from mentor.compilation import CompilationRun, CorpusSnapshot, SourceProcessingResult, TokenPricing
+from mentor.derived_records import Claim, RecordDependency
 from mentor.gate1 import (
     CONSERVATIVE_SOL_PRICING,
     GATE1_PRIOR_SPEND_USD,
@@ -86,9 +87,21 @@ def _production_runtime(tmp_path: Path):
         created_at=1.0,
     )
     storage.create_compilation_candidate(run, snapshot)
+    first = revisions[0]
+    storage.store_derived_record(Claim.create(
+        snapshot_id=snapshot.snapshot_id,
+        anchors=("anc_production_candidate",),
+        dependencies=(RecordDependency("source_revision", first.revision_id),),
+        validation_state="validated",
+        lifecycle_state="active",
+        qualification="Synthetic candidate support.",
+        subject="candidate",
+        predicate="supports",
+        object="publication",
+    ))
     storage.record_candidate_gate(
         snapshot.snapshot_id,
-        tuple(SourceProcessingResult(item.revision_id, "processed", 1) for item in revisions),
+        tuple(SourceProcessingResult(item.revision_id, "processed", int(item == first)) for item in revisions),
         checked_at=2.0,
     )
     storage.transition_snapshot(snapshot.snapshot_id, "validating", transitioned_at=2.0)
@@ -204,10 +217,24 @@ def test_execute_builds_and_publishes_only_in_pilot_then_runs_evaluation(tmp_pat
             )
             self.storage.create_compilation_candidate(request.run, snapshot)
             self.storage.record_candidate_artifact_scope(snapshot.snapshot_id, "pilot")
+            first = request.sources[0].revision
+            self.storage.store_derived_record(Claim.create(
+                snapshot_id=snapshot.snapshot_id,
+                anchors=("anc_pilot_candidate",),
+                dependencies=(RecordDependency("source_revision", first.revision_id),),
+                validation_state="validated",
+                lifecycle_state="active",
+                qualification="Synthetic pilot candidate support.",
+                subject="candidate",
+                predicate="supports",
+                object="publication",
+            ))
             self.storage.record_candidate_gate(
                 snapshot.snapshot_id,
                 tuple(
-                    SourceProcessingResult(source.revision.revision_id, "processed", 1)
+                    SourceProcessingResult(
+                        source.revision.revision_id, "processed", int(source.revision == first)
+                    )
                     for source in request.sources
                 ),
                 checked_at=5.0,

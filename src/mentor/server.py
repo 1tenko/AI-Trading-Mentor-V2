@@ -312,6 +312,7 @@ def _snapshot_detail(storage: Storage, snapshot_id: str) -> dict | None:
             "processed": sum(result.status == "processed" for result in coverage),
             "failed": sum(result.status == "failed" for result in coverage),
         },
+        "validation": storage.validation_audit_counts(snapshot_id),
         "candidate_gate": None if gate is None else {
             "status": gate.status,
             "checked_at": gate.checked_at,

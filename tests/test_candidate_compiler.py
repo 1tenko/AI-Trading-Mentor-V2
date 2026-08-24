@@ -1079,7 +1079,7 @@ def test_extraction_failure_is_visible_and_leaves_candidate_failed_and_unpublish
     assert vector_client.calls == []
 
 
-def test_nonaffirmative_validation_blocks_candidate_readiness_and_excludes_the_claim(tmp_path):
+def test_unsupported_candidate_is_excluded_without_blocking_a_valid_candidate(tmp_path):
     storage, candidate_compiler, request, _ = compiler(
         tmp_path,
         validation_outputs=[
@@ -1090,14 +1090,171 @@ def test_nonaffirmative_validation_blocks_candidate_readiness_and_excludes_the_c
 
     result = candidate_compiler.build(request)
 
-    assert result.ready is False
-    assert result.snapshot.status == "failed"
-    assert any("validation" in failure for failure in result.failures)
+    assert result.ready is True
+    assert not any("validation" in failure for failure in result.failures)
     assert len(storage.derived_records(result.snapshot.snapshot_id)) == 1
     assert storage.current_snapshot() is None
     metrics = {metric.stage: metric for metric in result.stage_metrics}
     assert metrics["extraction"].record_count == 2
     assert metrics["validation"].record_count == 1
+
+
+def test_eight_affirmative_and_two_partial_candidates_can_continue_with_only_affirmative_records(tmp_path):
+    class EmptySynthesizer:
+        provenance = CompilerProvenance("synthetic", "synthetic", "synthetic")
+
+        def synthesize(self, *, records, **_kwargs):
+            return SynthesisResult(
+                (), self.provenance,
+                coverage=ReconciliationCoverage(
+                    len(records), tuple(sorted(record.record_id for record in records)), 1, 0
+                ),
+            )
+
+    def extraction_payload(prefix):
+        def response(request):
+            anchors = json.loads(request["input"].split("Candidate anchors:\n", 1)[1])
+            return {"candidates": [
+                {
+                    "family": "claim",
+                    "anchors": [next(iter(anchors))],
+                    "qualification": "Synthetic candidate.",
+                    "subject": f"{prefix} topic {index}",
+                    "predicate": "guides",
+                    "object": "bounded context",
+                    "semantic_subtype": "statement",
+                    "concept_hints": [],
+                }
+                for index in range(5)
+            ]}
+        return response
+
+    affirmative = {"outcome": "affirmatively_supported", "audit": "Synthetic span supports the claim."}
+    partial = {"outcome": "partially_supported", "audit": "Synthetic span supports only part of the claim."}
+    storage, candidate_compiler, request, _ = compiler(
+        tmp_path,
+        extraction_outputs=[extraction_payload("earlier"), extraction_payload("later")],
+        validation_outputs=[affirmative] * 8 + [partial] * 2,
+        synthesizer=EmptySynthesizer(),
+    )
+
+    result = candidate_compiler.build(request)
+
+    active_source_records = [
+        record for record in storage.derived_records(result.snapshot.snapshot_id)
+        if record.derived_kind == "source_extracted_claim"
+    ]
+    assert result.ready is True
+    assert len(active_source_records) == 8
+    assert [audit[1] for audit in storage.validation_audits(result.snapshot.snapshot_id)].count("partially_supported") == 2
+    assert storage.validation_audit_counts(result.snapshot.snapshot_id) == {
+        "extracted": 10,
+        "affirmative": 8,
+        "partial": 2,
+        "ambiguous": 0,
+        "unsupported": 0,
+        "needs_broader_context": 0,
+        "excluded": 2,
+        "unresolved": 0,
+    }
+
+
+@pytest.mark.parametrize("outcome", ["ambiguous", "needs_broader_context"])
+def test_nonaffirmative_but_nonstructural_validation_outcomes_are_excluded_without_blocking(tmp_path, outcome):
+    storage, candidate_compiler, request, _ = compiler(
+        tmp_path,
+        validation_outputs=[
+            {"outcome": outcome, "audit": "Synthetic evidence is not decisive."},
+            {"outcome": "affirmatively_supported", "audit": "Synthetic span supports the claim."},
+        ],
+    )
+
+    result = candidate_compiler.build(request)
+
+    assert result.ready is True
+    assert len(storage.derived_records(result.snapshot.snapshot_id)) == 1
+    assert [audit[1] for audit in storage.validation_audits(result.snapshot.snapshot_id)].count(outcome) == 1
+
+
+def test_nonaffirmative_validation_does_not_invent_an_unresolved_record(tmp_path):
+    storage, candidate_compiler, request, _ = compiler(
+        tmp_path,
+        validation_outputs=[
+            {"outcome": "partially_supported", "audit": "Synthetic evidence supports only part of the claim."},
+            {"outcome": "affirmatively_supported", "audit": "Synthetic span supports the claim."},
+        ],
+    )
+
+    result = candidate_compiler.build(request)
+
+    assert result.ready is True
+    assert all(record.family != "conflict_unresolved" for record in storage.derived_records(result.snapshot.snapshot_id))
+    assert storage.validation_audit_counts(result.snapshot.snapshot_id)["unresolved"] == 0
+
+
+def test_candidate_fails_when_no_validated_records_survive_strict_validation(tmp_path):
+    storage, candidate_compiler, request, vector_client = compiler(
+        tmp_path,
+        validation_outputs=[
+            {"outcome": "unsupported", "audit": "Synthetic span does not support the claim."},
+            {"outcome": "ambiguous", "audit": "Synthetic evidence is ambiguous."},
+        ],
+    )
+
+    result = candidate_compiler.build(request)
+
+    assert result.ready is False
+    assert result.snapshot.status == "failed"
+    assert any("no validated derived records" in failure for failure in result.failures)
+    coverage = storage.snapshot_source_coverage(result.snapshot.snapshot_id)
+    assert len(coverage) == len(request.sources)
+    assert all(item.status == "processed" and item.record_count == 0 for item in coverage)
+    assert vector_client.calls == []
+
+
+def test_synthesis_cannot_depend_on_a_rejected_partial_candidate(tmp_path):
+    class RejectedDependencySynthesizer:
+        provenance = CompilerProvenance("synthetic", "synthetic", "synthetic")
+
+        def synthesize(self, *, snapshot_id, records, revisions, **_kwargs):
+            assert len(records) == 1
+            record = records[0]
+            revision_id = next(
+                dependency.identifier for dependency in record.dependencies
+                if dependency.kind == "source_revision"
+            )
+            return SynthesisResult((Relationship.create(
+                snapshot_id=snapshot_id,
+                anchors=record.anchors,
+                dependencies=(
+                    RecordDependency("source_revision", revision_id),
+                    RecordDependency("derived_record", record.record_id),
+                    RecordDependency("derived_record", "rec_rejected_partial"),
+                ),
+                validation_state="validated",
+                lifecycle_state="active",
+                qualification="Synthetic invalid dependency.",
+                evidence_state="cross_source_synthesis",
+                compiler_provenance=self.provenance,
+                left="Synthetic",
+                relation="supports",
+                right="Validated evidence",
+            ),), self.provenance, coverage=ReconciliationCoverage(1, (record.record_id,), 1, 0))
+
+    storage, candidate_compiler, request, vector_client = compiler(
+        tmp_path,
+        synthesizer=RejectedDependencySynthesizer(),
+        validation_outputs=[
+            {"outcome": "partially_supported", "audit": "Synthetic evidence supports only part of the claim."},
+            {"outcome": "affirmatively_supported", "audit": "Synthetic span supports the claim."},
+        ],
+    )
+
+    result = candidate_compiler.build(request)
+
+    assert result.ready is False
+    assert any("unavailable input record" in failure for failure in result.failures)
+    assert vector_client.calls == []
 
 
 def test_remote_readiness_failure_marks_candidate_failed_without_pointer_mutation(tmp_path):

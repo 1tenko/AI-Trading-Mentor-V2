@@ -5,6 +5,7 @@ import sqlite3
 import pytest
 
 from mentor.compilation import CompilationRun, CorpusSnapshot, SourceProcessingResult
+from mentor.derived_records import Claim, RecordDependency
 from mentor.evaluation import (
     EvaluationCase,
     EvaluationMetrics,
@@ -62,11 +63,22 @@ def _candidate(
         created_at=1.0,
     )
     storage.create_compilation_candidate(run, snapshot)
+    storage.store_derived_record(Claim.create(
+        snapshot_id=snapshot.snapshot_id,
+        anchors=(f"anc_candidate_{run_id}",),
+        dependencies=(RecordDependency("source_revision", revision.revision_id),),
+        validation_state="validated",
+        lifecycle_state="active",
+        qualification="Synthetic candidate support.",
+        subject="candidate",
+        predicate="supports",
+        object="publication",
+    ))
     if artifact_scope is not None:
         storage.record_candidate_artifact_scope(snapshot.snapshot_id, artifact_scope)
     storage.record_candidate_gate(
         snapshot.snapshot_id,
-        (SourceProcessingResult(revision.revision_id, "processed", 0),),
+        (SourceProcessingResult(revision.revision_id, "processed", 1),),
         checked_at=2.0,
     )
     storage.transition_snapshot(snapshot.snapshot_id, "validating", transitioned_at=2.0)

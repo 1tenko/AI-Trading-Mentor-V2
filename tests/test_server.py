@@ -8,7 +8,7 @@ import pytest
 
 from mentor.chat_service import Answer, StreamEvent
 from mentor.anchors import SourceAnchor
-from mentor.compilation import CompilationRun, CorpusSnapshot, SourceProcessingResult
+from mentor.compilation import CompilationMetric, CompilationRun, CorpusSnapshot, SourceProcessingResult
 from mentor.derived_records import (
     Claim,
     ConflictUnresolved,
@@ -71,7 +71,10 @@ def test_inspector_filename_sanitizer_uses_cross_platform_basenames(value, expec
     assert _safe_filename(value) == expected
 
 
-def inspected_snapshot(storage, *, run_id="run_inspector", publish=True, persist_anchor=True):
+def inspected_snapshot(
+    storage, *, run_id="run_inspector", publish=True, persist_anchor=True,
+    validation_outcomes=(), extracted_count=None,
+):
     transcript = "[00:00:01] PRIVATE RAW TRANSCRIPT BODY must never be returned."
     collection = Collection("collection_inspector", "Inspector tests", "trading", True, "test")
     source = LibrarySource.create(
@@ -128,6 +131,30 @@ def inspected_snapshot(storage, *, run_id="run_inspector", publish=True, persist
         object="Synthetic object",
     )
     storage.store_derived_record(record)
+    if validation_outcomes:
+        with storage._connect() as connection:
+            connection.executemany(
+                """
+                INSERT INTO candidate_validation_audits(
+                    candidate_record_id, snapshot_id, outcome, audit, validated_record_id
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        f"candidate_audit_{index}",
+                        snapshot.snapshot_id,
+                        outcome,
+                        "Synthetic validation audit.",
+                        record.record_id if outcome == "affirmatively_supported" else None,
+                    )
+                    for index, outcome in enumerate(validation_outcomes)
+                ],
+            )
+    if extracted_count is not None:
+        storage.record_compilation_metric(
+            run.run_id,
+            CompilationMetric("extraction", 1, extracted_count, 0, 0, 0, 0, 0, 0, 0),
+        )
     synthesis = SynthesisCandidate.from_records(
         snapshot_id=snapshot.snapshot_id,
         records=(record,),
@@ -166,7 +193,17 @@ def inspected_snapshot(storage, *, run_id="run_inspector", publish=True, persist
 def test_server_exposes_read_only_inspector_without_raw_or_private_payloads(tmp_path):
     storage = Storage(tmp_path / "mentor.sqlite3")
     storage.initialize()
-    snapshot, record, anchor, source = inspected_snapshot(storage)
+    snapshot, record, anchor, source = inspected_snapshot(
+        storage,
+        validation_outcomes=(
+            "affirmatively_supported",
+            "partially_supported",
+            "ambiguous",
+            "unsupported",
+            "needs_broader_context",
+        ),
+        extracted_count=6,
+    )
     storage.store_source_change(
         SourceChange(source.source_id, "changed", None, "C:/private/synthetic.txt", 4.0)
     )
@@ -243,6 +280,16 @@ def test_server_exposes_read_only_inspector_without_raw_or_private_payloads(tmp_
         detail = json.loads(body)
         assert status == 200
         assert detail["coverage"] == {"processed": 1, "failed": 0}
+        assert detail["validation"] == {
+            "extracted": 6,
+            "affirmative": 1,
+            "partial": 1,
+            "ambiguous": 1,
+            "unsupported": 1,
+            "needs_broader_context": 1,
+            "excluded": 4,
+            "unresolved": 0,
+        }
         assert detail["records"] == [{
             "record_id": record.record_id,
             "family": "claim",

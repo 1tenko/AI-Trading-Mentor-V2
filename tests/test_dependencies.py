@@ -388,6 +388,16 @@ def test_only_building_candidates_can_be_marked_stale(tmp_path, target_status):
     storage.initialize()
     revision = source_revision(storage, f"source_{target_status}")
     snapshot = candidate(storage, (revision,), run_id=f"run_{target_status}")
+    storage.store_derived_record(claim(
+        snapshot.snapshot_id,
+        "transition support",
+        (RecordDependency("source_revision", revision.revision_id),),
+    ))
+    storage.record_candidate_gate(
+        snapshot.snapshot_id,
+        (SourceProcessingResult(revision.revision_id, "processed", 1),),
+        checked_at=1_700_000_003.0,
+    )
     storage.transition_snapshot(snapshot.snapshot_id, "validating")
     if target_status == "failed":
         storage.transition_snapshot(snapshot.snapshot_id, "failed", failure_reason="synthetic failure")

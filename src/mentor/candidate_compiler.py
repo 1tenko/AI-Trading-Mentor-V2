@@ -377,13 +377,7 @@ class CandidateCompiler:
                             ),
                         )
                         validation_usage = _sum_usage(validation_usage, outcome.usage)
-                        if outcome.source_extracted is None:
-                            validation_failures += 1
-                            source_failed = True
-                            failures.append(
-                                f"validation {outcome.outcome} for {outcome.candidate_record_id}"
-                            )
-                        else:
+                        if outcome.source_extracted is not None:
                             accepted += 1
                             extraction_hints.extend(outcome.validated_hints)
                     except Exception as error:
@@ -398,6 +392,9 @@ class CandidateCompiler:
                     accepted,
                 )
             )
+
+        if not failures and not any(result.record_count for result in source_results):
+            failures.append("candidate contains no validated derived records")
 
         stage_metrics.append(
             self._record_metric(

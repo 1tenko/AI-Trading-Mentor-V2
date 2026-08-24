@@ -179,6 +179,8 @@ function showSnapshot(data) {
   inspectorValue(section, "Status", snapshot.status);
   inspectorValue(section, "Source revisions", snapshot.source_count);
   inspectorValue(section, "Coverage", `${data.coverage.processed} processed · ${data.coverage.failed} failed`);
+  const validation = data.validation || {};
+  inspectorValue(section, "Validation", `${validation.extracted || 0} extracted · ${validation.affirmative || 0} affirmative · ${validation.partial || 0} partial · ${validation.ambiguous || 0} ambiguous · ${validation.unsupported || 0} unsupported · ${validation.needs_broader_context || 0} broader-context · ${validation.excluded || 0} excluded · ${validation.unresolved || 0} unresolved`);
   inspectorValue(section, "Compiler", data.compiler.model_version);
   inspectorValue(section, "Schema", data.compiler.schema_version);
   inspectorValue(section, "Candidate gate", data.candidate_gate?.status || "Not checked");

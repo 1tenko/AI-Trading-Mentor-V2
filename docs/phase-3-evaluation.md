@@ -187,3 +187,14 @@ call, token, and latency distribution; record the active source count and the
 explicit extrapolation assumptions. Keep uncertainty as a range or scenario
 table rather than inventing a single precise number. The pilot result still
 requires Theo's separate review before any full-corpus assimilation.
+
+## Candidate readiness correction
+
+Candidate readiness distinguishes a rejected extracted record from a failed
+candidate. Only an affirmatively supported semantic-validation outcome creates
+an active `source_extracted_claim`; partial, ambiguous, unsupported, and
+needs-broader-context outcomes remain in the audit and are excluded by default.
+They do not create artificial unresolved records or fail a candidate merely by
+existing. Extraction or validation errors, coverage/anchor/dependency/lineage
+failures, an empty validated candidate, remote setup failures, and later
+synthesis/publication failures remain candidate-level blockers.

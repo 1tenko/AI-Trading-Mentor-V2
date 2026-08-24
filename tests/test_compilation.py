@@ -47,7 +47,8 @@ def revision_for(storage: Storage, identity_key: str) -> SourceRevision:
 
 
 def candidate(
-    storage: Storage, run_id: str, revisions: list[SourceRevision], *, record_gate: bool = True
+    storage: Storage, run_id: str, revisions: list[SourceRevision], *, record_gate: bool = True,
+    seed_record: bool = True,
 ) -> CorpusSnapshot:
     run = CompilationRun(run_id, "test-model", "prompt-v1", "schema-v1", 1_700_000_000.0)
     snapshot = CorpusSnapshot.create(
@@ -58,10 +59,23 @@ def candidate(
         created_at=1_700_000_001.0,
     )
     storage.create_compilation_candidate(run, snapshot)
+    first = revisions[0]
+    if seed_record:
+        storage.store_derived_record(Claim.create(
+            snapshot_id=snapshot.snapshot_id,
+            anchors=(f"anc_candidate_{run_id}",),
+            dependencies=(RecordDependency("source_revision", first.revision_id),),
+            validation_state="validated",
+            lifecycle_state="active",
+            qualification="Synthetic candidate support.",
+            subject="candidate",
+            predicate="supports",
+            object="publication",
+        ))
     if record_gate:
         storage.record_candidate_gate(
             snapshot.snapshot_id,
-            tuple(SourceProcessingResult(revision.revision_id, "processed", 0) for revision in revisions),
+            tuple(SourceProcessingResult(revision.revision_id, "processed", int(revision == first)) for revision in revisions),
             checked_at=1_700_000_002.0,
         )
     return snapshot
@@ -322,17 +336,20 @@ def test_publication_requires_a_persisted_passing_candidate_gate(tmp_path):
         storage.transition_snapshot(failed_source.snapshot_id, "published")
 
 
-def test_candidate_gate_accepts_processed_zero_records_but_rejects_duplicate_active_revisions(tmp_path):
+def test_candidate_gate_rejects_processed_zero_records_but_rejects_duplicate_active_revisions(tmp_path):
     storage = Storage(tmp_path / "mentor.sqlite3")
     storage.initialize()
     first = revision_for(storage, "source_zero")
-    zero = candidate(storage, "run_gate_zero", [first], record_gate=False)
+    zero = candidate(storage, "run_gate_zero", [first], record_gate=False, seed_record=False)
 
     assert storage.record_candidate_gate(
         zero.snapshot_id,
         (SourceProcessingResult(first.revision_id, "processed", 0),),
         checked_at=1_700_000_002.0,
-    ) == CandidateGateResult(zero.snapshot_id, "passed", 1_700_000_002.0, None)
+    ) == CandidateGateResult(
+        zero.snapshot_id, "failed", 1_700_000_002.0,
+        "candidate contains no validated derived records",
+    )
     with storage._connect() as connection:
         gate_shape = connection.execute(
             "SELECT structural_version, record_count, record_fingerprint FROM candidate_gates WHERE snapshot_id = ?",
@@ -421,6 +438,7 @@ def test_derived_record_writes_are_sealed_outside_building_candidates(tmp_path, 
         storage.transition_snapshot(replacement.snapshot_id, "validating")
         storage.transition_snapshot(replacement.snapshot_id, "published")
 
+    existing_records = storage.derived_records(snapshot.snapshot_id, include_stale=True)
     record = Claim.create(
         snapshot_id=snapshot.snapshot_id,
         anchors=("anc_sealed",),
@@ -446,7 +464,7 @@ def test_derived_record_writes_are_sealed_outside_building_candidates(tmp_path, 
                 (f"rec_bypass_{state}", snapshot.snapshot_id),
             )
 
-    assert storage.derived_records(snapshot.snapshot_id, include_stale=True) == []
+    assert storage.derived_records(snapshot.snapshot_id, include_stale=True) == existing_records
     if state == "published":
         assert storage.current_snapshot() == storage.snapshot(snapshot.snapshot_id)
 
