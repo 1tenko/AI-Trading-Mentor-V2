@@ -69,6 +69,53 @@ strip.
 All of this coverage is synthetic/local. It performs no OpenAI request, vector
 mutation, paid compilation, or production-runtime migration.
 
+## Pre-Gate 1 remediation round 2
+
+The second deterministic review closure remains inside Tasks 1-19. The strict
+source-extraction schema now uses explicit closed unions whose object fields are
+all required (nullable where absence is meaningful). A local check through the
+installed OpenAI Python SDK 2.54.0 strict-schema conversion leaves the schema
+unchanged, so the request shape is tested against the SDK behavior used by this
+workspace without making a network request.
+
+Typed extraction, validation, persistence, and reconciliation now carry a
+generic expanded relationship vocabulary plus explicit procedure prerequisites,
+conditions, and branches. Extracted aliases are sent through the independent
+raw-span semantic validator and are retained only after affirmative validation;
+unvalidated extractor aliases cannot enter a candidate concept.
+
+Reconciliation no longer has a 64-record whole-candidate bottleneck. It builds
+deterministic semantic/alias affinity components, bounded primary batches,
+affinity bridges for related concepts split across batches, and global boundary
+bridges that connect the complete batch graph. Each call remains bounded, the
+candidate and call-plan safety ceilings remain explicit, every input record is
+accounted for, and no whole corpus is placed in one prompt.
+
+Validated concept labels, aliases, scopes, support counts, and occurrence
+summaries are included in bounded derived orientation artifacts and in the
+transient Mentor orientation tool output. The read-only Inspector renders the
+same safe summaries and human-verifiable anchor locations while hiding concept,
+record, revision, snapshot, hash, and dependency identifiers from its visible
+presentation. Raw transcript text and native citation authority remain outside
+the derived orientation layer.
+
+Candidate input now rejects two revisions for one logical source before file or
+model work. Reuse is permitted only when the published snapshot's compiler
+model, prompt, and schema versions exactly match the new run. Live Sol pricing
+for extraction, validation, and reconciliation is preflighted before source
+preparation, candidate reservation, or the first paid stage call.
+
+The final browser smoke also found and fixed a compact diagnostics grid that
+could expand the chat beyond the viewport. At desktop width the 248px left
+sidebar and centered 760px composer remain intact. At 390px the chat,
+diagnostics, controls, composer, and Inspector remain within the viewport; the
+Inspector concept summaries are readable, static assets return HTTP 200, and
+the isolated browser reports no console errors or failed requests.
+
+This round used only synthetic fixtures, temporary SQLite runtimes, the local
+SDK, and an isolated loopback browser. It did not read the Jacob corpus, modify
+the real migrated runtime, call OpenAI, mutate a vector store, or run Gate 1.
+
 A failed case is retained as a failure type while its exception message and
 private output are discarded. Baseline comparison requires the same ordered
 case IDs/categories on both sides.
