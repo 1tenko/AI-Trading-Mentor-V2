@@ -8,11 +8,20 @@
   </head>
   <body>
     <div class="app">
-      <aside class="sidebar" aria-label="Conversations"><div class="brand">Theo's Trading Mentor</div><button class="new-thread" id="new-thread" type="button">+ New conversation</button><nav id="threads" aria-label="Saved conversations"></nav></aside>
+      <aside class="sidebar" aria-label="Conversations"><div class="brand">Theo's Trading Mentor</div><button class="new-thread" id="new-thread" type="button">+ New conversation</button><nav id="threads" aria-label="Saved conversations"></nav><button class="inspector-toggle" id="inspector-toggle" type="button" aria-pressed="false">Assimilation inspector</button></aside>
       <main class="chat" aria-label="Mentor conversation">
         <header class="chat-header"><div class="header-content"><div><h1>Jacob Speculates mentor</h1><p class="subtitle">Private, source-grounded Trading Mentor</p></div><div class="controls" role="group" aria-label="Research and reasoning controls"><label>Research<select id="research-depth"><option value="auto">Auto</option><option value="normal">Normal</option><option value="deep">Deep</option><option value="exhaustive">Exhaustive</option></select></label><label>Effort<select id="reasoning-effort"><option value="high">High</option><option value="xhigh">XHigh</option><option value="max">Max</option></select></label><label>Mode<select id="reasoning-mode"><option value="standard">Standard</option><option value="pro">Pro</option></select></label></div></div></header>
         <div class="conversation" id="messages" aria-live="polite"><p class="empty">Ask a question to start a private, source-grounded evaluation.</p></div>
         <div class="composer-wrap"><form class="composer" id="question-form"><label for="question" class="subtitle">Ask about Jacob's trading teaching</label><textarea id="question" required maxlength="8000" placeholder="Ask a specific trading question…"></textarea><div class="composer-footer"><p id="status" role="status"></p><button class="send" type="submit">Send</button></div></form></div>
+      </main>
+      <main class="inspector" id="inspector" aria-label="Read-only assimilation inspector" hidden>
+        <header class="inspector-header"><div><h1>Assimilation inspector</h1><p class="subtitle">Read-only derived knowledge and its raw-source anchors.</p></div><button id="inspector-close" type="button">Back to chat</button></header>
+        <div class="inspector-content">
+          <p class="inspector-status" id="inspector-status" role="status">Open the inspector to view the current knowledge snapshot.</p>
+          <section id="inspector-overview" aria-label="Knowledge snapshots"></section>
+          <section id="inspector-detail" aria-label="Derived record details"></section>
+          <section id="inspector-audit" aria-label="Conversation orientation audit"></section>
+        </div>
       </main>
     </div>
     <script src="/vendor/purify.min.js"></script><script type="module" src="/app.js"></script>

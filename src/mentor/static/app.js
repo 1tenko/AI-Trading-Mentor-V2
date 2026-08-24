@@ -9,10 +9,214 @@ const send = form.querySelector("button[type=submit]");
 const effort = document.querySelector("#reasoning-effort");
 const mode = document.querySelector("#reasoning-mode");
 const researchDepth = document.querySelector("#research-depth");
+const inspector = document.querySelector("#inspector");
+const inspectorToggle = document.querySelector("#inspector-toggle");
+const inspectorClose = document.querySelector("#inspector-close");
+const inspectorStatus = document.querySelector("#inspector-status");
+const inspectorOverview = document.querySelector("#inspector-overview");
+const inspectorDetail = document.querySelector("#inspector-detail");
+const inspectorAudit = document.querySelector("#inspector-audit");
+const chat = document.querySelector(".chat");
 const SETTINGS_KEY = "trading-mentor-evaluation-settings";
 const ACTIVE_THREAD_KEY = "trading-mentor-active-thread";
 const CONTINUE_PROMPT = "Continue the previous response from where it stopped. Do not repeat completed material.";
 let activeThreadId;
+
+function inspectorSection(title, className = "") {
+  const section = document.createElement("section");
+  section.className = `inspector-section ${className}`.trim();
+  const heading = document.createElement("h2");
+  heading.textContent = title;
+  section.append(heading);
+  return section;
+}
+
+function inspectorValue(container, name, value) {
+  const row = document.createElement("div");
+  row.className = "inspector-value";
+  const label = document.createElement("strong");
+  label.textContent = name;
+  const detail = document.createElement("span");
+  detail.textContent = value == null || value === "" ? "Not recorded" : String(value);
+  row.append(label, detail);
+  container.append(row);
+}
+
+function inspectorList(container, values, empty = "None recorded.") {
+  if (!values?.length) {
+    const message = document.createElement("p");
+    message.className = "inspector-empty";
+    message.textContent = empty;
+    container.append(message);
+    return;
+  }
+  const list = document.createElement("ul");
+  values.forEach((value) => {
+    const item = document.createElement("li");
+    item.textContent = typeof value === "string" ? value : JSON.stringify(value);
+    list.append(item);
+  });
+  container.append(list);
+}
+
+function inspectorTimestamp(start, end) {
+  if (!Number.isInteger(start) || !Number.isInteger(end)) return "Range not recorded";
+  return `${formatSeconds(start / 1000)}–${formatSeconds(end / 1000)}`;
+}
+
+function setInspectorOpen(open) {
+  inspector.hidden = !open;
+  chat.hidden = open;
+  inspectorToggle.setAttribute("aria-pressed", String(open));
+  if (open) loadInspector().catch(() => showInspectorError("Could not load the assimilation inspector."));
+}
+
+function showInspectorError(message) {
+  inspectorStatus.textContent = message;
+  inspectorOverview.replaceChildren();
+  inspectorDetail.replaceChildren();
+  inspectorAudit.replaceChildren();
+}
+
+async function inspectorJson(path) {
+  const response = await fetch(path);
+  if (!response.ok) throw new Error("Inspector request failed.");
+  return response.json();
+}
+
+function showInspectorOverview(data) {
+  inspectorOverview.replaceChildren();
+  const overview = inspectorSection("Knowledge library");
+  const collections = data.collections || [];
+  inspectorValue(overview, "Collections", collections.map((item) => item.display_name).join(", ") || "None");
+  inspectorValue(overview, "Published snapshot", data.current_snapshot?.snapshot_id || "None published");
+  inspectorValue(overview, "Pending source changes", data.pending_source_changes?.length || "None");
+  inspectorOverview.append(overview);
+
+  const snapshots = inspectorSection("Snapshots");
+  const rows = document.createElement("div");
+  rows.className = "inspector-snapshots";
+  (data.snapshots || []).forEach((snapshot) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = `inspector-snapshot inspector-snapshot--${snapshot.status}`;
+    button.textContent = `${snapshot.status === "published" ? "Current" : snapshot.status} · ${snapshot.snapshot_id}`;
+    button.addEventListener("click", () => loadSnapshot(snapshot.snapshot_id).catch(() => showInspectorError("Could not load this snapshot.")));
+    rows.append(button);
+  });
+  if (!rows.childElementCount) inspectorList(snapshots, [], "No compiled snapshots are available yet.");
+  else snapshots.append(rows);
+  inspectorOverview.append(snapshots);
+}
+
+function showSnapshot(data) {
+  inspectorDetail.replaceChildren();
+  const snapshot = data.snapshot;
+  const section = inspectorSection("Snapshot status");
+  inspectorValue(section, "Snapshot", snapshot.snapshot_id);
+  inspectorValue(section, "Status", snapshot.status);
+  inspectorValue(section, "Source revisions", snapshot.source_count);
+  inspectorValue(section, "Coverage", `${data.coverage.processed} processed · ${data.coverage.failed} failed`);
+  inspectorValue(section, "Compiler", data.compiler.model_version);
+  inspectorValue(section, "Schema", data.compiler.schema_version);
+  inspectorValue(section, "Candidate gate", data.candidate_gate?.status || "Not checked");
+  const staleRecordIds = data.stale_record_ids;
+  if (staleRecordIds?.length) inspectorValue(section, "Stale records", staleRecordIds.length);
+  inspectorDetail.append(section);
+
+  const records = inspectorSection("Derived records", "inspector--derived");
+  const list = document.createElement("div");
+  list.className = "inspector-records";
+  (data.records || []).forEach((record) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "inspector-record";
+    button.textContent = `Derived record · ${record.family} · ${record.provenance_label}${record.stale ? " · stale" : ""}`;
+    button.addEventListener("click", () => loadRecord(snapshot.snapshot_id, record.record_id).catch(() => showInspectorError("Could not load this derived record.")));
+    list.append(button);
+  });
+  if (!list.childElementCount) inspectorList(records, [], "This snapshot has no derived records.");
+  else records.append(list);
+  inspectorDetail.append(records);
+}
+
+function showRecord(data) {
+  inspectorDetail.replaceChildren();
+  const record = inspectorSection("Derived record", "inspector--derived");
+  inspectorValue(record, "Family", data.family);
+  inspectorValue(record, "Classification", data.provenance_label);
+  inspectorValue(record, "Evidence state", data.evidence_state);
+  inspectorValue(record, "Validation", data.validation_state);
+  inspectorValue(record, "Lifecycle", `${data.lifecycle_state}${data.stale ? " · stale" : ""}`);
+  inspectorValue(record, "Qualification", data.qualification);
+  Object.entries(data.content || {}).forEach(([name, value]) => inspectorValue(record, name.replaceAll("_", " "), Array.isArray(value) ? value.join(", ") : value));
+  inspectorDetail.append(record);
+
+  const anchors = inspectorSection("Raw source anchors");
+  (data.anchors || []).forEach((anchor) => {
+    const item = document.createElement("article");
+    item.className = "inspector-anchor";
+    inspectorValue(item, "Raw source anchor", `${anchor.author || "Unknown author"} · ${anchor.course || "Unknown course"}`);
+    inspectorValue(item, "Lesson", anchor.lesson_title || anchor.filename);
+    inspectorValue(item, "Year", anchor.year);
+    inspectorValue(item, "Timestamp", inspectorTimestamp(anchor.timestamp_start_ms, anchor.timestamp_end_ms));
+    inspectorValue(item, "Source revision", anchor.revision_sha256);
+    anchors.append(item);
+  });
+  if (!data.anchors?.length) inspectorList(anchors, [], "No safe raw-source anchors are available for this record.");
+  inspectorDetail.append(anchors);
+
+  const context = inspectorSection("Relationships, evolution, and uncertainty");
+  inspectorValue(context, "Concept", data.concept_id);
+  inspectorList(context, data.dependencies?.map((item) => `${item.kind}: ${item.identifier}`), "No dependencies recorded.");
+  inspectorDetail.append(context);
+}
+
+function showAudit(data) {
+  inspectorAudit.replaceChildren();
+  const audit = inspectorSection("Current conversation orientation audit");
+  if (!activeThreadId) {
+    inspectorList(audit, [], "Select a conversation in chat to inspect its orientation audit.");
+  } else {
+    inspectorValue(audit, "Conversation", data.thread_id);
+    (data.turns || []).forEach((turn) => {
+      const context = turn.knowledge_context || {};
+      const item = document.createElement("article");
+      item.className = "inspector-audit-turn";
+      inspectorValue(item, `Turn ${turn.turn_number}`, context.status || "Not used");
+      inspectorValue(item, "Snapshot", context.snapshot_id);
+      inspectorValue(item, "Derived records", context.record_count);
+      inspectorList(item, context.record_ids, "No derived record IDs were retained for this turn.");
+      inspectorValue(item, "Budget", context.budget ? `${context.used_tokens ?? 0}/${context.budget.max_tokens ?? "?"} tokens` : "Not recorded");
+      audit.append(item);
+    });
+    if (!data.turns?.length) inspectorList(audit, [], "No orientation audit has been recorded for this conversation.");
+  }
+  inspectorAudit.append(audit);
+}
+
+async function loadSnapshot(snapshotId) {
+  inspectorStatus.textContent = "Loading snapshot…";
+  showSnapshot(await inspectorJson(`/api/knowledge/snapshots/${snapshotId}`));
+  inspectorStatus.textContent = "Read-only snapshot loaded.";
+}
+
+async function loadRecord(snapshotId, recordId) {
+  inspectorStatus.textContent = "Loading derived record…";
+  showRecord(await inspectorJson(`/api/knowledge/snapshots/${snapshotId}/records/${recordId}`));
+  inspectorStatus.textContent = "Read-only derived record loaded.";
+}
+
+async function loadInspector() {
+  inspectorStatus.textContent = "Loading read-only assimilation data…";
+  const overview = await inspectorJson("/api/knowledge");
+  showInspectorOverview(overview);
+  if (overview.current_snapshot?.snapshot_id) await loadSnapshot(overview.current_snapshot.snapshot_id);
+  else inspectorDetail.replaceChildren();
+  if (activeThreadId) showAudit(await inspectorJson(`/api/knowledge/threads/${activeThreadId}/orientation`));
+  else showAudit({ turns: [] });
+  inspectorStatus.textContent = "Read-only assimilation inspector.";
+}
 
 function showEmpty() {
   messages.replaceChildren();
@@ -448,6 +652,8 @@ async function sendMessage(text, showUser = true) {
 }
 
 document.querySelector("#new-thread").addEventListener("click", () => createThread().catch((error) => { status.textContent = error.message; }));
+inspectorToggle.addEventListener("click", () => setInspectorOpen(true));
+inspectorClose.addEventListener("click", () => setInspectorOpen(false));
 form.addEventListener("submit", async (event) => {
   event.preventDefault();
   const text = question.value.trim();

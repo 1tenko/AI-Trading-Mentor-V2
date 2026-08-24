@@ -626,7 +626,7 @@ def test_server_serves_the_persistent_chat_controls(tmp_path):
         assert b"Assimilated orientation" in script
         assert b"knowledge_context" in script
         assert b"Orientation unavailable" in script
-        assert b"record_ids" not in script
+        assert b"turn.knowledge_context.record_ids" not in script
         assert b"anchor_ids" not in script
         assert b'event.type === "error"' in script
         assert b"Mentor unavailable. You can retry." in script
@@ -635,6 +635,36 @@ def test_server_serves_the_persistent_chat_controls(tmp_path):
         assert b"overflow-wrap: normal" in stylesheet
         assert b".markdown-table-scroll { margin: 1rem 0; max-width: 100%; overflow-x: auto; width: 100%; }" in stylesheet
         assert b"#threads { min-width: 0;" in stylesheet
+    finally:
+        server.shutdown()
+        worker.join()
+
+
+def test_server_serves_a_read_only_assimilation_inspector_shell(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    server = create_server(storage, FakeChatService(), port=0)
+    worker = threading.Thread(target=server.serve_forever)
+    worker.start()
+    try:
+        status, _, page = request(server, "GET", "/")
+        assert status == 200
+        assert b'id="inspector-toggle"' in page
+        assert b'id="inspector"' in page
+        assert b"Read-only assimilation inspector" in page
+        status, _, script = request(server, "GET", "/app.js")
+        assert status == 200
+        assert b'inspectorJson("/api/knowledge")' in script
+        assert b"/api/knowledge/snapshots/${snapshotId}" in script
+        assert b"/api/knowledge/threads/${activeThreadId}/orientation" in script
+        assert b"Derived record" in script
+        assert b"Raw source anchor" in script
+        assert b"Upload" not in script
+        assert b"source manager" not in script
+        status, _, stylesheet = request(server, "GET", "/app.css")
+        assert b".inspector" in stylesheet
+        assert b".inspector--derived" in stylesheet
+        assert b"[hidden] { display: none !important; }" in stylesheet
     finally:
         server.shutdown()
         worker.join()
