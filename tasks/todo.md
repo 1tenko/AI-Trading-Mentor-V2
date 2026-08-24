@@ -83,7 +83,7 @@ Stay on feature/phase-3-knowledge-assimilation. Do not begin Phase 4.
 
 ## candidate-compilation-orchestration
 
-- [ ] **Task 15 — End-to-end candidate compilation orchestrator**
+- [x] **Task 15 — End-to-end candidate compilation orchestrator**
   - Depends on: Checkpoint D. Verify: fake-service candidate success/failure,
     stale-record, bounded-artifact, unpublished-state, and metric-aggregation
     tests; full pytest; no network calls.
