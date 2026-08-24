@@ -49,9 +49,34 @@ class ReconciliationCoverage:
 
 
 @dataclass(frozen=True)
+class ReconciliationSource:
+    """Safe registry metadata used to ground source-set and chronology claims."""
+
+    revision_id: str
+    collection_id: str
+    source_id: str
+    author: str
+    course: str
+    lesson_title: str
+    year: int
+    original_filename: str
+
+    @property
+    def coverage_id(self) -> str:
+        return _source_coverage((self.revision_id,), {self.revision_id: self})[0]
+
+
+@dataclass(frozen=True)
 class _ReconciliationBatch:
     records: tuple[DerivedRecord, ...]
     kind: str
+
+
+@dataclass(frozen=True)
+class _ClusterSummary:
+    representative: DerivedRecord
+    covered_records: tuple[DerivedRecord, ...]
+    conclusions: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -110,6 +135,10 @@ class SynthesisReconciler:
         self._live_mode = live_mode
         self.preflight_live_pricing()
 
+    @property
+    def provenance(self) -> CompilerProvenance:
+        return self._provenance
+
     def preflight_live_pricing(self) -> None:
         if self._provenance.model_version == SOL_MODEL:
             if not self._live_mode or self._pricing is None:
@@ -122,6 +151,7 @@ class SynthesisReconciler:
         snapshot_id: str,
         records: Sequence[DerivedRecord],
         revisions: Sequence[object],
+        source_metadata: Sequence[ReconciliationSource],
         anchor_spans: dict[str, str],
         hints: Sequence[ConceptHint] = (),
     ) -> SynthesisResult:
@@ -150,13 +180,24 @@ class SynthesisReconciler:
         }
         if None in known_revisions or len(known_revisions) != len(revision_values):
             raise ValueError("synthesis revisions require unique immutable IDs")
-        batches = _reconciliation_batches(record_values, self._max_records_per_call, hint_values)
-        if len(batches) > self._max_calls:
+        canonical_sources = _canonical_reconciliation_sources(
+            revision_values, tuple(source_metadata)
+        )
+        primary_batches = _reconciliation_batches(
+            record_values, self._max_records_per_call, hint_values
+        )
+        if _hierarchical_call_count(len(primary_batches), self._max_records_per_call) > self._max_calls:
             raise ValueError("reconciliation call plan exceeds the bounded safety limit")
         synthesized_by_id: dict[str, DerivedRecord] = {}
         hints: list[ConceptHint] = []
         usage = CallUsage()
-        for planned_batch in batches:
+        call_count = 0
+
+        def reconcile_batch(
+            planned_batch: _ReconciliationBatch,
+            prior_summaries: tuple[_ClusterSummary, ...] = (),
+        ) -> tuple[tuple[DerivedRecord, ...], tuple[ConceptHint, ...]]:
+            nonlocal call_count, usage
             batch = planned_batch.records
             batch_record_ids = tuple(record.record_id for record in batch)
             batch_anchor_ids = tuple(
@@ -175,6 +216,21 @@ class SynthesisReconciler:
             missing_spans = set(batch_anchor_ids).difference(anchor_spans)
             if missing_spans:
                 raise ValueError("synthesis is missing a required bounded anchor span")
+            context_records = tuple(dict.fromkeys(
+                record
+                for summary in prior_summaries
+                for record in summary.covered_records
+            )) or batch
+            context_record_ids = tuple(record.record_id for record in context_records)
+            context_anchor_ids = tuple(dict.fromkeys(
+                anchor for record in context_records for anchor in record.anchors
+            ))
+            context_revision_ids = tuple(dict.fromkeys(
+                dependency.identifier
+                for record in context_records
+                for dependency in record.dependencies
+                if dependency.kind == "source_revision"
+            ))
             response = self._client.responses.create(
                 model=self._provenance.model_version,
                 store=False,
@@ -191,6 +247,13 @@ class SynthesisReconciler:
                         "reconciliation_batch": {"kind": planned_batch.kind},
                         "records": [asdict(record) for record in batch],
                         "revision_ids": list(batch_revision_ids),
+                        "sources": [
+                            asdict(canonical_sources[revision_id])
+                            for revision_id in batch_revision_ids
+                        ],
+                        "prior_cluster_summaries": [
+                            _cluster_summary_payload(summary) for summary in prior_summaries
+                        ],
                         "supporting_spans": {
                             anchor_id: anchor_spans[anchor_id] for anchor_id in batch_anchor_ids
                         },
@@ -227,6 +290,10 @@ class SynthesisReconciler:
                     record_ids=batch_record_ids,
                     anchor_ids=batch_anchor_ids,
                     revision_ids=batch_revision_ids,
+                    source_metadata=canonical_sources,
+                    context_record_ids=context_record_ids,
+                    context_anchor_ids=context_anchor_ids,
+                    context_revision_ids=context_revision_ids,
                 )
                 for payload in output
             )
@@ -239,15 +306,43 @@ class SynthesisReconciler:
                 if hint.record_id in {record.record_id for record in new_records}
             )
             usage = _sum_usage(usage, usage_from_response(response, pricing=self._pricing))
+            call_count += 1
             if len(synthesized_by_id) > self._max_total_records:
                 raise ValueError("batched synthesis exceeded the candidate output limit")
-        primary_batches = tuple(batch for batch in batches if batch.kind == "primary")
-        bridge_batches = tuple(batch for batch in batches if batch.kind != "primary")
+            return batch_records, tuple(
+                hint for hint in hints[-len(hint_payloads):]
+                if hint.record_id in {record.record_id for record in batch_records}
+            ) if hint_payloads else ()
+
+        summaries: list[_ClusterSummary] = []
+        for planned_batch in primary_batches:
+            batch_records, _batch_hints = reconcile_batch(planned_batch)
+            summaries.append(_cluster_summary(planned_batch.records, batch_records))
+
+        reduction_round = 0
+        bridge_call_count = 0
+        while len(summaries) > 1:
+            reduction_round += 1
+            reduced: list[_ClusterSummary] = []
+            for start in range(0, len(summaries), self._max_records_per_call):
+                children = tuple(summaries[start : start + self._max_records_per_call])
+                if len(children) == 1:
+                    reduced.append(children[0])
+                    continue
+                planned = _ReconciliationBatch(
+                    tuple(child.representative for child in children),
+                    f"hierarchical_reduction_{reduction_round}",
+                )
+                batch_records, _batch_hints = reconcile_batch(planned, children)
+                reduced.append(_merged_cluster_summary(children, batch_records))
+                bridge_call_count += 1
+            summaries = reduced
+
         covered_record_ids = tuple(sorted({
             record.record_id for batch in primary_batches for record in batch.records
         }))
         coverage = ReconciliationCoverage(
-            len(record_values), covered_record_ids, len(primary_batches), len(bridge_batches)
+            len(record_values), covered_record_ids, len(primary_batches), bridge_call_count
         )
         if not coverage.complete or set(covered_record_ids) != {
             record.record_id for record in record_values
@@ -255,7 +350,7 @@ class SynthesisReconciler:
             raise ValueError("reconciliation coverage is incomplete")
         return SynthesisResult(
             tuple(synthesized_by_id.values()), self._provenance, usage, tuple(hints),
-            call_count=len(batches), coverage=coverage,
+            call_count=call_count, coverage=coverage,
         )
 
 
@@ -287,19 +382,25 @@ def _synthesis_record(
     record_ids: tuple[str, ...],
     anchor_ids: tuple[str, ...],
     revision_ids: tuple[str, ...],
+    source_metadata: dict[str, ReconciliationSource],
+    context_record_ids: tuple[str, ...],
+    context_anchor_ids: tuple[str, ...],
+    context_revision_ids: tuple[str, ...],
 ) -> DerivedRecord:
     if not isinstance(payload, dict) or not isinstance(payload.get("family"), str):
         raise ValueError("synthesis record must be a typed object")
     family = payload["family"]
-    anchors = _required_reference_ids(payload, "anchors", anchor_ids)
+    anchors = tuple(dict.fromkeys(
+        _required_reference_ids(payload, "anchors", anchor_ids) + context_anchor_ids
+    ))
     inputs = _required_reference_ids(payload, "input_record_ids", record_ids)
     sources = _required_reference_ids(payload, "source_revision_ids", revision_ids)
     common = {
         "snapshot_id": snapshot_id,
         "anchors": anchors,
         "dependencies": tuple(
-            [*(RecordDependency("source_revision", value) for value in sources),
-             *(RecordDependency("derived_record", value) for value in inputs)]
+            [*(RecordDependency("source_revision", value) for value in dict.fromkeys(sources + context_revision_ids)),
+             *(RecordDependency("derived_record", value) for value in dict.fromkeys(inputs + context_record_ids))]
         ),
         "validation_state": "validated",
         "lifecycle_state": "active",
@@ -341,6 +442,13 @@ def _synthesis_record(
         _allow_synthesis_fields(payload, fields)
         earlier = _required_reference_ids(payload, "earlier_source_set", revision_ids)
         later = _required_reference_ids(payload, "later_source_set", revision_ids)
+        earlier_coverage = _source_coverage(earlier, source_metadata)
+        later_coverage = _source_coverage(later, source_metadata)
+        if (
+            payload.get("classification") not in {"apparently_contradictory", "uncertain_chronology", "no_supported_classification"}
+            and max(earlier_coverage[1]) > min(later_coverage[1])
+        ):
+            raise ValueError("evolution chronology conflicts with canonical source years")
         dependencies = tuple(dict.fromkeys(common["dependencies"] + tuple(
             RecordDependency("source_revision", value) for value in earlier + later
         )))
@@ -354,10 +462,10 @@ def _synthesis_record(
             classification=payload.get("classification"),
             negative_evidence_state=payload.get("negative_evidence_state"),
             competing_anchors=_optional_reference_ids(payload, "competing_anchors", anchor_ids),
-            earlier_coverage_id=payload.get("earlier_coverage_id"),
-            later_coverage_id=payload.get("later_coverage_id"),
-            earlier_observed_years=_payload_years(payload.get("earlier_observed_years")),
-            later_observed_years=_payload_years(payload.get("later_observed_years")),
+            earlier_coverage_id=earlier_coverage[0],
+            later_coverage_id=later_coverage[0],
+            earlier_observed_years=earlier_coverage[1],
+            later_observed_years=later_coverage[1],
             deprecation_evidence_anchors=_optional_reference_ids(
                 payload, "deprecation_evidence_anchors", anchor_ids
             ),
@@ -384,6 +492,62 @@ def _synthesis_record(
             unresolved_questions=_payload_texts(payload.get("unresolved_questions"), allow_empty=True),
         )
     raise ValueError("synthesis returned an unsupported typed family")
+
+
+def _canonical_reconciliation_sources(
+    revisions: tuple[object, ...], sources: tuple[ReconciliationSource, ...]
+) -> dict[str, ReconciliationSource]:
+    revision_ids = {getattr(revision, "revision_id", None) for revision in revisions}
+    if None in revision_ids or len(sources) != len(revision_ids):
+        raise ValueError("synthesis requires canonical metadata for every revision")
+    result: dict[str, ReconciliationSource] = {}
+    for source in sources:
+        if not isinstance(source, ReconciliationSource) or source.revision_id not in revision_ids:
+            raise ValueError("synthesis source metadata does not match its revisions")
+        if source.revision_id in result:
+            raise ValueError("synthesis source metadata requires unique revisions")
+        if (
+            not all(
+                isinstance(value, str) and value.strip()
+                for value in (
+                    source.collection_id,
+                    source.source_id,
+                    source.author,
+                    source.course,
+                    source.lesson_title,
+                    source.original_filename,
+                )
+            )
+            or isinstance(source.year, bool)
+            or not isinstance(source.year, int)
+            or source.year < 1
+        ):
+            raise ValueError("synthesis source metadata is incomplete")
+        result[source.revision_id] = source
+    if set(result) != revision_ids:
+        raise ValueError("synthesis requires canonical metadata for every revision")
+    return result
+
+
+def _source_coverage(
+    revision_ids: tuple[str, ...], sources: dict[str, ReconciliationSource]
+) -> tuple[str, tuple[int, ...]]:
+    values = tuple(sources[revision_id] for revision_id in sorted(revision_ids))
+    payload = json.dumps(
+        [asdict(value) for value in values], sort_keys=True, separators=(",", ":")
+    )
+    years = tuple(sorted({value.year for value in values}))
+    return f"cov_{sha256(payload.encode()).hexdigest()}", years
+
+
+def source_coverage(
+    revision_ids: tuple[str, ...], sources: Sequence[ReconciliationSource]
+) -> tuple[str, tuple[int, ...]]:
+    """Return the deterministic coverage identity for a registry-grounded source set."""
+    source_map = {source.revision_id: source for source in sources}
+    if len(source_map) != len(tuple(sources)) or not set(revision_ids) <= set(source_map):
+        raise ValueError("coverage source set is not present in canonical metadata")
+    return _source_coverage(revision_ids, source_map)
 
 
 def _synthesis_hints(
@@ -432,7 +596,7 @@ def _reconciliation_batches(
     max_records: int,
     hints: tuple[ConceptHint, ...] = (),
 ) -> tuple[_ReconciliationBatch, ...]:
-    """Build complete bounded primary coverage plus semantic and global bridge passes."""
+    """Build complete bounded primary coverage grouped by semantic affinity."""
     components = _affinity_components(records, hints)
     units: list[tuple[int, tuple[DerivedRecord, ...]]] = []
     for component_index, component in enumerate(components):
@@ -457,53 +621,57 @@ def _reconciliation_batches(
         primary_records.append(tuple(current))
         primary_components.append(current_components)
 
-    bridges: list[_ReconciliationBatch] = []
-    if max_records >= 2:
-        for component_index, component in enumerate(components):
-            containing = [
-                batch
-                for batch, component_ids in zip(primary_records, primary_components)
-                if component_index in component_ids
-            ]
-            representatives = tuple(
-                next(record for record in batch if record in component)
-                for batch in containing
-            )
-            bridges.extend(
-                _hub_bridge_batches(representatives, max_records, "affinity_bridge")
-            )
-
-        # Connect every bounded primary batch into one reconciliation graph.
-        # Affinity-specific bridges above handle a concept that spans batches;
-        # boundary bridges provide complete cross-batch connectivity without
-        # injecting the corpus into one prompt.
-        bridges.extend(
-            _ReconciliationBatch((left[-1], right[0]), "global_bridge")
-            for left, right in zip(primary_records, primary_records[1:])
-        )
-
-    primary = tuple(_ReconciliationBatch(batch, "primary") for batch in primary_records)
-    seen = {tuple(record.record_id for record in batch.records) for batch in primary}
-    deduplicated_bridges = []
-    for bridge in bridges:
-        key = tuple(record.record_id for record in bridge.records)
-        if key not in seen:
-            seen.add(key)
-            deduplicated_bridges.append(bridge)
-    return primary + tuple(deduplicated_bridges)
+    return tuple(_ReconciliationBatch(batch, "primary") for batch in primary_records)
 
 
-def _hub_bridge_batches(
-    representatives: tuple[DerivedRecord, ...], max_records: int, kind: str
-) -> tuple[_ReconciliationBatch, ...]:
-    if len(representatives) < 2:
-        return ()
-    hub = representatives[0]
-    width = max_records - 1
-    return tuple(
-        _ReconciliationBatch((hub, *representatives[start : start + width]), kind)
-        for start in range(1, len(representatives), width)
+def _hierarchical_call_count(primary_count: int, width: int) -> int:
+    calls = primary_count
+    pending = primary_count
+    while pending > 1:
+        full_groups, remainder = divmod(pending, width)
+        calls += full_groups + int(remainder > 1)
+        pending = full_groups + int(bool(remainder))
+    return calls
+
+
+def _cluster_summary(
+    covered_records: tuple[DerivedRecord, ...], outputs: tuple[DerivedRecord, ...]
+) -> _ClusterSummary:
+    conclusions = _compact_conclusions(outputs or covered_records)
+    return _ClusterSummary(covered_records[0], covered_records, conclusions)
+
+
+def _merged_cluster_summary(
+    children: tuple[_ClusterSummary, ...], outputs: tuple[DerivedRecord, ...]
+) -> _ClusterSummary:
+    covered = tuple(dict.fromkeys(
+        record for child in children for record in child.covered_records
+    ))
+    conclusions = _bounded_unique_strings((
+        *(_compact_conclusions(outputs)),
+        *(conclusion for child in children for conclusion in child.conclusions),
+    ))
+    return _ClusterSummary(children[0].representative, covered, conclusions)
+
+
+def _cluster_summary_payload(summary: _ClusterSummary) -> dict[str, object]:
+    covered_ids = tuple(sorted(record.record_id for record in summary.covered_records))
+    return {
+        "covered_record_count": len(covered_ids),
+        "coverage_digest": sha256("\n".join(covered_ids).encode()).hexdigest(),
+        "conclusions": list(summary.conclusions),
+    }
+
+
+def _compact_conclusions(records: Sequence[DerivedRecord]) -> tuple[str, ...]:
+    return _bounded_unique_strings(
+        " | ".join(label for _role, _position, label in _record_occurrence_terms(record))
+        for record in records
     )
+
+
+def _bounded_unique_strings(values: Sequence[str]) -> tuple[str, ...]:
+    return tuple(dict.fromkeys(value[:280] for value in values if value.strip()))[:16]
 
 
 def _affinity_components(

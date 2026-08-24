@@ -13,6 +13,7 @@ from mentor.candidate_compiler import (
     CandidateSource,
     CandidateSourcePreparer,
     MAX_PREPARED_ANCHOR_CHARS,
+    ReconciliationCoverage,
     SynthesisResult,
 )
 from mentor.compilation import CompilationRun, TokenPricing
@@ -93,7 +94,7 @@ class FakeVectorClient:
 
     def attach(self, store_id, **kwargs):
         self.calls.append(("attach", store_id, kwargs))
-        if self.attach_exception is not None:
+        if self.attach_exception is not None and kwargs["file_id"].startswith("file_derived_"):
             raise self.attach_exception
         return SimpleNamespace(
             id=f"vsf_{kwargs['file_id']}",
@@ -135,13 +136,19 @@ class SyntheticSynthesizer:
     def __init__(self, *, stale=False):
         self.stale = stale
         self.calls = []
+        self.provenance = CompilerProvenance(
+            "synthetic-synthesizer", "synthesis-prompt-v1", "synthesis-schema-v1"
+        )
 
-    def synthesize(self, *, snapshot_id, records, revisions, anchor_spans, hints=()):
+    def synthesize(self, *, snapshot_id, records, revisions, source_metadata, anchor_spans, hints=()):
         self.calls.append((snapshot_id, tuple(record.record_id for record in records)))
         assert anchor_spans
-        provenance = CompilerProvenance("synthetic-synthesizer", "synthesis-prompt-v1", "synthesis-schema-v1")
+        provenance = self.provenance
+        coverage = ReconciliationCoverage(
+            len(records), tuple(sorted(record.record_id for record in records)), 1, 0
+        )
         if len(records) < 2:
-            return SynthesisResult((), provenance)
+            return SynthesisResult((), provenance, coverage=coverage)
         first, second = records[:2]
         source_dependencies = tuple(
             RecordDependency("source_revision", revision.revision_id) for revision in revisions
@@ -175,10 +182,10 @@ class SyntheticSynthesizer:
             later_source_set=(revisions[1].revision_id,),
             classification="refined",
             negative_evidence_state="positive_teaching",
-            earlier_coverage_id="coverage_earlier",
-            later_coverage_id="coverage_later",
-            earlier_observed_years=(2025,),
-            later_observed_years=(2026,),
+            earlier_coverage_id=source_metadata[0].coverage_id,
+            later_coverage_id=source_metadata[1].coverage_id,
+            earlier_observed_years=(source_metadata[0].year,),
+            later_observed_years=(source_metadata[1].year,),
         )
         conflict = ConflictUnresolved.create(
             **common,
@@ -190,7 +197,62 @@ class SyntheticSynthesizer:
             relevant_scopes=("synthetic scope",),
             unresolved_questions=("Which synthetic condition applies?",),
         )
-        return SynthesisResult((relationship, evolution, conflict), provenance)
+        return SynthesisResult((relationship, evolution, conflict), provenance, coverage=coverage)
+
+
+class IncompleteCoverageSynthesizer(SyntheticSynthesizer):
+    def synthesize(self, **kwargs):
+        result = super().synthesize(**kwargs)
+        return replace(result, coverage=None)
+
+
+class ClusterSynthesizer:
+    provenance = CompilerProvenance(
+        "synthetic-cluster", "cluster-prompt-v1", "cluster-schema-v1"
+    )
+
+    def __init__(self):
+        self.calls = []
+
+    def synthesize(self, *, snapshot_id, records, revisions, source_metadata, **_kwargs):
+        self.calls.append(tuple(record.subject for record in records))
+        by_revision = {revision.revision_id: revision for revision in revisions}
+        groups = {}
+        for record in records:
+            groups.setdefault(record.subject.split()[0], []).append(record)
+        outputs = []
+        for members in groups.values():
+            if len(members) < 2:
+                continue
+            left, right = members[:2]
+            revision_ids = tuple(dict.fromkeys(
+                dependency.identifier
+                for record in (left, right)
+                for dependency in record.dependencies
+                if dependency.kind == "source_revision"
+            ))
+            assert set(revision_ids) <= set(by_revision)
+            outputs.append(Relationship.create(
+                snapshot_id=snapshot_id,
+                anchors=tuple(dict.fromkeys(left.anchors + right.anchors)),
+                dependencies=tuple(
+                    [*(RecordDependency("source_revision", revision_id) for revision_id in revision_ids),
+                     RecordDependency("derived_record", left.record_id),
+                     RecordDependency("derived_record", right.record_id)]
+                ),
+                validation_state="validated",
+                lifecycle_state="active",
+                qualification="Synthetic cluster relationship.",
+                evidence_state="cross_source_synthesis",
+                compiler_provenance=self.provenance,
+                left=left.subject,
+                relation="supports",
+                right=right.subject,
+            ))
+        coverage = ReconciliationCoverage(
+            len(records), tuple(sorted(record.record_id for record in records)), 1, 0
+        )
+        return SynthesisResult(tuple(outputs), self.provenance, coverage=coverage)
 
 
 class MissingPricingSynthesizer(SyntheticSynthesizer):
@@ -199,9 +261,11 @@ class MissingPricingSynthesizer(SyntheticSynthesizer):
 
 
 class RawClaimBypassSynthesizer:
+    provenance = CompilerProvenance("synthetic", "prompt", "schema")
+
     def synthesize(self, *, snapshot_id, records, revisions, **_kwargs):
         first = records[0]
-        provenance = CompilerProvenance("synthetic", "prompt", "schema")
+        provenance = self.provenance
         return SynthesisResult((Claim.create(
             snapshot_id=snapshot_id,
             anchors=first.anchors,
@@ -417,6 +481,104 @@ def test_replacement_reuses_unaffected_records_and_promotes_only_after_candidate
     assert storage.source_revision(replacement.revision_id).lifecycle_state == "active"
 
 
+def test_selective_rebuild_reconciles_only_affected_cluster_and_keeps_unaffected_synthesis_once(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3", runtime_scope="pilot")
+    storage.initialize()
+    sources = tuple(
+        source_bundle(storage, identity, year)
+        for identity, year in (("A one", 2025), ("A two", 2026), ("B one", 2025), ("B two", 2026))
+    )
+    extraction_outputs = [{"candidates": [{
+        "family": "claim",
+        "anchors": [next(iter(source.anchors))],
+        "qualification": "Synthetic cluster claim.",
+        "subject": source.revision.source_id.split("_")[-1].replace("%20", " "),
+        "predicate": "guides",
+        "object": "bounded context",
+    }]} for source in sources]
+    # Stable explicit labels keep the test independent of source ID encoding.
+    for output, label in zip(extraction_outputs, ("A one", "A two", "B one", "B two")):
+        output["candidates"][0]["subject"] = label
+    first_synthesizer = ClusterSynthesizer()
+    first_compiler = CandidateCompiler(
+        storage=storage,
+        extractor=SourceExtractor(SimpleNamespace(responses=QueueResponses(extraction_outputs))),
+        validation_client=SimpleNamespace(responses=QueueResponses([
+            {"outcome": "affirmatively_supported", "audit": "Synthetic cluster support."}
+            for _source in sources
+        ])),
+        synthesizer=first_synthesizer,
+        vector_stores=VectorStoreAdapter(FakeVectorClient()),
+        orientation_budget=OrientationBudget(max_records=20, max_tokens=10_000),
+        readiness_checks=2,
+        sleep=lambda _seconds: None,
+    )
+    first = first_compiler.build(BuildRequest(
+        CompilationRun("run_clusters_1", "caller", "caller", "caller", 1.0),
+        sources,
+        ArtifactScope.PILOT,
+    ))
+    assert first.ready is True
+    storage.transition_snapshot(first.snapshot.snapshot_id, "published", transitioned_at=2.0)
+
+    replaced = sources[0]
+    library_source = storage.library_source(replaced.revision.source_id)
+    replacement_text = "[00:00:02] Synthetic A replacement teaching."
+    replacement = SourceRevision.create(
+        source=library_source,
+        content_sha256=sha256(replacement_text.encode()).hexdigest(),
+        byte_size=len(replacement_text.encode()),
+        local_locator="C:/synthetic/A-replacement.txt",
+        observed_at=3.0,
+        lifecycle_state="replacement_pending",
+        remote_file_id="file_raw_A_replacement",
+    )
+    storage.store_source_revision(replacement)
+    replacement_anchor = SourceAnchor.create(
+        revision=replacement, transcript=replacement_text,
+        start_offset=0, end_offset=len(replacement_text),
+    )
+    second_synthesizer = ClusterSynthesizer()
+    second_compiler = CandidateCompiler(
+        storage=storage,
+        extractor=SourceExtractor(SimpleNamespace(responses=QueueResponses([{"candidates": [{
+            "family": "claim",
+            "anchors": [replacement_anchor.anchor_id],
+            "qualification": "Synthetic replacement cluster claim.",
+            "subject": "A replacement",
+            "predicate": "guides",
+            "object": "bounded context",
+        }]}]))),
+        validation_client=SimpleNamespace(responses=QueueResponses([{
+            "outcome": "affirmatively_supported", "audit": "Synthetic replacement support."
+        }])),
+        synthesizer=second_synthesizer,
+        vector_stores=VectorStoreAdapter(FakeVectorClient()),
+        orientation_budget=OrientationBudget(max_records=20, max_tokens=10_000),
+        readiness_checks=2,
+        sleep=lambda _seconds: None,
+    )
+    second_sources = (
+        CandidateSource(replacement, replacement_text, {replacement_anchor.anchor_id: replacement_anchor}),
+        *sources[1:],
+    )
+
+    second = second_compiler.build(BuildRequest(
+        CompilationRun("run_clusters_2", "caller", "caller", "caller", 3.0),
+        second_sources,
+        ArtifactScope.PILOT,
+    ))
+
+    assert second.ready is True
+    assert set(second_synthesizer.calls[0]) == {"A replacement", "A two"}
+    b_relationships = [
+        record for record in second.records
+        if isinstance(record, Relationship) and record.left.startswith("B ")
+    ]
+    assert len(b_relationships) == 1
+    assert b_relationships[0].record_id in storage.derived_record_reuse(second.snapshot.snapshot_id)
+
+
 def test_candidate_rejects_two_revisions_of_the_same_logical_source_before_any_stage_call(tmp_path):
     storage, candidate_compiler, request, vector_client = compiler(tmp_path)
     original = request.sources[0]
@@ -486,9 +648,10 @@ def test_changed_compiler_configuration_forces_reextraction_instead_of_record_re
         orientation_budget=OrientationBudget(max_records=12, max_tokens=10_000),
         readiness_checks=2,
         sleep=lambda _seconds: None,
+        validation_model="synthetic-validator-v2",
     )
     changed_request = BuildRequest(
-        run=CompilationRun("run_changed_compiler", "synthetic-v2", "prompt-v2", "schema-v2", 3.0),
+        run=CompilationRun("run_changed_compiler", "synthetic", "prompt-v1", "schema-v1", 3.0),
         sources=first_request.sources,
         artifact_scope=ArtifactScope.PILOT,
     )
@@ -498,6 +661,20 @@ def test_changed_compiler_configuration_forces_reextraction_instead_of_record_re
     assert result.ready is True
     assert len(extraction_responses.calls) == len(first_request.sources)
     assert storage.derived_record_reuse(result.snapshot.snapshot_id) == {}
+    assert result.snapshot.model_version != changed_request.run.model_version
+
+
+def test_candidate_rejects_missing_reconciliation_coverage_before_remote_setup(tmp_path):
+    storage, candidate_compiler, request, vector_client = compiler(
+        tmp_path, synthesizer=IncompleteCoverageSynthesizer()
+    )
+
+    result = candidate_compiler.build(request)
+
+    assert result.ready is False
+    assert any("coverage" in failure for failure in result.failures)
+    assert vector_client.calls == []
+    assert storage.current_snapshot() is None
 
 
 @pytest.mark.parametrize(
@@ -678,9 +855,22 @@ def test_build_composes_a_ready_unpublished_candidate_with_typed_bounded_artifac
         anchor_id for source in request.sources for anchor_id in source.anchors
     }
     assert all("Synthetic earlier teaching" not in str(anchor) for anchor in stored_anchors)
-    assert any(call[0] == "batch" for call in vector_client.calls)
-    raw_batch = next(call for call in vector_client.calls if call[0] == "batch")
-    assert raw_batch[2]["file_ids"] == [source.revision.remote_file_id for source in request.sources]
+    raw_attachments = [
+        call for call in vector_client.calls
+        if call[0] == "attach" and call[1] == result.raw_artifact.store_id
+    ]
+    assert [call[2]["file_id"] for call in raw_attachments] == [
+        source.revision.remote_file_id for source in request.sources
+    ]
+    assert {call[2]["attributes"]["year"] for call in raw_attachments} == {2025, 2026}
+    assert all(
+        {
+            "snapshot_id", "artifact_scope", "status", "collection_id",
+            "source_id", "source", "year", "course", "lesson", "relative_path",
+        } <= set(call[2]["attributes"])
+        for call in raw_attachments
+    )
+    assert all("C:/synthetic" not in str(call[2]["attributes"]) for call in raw_attachments)
     assert len([call for call in vector_client.calls if call[0] == "upload"]) == len(result.orientation_artifacts)
 
 
@@ -731,7 +921,7 @@ def test_remote_readiness_failure_marks_candidate_failed_without_pointer_mutatio
 
     assert result.ready is False
     assert result.snapshot.status == "failed"
-    assert any("derived store" in failure for failure in result.failures)
+    assert any("raw store" in failure for failure in result.failures)
     assert storage.current_snapshot() is None
 
 
@@ -910,7 +1100,10 @@ def test_upload_success_and_attach_failure_retain_partial_remote_audit_and_actua
     derived = next(metric for metric in first.stage_metrics if metric.stage == "derived_store")
     assert (derived.call_count, derived.remote_calls, derived.failure_count) == (2, 2, 1)
     upload = next(operation for operation in audit_after_failure if operation.operation == "upload_file")
-    attach = next(operation for operation in audit_after_failure if operation.operation == "attach_file")
+    attach = next(
+        operation for operation in audit_after_failure
+        if operation.operation == "attach_file" and operation.file_id == upload.file_id
+    )
     assert upload.status == "succeeded"
     assert upload.file_id == "file_derived_1"
     assert attach.status == "failed"

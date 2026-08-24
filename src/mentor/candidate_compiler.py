@@ -1,8 +1,9 @@
 """End-to-end construction of validated, unpublished Phase 3 candidates."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from hashlib import sha256
+import json
 from pathlib import Path
 import time
 from typing import Any, Callable, Mapping
@@ -23,6 +24,10 @@ from mentor.compilation import (
     TokenPricing,
 )
 from mentor.compiler import ExtractionResult, SourceExtractor
+from mentor.compiler_prompts import (
+    SEMANTIC_VALIDATION_PROMPT_VERSION,
+    SEMANTIC_VALIDATION_SCHEMA_VERSION,
+)
 from mentor.dependencies import DependencyGraph
 from mentor.derived_records import (
     Claim,
@@ -38,9 +43,11 @@ from mentor.knowledge import SourceRevision
 from mentor.orientation import OrientationBudget, concept_summaries, render_orientation_artifact
 from mentor.synthesis import (
     ConceptHint,
+    ReconciliationSource,
     ReconciliationCoverage,
     SynthesisCandidate,
     SynthesisResult,
+    source_coverage,
 )
 
 
@@ -204,13 +211,20 @@ class CandidateCompiler:
         if getattr(self._storage, "runtime_scope", None) != scope:
             raise ValueError("candidate artifact scope does not match runtime scope")
         self._preflight_live_pricing()
+        request = replace(request, run=self._bound_compilation_run(request.run))
         if request.revision_ids:
             requested_sources = self._source_preparer.prepare(request.revision_ids)
         sources = _canonical_sources(self._storage, requested_sources)
         for source in sources:
             _validate_candidate_source(source)
         revision_ids, _fingerprint, snapshot_id = CorpusSnapshot.identity_for(
-            request.run.run_id, [source.revision.revision_id for source in sources]
+            request.run.run_id,
+            [source.revision.revision_id for source in sources],
+            compiler_versions=(
+                request.run.model_version,
+                request.run.prompt_version,
+                request.run.schema_version,
+            ),
         )
         existing_run = self._storage.compilation_run(request.run.run_id)
         if existing_run is not None:
@@ -258,9 +272,16 @@ class CandidateCompiler:
         reused_records: tuple[DerivedRecord, ...] = ()
         reused_hints: tuple[ConceptHint, ...] = ()
         reused_revision_ids: set[str] = set()
+        reconciliation_revision_ids = set(snapshot.selected_revision_ids)
         if previous_snapshot is not None and _compiler_config_matches(previous_snapshot, request.run):
             stale_predecessor_revisions = _stale_predecessor_revisions(
                 self._storage, previous_snapshot, sources, request.stale_revision_ids
+            )
+            reconciliation_revision_ids = _selective_reconciliation_revision_ids(
+                self._storage,
+                previous_snapshot,
+                sources,
+                stale_predecessor_revisions,
             )
             record_mapping, reused_records = self._storage.clone_reusable_records(
                 previous_snapshot.snapshot_id,
@@ -416,23 +437,54 @@ class CandidateCompiler:
         hints: tuple[ConceptHint, ...] = reused_hints + tuple(extraction_hints)
         try:
             extracted_records = tuple(self._storage.derived_records(snapshot.snapshot_id, include_stale=True))
+            source_metadata = _reconciliation_sources(self._storage, sources)
+            all_source_extracted = tuple(
+                record for record in extracted_records
+                if record.derived_kind == "source_extracted_claim"
+            )
+            synthesis_inputs = (
+                all_source_extracted
+                if extraction_calls == 0
+                else tuple(
+                    record for record in all_source_extracted
+                    if any(
+                        dependency.kind == "source_revision"
+                        and dependency.identifier in reconciliation_revision_ids
+                        for dependency in record.dependencies
+                    )
+                )
+            )
             if extraction_calls == 0 and reused_records:
                 synthesized = SynthesisResult(
-                    (), CompilerProvenance(
-                        request.run.model_version, request.run.prompt_version, request.run.schema_version
-                    )
+                    (), self._synthesis_provenance(),
+                    coverage=ReconciliationCoverage(
+                        len(synthesis_inputs),
+                        tuple(sorted(record.record_id for record in synthesis_inputs)),
+                        0,
+                        0,
+                    ),
                 )
             else:
                 synthesis_invoked = True
+                synthesis_sources = tuple(
+                    source for source in sources
+                    if source.revision.revision_id in reconciliation_revision_ids
+                )
+                synthesis_metadata = tuple(
+                    item for item in source_metadata
+                    if item.revision_id in reconciliation_revision_ids
+                )
+                synthesis_hints = tuple(
+                    hint for hint in hints
+                    if hint.record_id in {record.record_id for record in synthesis_inputs}
+                )
                 synthesized = self._synthesizer.synthesize(
                     snapshot_id=snapshot.snapshot_id,
-                    records=tuple(
-                        record for record in extracted_records
-                        if record.derived_kind == "source_extracted_claim"
-                    ),
-                    revisions=tuple(source.revision for source in sources),
-                    anchor_spans=_source_anchor_spans(sources),
-                    hints=hints,
+                    records=synthesis_inputs,
+                    revisions=tuple(source.revision for source in synthesis_sources),
+                    source_metadata=synthesis_metadata,
+                    anchor_spans=_source_anchor_spans(synthesis_sources),
+                    hints=synthesis_hints,
                 )
             if not isinstance(synthesized, SynthesisResult):
                 raise ValueError("synthesis stage must return SynthesisResult")
@@ -443,7 +495,9 @@ class CandidateCompiler:
                 synthesized,
                 snapshot.snapshot_id,
                 {anchor_id for source in sources for anchor_id in source.anchors},
+                source_metadata,
             )
+            _validate_reconciliation_coverage(synthesized, synthesis_inputs)
             _validate_candidate_dependencies(
                 extracted_records + synthesized.records,
                 set(snapshot.selected_revision_ids),
@@ -602,31 +656,44 @@ class CandidateCompiler:
         raw_file_ids = tuple(source.revision.remote_file_id for source in sources)
         raw_calls = 0
         try:
-            raw_calls += 1
-            batch_operation = self._storage.begin_candidate_remote_operation(
-                snapshot.snapshot_id,
-                "raw_store",
-                "create_batch",
-                store_id=raw_store.store_id,
-            )
-            batch = None
-            try:
-                batch = self._vector_stores.create_batch(
-                    raw_store.store_id,
-                    list(raw_file_ids),
-                    {"snapshot_id": snapshot.snapshot_id, "artifact_scope": scope, "status": "published"},
+            for source in sources:
+                raw_calls += 1
+                file_id = source.revision.remote_file_id
+                operation = self._storage.begin_candidate_remote_operation(
+                    snapshot.snapshot_id,
+                    "raw_store",
+                    "attach_file",
+                    store_id=raw_store.store_id,
+                    file_id=file_id,
                 )
-                raw_calls += self._await_batch(snapshot.snapshot_id, raw_store.store_id, batch)
-            except Exception:
+                attachment = None
+                try:
+                    attachment = self._vector_stores.attach_file(
+                        raw_store.store_id,
+                        file_id,
+                        _raw_file_attributes(
+                            self._storage, snapshot, request.artifact_scope, source
+                        ),
+                    )
+                    raw_calls += self._await_attachment(
+                        snapshot.snapshot_id,
+                        raw_store.store_id,
+                        file_id,
+                        attachment,
+                        artifact_kind="raw_store",
+                    )
+                except Exception:
+                    self._storage.finish_candidate_remote_operation(
+                        operation,
+                        "failed",
+                        attachment_id=getattr(attachment, "attachment_id", None),
+                    )
+                    raise
                 self._storage.finish_candidate_remote_operation(
-                    batch_operation,
-                    "failed",
-                    batch_id=getattr(batch, "batch_id", None),
+                    operation,
+                    "succeeded",
+                    attachment_id=getattr(attachment, "attachment_id", None),
                 )
-                raise
-            self._storage.finish_candidate_remote_operation(
-                batch_operation, "succeeded", batch_id=batch.batch_id
-            )
         except Exception as error:
             failures.append(f"raw store readiness failed: {error}")
         raw_artifact = RemoteArtifact("raw", request.artifact_scope, raw_store.store_id, raw_file_ids)
@@ -768,6 +835,37 @@ class CandidateCompiler:
                 )
             self._validation_pricing.require_complete("validation")
 
+    def _bound_compilation_run(self, run: CompilationRun) -> CompilationRun:
+        provenances = (
+            self._extractor.provenance,
+            CompilerProvenance(
+                self._validation_model,
+                SEMANTIC_VALIDATION_PROMPT_VERSION,
+                SEMANTIC_VALIDATION_SCHEMA_VERSION,
+            ),
+            self._synthesis_provenance(),
+        )
+        if any(not isinstance(provenance, CompilerProvenance) for provenance in provenances):
+            raise ValueError("candidate compiler stages require immutable provenance")
+        return replace(
+            run,
+            model_version=_aggregate_stage_version(
+                "models", tuple(provenance.model_version for provenance in provenances)
+            ),
+            prompt_version=_aggregate_stage_version(
+                "prompts", tuple(provenance.prompt_version for provenance in provenances)
+            ),
+            schema_version=_aggregate_stage_version(
+                "schemas", tuple(provenance.schema_version for provenance in provenances)
+            ),
+        )
+
+    def _synthesis_provenance(self) -> CompilerProvenance:
+        provenance = getattr(self._synthesizer, "provenance", None)
+        if not isinstance(provenance, CompilerProvenance):
+            raise ValueError("synthesis stage requires immutable provenance")
+        return provenance
+
     def _build_orientation_artifacts(
         self,
         snapshot: CorpusSnapshot,
@@ -873,7 +971,13 @@ class CandidateCompiler:
         raise ValueError("batch did not become ready within the configured checks")
 
     def _await_attachment(
-        self, snapshot_id: str, store_id: str, file_id: str, attachment: Any
+        self,
+        snapshot_id: str,
+        store_id: str,
+        file_id: str,
+        attachment: Any,
+        *,
+        artifact_kind: str = "derived_store",
     ) -> int:
         calls = 0
         current = attachment
@@ -888,7 +992,7 @@ class CandidateCompiler:
                 calls += 1
                 operation = self._storage.begin_candidate_remote_operation(
                     snapshot_id,
-                    "derived_store",
+                    artifact_kind,
                     "attachment_status",
                     store_id=store_id,
                     file_id=file_id,
@@ -966,7 +1070,13 @@ class CandidateCompiler:
         excluded_record_ids: tuple[str, ...] = (),
     ) -> CandidateBuildResult:
         snapshot_id = gate.snapshot_id if gate is not None else CorpusSnapshot.identity_for(
-            request.run.run_id, [source.revision.revision_id for source in request.sources]
+            request.run.run_id,
+            [source.revision.revision_id for source in request.sources],
+            compiler_versions=(
+                request.run.model_version,
+                request.run.prompt_version,
+                request.run.schema_version,
+            ),
         )[2]
         snapshot = self._storage.snapshot(snapshot_id)
         if snapshot.status == "building":
@@ -1074,6 +1184,54 @@ def _stale_predecessor_revisions(
     return tuple(sorted(stale))
 
 
+def _selective_reconciliation_revision_ids(
+    storage: Any,
+    previous_snapshot: CorpusSnapshot,
+    sources: tuple[CandidateSource, ...],
+    stale_revision_ids: tuple[str, ...],
+) -> set[str]:
+    """Map the predecessor's affected synthesis closure onto current revisions."""
+    current_by_source = {
+        source.revision.source_id: source.revision.revision_id for source in sources
+    }
+    previous_by_source: dict[str, str] = {}
+    for revision_id in previous_snapshot.selected_revision_ids:
+        revision = storage.source_revision(revision_id)
+        if revision is None:
+            raise ValueError("published predecessor references an unknown source revision")
+        previous_by_source[revision.source_id] = revision_id
+    added_source_ids = set(current_by_source).difference(previous_by_source)
+    if added_source_ids:
+        # A newly introduced source has no predecessor dependency closure; its
+        # possible cross-corpus effects must be reconciled conservatively.
+        return set(current_by_source.values())
+
+    affected_source_ids = {
+        revision.source_id
+        for revision_id in stale_revision_ids
+        if (revision := storage.source_revision(revision_id)) is not None
+    }
+    if stale_revision_ids:
+        affected_record_ids = set(
+            storage.rebuild_record_ids(previous_snapshot.snapshot_id, stale_revision_ids)
+        )
+        for record in storage.derived_records(previous_snapshot.snapshot_id, include_stale=True):
+            if record.record_id not in affected_record_ids:
+                continue
+            for dependency in record.dependencies:
+                if dependency.kind != "source_revision":
+                    continue
+                revision = storage.source_revision(dependency.identifier)
+                if revision is None:
+                    raise ValueError("affected synthesis references an unknown source revision")
+                affected_source_ids.add(revision.source_id)
+    return {
+        revision_id
+        for source_id, revision_id in current_by_source.items()
+        if source_id in affected_source_ids
+    }
+
+
 def _remapped_concept_hints(
     storage: Any, previous_snapshot_id: str, record_id_mapping: Mapping[str, str]
 ) -> tuple[ConceptHint, ...]:
@@ -1142,6 +1300,30 @@ def _source_anchor_spans(sources: tuple[CandidateSource, ...]) -> dict[str, str]
     }
 
 
+def _raw_file_attributes(
+    storage: Any,
+    snapshot: CorpusSnapshot,
+    scope: ArtifactScope,
+    candidate_source: CandidateSource,
+) -> dict[str, str | int]:
+    source = storage.library_source(candidate_source.revision.source_id)
+    if source is None or source.collection_id != candidate_source.revision.collection_id:
+        raise ValueError("raw candidate file has no canonical source metadata")
+    relative_path = f"{source.year}/{source.original_filename}"
+    return {
+        "snapshot_id": snapshot.snapshot_id,
+        "artifact_scope": scope.value,
+        "status": "published",
+        "collection_id": source.collection_id,
+        "source_id": source.source_id,
+        "source": source.original_filename,
+        "year": source.year,
+        "course": source.course,
+        "lesson": source.lesson_title,
+        "relative_path": relative_path,
+    }
+
+
 def _validate_extraction_result(result: ExtractionResult, source: CandidateSource) -> None:
     if not isinstance(result, ExtractionResult) or result.revision_id != source.revision.revision_id:
         raise ValueError("extraction result does not match its source revision")
@@ -1183,7 +1365,10 @@ def _validate_candidate_dependencies(
 
 
 def _validate_synthesis_result(
-    result: SynthesisResult, snapshot_id: str, known_anchor_ids: set[str]
+    result: SynthesisResult,
+    snapshot_id: str,
+    known_anchor_ids: set[str],
+    source_metadata: tuple[ReconciliationSource, ...],
 ) -> None:
     if not isinstance(result.provenance, CompilerProvenance):
         raise ValueError("source synthesis requires compiler provenance")
@@ -1206,6 +1391,59 @@ def _validate_synthesis_result(
             raise ValueError("source synthesis records require source revision provenance")
         if not set(record.anchors) <= known_anchor_ids:
             raise ValueError("source synthesis records require canonical source anchors")
+        if isinstance(record, Evolution):
+            earlier = source_coverage(record.earlier_source_set, source_metadata)
+            later = source_coverage(record.later_source_set, source_metadata)
+            if (
+                (record.earlier_coverage_id, record.earlier_observed_years) != earlier
+                or (record.later_coverage_id, record.later_observed_years) != later
+            ):
+                raise ValueError("evolution coverage is not grounded in canonical source metadata")
+
+
+def _validate_reconciliation_coverage(
+    result: SynthesisResult, input_records: tuple[DerivedRecord, ...]
+) -> None:
+    coverage = result.coverage
+    expected = tuple(sorted(record.record_id for record in input_records))
+    if (
+        not isinstance(coverage, ReconciliationCoverage)
+        or not coverage.complete
+        or coverage.input_record_count != len(expected)
+        or coverage.covered_record_ids != expected
+    ):
+        raise ValueError("reconciliation coverage must exactly cover every input record")
+
+
+def _aggregate_stage_version(kind: str, values: tuple[str, ...]) -> str:
+    if any(not isinstance(value, str) or not value for value in values):
+        raise ValueError("candidate compiler stage provenance is incomplete")
+    digest = sha256(json.dumps(values, separators=(",", ":")).encode()).hexdigest()
+    return f"phase3-{kind}-v1-{digest}"
+
+
+def _reconciliation_sources(
+    storage: Any, sources: tuple[CandidateSource, ...]
+) -> tuple[ReconciliationSource, ...]:
+    result = []
+    for candidate_source in sources:
+        source = storage.library_source(candidate_source.revision.source_id)
+        if (
+            source is None
+            or source.collection_id != candidate_source.revision.collection_id
+        ):
+            raise ValueError("candidate source has no canonical library metadata")
+        result.append(ReconciliationSource(
+            revision_id=candidate_source.revision.revision_id,
+            collection_id=source.collection_id,
+            source_id=source.source_id,
+            author=source.author,
+            course=source.course,
+            lesson_title=source.lesson_title,
+            year=source.year,
+            original_filename=source.original_filename,
+        ))
+    return tuple(result)
 
 
 def _sum_usage(first: CallUsage, second: CallUsage) -> CallUsage:

@@ -66,6 +66,10 @@ class SourceExtractor:
         self._provenance = CompilerProvenance(model, EXTRACTION_PROMPT_VERSION, EXTRACTION_SCHEMA_VERSION)
         self.preflight_live_pricing()
 
+    @property
+    def provenance(self) -> CompilerProvenance:
+        return self._provenance
+
     def preflight_live_pricing(self) -> None:
         if self._provenance.model_version == SOL_MODEL:
             if not self._live_mode or self._pricing is None:

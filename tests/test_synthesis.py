@@ -15,6 +15,7 @@ from mentor.derived_records import (
 from mentor.synthesis import (
     ConceptHint,
     ProcedureBranch,
+    ReconciliationSource,
     SynthesisCandidate,
     SynthesisReconciler,
 )
@@ -93,6 +94,72 @@ class RecordingResponses:
         return SimpleNamespace(output_text=json.dumps(payload), usage=None)
 
 
+def reconciliation_source(revision_id: str, *, year: int) -> ReconciliationSource:
+    return ReconciliationSource(
+        revision_id=revision_id,
+        collection_id="collection_synthetic",
+        source_id=f"source_{revision_id}",
+        author="Synthetic Author",
+        course="Synthetic Course",
+        lesson_title=f"Synthetic lesson {year}",
+        year=year,
+        original_filename=f"{revision_id}.txt",
+    )
+
+
+def test_evolution_scope_and_coverage_are_derived_from_canonical_source_metadata():
+    earlier = claim(
+        subject="Earlier form",
+        anchors=("anc_earlier",),
+        dependencies=(RecordDependency("source_revision", "rev_earlier"),),
+    )
+    later = claim(
+        subject="Later form",
+        anchors=("anc_later",),
+        dependencies=(RecordDependency("source_revision", "rev_later"),),
+    )
+
+    def response(request):
+        assert {item["year"] for item in request["sources"]} == {2025, 2026}
+        return {"records": [{
+            "family": "evolution",
+            "qualification": "Synthetic comparison.",
+            "anchors": ["anc_earlier", "anc_later"],
+            "input_record_ids": [earlier.record_id, later.record_id],
+            "source_revision_ids": ["rev_earlier", "rev_later"],
+            "subject": "Synthetic form",
+            "previous": "Earlier",
+            "current": "Later",
+            "earlier_source_set": ["rev_earlier"],
+            "later_source_set": ["rev_later"],
+            "classification": "refined",
+            "negative_evidence_state": "positive_teaching",
+            "earlier_coverage_id": "model-invented-earlier",
+            "later_coverage_id": "model-invented-later",
+            "earlier_observed_years": [1900],
+            "later_observed_years": [1901],
+        }]}
+
+    responses = RecordingResponses(response)
+    result = SynthesisReconciler(SimpleNamespace(responses=responses)).synthesize(
+        snapshot_id=SNAPSHOT_ID,
+        records=(earlier, later),
+        revisions=(SimpleNamespace(revision_id="rev_earlier"), SimpleNamespace(revision_id="rev_later")),
+        source_metadata=(
+            reconciliation_source("rev_earlier", year=2025),
+            reconciliation_source("rev_later", year=2026),
+        ),
+        anchor_spans={"anc_earlier": "earlier span", "anc_later": "later span"},
+    )
+
+    evolution = result.records[0]
+    assert evolution.earlier_observed_years == (2025,)
+    assert evolution.later_observed_years == (2026,)
+    assert evolution.earlier_coverage_id.startswith("cov_")
+    assert evolution.later_coverage_id.startswith("cov_")
+    assert evolution.earlier_coverage_id != "model-invented-earlier"
+
+
 def test_concrete_reconciliation_batches_every_record_and_filters_anchor_spans():
     records = tuple(claim(subject=f"Concept {index}") for index in range(5))
     responses = RecordingResponses(lambda _request: {"records": [], "concept_hints": []})
@@ -105,6 +172,7 @@ def test_concrete_reconciliation_batches_every_record_and_filters_anchor_spans()
         snapshot_id=SNAPSHOT_ID,
         records=records,
         revisions=(SimpleNamespace(revision_id="rev_synthetic"),),
+        source_metadata=(reconciliation_source("rev_synthetic", year=2025),),
         anchor_spans={record.anchors[0]: f"span {index}" for index, record in enumerate(records)},
     )
 
@@ -120,12 +188,21 @@ def test_concrete_reconciliation_batches_every_record_and_filters_anchor_spans()
         == {anchor for record in request["records"] for anchor in record["anchors"]}
         for request in requests
     )
-    ordered_primary = requests[:3]
-    assert any(
-        {ordered_primary[0]["records"][-1]["record_id"], ordered_primary[1]["records"][0]["record_id"]}
-        == {record["record_id"] for record in request["records"]}
-        for request in requests[3:]
-    )
+    reduction_requests = [
+        request for request in requests
+        if request["reconciliation_batch"]["kind"].startswith("hierarchical_reduction")
+    ]
+    assert reduction_requests
+    assert "prior_cluster_summaries" in reduction_requests[-1]
+    assert sum(
+        summary["covered_record_count"]
+        for summary in reduction_requests[-1]["prior_cluster_summaries"]
+    ) == len(records)
+    assert max(
+        len(summary["conclusions"])
+        for request in reduction_requests
+        for summary in request["prior_cluster_summaries"]
+    ) <= 16
 
 
 def test_reconciliation_rejects_a_batch_size_that_cannot_compare_records():
@@ -151,6 +228,7 @@ def test_reconciliation_uses_alias_affinity_instead_of_alphabetical_adjacency():
         snapshot_id=SNAPSHOT_ID,
         records=records,
         revisions=(SimpleNamespace(revision_id="rev_synthetic"),),
+        source_metadata=(reconciliation_source("rev_synthetic", year=2025),),
         anchor_spans={record.anchors[0]: "bounded span" for record in records},
         hints=(
             ConceptHint(alpha.record_id, "Alpha setup", aliases=("Shared setup",)),
@@ -173,6 +251,8 @@ def test_reconciliation_can_emit_more_than_sixty_four_candidate_records_with_bou
     records = tuple(claim(subject=f"Distinct topic {index:03d}") for index in range(70))
 
     def response(request):
+        if request["reconciliation_batch"]["kind"] != "primary":
+            return {"records": [], "concept_hints": []}
         outputs = []
         for record in request["records"]:
             outputs.append({
@@ -197,6 +277,7 @@ def test_reconciliation_can_emit_more_than_sixty_four_candidate_records_with_bou
         snapshot_id=SNAPSHOT_ID,
         records=records,
         revisions=(SimpleNamespace(revision_id="rev_synthetic"),),
+        source_metadata=(reconciliation_source("rev_synthetic", year=2025),),
         anchor_spans={record.anchors[0]: "bounded span" for record in records},
     )
 
@@ -250,6 +331,7 @@ def test_concrete_reconciliation_emits_structured_procedure_and_alias_hint():
         snapshot_id=SNAPSHOT_ID,
         records=records,
         revisions=(SimpleNamespace(revision_id="rev_synthetic"),),
+        source_metadata=(reconciliation_source("rev_synthetic", year=2025),),
         anchor_spans={record.anchors[0]: "bounded span" for record in records},
     )
 

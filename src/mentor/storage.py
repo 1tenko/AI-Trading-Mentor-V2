@@ -568,7 +568,13 @@ class Storage:
             raise ValueError("snapshot versions do not match compilation run")
         try:
             expected_ids, expected_fingerprint, expected_snapshot_id = CorpusSnapshot.identity_for(
-                snapshot.run_id, snapshot.selected_revision_ids
+                snapshot.run_id,
+                snapshot.selected_revision_ids,
+                compiler_versions=(
+                    snapshot.model_version,
+                    snapshot.prompt_version,
+                    snapshot.schema_version,
+                ),
             )
         except ValueError as error:
             raise ValueError("snapshot identity is not canonical") from error

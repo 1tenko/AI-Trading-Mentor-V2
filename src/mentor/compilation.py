@@ -130,7 +130,9 @@ class CorpusSnapshot:
         created_at: float,
     ) -> "CorpusSnapshot":
         revision_ids, fingerprint, snapshot_id = cls.identity_for(
-            run.run_id, [revision.revision_id for revision in selected_revisions]
+            run.run_id,
+            [revision.revision_id for revision in selected_revisions],
+            compiler_versions=(run.model_version, run.prompt_version, run.schema_version),
         )
         return cls(
             snapshot_id=snapshot_id,
@@ -147,12 +149,22 @@ class CorpusSnapshot:
         )
 
     @staticmethod
-    def identity_for(run_id: str, selected_revision_ids: Sequence[str]) -> tuple[tuple[str, ...], str, str]:
+    def identity_for(
+        run_id: str,
+        selected_revision_ids: Sequence[str],
+        *,
+        compiler_versions: tuple[str, str, str] | None = None,
+    ) -> tuple[tuple[str, ...], str, str]:
         revision_ids = tuple(sorted(selected_revision_ids))
         if not revision_ids or len(set(revision_ids)) != len(revision_ids):
             raise ValueError("selected revisions must be non-empty and unique")
         fingerprint = sha256("\n".join(revision_ids).encode()).hexdigest()
-        snapshot_id = f"snap_{sha256(f'{run_id}\0{fingerprint}'.encode()).hexdigest()}"
+        identity = f"{run_id}\0{fingerprint}"
+        if compiler_versions is not None:
+            if any(not isinstance(value, str) or not value for value in compiler_versions):
+                raise ValueError("compiler versions must be complete")
+            identity += "\0" + "\0".join(compiler_versions)
+        snapshot_id = f"snap_{sha256(identity.encode()).hexdigest()}"
         return revision_ids, fingerprint, snapshot_id
 
 
