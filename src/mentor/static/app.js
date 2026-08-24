@@ -67,8 +67,13 @@ function inspectorTimestamp(start, end) {
 function setInspectorOpen(open) {
   inspector.hidden = !open;
   chat.hidden = open;
-  inspectorToggle.setAttribute("aria-pressed", String(open));
-  if (open) loadInspector().catch(() => showInspectorError("Could not load the assimilation inspector."));
+  inspectorToggle.setAttribute("aria-expanded", String(open));
+  if (open) {
+    inspectorClose.focus();
+    loadInspector().catch(() => showInspectorError("Could not load the assimilation inspector."));
+  } else {
+    inspectorToggle.focus();
+  }
 }
 
 function showInspectorError(message) {
@@ -76,6 +81,35 @@ function showInspectorError(message) {
   inspectorOverview.replaceChildren();
   inspectorDetail.replaceChildren();
   inspectorAudit.replaceChildren();
+}
+
+function recordContentFields(data) {
+  const content = data.content || {};
+  if (data.family === "claim") return [["Subject", content.subject], ["Predicate", content.predicate], ["Object", content.object]];
+  if (data.family === "relationship") return [["From", content.left], ["Relationship", content.relation], ["To", content.right]];
+  if (data.family === "procedure_sequence_hierarchy") return [["Structure", content.kind], ["Ordered items", Array.isArray(content.terms) ? content.terms.join(", ") : null]];
+  if (data.family === "evolution") return [
+    ["Subject", content.subject], ["Earlier understanding", content.previous], ["Later understanding", content.current],
+    ["Classification", content.classification], ["Evidence state", content.negative_evidence_state],
+    ["Earlier observed years", Array.isArray(content.earlier_observed_years) ? content.earlier_observed_years.join(", ") : null],
+    ["Later observed years", Array.isArray(content.later_observed_years) ? content.later_observed_years.join(", ") : null],
+  ];
+  if (data.family === "conflict_unresolved") return [
+    ["Kind", content.kind], ["Subject", content.subject], ["Alternatives", Array.isArray(content.alternatives) ? content.alternatives.join(", ") : null],
+    ["Reconciliation", content.reconciliation_state], ["Relevant scopes", Array.isArray(content.relevant_scopes) ? content.relevant_scopes.join(", ") : null],
+    ["Conditions", Array.isArray(content.conditions) ? content.conditions.join(", ") : null],
+    ["Open questions", Array.isArray(content.unresolved_questions) ? content.unresolved_questions.join(", ") : null],
+  ];
+  return [];
+}
+
+function dependencySummary(dependencies) {
+  const counts = (dependencies || []).reduce((summary, dependency) => {
+    const label = dependency.kind === "source_revision" ? "raw source revision" : dependency.kind === "derived_record" ? "derived record" : "other dependency";
+    summary[label] = (summary[label] || 0) + 1;
+    return summary;
+  }, {});
+  return Object.entries(counts).map(([label, count]) => `${count} ${label}${count === 1 ? "" : "s"}`);
 }
 
 async function inspectorJson(path) {
@@ -149,7 +183,7 @@ function showRecord(data) {
   inspectorValue(record, "Validation", data.validation_state);
   inspectorValue(record, "Lifecycle", `${data.lifecycle_state}${data.stale ? " · stale" : ""}`);
   inspectorValue(record, "Qualification", data.qualification);
-  Object.entries(data.content || {}).forEach(([name, value]) => inspectorValue(record, name.replaceAll("_", " "), Array.isArray(value) ? value.join(", ") : value));
+  recordContentFields(data).forEach(([name, value]) => inspectorValue(record, name, value));
   inspectorDetail.append(record);
 
   const anchors = inspectorSection("Raw source anchors");
@@ -160,15 +194,13 @@ function showRecord(data) {
     inspectorValue(item, "Lesson", anchor.lesson_title || anchor.filename);
     inspectorValue(item, "Year", anchor.year);
     inspectorValue(item, "Timestamp", inspectorTimestamp(anchor.timestamp_start_ms, anchor.timestamp_end_ms));
-    inspectorValue(item, "Source revision", anchor.revision_sha256);
     anchors.append(item);
   });
   if (!data.anchors?.length) inspectorList(anchors, [], "No safe raw-source anchors are available for this record.");
   inspectorDetail.append(anchors);
 
   const context = inspectorSection("Relationships, evolution, and uncertainty");
-  inspectorValue(context, "Concept", data.concept_id);
-  inspectorList(context, data.dependencies?.map((item) => `${item.kind}: ${item.identifier}`), "No dependencies recorded.");
+  inspectorList(context, dependencySummary(data.dependencies), "No dependencies recorded.");
   inspectorDetail.append(context);
 }
 
@@ -186,13 +218,24 @@ function showAudit(data) {
       inspectorValue(item, `Turn ${turn.turn_number}`, context.status || "Not used");
       inspectorValue(item, "Snapshot", context.snapshot_id);
       inspectorValue(item, "Derived records", context.record_count);
-      inspectorList(item, context.record_ids, "No derived record IDs were retained for this turn.");
       inspectorValue(item, "Budget", context.budget ? `${context.used_tokens ?? 0}/${context.budget.max_tokens ?? "?"} tokens` : "Not recorded");
       audit.append(item);
     });
     if (!data.turns?.length) inspectorList(audit, [], "No orientation audit has been recorded for this conversation.");
   }
   inspectorAudit.append(audit);
+}
+
+async function refreshInspectorAudit() {
+  if (inspector.hidden) return;
+  const threadId = activeThreadId;
+  if (!threadId) {
+    showAudit({ turns: [] });
+    return;
+  }
+  showAudit({ thread_id: threadId, turns: [] });
+  const audit = await inspectorJson(`/api/knowledge/threads/${threadId}/orientation`);
+  if (activeThreadId === threadId && !inspector.hidden) showAudit(audit);
 }
 
 async function loadSnapshot(snapshotId) {
@@ -213,8 +256,7 @@ async function loadInspector() {
   showInspectorOverview(overview);
   if (overview.current_snapshot?.snapshot_id) await loadSnapshot(overview.current_snapshot.snapshot_id);
   else inspectorDetail.replaceChildren();
-  if (activeThreadId) showAudit(await inspectorJson(`/api/knowledge/threads/${activeThreadId}/orientation`));
-  else showAudit({ turns: [] });
+  await refreshInspectorAudit();
   inspectorStatus.textContent = "Read-only assimilation inspector.";
 }
 
@@ -518,6 +560,7 @@ async function loadThreads() {
       activeThreadId = thread.id;
       localStorage.setItem(ACTIVE_THREAD_KEY, String(thread.id));
       status.textContent = `Conversation: ${thread.title}`;
+      refreshInspectorAudit().catch(() => showInspectorError("Could not load this conversation's orientation audit."));
       loadThread(thread.id).catch(() => { status.textContent = "Could not restore this conversation."; });
       loadThreads().catch(() => { status.textContent = "Could not refresh conversations."; });
     });
@@ -538,6 +581,7 @@ async function loadThread(threadId) {
   const thread = await response.json();
   activeThreadId = thread.id;
   localStorage.setItem(ACTIVE_THREAD_KEY, String(thread.id));
+  refreshInspectorAudit().catch(() => showInspectorError("Could not load this conversation's orientation audit."));
   renderTimeline(thread.turns);
   status.textContent = `Conversation: ${thread.title}`;
 }
@@ -565,6 +609,7 @@ async function deleteThread(thread) {
   if (activeThreadId === thread.id) {
     activeThreadId = undefined;
     localStorage.removeItem(ACTIVE_THREAD_KEY);
+    await refreshInspectorAudit();
     showEmpty();
     status.textContent = "Conversation deleted.";
   }
@@ -577,6 +622,7 @@ async function createThread(title = "New conversation") {
   const thread = await response.json();
   activeThreadId = thread.id;
   localStorage.setItem(ACTIVE_THREAD_KEY, String(thread.id));
+  refreshInspectorAudit().catch(() => showInspectorError("Could not load this conversation's orientation audit."));
   showEmpty();
   await loadThreads();
 }

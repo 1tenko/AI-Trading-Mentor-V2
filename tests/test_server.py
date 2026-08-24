@@ -656,7 +656,7 @@ def test_server_serves_a_read_only_assimilation_inspector_shell(tmp_path):
         assert status == 200
         assert b'inspectorJson("/api/knowledge")' in script
         assert b"/api/knowledge/snapshots/${snapshotId}" in script
-        assert b"/api/knowledge/threads/${activeThreadId}/orientation" in script
+        assert b"/api/knowledge/threads/${threadId}/orientation" in script
         assert b"Derived record" in script
         assert b"Raw source anchor" in script
         assert b"Upload" not in script
@@ -665,6 +665,38 @@ def test_server_serves_a_read_only_assimilation_inspector_shell(tmp_path):
         assert b".inspector" in stylesheet
         assert b".inspector--derived" in stylesheet
         assert b"[hidden] { display: none !important; }" in stylesheet
+    finally:
+        server.shutdown()
+        worker.join()
+
+
+def test_inspector_static_contract_omits_derived_and_raw_identifiers(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    server = create_server(storage, FakeChatService(), port=0)
+    worker = threading.Thread(target=server.serve_forever)
+    worker.start()
+    try:
+        _status, _, page = request(server, "GET", "/")
+        _status, _, script = request(server, "GET", "/app.js")
+        assert b'aria-controls="inspector"' in page
+        assert b'aria-expanded="false"' in page
+        assert b"function recordContentFields" in script
+        assert b"Object.entries(data.content" not in script
+        assert b"content.negative_evidence_state" in script
+        assert b"content.reconciliation_state" in script
+        assert b"content.deprecation_evidence_anchor_ids" not in script
+        assert b"content.earlier_source_set" not in script
+        assert b"content.competing_record_ids" not in script
+        assert b"data.concept_id" not in script
+        assert b"item.identifier" not in script
+        assert b"context.record_ids" not in script
+        assert b"anchor.revision_sha256" not in script
+        assert b'dependency.kind === "source_revision"' in script
+        assert b"refreshInspectorAudit" in script
+        assert b"if (activeThreadId === threadId && !inspector.hidden)" in script
+        assert b"inspectorClose.focus()" in script
+        assert b"inspectorToggle.focus()" in script
     finally:
         server.shutdown()
         worker.join()
