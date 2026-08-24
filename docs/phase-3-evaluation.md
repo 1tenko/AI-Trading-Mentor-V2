@@ -198,3 +198,29 @@ They do not create artificial unresolved records or fail a candidate merely by
 existing. Extraction or validation errors, coverage/anchor/dependency/lineage
 failures, an empty validated candidate, remote setup failures, and later
 synthesis/publication failures remain candidate-level blockers.
+
+## Gate 1 synthesis structured-output hardening
+
+The first fresh Gate 1 candidate reached reconciliation after 71 extracted
+candidates and 65 affirmatively supported source-extracted records, but stopped
+at the response boundary before any candidate store, publication, orientation,
+or Mentor evaluation. The response was intentionally non-persistent
+(`store=False`), so its exact private malformed JSON cannot be reconstructed;
+the retained parser failure established that a returned record was not a typed
+object with a string family.
+
+The prior reconciliation response contract used a loose `array<object>` schema
+with non-strict output despite the local parser requiring four closed typed
+families. The corrected, versioned contract is strict and contains only
+relationship, procedure/sequence/hierarchy, evolution, and conflict/unresolved
+objects. Every object has explicit required fields, `additionalProperties:
+false`, bounded payloads, explicit lineage fields, and the exact concept-hint
+shape; nullable scope, role, and position remain explicit properties.
+
+The installed OpenAI SDK strict-schema conversion leaves the extraction,
+semantic-validation, and synthesis schemas unchanged. Deterministic tests cover
+all four synthesis families through the local parser, closed family and hint
+shapes, lineage fields, and the synthetic candidate compiler path. The failed
+candidate remains incompatible with the new synthesis provenance and is never
+reused or published. Cumulative prior Gate 1 spend is recorded as `$3.607125`
+against the fixed `$25.00` ceiling before any subsequent paid call.

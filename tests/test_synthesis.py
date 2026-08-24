@@ -1,8 +1,10 @@
+from copy import deepcopy
 from dataclasses import replace
 import json
 from types import SimpleNamespace
 
 import pytest
+from openai.lib._pydantic import _ensure_strict_json_schema
 
 from mentor.derived_records import (
     Claim,
@@ -18,6 +20,7 @@ from mentor.synthesis import (
     ReconciliationSource,
     SynthesisCandidate,
     SynthesisReconciler,
+    SYNTHESIS_RESPONSE_SCHEMA,
 )
 
 
@@ -105,6 +108,108 @@ def reconciliation_source(revision_id: str, *, year: int) -> ReconciliationSourc
         year=year,
         original_filename=f"{revision_id}.txt",
     )
+
+
+def test_synthesis_response_schema_is_a_closed_typed_union_under_the_openai_strict_contract():
+    schema = deepcopy(SYNTHESIS_RESPONSE_SCHEMA)
+    assert _ensure_strict_json_schema(schema, path=(), root=schema) == SYNTHESIS_RESPONSE_SCHEMA
+
+    response_properties = SYNTHESIS_RESPONSE_SCHEMA["properties"]
+    assert set(SYNTHESIS_RESPONSE_SCHEMA["required"]) == set(response_properties)
+    assert SYNTHESIS_RESPONSE_SCHEMA["additionalProperties"] is False
+    record_schemas = response_properties["records"]["items"]["anyOf"]
+    assert {item["properties"]["family"]["enum"][0] for item in record_schemas} == {
+        "relationship",
+        "procedure_sequence_hierarchy",
+        "evolution",
+        "conflict_unresolved",
+    }
+    for item in record_schemas:
+        assert item["additionalProperties"] is False
+        assert set(item["required"]) == set(item["properties"])
+        assert {"family", "qualification", "anchors", "input_record_ids", "input_conclusion_ids", "source_revision_ids"} <= set(item["required"])
+
+
+def test_synthesis_response_schema_closes_family_and_concept_hint_shapes():
+    record_schemas = SYNTHESIS_RESPONSE_SCHEMA["properties"]["records"]["items"]["anyOf"]
+    relationship_schema = next(
+        item for item in record_schemas
+        if item["properties"]["family"]["enum"] == ["relationship"]
+    )
+    assert "kind" not in relationship_schema["properties"]
+    assert relationship_schema["additionalProperties"] is False
+
+    hint_schema = SYNTHESIS_RESPONSE_SCHEMA["properties"]["concept_hints"]["items"]
+    assert hint_schema["additionalProperties"] is False
+    assert set(hint_schema["required"]) == {
+        "record_index", "label", "aliases", "scope", "role", "position"
+    }
+    assert hint_schema["properties"]["scope"]["type"] == ["string", "null"]
+    assert hint_schema["properties"]["position"]["type"] == ["integer", "null"]
+
+
+@pytest.mark.parametrize(
+    "family_payload",
+    [
+        lambda first, second: {
+            "family": "relationship", "left": "First", "relation": "supports", "right": "Second",
+        },
+        lambda first, second: {
+            "family": "procedure_sequence_hierarchy", "kind": "sequence",
+            "terms": ["First", "Second"], "prerequisites": [], "conditions": [], "branches": [],
+        },
+        lambda first, second: {
+            "family": "evolution", "subject": "Synthetic concept", "previous": "Earlier form",
+            "current": "Later form", "earlier_source_set": ["rev_earlier"],
+            "later_source_set": ["rev_later"], "classification": "refined",
+            "negative_evidence_state": "positive_teaching", "competing_anchors": [],
+            "deprecation_evidence_anchors": [],
+        },
+        lambda first, second: {
+            "family": "conflict_unresolved", "kind": "unresolved", "subject": "Synthetic question",
+            "alternatives": ["First statement", "Second statement"],
+            "competing_record_ids": [first.record_id, second.record_id],
+            "reconciliation_state": "unresolved", "relevant_scopes": ["Synthetic scope"],
+            "conditions": [], "unresolved_questions": ["Which scope applies?"],
+        },
+    ],
+    ids=["relationship", "procedure", "evolution", "conflict"],
+)
+def test_each_strict_synthesis_family_shape_reaches_the_typed_parser(family_payload):
+    first = claim(
+        subject="First", anchors=("anc_earlier",),
+        dependencies=(RecordDependency("source_revision", "rev_earlier"),),
+    )
+    second = claim(
+        subject="Second", anchors=("anc_later",),
+        dependencies=(RecordDependency("source_revision", "rev_later"),),
+    )
+
+    payload = {
+        **family_payload(first, second),
+        "qualification": "Synthetic bounded reconciliation.",
+        "anchors": ["anc_earlier", "anc_later"],
+        "input_record_ids": [first.record_id, second.record_id],
+        "input_conclusion_ids": [],
+        "source_revision_ids": ["rev_earlier", "rev_later"],
+    }
+    responses = RecordingResponses(lambda _request: {"records": [payload], "concept_hints": []})
+
+    result = SynthesisReconciler(SimpleNamespace(responses=responses)).synthesize(
+        snapshot_id=SNAPSHOT_ID,
+        records=(first, second),
+        revisions=(SimpleNamespace(revision_id="rev_earlier"), SimpleNamespace(revision_id="rev_later")),
+        source_metadata=(
+            reconciliation_source("rev_earlier", year=2025),
+            reconciliation_source("rev_later", year=2026),
+        ),
+        anchor_spans={"anc_earlier": "earlier span", "anc_later": "later span"},
+    )
+
+    assert len(result.records) == 1
+    request_format = responses.calls[0]["text"]["format"]
+    assert request_format["strict"] is True
+    assert request_format["schema"] == SYNTHESIS_RESPONSE_SCHEMA
 
 
 def test_evolution_scope_and_coverage_are_derived_from_canonical_source_metadata():

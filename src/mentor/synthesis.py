@@ -12,9 +12,16 @@ from mentor.derived_records import (
     CompilerProvenance,
     ConflictUnresolved,
     DerivedRecord,
+    EVOLUTION_CLASSIFICATIONS,
+    MAX_FACET_VALUE_LENGTH,
+    MAX_TERMS,
+    MAX_TYPED_CONTENT_LENGTH,
+    NEGATIVE_EVIDENCE_STATES,
     Evolution,
     ProcedureRecordBranch,
     ProcedureSequenceHierarchy,
+    RECONCILIATION_STATES,
+    RELATIONSHIP_TYPES,
     Relationship,
     RecordDependency,
     is_legacy_record,
@@ -28,12 +35,154 @@ MAX_ALIASES = 8
 MAX_SCOPE_LENGTH = 160
 MAX_CONDITION_LENGTH = 160
 MAX_JUSTIFICATION_LENGTH = 280
-SYNTHESIS_PROMPT_VERSION = "cross-source-synthesis-v5"
-SYNTHESIS_SCHEMA_VERSION = "cross-source-synthesis-schema-v6"
+SYNTHESIS_PROMPT_VERSION = "cross-source-synthesis-v6"
+SYNTHESIS_SCHEMA_VERSION = "cross-source-synthesis-schema-v7"
 SOL_MODEL = "gpt-5.6-sol"
 MAX_SYNTHESIS_RECORDS_PER_CALL = 64
 MAX_SYNTHESIS_RECORDS_PER_CANDIDATE = 4_096
 MAX_RECONCILIATION_CALLS = 1_024
+MAX_SYNTHESIS_ANCHORS = MAX_SYNTHESIS_RECORDS_PER_CALL * 8
+
+
+_SYNTHESIS_ID_SCHEMA = {
+    "type": "string", "minLength": 1, "maxLength": MAX_TYPED_CONTENT_LENGTH,
+}
+_SYNTHESIS_INPUT_IDS_SCHEMA = {
+    "type": "array", "maxItems": MAX_SYNTHESIS_RECORDS_PER_CALL,
+    "items": _SYNTHESIS_ID_SCHEMA,
+}
+_SYNTHESIS_ANCHORS_SCHEMA = {
+    "type": "array", "minItems": 1, "maxItems": MAX_SYNTHESIS_ANCHORS,
+    "items": _SYNTHESIS_ID_SCHEMA,
+}
+_SYNTHESIS_TEXT_SCHEMA = {
+    "type": "string", "minLength": 1, "maxLength": MAX_TYPED_CONTENT_LENGTH,
+}
+_SYNTHESIS_TERM_SCHEMA = {
+    "type": "string", "minLength": 1, "maxLength": MAX_LABEL_LENGTH,
+}
+_SYNTHESIS_TERM_LIST_SCHEMA = {
+    "type": "array", "maxItems": MAX_TERMS, "items": _SYNTHESIS_TERM_SCHEMA,
+}
+_SYNTHESIS_TEXT_LIST_SCHEMA = {
+    "type": "array", "maxItems": MAX_TERMS, "items": _SYNTHESIS_TEXT_SCHEMA,
+}
+_SYNTHESIS_COMMON_PROPERTIES = {
+    "family": {"enum": []},
+    "qualification": {
+        "type": "string", "minLength": 1, "maxLength": MAX_JUSTIFICATION_LENGTH,
+    },
+    "anchors": _SYNTHESIS_ANCHORS_SCHEMA,
+    "input_record_ids": _SYNTHESIS_INPUT_IDS_SCHEMA,
+    "input_conclusion_ids": _SYNTHESIS_INPUT_IDS_SCHEMA,
+    "source_revision_ids": _SYNTHESIS_INPUT_IDS_SCHEMA | {"minItems": 1},
+}
+
+
+def _synthesis_family_schema(family: str, **properties: object) -> dict[str, object]:
+    values = {
+        **_SYNTHESIS_COMMON_PROPERTIES,
+        "family": {"enum": [family]},
+        **properties,
+    }
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "required": list(values),
+        "properties": values,
+    }
+
+
+SYNTHESIS_RESPONSE_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["records", "concept_hints"],
+    "properties": {
+        "records": {
+            "type": "array",
+            "maxItems": MAX_SYNTHESIS_RECORDS_PER_CALL,
+            "items": {
+                "anyOf": [
+                    _synthesis_family_schema(
+                        "relationship",
+                        left=_SYNTHESIS_TERM_SCHEMA,
+                        relation={"enum": sorted(RELATIONSHIP_TYPES)},
+                        right=_SYNTHESIS_TERM_SCHEMA,
+                    ),
+                    _synthesis_family_schema(
+                        "procedure_sequence_hierarchy",
+                        kind={"enum": ["procedure", "sequence", "hierarchy"]},
+                        terms=_SYNTHESIS_TERM_LIST_SCHEMA | {"minItems": 2},
+                        prerequisites=_SYNTHESIS_TERM_LIST_SCHEMA,
+                        conditions=_SYNTHESIS_TEXT_LIST_SCHEMA,
+                        branches={
+                            "type": "array",
+                            "maxItems": MAX_TERMS,
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "required": ["condition", "steps"],
+                                "properties": {
+                                    "condition": {
+                                        "type": "string", "minLength": 1,
+                                        "maxLength": MAX_FACET_VALUE_LENGTH,
+                                    },
+                                    "steps": _SYNTHESIS_TERM_LIST_SCHEMA | {"minItems": 1},
+                                },
+                            },
+                        },
+                    ),
+                    _synthesis_family_schema(
+                        "evolution",
+                        subject=_SYNTHESIS_TEXT_SCHEMA,
+                        previous=_SYNTHESIS_TEXT_SCHEMA,
+                        current=_SYNTHESIS_TEXT_SCHEMA,
+                        earlier_source_set=_SYNTHESIS_INPUT_IDS_SCHEMA | {"minItems": 1},
+                        later_source_set=_SYNTHESIS_INPUT_IDS_SCHEMA | {"minItems": 1},
+                        classification={"enum": sorted(EVOLUTION_CLASSIFICATIONS)},
+                        negative_evidence_state={"enum": sorted(NEGATIVE_EVIDENCE_STATES)},
+                        competing_anchors=_SYNTHESIS_ANCHORS_SCHEMA | {"minItems": 0},
+                        deprecation_evidence_anchors=_SYNTHESIS_ANCHORS_SCHEMA | {"minItems": 0},
+                    ),
+                    _synthesis_family_schema(
+                        "conflict_unresolved",
+                        kind={"enum": ["conflict", "unresolved"]},
+                        subject=_SYNTHESIS_TEXT_SCHEMA,
+                        alternatives=_SYNTHESIS_TEXT_LIST_SCHEMA | {"minItems": 2},
+                        competing_record_ids=_SYNTHESIS_INPUT_IDS_SCHEMA | {"minItems": 2, "maxItems": MAX_TERMS},
+                        reconciliation_state={"enum": sorted(RECONCILIATION_STATES)},
+                        relevant_scopes=_SYNTHESIS_TEXT_LIST_SCHEMA | {"minItems": 1},
+                        conditions=_SYNTHESIS_TEXT_LIST_SCHEMA,
+                        unresolved_questions=_SYNTHESIS_TEXT_LIST_SCHEMA,
+                    ),
+                ]
+            },
+        },
+        "concept_hints": {
+            "type": "array",
+            "maxItems": MAX_SYNTHESIS_RECORDS_PER_CALL,
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["record_index", "label", "aliases", "scope", "role", "position"],
+                "properties": {
+                    "record_index": {
+                        "type": "integer", "minimum": 0,
+                        "maximum": MAX_SYNTHESIS_RECORDS_PER_CALL - 1,
+                    },
+                    "label": _SYNTHESIS_TERM_SCHEMA,
+                    "aliases": {
+                        "type": "array", "maxItems": MAX_ALIASES,
+                        "items": _SYNTHESIS_TERM_SCHEMA,
+                    },
+                    "scope": {"type": ["string", "null"], "maxLength": MAX_SCOPE_LENGTH},
+                    "role": {"type": ["string", "null"], "maxLength": MAX_LABEL_LENGTH},
+                    "position": {"type": ["integer", "null"], "minimum": 0},
+                },
+            },
+        },
+    },
+}
 
 
 @dataclass(frozen=True)
@@ -246,6 +395,8 @@ class SynthesisReconciler:
                     f"Prompt version: {SYNTHESIS_PROMPT_VERSION}\n"
                     "Return only small typed cross-source relationship, procedure/sequence/hierarchy, "
                     "evolution, or conflict records plus explicit alias-aware concept hints. "
+                    "Every record must use exactly one supplied family shape; include every required "
+                    "lineage field and return an empty concept_hints list when there are no hints. "
                     "Keep procedure prerequisites, conditions, and conditional branches structured. "
                     "Use only supplied record, anchor, and revision IDs. Preserve uncertainty; do not claim raw authority. "
                     "Prior cluster summaries contain independently addressable validated conclusions. Connect them "
@@ -282,19 +433,8 @@ class SynthesisReconciler:
                     "format": {
                         "type": "json_schema",
                         "name": SYNTHESIS_SCHEMA_VERSION,
-                        "schema": {
-                            "type": "object",
-                            "required": ["records"],
-                            "properties": {
-                                "records": {
-                                    "type": "array",
-                                    "maxItems": MAX_SYNTHESIS_RECORDS_PER_CALL,
-                                    "items": {"type": "object"},
-                                },
-                                "concept_hints": {"type": "array", "items": {"type": "object"}},
-                            },
-                        },
-                        "strict": False,
+                        "schema": SYNTHESIS_RESPONSE_SCHEMA,
+                        "strict": True,
                     }
                 },
             )
