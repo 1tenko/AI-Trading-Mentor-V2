@@ -702,7 +702,8 @@ def test_server_serves_the_persistent_chat_controls(tmp_path):
         assert b".markdown-table-scroll { margin: 1rem 0; max-width: 100%; overflow-x: auto; width: 100%; }" in stylesheet
         assert b"#threads { min-width: 0;" in stylesheet
         assert b"overflow-x: clip" in stylesheet
-        assert b"grid-template-columns: repeat(auto-fit, minmax(min(7rem, 100%), 1fr))" in stylesheet
+        assert b"grid-template-columns: repeat(3, minmax(0, 1fr))" in stylesheet
+        assert b"grid-template-columns: minmax(0, 1fr)" in stylesheet
         assert b".composer-wrap, .composer, .conversation, .message-content" in stylesheet
         assert b"grid-template-columns: minmax(0, auto) minmax(0, 1fr)" in stylesheet
         assert b".diagnostics dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }" in stylesheet
