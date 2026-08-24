@@ -123,40 +123,25 @@ def _production_runtime(tmp_path: Path):
     return database_path, manifest_path, storage, production_snapshot
 
 
-def test_gate1_defaults_to_offline_dry_run_without_creating_a_pilot(tmp_path):
+def test_gate1_preflight_blocks_an_over_ceiling_dry_run_without_creating_a_pilot(tmp_path):
     database_path, manifest_path, production, production_snapshot = _production_runtime(tmp_path)
     client_calls = []
     pilot_root = tmp_path / "private-pilots"
 
-    report = Gate1Runner(
-        production_database_path=database_path,
-        manifest_path=manifest_path,
-        pilot_root=pilot_root,
-        client_factory=lambda: client_calls.append("called"),
-        today=lambda: GATE1_PRICING_CHECKED_ON,
-        expected_manifest_sha256=_manifest_hash(manifest_path),
-    ).run()
+    with pytest.raises(ValueError, match="estimated Gate 1 cost"):
+        Gate1Runner(
+            production_database_path=database_path,
+            manifest_path=manifest_path,
+            pilot_root=pilot_root,
+            spend_limit_usd=2.18,
+            client_factory=lambda: client_calls.append("called"),
+            today=lambda: GATE1_PRICING_CHECKED_ON,
+            expected_manifest_sha256=_manifest_hash(manifest_path),
+        ).run()
 
-    assert report.executed is False
-    assert report.source_count == 6
-    assert report.estimated_upper_bound_usd < 20
     assert client_calls == []
     assert not pilot_root.exists()
     assert production.current_snapshot() == production_snapshot
-
-
-def test_gate1_default_run_reserves_the_first_pilot_spend_from_the_cumulative_ceiling(tmp_path):
-    database_path, manifest_path, _production, _production_snapshot = _production_runtime(tmp_path)
-
-    report = Gate1Runner(
-        production_database_path=database_path,
-        manifest_path=manifest_path,
-        pilot_root=tmp_path / "private-pilots",
-        today=lambda: GATE1_PRICING_CHECKED_ON,
-        expected_manifest_sha256=_manifest_hash(manifest_path),
-    ).run()
-
-    assert report.spent_usd == pytest.approx(GATE1_PRIOR_SPEND_USD)
 
 
 def test_gate1_stops_before_runtime_or_client_when_estimate_exceeds_limit(tmp_path):
@@ -169,7 +154,7 @@ def test_gate1_stops_before_runtime_or_client_when_estimate_exceeds_limit(tmp_pa
             production_database_path=database_path,
             manifest_path=manifest_path,
             pilot_root=pilot_root,
-            spend_limit_usd=1.00,
+            spend_limit_usd=2.18,
             client_factory=lambda: client_calls.append("called"),
             today=lambda: GATE1_PRICING_CHECKED_ON,
             expected_manifest_sha256=_manifest_hash(manifest_path),
@@ -320,11 +305,12 @@ def test_budgeted_client_caps_output_and_accounts_actual_usage_before_next_call(
 
 
 def test_spend_ledger_counts_a_prior_gate1_run_against_the_same_hard_ceiling():
-    ledger = SpendLedger(20.0, CONSERVATIVE_SOL_PRICING, prior_spend_usd=0.951195)
+    assert GATE1_PRIOR_SPEND_USD == pytest.approx(2.172875)
+    ledger = SpendLedger(20.0, CONSERVATIVE_SOL_PRICING, prior_spend_usd=GATE1_PRIOR_SPEND_USD)
 
-    assert ledger.spent_usd == pytest.approx(0.951195)
+    assert ledger.spent_usd == pytest.approx(2.172875)
     with pytest.raises(RuntimeError, match="spend ceiling"):
-        ledger.ensure("extraction", 19.048806)
+        ledger.ensure("extraction", 17.827126)
 
 
 def test_budgeted_client_enforces_stage_budget_before_a_paid_call():
