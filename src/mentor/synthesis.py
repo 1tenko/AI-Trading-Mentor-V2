@@ -153,9 +153,9 @@ def _synthesis_record(
     if not isinstance(payload, dict) or not isinstance(payload.get("family"), str):
         raise ValueError("synthesis record must be a typed object")
     family = payload["family"]
-    anchors = _payload_ids(payload.get("anchors"), anchor_ids)
-    inputs = _payload_ids(payload.get("input_record_ids"), record_ids)
-    sources = _payload_ids(payload.get("source_revision_ids"), revision_ids)
+    anchors = _required_reference_ids(payload, "anchors", anchor_ids)
+    inputs = _required_reference_ids(payload, "input_record_ids", record_ids)
+    sources = _required_reference_ids(payload, "source_revision_ids", revision_ids)
     common = {
         "snapshot_id": snapshot_id,
         "anchors": anchors,
@@ -188,8 +188,8 @@ def _synthesis_record(
             "later_observed_years", "deprecation_evidence_anchors",
         }
         _allow_synthesis_fields(payload, fields)
-        earlier = _payload_ids(payload.get("earlier_source_set"), revision_ids[:1])
-        later = _payload_ids(payload.get("later_source_set"), revision_ids[1:])
+        earlier = _required_reference_ids(payload, "earlier_source_set", revision_ids)
+        later = _required_reference_ids(payload, "later_source_set", revision_ids)
         dependencies = tuple(dict.fromkeys(common["dependencies"] + tuple(
             RecordDependency("source_revision", value) for value in earlier + later
         )))
@@ -202,13 +202,13 @@ def _synthesis_record(
             later_source_set=later,
             classification=payload.get("classification"),
             negative_evidence_state=payload.get("negative_evidence_state"),
-            competing_anchors=_payload_ids(payload.get("competing_anchors"), (), allow_empty=True),
+            competing_anchors=_optional_reference_ids(payload, "competing_anchors", anchor_ids),
             earlier_coverage_id=payload.get("earlier_coverage_id"),
             later_coverage_id=payload.get("later_coverage_id"),
             earlier_observed_years=_payload_years(payload.get("earlier_observed_years")),
             later_observed_years=_payload_years(payload.get("later_observed_years")),
-            deprecation_evidence_anchors=_payload_ids(
-                payload.get("deprecation_evidence_anchors"), (), allow_empty=True
+            deprecation_evidence_anchors=_optional_reference_ids(
+                payload, "deprecation_evidence_anchors", anchor_ids
             ),
         )
     if family == "conflict_unresolved":
@@ -217,7 +217,7 @@ def _synthesis_record(
             "relevant_scopes", "conditions", "unresolved_questions",
         }
         _allow_synthesis_fields(payload, fields)
-        competing = _payload_ids(payload.get("competing_record_ids"), record_ids[:2])
+        competing = _required_reference_ids(payload, "competing_record_ids", record_ids)
         dependencies = tuple(dict.fromkeys(common["dependencies"] + tuple(
             RecordDependency("derived_record", value) for value in competing
         )))
@@ -235,18 +235,32 @@ def _synthesis_record(
     raise ValueError("synthesis may create only relationship, evolution, or conflict records")
 
 
-def _payload_ids(value: object, default: tuple[str, ...], *, allow_empty: bool = False) -> tuple[str, ...]:
-    if value == [] or value is None:
-        values = default
-    elif isinstance(value, list):
-        values = tuple(value)
-    else:
-        raise ValueError("synthesis IDs must be a list")
-    if (not values and not allow_empty) or len(set(values)) != len(values) or any(
-        not isinstance(item, str) or not item for item in values
-    ):
-        raise ValueError("synthesis IDs must be non-empty and unique")
+def _required_reference_ids(
+    payload: dict[str, object], field: str, allowed: tuple[str, ...]
+) -> tuple[str, ...]:
+    if field not in payload or not isinstance(payload[field], list) or not payload[field]:
+        raise ValueError(f"synthesis {field} must be an explicit non-empty list")
+    values = tuple(payload[field])
+    if any(not isinstance(item, str) or not item for item in values):
+        raise ValueError(f"synthesis {field} must contain unique non-empty IDs")
+    if len(set(values)) != len(values):
+        raise ValueError(f"synthesis {field} must contain unique non-empty IDs")
+    if not set(values) <= set(allowed):
+        raise ValueError(f"synthesis {field} contains an unsupported reference")
     return values
+
+
+def _optional_reference_ids(
+    payload: dict[str, object], field: str, allowed: tuple[str, ...]
+) -> tuple[str, ...]:
+    if field not in payload:
+        return ()
+    value = payload[field]
+    if not isinstance(value, list):
+        raise ValueError(f"synthesis {field} must be a list")
+    if not value:
+        return ()
+    return _required_reference_ids(payload, field, allowed)
 
 
 def _payload_texts(value: object, *, allow_empty: bool = False) -> tuple[str, ...]:

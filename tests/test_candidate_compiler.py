@@ -39,6 +39,8 @@ class QueueResponses:
         output = self.outputs.pop(0)
         if isinstance(output, Exception):
             raise output
+        if callable(output):
+            output = output(request)
         return SimpleNamespace(
             output_text=json.dumps(output),
             usage=SimpleNamespace(input_tokens=11, output_tokens=7),
@@ -46,13 +48,21 @@ class QueueResponses:
 
 
 class FakeVectorClient:
-    def __init__(self, *, attachment_status="completed", batch_status="completed", create_failure_at=None):
+    def __init__(
+        self,
+        *,
+        attachment_status="completed",
+        batch_status="completed",
+        create_failure_at=None,
+        attach_exception=None,
+    ):
         self.calls = []
         self.attachment_status = attachment_status
         self.batch_result_status = batch_status
         self.next_store = 0
         self.next_file = 0
         self.create_failure_at = create_failure_at
+        self.attach_exception = attach_exception
         self.files = SimpleNamespace(create=self.upload)
         self.vector_store_files = SimpleNamespace(
             create=self.attach,
@@ -81,6 +91,8 @@ class FakeVectorClient:
 
     def attach(self, store_id, **kwargs):
         self.calls.append(("attach", store_id, kwargs))
+        if self.attach_exception is not None:
+            raise self.attach_exception
         return SimpleNamespace(
             id=f"vsf_{kwargs['file_id']}",
             status=self.attachment_status,
@@ -195,6 +207,53 @@ class RawClaimBypassSynthesizer:
             object="raw authority",
             compiler_provenance=provenance,
         ),), provenance)
+
+
+def synthesis_response(request):
+    supplied = json.loads(request["input"])
+    records = supplied["records"]
+    record_ids = [record["record_id"] for record in records]
+    anchor_ids = list(dict.fromkeys(anchor for record in records for anchor in record["anchors"]))
+    revision_ids = supplied["revision_ids"]
+    common = {
+        "qualification": "Synthetic reconciled evidence.",
+        "anchors": anchor_ids,
+        "input_record_ids": record_ids,
+        "source_revision_ids": revision_ids,
+    }
+    return {"records": [
+        common | {
+            "family": "relationship",
+            "left": "Synthetic 1",
+            "relation": "supports",
+            "right": "Synthetic 2",
+        },
+        common | {
+            "family": "evolution",
+            "subject": "Synthetic framework",
+            "previous": "Earlier bounded form",
+            "current": "Later qualified form",
+            "earlier_source_set": revision_ids[:1],
+            "later_source_set": revision_ids[1:],
+            "classification": "refined",
+            "negative_evidence_state": "positive_teaching",
+            "earlier_coverage_id": "coverage_earlier",
+            "later_coverage_id": "coverage_later",
+            "earlier_observed_years": [2025],
+            "later_observed_years": [2026],
+        },
+        common | {
+            "family": "conflict_unresolved",
+            "kind": "unresolved",
+            "subject": "Synthetic context",
+            "alternatives": ["Earlier condition", "Later condition"],
+            "competing_record_ids": record_ids,
+            "reconciliation_state": "unresolved",
+            "relevant_scopes": ["synthetic scope"],
+            "conditions": [],
+            "unresolved_questions": ["Which synthetic condition applies?"],
+        },
+    ]}
 
 
 def source_bundle(storage, identity, year):
@@ -320,7 +379,7 @@ def test_build_composes_a_ready_unpublished_candidate_with_typed_bounded_artifac
 
 
 def test_extraction_failure_is_visible_and_leaves_candidate_failed_and_unpublished(tmp_path):
-    storage, candidate_compiler, request, _ = compiler(
+    storage, candidate_compiler, request, vector_client = compiler(
         tmp_path,
         extraction_outputs=[RuntimeError("synthetic extraction failed"), {"candidates": []}],
     )
@@ -332,6 +391,9 @@ def test_extraction_failure_is_visible_and_leaves_candidate_failed_and_unpublish
     assert "extraction" in result.failures[0]
     assert storage.current_snapshot() is None
     assert result.total_metric.failure_count >= 1
+    assert result.snapshot.raw_store_id is None
+    assert result.snapshot.derived_store_id is None
+    assert vector_client.calls == []
 
 
 def test_nonaffirmative_validation_blocks_candidate_readiness_and_excludes_the_claim(tmp_path):
@@ -442,51 +504,7 @@ def test_synthesis_cannot_bypass_storage_owned_source_claim_validation(tmp_path)
 def test_concrete_reconciliation_stage_builds_typed_provenanced_records_without_network(tmp_path):
     storage, candidate_compiler, request, _ = compiler(
         tmp_path,
-        synthesis_outputs=[{"records": [
-            {
-                "family": "relationship",
-                "qualification": "Synthetic relationship synthesis.",
-                "anchors": [],
-                "input_record_ids": [],
-                "source_revision_ids": [],
-                "left": "Synthetic 1",
-                "relation": "supports",
-                "right": "Synthetic 2",
-            },
-            {
-                "family": "evolution",
-                "qualification": "Synthetic evolution synthesis.",
-                "anchors": [],
-                "input_record_ids": [],
-                "source_revision_ids": [],
-                "subject": "Synthetic framework",
-                "previous": "Earlier bounded form",
-                "current": "Later qualified form",
-                "earlier_source_set": [],
-                "later_source_set": [],
-                "classification": "refined",
-                "negative_evidence_state": "positive_teaching",
-                "earlier_coverage_id": "coverage_earlier",
-                "later_coverage_id": "coverage_later",
-                "earlier_observed_years": [2025],
-                "later_observed_years": [2026],
-            },
-            {
-                "family": "conflict_unresolved",
-                "qualification": "Synthetic unresolved synthesis.",
-                "anchors": [],
-                "input_record_ids": [],
-                "source_revision_ids": [],
-                "kind": "unresolved",
-                "subject": "Synthetic context",
-                "alternatives": ["Earlier condition", "Later condition"],
-                "competing_record_ids": [],
-                "reconciliation_state": "unresolved",
-                "relevant_scopes": ["synthetic scope"],
-                "conditions": [],
-                "unresolved_questions": ["Which synthetic condition applies?"],
-            },
-        ]}],
+        synthesis_outputs=[synthesis_response],
     )
 
     result = candidate_compiler.build(request)
@@ -496,6 +514,27 @@ def test_concrete_reconciliation_stage_builds_typed_provenanced_records_without_
     assert {record.family for record in synthesized} == {"relationship", "evolution", "conflict_unresolved"}
     assert all(record.compiler_provenance is not None for record in synthesized)
     assert next(metric for metric in result.stage_metrics if metric.stage == "synthesis").input_tokens == 11
+
+
+def test_concrete_reconciler_rejects_relationship_without_explicit_evidence_references(tmp_path):
+    def unsupported_relationship(request):
+        payload = synthesis_response(request)
+        relationship = payload["records"][0]
+        relationship.pop("anchors")
+        return {"records": [relationship]}
+
+    storage, candidate_compiler, request, vector_client = compiler(
+        tmp_path,
+        synthesis_outputs=[unsupported_relationship],
+    )
+
+    result = candidate_compiler.build(request)
+
+    assert result.ready is False
+    assert result.snapshot.status == "failed"
+    assert any("synthesis" in failure and "anchors" in failure for failure in result.failures)
+    assert vector_client.calls == []
+    assert storage.current_snapshot() is None
 
 
 def test_partial_remote_setup_is_auditable_and_retry_returns_the_same_failed_run(tmp_path):
@@ -517,7 +556,32 @@ def test_partial_remote_setup_is_auditable_and_retry_returns_the_same_failed_run
     assert len(vector_client.calls) == call_count == 2
     setup = next(metric for metric in first.stage_metrics if metric.stage == "remote_setup")
     assert (setup.call_count, setup.remote_calls, setup.failure_count) == (2, 2, 1)
-    assert candidate_compiler._extractor._client.responses.calls == []
+    assert len(candidate_compiler._extractor._client.responses.calls) == 2
     with pytest.raises(ValueError, match="run ID"):
         candidate_compiler.build(replace(request, artifact_scope=ArtifactScope.PRODUCTION))
     assert len(vector_client.calls) == call_count
+
+
+def test_upload_success_and_attach_failure_retain_partial_remote_audit_and_actual_metrics(tmp_path):
+    vector_client = FakeVectorClient(attach_exception=RuntimeError("Synthetic attach call failure."))
+    storage, candidate_compiler, request, _ = compiler(tmp_path, vector_client=vector_client)
+
+    first = candidate_compiler.build(request)
+    calls_after_failure = len(vector_client.calls)
+    audit_after_failure = storage.candidate_remote_operations(first.snapshot.snapshot_id)
+    second = candidate_compiler.build(request)
+
+    assert first.ready is second.ready is False
+    assert first.snapshot.status == second.snapshot.status == "failed"
+    derived = next(metric for metric in first.stage_metrics if metric.stage == "derived_store")
+    assert (derived.call_count, derived.remote_calls, derived.failure_count) == (2, 2, 1)
+    upload = next(operation for operation in audit_after_failure if operation.operation == "upload_file")
+    attach = next(operation for operation in audit_after_failure if operation.operation == "attach_file")
+    assert upload.status == "succeeded"
+    assert upload.file_id == "file_derived_1"
+    assert attach.status == "failed"
+    assert attach.file_id == upload.file_id
+    assert attach.store_id == first.snapshot.derived_store_id
+    assert storage.candidate_remote_operations(first.snapshot.snapshot_id) == audit_after_failure
+    assert len(vector_client.calls) == calls_after_failure
+    assert storage.current_snapshot() is None

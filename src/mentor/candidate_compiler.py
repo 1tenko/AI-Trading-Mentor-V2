@@ -163,52 +163,9 @@ class CandidateCompiler:
 
         stage_metrics: list[CompilationMetric] = []
         failures: list[str] = []
-        setup_started = self._clock()
-        setup_calls = 0
-        try:
-            setup_calls += 1
-            raw_store = self._vector_stores.create_store(
-                f"Phase 3 {scope} raw {request.run.run_id}",
-                {"snapshot_id": snapshot_id, "artifact_scope": scope, "artifact_kind": "raw"},
-            )
-            snapshot = self._storage.record_candidate_store(snapshot_id, "raw", raw_store.store_id)
-            _reject_failed_store(raw_store)
-            setup_calls += 1
-            derived_store = self._vector_stores.create_store(
-                f"Phase 3 {scope} derived {request.run.run_id}",
-                {"snapshot_id": snapshot_id, "artifact_scope": scope, "artifact_kind": "derived"},
-            )
-            snapshot = self._storage.record_candidate_store(snapshot_id, "derived", derived_store.store_id)
-            _reject_failed_store(derived_store)
-        except Exception as error:
-            failures.append(f"remote setup failed: {error}")
-        stage_metrics.append(
-            self._record_metric(
-                request.run,
-                "remote_setup",
-                len(sources),
-                0,
-                setup_calls,
-                CallUsage(),
-                _elapsed_ms(setup_started, self._clock()),
-                setup_calls,
-                int(bool(failures)),
-            )
-        )
         empty_graph = DependencyGraph(())
-        empty_raw = RemoteArtifact("raw", request.artifact_scope, snapshot.raw_store_id, ())
-        empty_derived = RemoteArtifact("derived", request.artifact_scope, snapshot.derived_store_id, ())
-        if failures:
-            return self._failed_result(
-                request,
-                None,
-                failures,
-                stage_metrics,
-                empty_graph,
-                (),
-                empty_raw,
-                empty_derived,
-            )
+        empty_raw = RemoteArtifact("raw", request.artifact_scope, None, ())
+        empty_derived = RemoteArtifact("derived", request.artifact_scope, None, ())
 
         source_results: list[SourceProcessingResult] = []
         extraction_usage = CallUsage()
@@ -411,16 +368,113 @@ class CandidateCompiler:
                 empty_derived,
             )
 
+        setup_started = self._clock()
+        setup_calls = 0
+        raw_store = derived_store = None
+        try:
+            setup_calls += 1
+            raw_operation = self._storage.begin_candidate_remote_operation(
+                snapshot.snapshot_id, "remote_setup", "create_store"
+            )
+            try:
+                raw_store = self._vector_stores.create_store(
+                    f"Phase 3 {scope} raw {request.run.run_id}",
+                    {"snapshot_id": snapshot_id, "artifact_scope": scope, "artifact_kind": "raw"},
+                )
+                snapshot = self._storage.record_candidate_store(snapshot_id, "raw", raw_store.store_id)
+                _reject_failed_store(raw_store)
+            except Exception:
+                self._storage.finish_candidate_remote_operation(
+                    raw_operation,
+                    "failed",
+                    store_id=getattr(raw_store, "store_id", None),
+                )
+                raise
+            self._storage.finish_candidate_remote_operation(
+                raw_operation, "succeeded", store_id=raw_store.store_id
+            )
+
+            setup_calls += 1
+            derived_operation = self._storage.begin_candidate_remote_operation(
+                snapshot.snapshot_id, "remote_setup", "create_store"
+            )
+            try:
+                derived_store = self._vector_stores.create_store(
+                    f"Phase 3 {scope} derived {request.run.run_id}",
+                    {"snapshot_id": snapshot_id, "artifact_scope": scope, "artifact_kind": "derived"},
+                )
+                snapshot = self._storage.record_candidate_store(
+                    snapshot_id, "derived", derived_store.store_id
+                )
+                _reject_failed_store(derived_store)
+            except Exception:
+                self._storage.finish_candidate_remote_operation(
+                    derived_operation,
+                    "failed",
+                    store_id=getattr(derived_store, "store_id", None),
+                )
+                raise
+            self._storage.finish_candidate_remote_operation(
+                derived_operation, "succeeded", store_id=derived_store.store_id
+            )
+        except Exception as error:
+            failures.append(f"remote setup failed: {error}")
+        stage_metrics.append(
+            self._record_metric(
+                request.run,
+                "remote_setup",
+                len(sources),
+                0,
+                setup_calls,
+                CallUsage(),
+                _elapsed_ms(setup_started, self._clock()),
+                setup_calls,
+                int(bool(failures)),
+            )
+        )
+        empty_raw = RemoteArtifact("raw", request.artifact_scope, snapshot.raw_store_id, ())
+        empty_derived = RemoteArtifact("derived", request.artifact_scope, snapshot.derived_store_id, ())
+        if failures:
+            return self._failed_result(
+                request,
+                gate,
+                failures,
+                stage_metrics,
+                graph,
+                orientation_artifacts,
+                empty_raw,
+                empty_derived,
+            )
+
         raw_started = self._clock()
         raw_file_ids = tuple(source.revision.remote_file_id for source in sources)
-        raw_calls = 1
+        raw_calls = 0
         try:
-            batch = self._vector_stores.create_batch(
-                raw_store.store_id,
-                list(raw_file_ids),
-                {"snapshot_id": snapshot.snapshot_id, "artifact_scope": scope, "status": "published"},
+            raw_calls += 1
+            batch_operation = self._storage.begin_candidate_remote_operation(
+                snapshot.snapshot_id,
+                "raw_store",
+                "create_batch",
+                store_id=raw_store.store_id,
             )
-            raw_calls += self._await_batch(raw_store.store_id, batch)
+            batch = None
+            try:
+                batch = self._vector_stores.create_batch(
+                    raw_store.store_id,
+                    list(raw_file_ids),
+                    {"snapshot_id": snapshot.snapshot_id, "artifact_scope": scope, "status": "published"},
+                )
+                raw_calls += self._await_batch(snapshot.snapshot_id, raw_store.store_id, batch)
+            except Exception:
+                self._storage.finish_candidate_remote_operation(
+                    batch_operation,
+                    "failed",
+                    batch_id=getattr(batch, "batch_id", None),
+                )
+                raise
+            self._storage.finish_candidate_remote_operation(
+                batch_operation, "succeeded", batch_id=batch.batch_id
+            )
         except Exception as error:
             failures.append(f"raw store readiness failed: {error}")
         raw_artifact = RemoteArtifact("raw", request.artifact_scope, raw_store.store_id, raw_file_ids)
@@ -454,17 +508,53 @@ class CandidateCompiler:
         derived_calls = 0
         try:
             for artifact in orientation_artifacts:
-                file_id = self._vector_stores.upload_text(
-                    f"{artifact.record_id}.json",
-                    artifact.content,
+                derived_calls += 1
+                upload_operation = self._storage.begin_candidate_remote_operation(
+                    snapshot.snapshot_id, "derived_store", "upload_file"
+                )
+                file_id = None
+                try:
+                    file_id = self._vector_stores.upload_text(
+                        f"{artifact.record_id}.json",
+                        artifact.content,
+                    )
+                except Exception:
+                    self._storage.finish_candidate_remote_operation(upload_operation, "failed")
+                    raise
+                self._storage.finish_candidate_remote_operation(
+                    upload_operation, "succeeded", file_id=file_id
                 )
                 derived_file_ids.append(file_id)
-                attachment = self._vector_stores.attach_file(
-                    derived_store.store_id,
-                    file_id,
-                    artifact.attributes,
+                derived_calls += 1
+                attach_operation = self._storage.begin_candidate_remote_operation(
+                    snapshot.snapshot_id,
+                    "derived_store",
+                    "attach_file",
+                    store_id=derived_store.store_id,
+                    file_id=file_id,
                 )
-                derived_calls += 2 + self._await_attachment(derived_store.store_id, file_id, attachment)
+                attachment = None
+                try:
+                    attachment = self._vector_stores.attach_file(
+                        derived_store.store_id,
+                        file_id,
+                        artifact.attributes,
+                    )
+                    derived_calls += self._await_attachment(
+                        snapshot.snapshot_id, derived_store.store_id, file_id, attachment
+                    )
+                except Exception:
+                    self._storage.finish_candidate_remote_operation(
+                        attach_operation,
+                        "failed",
+                        attachment_id=getattr(attachment, "attachment_id", None),
+                    )
+                    raise
+                self._storage.finish_candidate_remote_operation(
+                    attach_operation,
+                    "succeeded",
+                    attachment_id=attachment.attachment_id,
+                )
         except Exception as error:
             failures.append(f"derived store readiness failed: {error}")
         derived_artifact = RemoteArtifact(
@@ -578,7 +668,7 @@ class CandidateCompiler:
             artifacts.append(OrientationArtifact(record.record_id, concept_id, content, attributes))
         return tuple(artifacts)
 
-    def _await_batch(self, store_id: str, batch: Any) -> int:
+    def _await_batch(self, snapshot_id: str, store_id: str, batch: Any) -> int:
         calls = 0
         current = batch
         for attempt in range(self._readiness_checks):
@@ -589,11 +679,25 @@ class CandidateCompiler:
                 raise ValueError(_remote_failure("batch", current))
             if attempt + 1 < self._readiness_checks:
                 self._sleep(1.0)
-                current = self._vector_stores.batch_status(store_id, batch.batch_id)
                 calls += 1
+                operation = self._storage.begin_candidate_remote_operation(
+                    snapshot_id,
+                    "raw_store",
+                    "batch_status",
+                    store_id=store_id,
+                    batch_id=batch.batch_id,
+                )
+                try:
+                    current = self._vector_stores.batch_status(store_id, batch.batch_id)
+                except Exception:
+                    self._storage.finish_candidate_remote_operation(operation, "failed")
+                    raise
+                self._storage.finish_candidate_remote_operation(operation, "succeeded")
         raise ValueError("batch did not become ready within the configured checks")
 
-    def _await_attachment(self, store_id: str, file_id: str, attachment: Any) -> int:
+    def _await_attachment(
+        self, snapshot_id: str, store_id: str, file_id: str, attachment: Any
+    ) -> int:
         calls = 0
         current = attachment
         for attempt in range(self._readiness_checks):
@@ -604,8 +708,25 @@ class CandidateCompiler:
                 raise ValueError(_remote_failure("attachment", current))
             if attempt + 1 < self._readiness_checks:
                 self._sleep(1.0)
-                current = self._vector_stores.attachment_status(store_id, file_id)
                 calls += 1
+                operation = self._storage.begin_candidate_remote_operation(
+                    snapshot_id,
+                    "derived_store",
+                    "attachment_status",
+                    store_id=store_id,
+                    file_id=file_id,
+                    attachment_id=getattr(current, "attachment_id", None),
+                )
+                try:
+                    current = self._vector_stores.attachment_status(store_id, file_id)
+                except Exception:
+                    self._storage.finish_candidate_remote_operation(operation, "failed")
+                    raise
+                self._storage.finish_candidate_remote_operation(
+                    operation,
+                    "succeeded",
+                    attachment_id=getattr(current, "attachment_id", None),
+                )
         raise ValueError("attachment did not become ready within the configured checks")
 
     def _record_metric(

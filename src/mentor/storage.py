@@ -61,6 +61,19 @@ class SourceChange:
 
 
 @dataclass(frozen=True)
+class CandidateRemoteOperation:
+    operation_id: int
+    snapshot_id: str
+    stage: str
+    operation: str
+    status: str
+    store_id: str | None
+    file_id: str | None
+    attachment_id: str | None
+    batch_id: str | None
+
+
+@dataclass(frozen=True)
 class Thread:
     id: int
     title: str
@@ -209,6 +222,20 @@ class Storage:
                 CREATE TABLE IF NOT EXISTS candidate_artifact_scopes (
                     snapshot_id TEXT PRIMARY KEY REFERENCES corpus_snapshots(snapshot_id),
                     artifact_scope TEXT NOT NULL CHECK(artifact_scope IN ('pilot', 'production'))
+                );
+                CREATE TABLE IF NOT EXISTS candidate_remote_operations (
+                    operation_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    snapshot_id TEXT NOT NULL REFERENCES corpus_snapshots(snapshot_id),
+                    stage TEXT NOT NULL CHECK(stage IN ('remote_setup', 'raw_store', 'derived_store')),
+                    operation TEXT NOT NULL CHECK(operation IN (
+                        'create_store', 'create_batch', 'batch_status',
+                        'upload_file', 'attach_file', 'attachment_status'
+                    )),
+                    status TEXT NOT NULL CHECK(status IN ('attempted', 'succeeded', 'failed')),
+                    store_id TEXT,
+                    file_id TEXT,
+                    attachment_id TEXT,
+                    batch_id TEXT
                 );
                 CREATE TABLE IF NOT EXISTS snapshot_source_coverage (
                     snapshot_id TEXT NOT NULL REFERENCES corpus_snapshots(snapshot_id),
@@ -533,6 +560,105 @@ class Storage:
                 (snapshot_id,),
             ).fetchone()
         return None if row is None else str(row[0])
+
+    def begin_candidate_remote_operation(
+        self,
+        snapshot_id: str,
+        stage: str,
+        operation: str,
+        *,
+        store_id: str | None = None,
+        file_id: str | None = None,
+        attachment_id: str | None = None,
+        batch_id: str | None = None,
+    ) -> int:
+        if stage not in {"remote_setup", "raw_store", "derived_store"}:
+            raise ValueError("invalid candidate remote stage")
+        if operation not in {
+            "create_store", "create_batch", "batch_status",
+            "upload_file", "attach_file", "attachment_status",
+        }:
+            raise ValueError("invalid candidate remote operation")
+        identifiers = (store_id, file_id, attachment_id, batch_id)
+        if any(value is not None and (not isinstance(value, str) or not value) for value in identifiers):
+            raise ValueError("candidate remote identifiers must be non-empty strings")
+        with self._connect() as connection:
+            snapshot = connection.execute(
+                "SELECT status FROM corpus_snapshots WHERE snapshot_id = ?", (snapshot_id,)
+            ).fetchone()
+            if snapshot is None or snapshot[0] != "building":
+                raise ValueError("candidate remote operations require a building candidate")
+            cursor = connection.execute(
+                """
+                INSERT INTO candidate_remote_operations(
+                    snapshot_id, stage, operation, status,
+                    store_id, file_id, attachment_id, batch_id
+                ) VALUES (?, ?, ?, 'attempted', ?, ?, ?, ?)
+                """,
+                (snapshot_id, stage, operation, store_id, file_id, attachment_id, batch_id),
+            )
+            return int(cursor.lastrowid)
+
+    def finish_candidate_remote_operation(
+        self,
+        operation_id: int,
+        status: str,
+        *,
+        store_id: str | None = None,
+        file_id: str | None = None,
+        attachment_id: str | None = None,
+        batch_id: str | None = None,
+    ) -> CandidateRemoteOperation:
+        if status not in {"succeeded", "failed"}:
+            raise ValueError("candidate remote operation requires a terminal status")
+        values = (store_id, file_id, attachment_id, batch_id)
+        if any(value is not None and (not isinstance(value, str) or not value) for value in values):
+            raise ValueError("candidate remote identifiers must be non-empty strings")
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT store_id, file_id, attachment_id, batch_id, status
+                FROM candidate_remote_operations WHERE operation_id = ?
+                """,
+                (operation_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError("unknown candidate remote operation")
+            if row[4] != "attempted":
+                raise ValueError("candidate remote operation is already complete")
+            merged = tuple(new if new is not None else old for old, new in zip(row[:4], values))
+            if any(old is not None and new is not None and old != new for old, new in zip(row[:4], values)):
+                raise ValueError("candidate remote operation identity is immutable")
+            connection.execute(
+                """
+                UPDATE candidate_remote_operations
+                SET status = ?, store_id = ?, file_id = ?, attachment_id = ?, batch_id = ?
+                WHERE operation_id = ?
+                """,
+                (status, *merged, operation_id),
+            )
+            updated = connection.execute(
+                """
+                SELECT operation_id, snapshot_id, stage, operation, status,
+                       store_id, file_id, attachment_id, batch_id
+                FROM candidate_remote_operations WHERE operation_id = ?
+                """,
+                (operation_id,),
+            ).fetchone()
+        return CandidateRemoteOperation(*updated)
+
+    def candidate_remote_operations(self, snapshot_id: str) -> tuple[CandidateRemoteOperation, ...]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT operation_id, snapshot_id, stage, operation, status,
+                       store_id, file_id, attachment_id, batch_id
+                FROM candidate_remote_operations
+                WHERE snapshot_id = ? ORDER BY operation_id
+                """,
+                (snapshot_id,),
+            ).fetchall()
+        return tuple(CandidateRemoteOperation(*row) for row in rows)
 
     def transition_snapshot(
         self,
