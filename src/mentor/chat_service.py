@@ -539,6 +539,7 @@ def _should_orient(question: str, effective_depth: str) -> bool:
             r"\b(all|every|everything|complete|exhaustive)\b|\bteach me\b"
             r"|\b(compare|comparison|difference|differences|changed|change|evolution|evolved|refined)\b"
             r"|\b(relationship|relationships|factor|factors|condition|conditions|affect|affects|influence|influences|interaction|interact)\b"
+            r"|\b(research question|research hypothesis|falsifiable hypothesis|backtest|experiment|overfitting|confound)\b"
             r"|\b(whole|overall|entire)\s+system\b"
             r"|\b(explain|teach).{0,160}\b(major parts|fit together|whole system)\b"
             r"|\b(how do|how does).{0,160}\b(work together|fit together|relate|interact)\b",

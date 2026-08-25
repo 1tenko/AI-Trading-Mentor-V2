@@ -225,6 +225,7 @@ def test_direct_orientation_never_enters_thread_or_replay_state(
         ("Give me all of Jacob's teachings on timing.", "normal", True),
         ("Give me a complete mapping of Jacob's timeframes.", "deep", True),
         ("Teach me about SMT.", "auto", True),
+        ("I want to test whether Asset Synchronization changes the usefulness of a reversal-model sequence. Form a falsifiable hypothesis.", "normal", True),
         ("What does TPD stand for?", "deep", False),
         ("Compare the exact source quotes from 2025 and 2026.", "auto", False),
         ("Give me every exact source quote for SMT.", "normal", False),
