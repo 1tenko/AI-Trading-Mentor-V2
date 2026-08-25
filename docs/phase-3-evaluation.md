@@ -410,3 +410,27 @@ existing 83-record downstream pilot replay also retained valid lineage and
 bounded orientation retrieval. The updated cumulative Gate 1 spend baseline is
 `$11.597070` against the unchanged `$30.00` ceiling; no new paid call was made
 by this hardening work.
+
+## Controlled Gate 1 result after evolution hardening
+
+The fresh six-source candidate completed all six extraction calls, 69
+independent validation calls, and five synthesis calls. It produced 75 active
+derived records: 25 claims, 33 procedures/sequences/hierarchies, 15
+relationships, and two evolution records. Its synthesis admission audit was
+20 proposed conclusions, 19 admitted conclusions, and one evolution conclusion
+rejected for the existing negative-evidence rule. No fatal synthesis structural
+failure occurred.
+
+The candidate then stopped at remote setup. The runner refused the first
+vector-store creation before provider access because the present design has no
+defensible bounded retention-cost policy for remote storage. It therefore did
+not create a remote store, publish a snapshot, build orientation artifacts,
+run Mentor evaluation, or alter production pointers. This is a cost-policy
+blocker, not a synthesis, raw-source, provenance, or candidate-readiness
+failure.
+
+Measured incremental spend was `$2.256515`: `$0.628820` extraction,
+`$0.781790` validation, and `$0.845905` synthesis. Cumulative Gate 1 R&D spend
+is `$13.853585`, leaving `$16.146415` under the unchanged `$30.00` checkpoint.
+The failed candidate and all response/record artifacts remain private and
+ignored.
