@@ -43,6 +43,7 @@ from mentor.derived_records import (
 from mentor.knowledge import SourceRevision
 from mentor.orientation import OrientationBudget, concept_summaries, render_orientation_artifact
 from mentor.synthesis import (
+    AliasAudit,
     ConceptHint,
     ReconciliationSource,
     ReconciliationCoverage,
@@ -50,6 +51,7 @@ from mentor.synthesis import (
     SynthesisResult,
     concept_hint_from_record_selector,
     record_reaches_any,
+    reconcile_concept_hints,
     source_coverage,
     validate_concept_hint_integrity,
 )
@@ -169,6 +171,7 @@ class CandidateBuildResult:
     failures: tuple[str, ...]
     excluded_record_ids: tuple[str, ...] = ()
     reconciliation_coverage: ReconciliationCoverage | None = None
+    alias_audit: AliasAudit = AliasAudit()
 
 
 class CandidateCompiler:
@@ -320,6 +323,7 @@ class CandidateCompiler:
         extracted_candidate_count = extraction_latency_ms = validation_latency_ms = 0
 
         extraction_hints: list[ConceptHint] = []
+        rejected_semantically_unsupported_aliases = 0
         for source in sources:
             if source.revision.revision_id in reused_revision_ids:
                 reused_count = sum(
@@ -373,6 +377,9 @@ class CandidateCompiler:
                     validation_started = self._clock()
                     try:
                         validation_calls += 1
+                        candidate_hints = tuple(
+                            hint for hint in extracted.hints if hint.record_id == candidate.record_id
+                        )
                         outcome = self._storage.validate_and_store_source_extracted(
                             client=self._validation_client,
                             candidate=candidate,
@@ -382,15 +389,16 @@ class CandidateCompiler:
                             model=self._validation_model,
                             live_mode=self._live_mode,
                             pricing=self._validation_pricing,
-                            concept_hints=tuple(
-                                hint for hint in extracted.hints
-                                if hint.record_id == candidate.record_id
-                            ),
+                            concept_hints=candidate_hints,
                         )
                         validation_usage = _sum_usage(validation_usage, outcome.usage)
                         if outcome.source_extracted is not None:
                             accepted += 1
                             extraction_hints.extend(outcome.validated_hints)
+                        else:
+                            rejected_semantically_unsupported_aliases += sum(
+                                len(hint.aliases) for hint in candidate_hints
+                            )
                     except Exception as error:
                         validation_failures += 1
                         source_failed = True
@@ -453,8 +461,16 @@ class CandidateCompiler:
         synthesis_invoked = False
         synthesized: SynthesisResult | None = None
         hints: tuple[ConceptHint, ...] = reused_hints + tuple(extraction_hints)
+        alias_audit = AliasAudit(
+            rejected_semantically_unsupported=rejected_semantically_unsupported_aliases
+        )
         try:
             extracted_records = tuple(self._storage.derived_records(snapshot.snapshot_id, include_stale=True))
+            extracted_aliases = reconcile_concept_hints(
+                extracted_records, hints, require_active=True
+            )
+            hints = extracted_aliases.hints
+            alias_audit = _combine_alias_audits(alias_audit, extracted_aliases.audit)
             source_metadata = _reconciliation_sources(self._storage, sources)
             all_source_extracted = tuple(
                 record for record in extracted_records
@@ -524,9 +540,13 @@ class CandidateCompiler:
             _validate_reconciliation_coverage(synthesized, synthesis_inputs)
             synthesized = _filter_synthesis_target_lineage(synthesized, synthesis_inputs)
             synthesized_count = len(synthesized.records)
-            hints += tuple(synthesized.hints)
-            _validate_context_not_regenerated(synthesized.records, reconciliation_context)
             candidate_records = extracted_records + synthesized.records
+            synthesis_aliases = reconcile_concept_hints(
+                candidate_records, synthesized.hints, require_active=True
+            )
+            hints += synthesis_aliases.hints
+            alias_audit = _combine_alias_audits(alias_audit, synthesis_aliases.audit)
+            _validate_context_not_regenerated(synthesized.records, reconciliation_context)
             validate_concept_hint_integrity(candidate_records, hints, require_active=True)
             _validate_candidate_dependencies(
                 candidate_records,
@@ -588,6 +608,7 @@ class CandidateCompiler:
                 empty_raw,
                 empty_derived,
                 excluded_record_ids,
+                alias_audit=alias_audit,
             )
 
         try:
@@ -605,6 +626,7 @@ class CandidateCompiler:
                 (),
                 empty_raw,
                 empty_derived,
+                alias_audit=alias_audit,
             )
 
         setup_started = self._clock()
@@ -683,6 +705,7 @@ class CandidateCompiler:
                 orientation_artifacts,
                 empty_raw,
                 empty_derived,
+                alias_audit=alias_audit,
             )
 
         raw_started = self._clock()
@@ -753,6 +776,7 @@ class CandidateCompiler:
                 orientation_artifacts,
                 raw_artifact,
                 empty_derived,
+                alias_audit=alias_audit,
             )
 
         derived_started = self._clock()
@@ -835,6 +859,7 @@ class CandidateCompiler:
                 orientation_artifacts,
                 raw_artifact,
                 derived_artifact,
+                alias_audit=alias_audit,
             )
 
         snapshot = self._storage.transition_snapshot(snapshot.snapshot_id, "validating", transitioned_at=self._now())
@@ -854,6 +879,7 @@ class CandidateCompiler:
             reconciliation_coverage=(
                 synthesized.coverage if isinstance(synthesized, SynthesisResult) else None
             ),
+            alias_audit=alias_audit,
         )
 
     def _preflight_live_pricing(self) -> None:
@@ -1101,6 +1127,7 @@ class CandidateCompiler:
         raw_artifact: RemoteArtifact,
         derived_artifact: RemoteArtifact,
         excluded_record_ids: tuple[str, ...] = (),
+        alias_audit: AliasAudit = AliasAudit(),
     ) -> CandidateBuildResult:
         snapshot_id = gate.snapshot_id if gate is not None else CorpusSnapshot.identity_for(
             request.run.run_id,
@@ -1138,6 +1165,7 @@ class CandidateCompiler:
             total,
             tuple(failures),
             excluded_record_ids,
+            alias_audit=alias_audit,
         )
 
     def _existing_failed_result(
@@ -1166,6 +1194,20 @@ class CandidateCompiler:
             total,
             (snapshot.failure_reason or "existing candidate failed",),
         )
+
+
+def _combine_alias_audits(first: AliasAudit, second: AliasAudit) -> AliasAudit:
+    return AliasAudit(
+        proposed=first.proposed + second.proposed,
+        accepted=first.accepted + second.accepted,
+        rejected_semantically_unsupported=(
+            first.rejected_semantically_unsupported + second.rejected_semantically_unsupported
+        ),
+        rejected_duplicate_or_self=first.rejected_duplicate_or_self + second.rejected_duplicate_or_self,
+        rejected_globally_ambiguous=(
+            first.rejected_globally_ambiguous + second.rejected_globally_ambiguous
+        ),
+    )
 
 
 def _validate_request(request: BuildRequest) -> tuple[CandidateSource, ...]:

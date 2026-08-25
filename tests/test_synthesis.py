@@ -15,6 +15,7 @@ from mentor.derived_records import (
     Relationship,
 )
 from mentor.synthesis import (
+    AliasAudit,
     ConceptHint,
     ProcedureBranch,
     ReconciliationSource,
@@ -23,6 +24,7 @@ from mentor.synthesis import (
     SYNTHESIS_RESPONSE_SCHEMA,
     _replace_legacy_synthesis_hints,
     concept_hint_from_record_selector,
+    reconcile_concept_hints,
     validate_concept_hint_integrity,
 )
 
@@ -943,19 +945,19 @@ def test_candidate_clusters_validated_record_terms_without_manual_concepts():
     assert candidate.concept_id_for("Range") == first_synthesis.left_concept_id
 
 
-def test_explicit_alias_hints_cluster_only_the_supported_scoped_references():
+def test_ambiguous_cross_concept_aliases_do_not_force_a_merge():
     support = relationship(left="Support", right="Entry")
     floor = relationship(left="Floor", right="Risk")
     candidate = SynthesisCandidate.from_records(
         snapshot_id=SNAPSHOT_ID,
         records=(support, floor),
         hints=(
-            ConceptHint(support.record_id, "Support", aliases=("Floor",), scope="range"),
-            ConceptHint(floor.record_id, "Floor", aliases=("Support",), scope="range"),
+            ConceptHint(support.record_id, "Support", aliases=("Floor",), scope="range", role="left"),
+            ConceptHint(floor.record_id, "Floor", aliases=("Support",), scope="range", role="left"),
         ),
     )
 
-    assert candidate.concept_id_for("Floor", scope="range") == candidate.concept_id_for("Support", scope="range")
+    assert candidate.concept_id_for("Floor", scope="range") != candidate.concept_id_for("Support", scope="range")
     with pytest.raises(ValueError, match="scope"):
         candidate.concept_id_for("Floor")
     automatic = candidate.synthesize_relationship(support.record_id)
@@ -963,6 +965,172 @@ def test_explicit_alias_hints_cluster_only_the_supported_scoped_references():
     assert automatic.left_concept_id == candidate.concept_id_for("Support", scope="range")
     assert synthesis.left_concept_id == candidate.concept_id_for("Support", scope="range")
     assert synthesis.left_scope == "range"
+
+
+def test_alias_reconciliation_accepts_one_unique_validated_alias():
+    record = relationship(left="Canonical", right="Other")
+    result = reconcile_concept_hints(
+        (record,), (ConceptHint(record.record_id, "Canonical", ("Navigation",), "scope", "left", None),),
+        require_active=False,
+    )
+
+    assert result.hints[0].aliases == ("Navigation",)
+    assert result.audit == AliasAudit(proposed=1, accepted=1)
+
+
+def test_alias_reconciliation_quarantines_alias_identical_to_canonical_after_normalization():
+    record = relationship(left="Nasdaq", right="Other")
+    result = reconcile_concept_hints(
+        (record,), (ConceptHint(record.record_id, "Nasdaq", ("NASDAQ",), "scope", "left", None),),
+        require_active=False,
+    )
+
+    assert result.hints[0].aliases == ()
+    assert result.audit.rejected_duplicate_or_self == 1
+
+
+def test_alias_reconciliation_deduplicates_duplicate_aliases_on_one_occurrence():
+    record = relationship(left="Canonical", right="Other")
+    result = reconcile_concept_hints(
+        (record,), (ConceptHint(record.record_id, "Canonical", ("Alias", " alias "), "scope", "left", None),),
+        require_active=False,
+    )
+
+    assert result.hints[0].aliases == ("Alias",)
+    assert result.audit.rejected_duplicate_or_self == 1
+
+
+def test_alias_reconciliation_rejects_one_alias_proposed_for_two_distinct_concepts():
+    first = relationship(left="First", right="One")
+    second = relationship(left="Second", right="Two")
+    result = reconcile_concept_hints(
+        (first, second),
+        (
+            ConceptHint(first.record_id, "First", ("Shared",), "scope", "left", None),
+            ConceptHint(second.record_id, "Second", ("Shared",), "scope", "left", None),
+        ),
+        require_active=False,
+    )
+
+    assert all(hint.aliases == () for hint in result.hints)
+    assert result.audit.rejected_globally_ambiguous == 2
+
+
+def test_alias_reconciliation_rejects_alias_that_collides_with_another_canonical_label():
+    first = relationship(left="First", right="One")
+    second = relationship(left="Second", right="Two")
+    result = reconcile_concept_hints(
+        (first, second),
+        (
+            ConceptHint(first.record_id, "First", ("Second",), "scope", "left", None),
+            ConceptHint(second.record_id, "Second", (), "scope", "left", None),
+        ),
+        require_active=False,
+    )
+
+    assert result.hints[0].aliases == ()
+    assert result.audit.rejected_globally_ambiguous == 1
+
+
+def test_alias_reconciliation_keeps_same_alias_in_distinct_scopes():
+    first = relationship(left="First", right="One")
+    second = relationship(left="Second", right="Two")
+    result = reconcile_concept_hints(
+        (first, second),
+        (
+            ConceptHint(first.record_id, "First", ("Shared",), "one", "left", None),
+            ConceptHint(second.record_id, "Second", ("Shared",), "two", "left", None),
+        ),
+        require_active=False,
+    )
+
+    assert [hint.aliases for hint in result.hints] == [("Shared",), ("Shared",)]
+
+
+def test_rejected_alias_preserves_validated_record_and_canonical_concept():
+    record = relationship(left="Nasdaq", right="Other")
+    candidate = SynthesisCandidate.from_records(
+        snapshot_id=SNAPSHOT_ID,
+        records=(record,),
+        hints=(ConceptHint(record.record_id, "Nasdaq", ("NASDAQ",), None, "left", None),),
+    )
+
+    assert candidate.records == (record,)
+    assert candidate.concept_id_for("Nasdaq")
+
+
+def test_unvalidated_record_alias_does_not_enter_clustering():
+    record = claim(subject="Unvalidated", validation_state="pending")
+    candidate = SynthesisCandidate.from_records(
+        snapshot_id=SNAPSHOT_ID,
+        records=(record,),
+        hints=(ConceptHint(record.record_id, "Unvalidated", ("Hidden",), None, "subject", None),),
+    )
+
+    assert candidate.concepts == ()
+
+
+def test_unique_alias_connects_identical_occurrences_without_merging_distinct_concepts():
+    first = relationship(left="Same", right="One")
+    second = relationship(left="same", right="Two")
+    candidate = SynthesisCandidate.from_records(
+        snapshot_id=SNAPSHOT_ID,
+        records=(first, second),
+        hints=(
+            ConceptHint(first.record_id, "Same", ("Alias",), "scope", "left", None),
+            ConceptHint(second.record_id, "same", (), "scope", "left", None),
+        ),
+    )
+
+    assert candidate.concept_id_for("Alias", scope="scope") == candidate.concept_id_for("same", scope="scope")
+
+
+def test_similarly_named_distinct_concepts_remain_separate_after_alias_reconciliation():
+    record = relationship(left="Support", right="Supportive")
+    candidate = SynthesisCandidate.from_records(snapshot_id=SNAPSHOT_ID, records=(record,))
+
+    assert candidate.concept_id_for("Support") != candidate.concept_id_for("Supportive")
+
+
+def test_orientation_concepts_have_unique_labels_and_aliases_after_reconciliation():
+    first = relationship(left="First", right="One")
+    second = relationship(left="Second", right="Two")
+    candidate = SynthesisCandidate.from_records(
+        snapshot_id=SNAPSHOT_ID,
+        records=(first, second),
+        hints=(
+            ConceptHint(first.record_id, "First", ("Shared",), "scope", "left", None),
+            ConceptHint(second.record_id, "Second", ("Shared",), "scope", "left", None),
+        ),
+    )
+
+    labels = [label.casefold() for concept in candidate.concepts for label in (concept.canonical_label, *concept.aliases)]
+    assert len(labels) == len(set(labels))
+
+
+def test_alias_reconciliation_reports_rejected_alias_audit_counts():
+    record = relationship(left="Canonical", right="Other")
+    result = reconcile_concept_hints(
+        (record,), (ConceptHint(record.record_id, "Canonical", ("CANONICAL", "Alias", "alias"), None, "left", None),),
+        require_active=False,
+    )
+
+    assert result.audit.proposed == 3
+    assert result.audit.accepted == 1
+    assert result.audit.rejected_duplicate_or_self == 2
+
+
+def test_alias_reconciliation_leaves_lineage_and_anchors_unchanged():
+    record = relationship(left="Canonical", right="Other", anchors=("anc_exact",))
+    candidate = SynthesisCandidate.from_records(
+        snapshot_id=SNAPSHOT_ID,
+        records=(record,),
+        hints=(ConceptHint(record.record_id, "Canonical", ("CANONICAL",), None, "left", None),),
+    )
+
+    [concept] = [concept for concept in candidate.concepts if concept.canonical_label == "Canonical"]
+    assert concept.supporting_record_ids == (record.record_id,)
+    assert concept.supporting_anchor_ids == ("anc_exact",)
 
 
 def test_same_labels_with_explicit_distinct_scopes_do_not_merge():

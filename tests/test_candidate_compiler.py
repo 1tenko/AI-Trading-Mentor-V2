@@ -923,6 +923,60 @@ def test_validated_concept_aliases_are_searchable_in_bounded_derived_artifacts(t
     assert all("record_id" not in payload and "anchor_ids" not in payload for payload in artifact_payloads)
 
 
+def test_self_alias_from_source_extraction_is_quarantined_without_rejecting_the_validated_record(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3", runtime_scope="pilot")
+    storage.initialize()
+    sources = (
+        source_bundle(storage, "self-alias-earlier", 2025),
+        source_bundle(storage, "self-alias-later", 2026),
+    )
+    extraction_responses = QueueResponses([
+        {"candidates": [{
+            "family": "claim",
+            "anchors": [next(iter(sources[0].anchors))],
+            "qualification": "Synthetic self-alias regression.",
+            "subject": occurrence("Nasdaq", aliases=("NASDAQ",), scope="synthetic scope"),
+            "predicate": "guides",
+            "object": occurrence("bounded context"),
+            "semantic_subtype": "statement",
+        }]},
+        {"candidates": [{
+            "family": "claim",
+            "anchors": [next(iter(sources[1].anchors))],
+            "qualification": "Synthetic companion claim.",
+            "subject": occurrence("Companion"),
+            "predicate": "guides",
+            "object": occurrence("bounded context"),
+            "semantic_subtype": "statement",
+        }]},
+    ])
+    validation_responses = QueueResponses([
+        {"outcome": "affirmatively_supported", "audit": "Synthetic occurrence is supported."},
+        {"outcome": "affirmatively_supported", "audit": "Synthetic occurrence is supported."},
+    ])
+    candidate_compiler = CandidateCompiler(
+        storage=storage,
+        extractor=SourceExtractor(SimpleNamespace(responses=extraction_responses)),
+        validation_client=SimpleNamespace(responses=validation_responses),
+        synthesizer=SyntheticSynthesizer(),
+        vector_stores=VectorStoreAdapter(FakeVectorClient()),
+        orientation_budget=OrientationBudget(max_records=12, max_tokens=10_000),
+        readiness_checks=2,
+        sleep=lambda _seconds: None,
+    )
+
+    result = candidate_compiler.build(BuildRequest(
+        run=CompilationRun("run_self_alias", "synthetic", "prompt-v1", "schema-v1", 1.0),
+        sources=sources,
+        artifact_scope=ArtifactScope.PILOT,
+    ))
+
+    assert result.ready is True
+    assert len(result.records) >= 2
+    assert result.alias_audit.rejected_duplicate_or_self == 1
+    assert all("NASDAQ" not in concept.aliases for concept in storage.orientation_concepts(result.snapshot.snapshot_id))
+
+
 def test_overlong_concept_term_is_rejected_during_extraction_before_a_validation_attempt(tmp_path):
     def claim_payload(subject, qualification):
         def response(request):

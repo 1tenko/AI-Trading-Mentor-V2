@@ -1268,6 +1268,23 @@ class ConceptHint:
     position: int | None = None
 
 
+@dataclass(frozen=True)
+class AliasAudit:
+    """Compact candidate-local accounting for optional alias proposals."""
+
+    proposed: int = 0
+    accepted: int = 0
+    rejected_semantically_unsupported: int = 0
+    rejected_duplicate_or_self: int = 0
+    rejected_globally_ambiguous: int = 0
+
+
+@dataclass(frozen=True)
+class AliasReconciliation:
+    hints: tuple[ConceptHint, ...]
+    audit: AliasAudit
+
+
 def validate_record_concept_terms(record: DerivedRecord) -> None:
     """Require every term that can become a concept to satisfy the concept contract."""
     for _role, _position, label in _record_occurrence_terms(record):
@@ -1296,7 +1313,7 @@ def concept_hint_from_record_selector(
         raise ValueError("concept hint selector does not identify one typed record occurrence")
     _term_role, _term_position, label = matches[0]
     _label_key(label)
-    _require_labels(aliases, _label_key(label))
+    _require_alias_shape(aliases)
     if scope is not None:
         _scope_key(scope)
     return ConceptHint(record.record_id, label, aliases, scope, role_key, position)
@@ -1345,6 +1362,90 @@ def validate_concept_hint_integrity(
         if key in seen:
             raise ValueError("duplicate concept hint")
         seen.add(key)
+
+
+def reconcile_concept_hints(
+    records: Sequence[DerivedRecord],
+    hints: Sequence[ConceptHint],
+    *,
+    require_active: bool = False,
+) -> AliasReconciliation:
+    """Keep only aliases that cannot alter a canonical concept's identity."""
+    validate_concept_hint_integrity(records, hints, require_active=require_active)
+    record_map = {record.record_id: record for record in records}
+    occurrences: dict[tuple[str, str, int | None], tuple[str, str | None]] = {}
+    for record in records:
+        if record.validation_state != "validated" or (require_active and record.lifecycle_state != "active"):
+            continue
+        for role, position, label in _record_occurrence_terms(record):
+            occurrences[(record.record_id, role, position)] = (label, None)
+    for hint in hints:
+        record = record_map.get(hint.record_id)
+        if record is None or hint.role is None:
+            continue
+        key = (hint.record_id, _role_key(hint.role), hint.position)
+        if key in occurrences:
+            label, _scope = occurrences[key]
+            occurrences[key] = (label, hint.scope)
+
+    canonical_owners: dict[tuple[str | None, str], set[tuple[str | None, str]]] = {}
+    for label, scope in occurrences.values():
+        node = (_scope_key(scope), _label_key(label))
+        canonical_owners.setdefault(node, set()).add(node)
+
+    alias_owners: dict[tuple[str | None, str], set[tuple[str | None, str]]] = {}
+    for hint in hints:
+        if hint.role is None:
+            continue
+        occurrence_key = (hint.record_id, _role_key(hint.role), hint.position)
+        if occurrence_key not in occurrences:
+            continue
+        label, scope = occurrences[occurrence_key]
+        owner = (_scope_key(scope), _label_key(label))
+        for alias in hint.aliases:
+            alias_owners.setdefault((_scope_key(scope), _label_key(alias)), set()).add(owner)
+
+    proposed = accepted = rejected_duplicate_or_self = rejected_globally_ambiguous = 0
+    reconciled = []
+    for hint in hints:
+        if hint.role is None:
+            reconciled.append(hint)
+            continue
+        occurrence_key = (hint.record_id, _role_key(hint.role), hint.position)
+        if occurrence_key not in occurrences:
+            continue
+        label, scope = occurrences[occurrence_key]
+        owner = (_scope_key(scope), _label_key(label))
+        retained = []
+        seen = set()
+        for alias in hint.aliases:
+            proposed += 1
+            alias_key = _label_key(alias)
+            alias_node = (_scope_key(scope), alias_key)
+            if alias_key == owner[1] or alias_key in seen:
+                rejected_duplicate_or_self += 1
+                continue
+            seen.add(alias_key)
+            if (
+                any(canonical_owner != owner for canonical_owner in canonical_owners.get(alias_node, ()))
+                or len(alias_owners[alias_node]) != 1
+            ):
+                rejected_globally_ambiguous += 1
+                continue
+            retained.append(alias)
+            accepted += 1
+        reconciled.append(ConceptHint(
+            hint.record_id, hint.label, tuple(retained), hint.scope, hint.role, hint.position
+        ))
+    return AliasReconciliation(
+        tuple(reconciled),
+        AliasAudit(
+            proposed=proposed,
+            accepted=accepted,
+            rejected_duplicate_or_self=rejected_duplicate_or_self,
+            rejected_globally_ambiguous=rejected_globally_ambiguous,
+        ),
+    )
 
 
 @dataclass(frozen=True)
@@ -1417,6 +1518,7 @@ class SynthesisCandidate:
     records: tuple[DerivedRecord, ...]
     concepts: tuple[Concept, ...]
     concept_occurrences: tuple[ConceptOccurrence, ...] = ()
+    alias_audit: AliasAudit = AliasAudit()
 
     @classmethod
     def from_records(
@@ -1447,12 +1549,12 @@ class SynthesisCandidate:
                 if not required_anchors <= set(record.anchors):
                     raise ValueError("conflict anchors must include competing record anchors")
         ordered_records = tuple(sorted(record_map.values(), key=lambda record: record.record_id))
-        validate_concept_hint_integrity(ordered_records, hints)
-        concepts, occurrences = _cluster_concepts(snapshot_id, ordered_records, hints)
+        reconciliation = reconcile_concept_hints(ordered_records, hints)
+        concepts, occurrences = _cluster_concepts(snapshot_id, ordered_records, reconciliation.hints)
         ordered_concepts = tuple(sorted(concepts, key=lambda concept: concept.concept_id))
         _validate_concepts(snapshot_id, ordered_concepts, record_map)
         _validate_concept_occurrences(occurrences, ordered_records, ordered_concepts)
-        return cls(snapshot_id, ordered_records, ordered_concepts, occurrences)
+        return cls(snapshot_id, ordered_records, ordered_concepts, occurrences, reconciliation.audit)
 
     @property
     def record_ids(self) -> tuple[str, ...]:
@@ -2078,6 +2180,13 @@ def _require_labels(aliases: tuple[str, ...], canonical_key: str) -> None:
     alias_keys = tuple(_label_key(alias) for alias in aliases)
     if canonical_key in alias_keys or len(set(alias_keys)) != len(alias_keys):
         raise ValueError("aliases must resolve uniquely")
+
+
+def _require_alias_shape(aliases: tuple[str, ...]) -> None:
+    if not isinstance(aliases, tuple) or len(aliases) > MAX_ALIASES:
+        raise ValueError("aliases must be a bounded tuple")
+    for alias in aliases:
+        _label_key(alias)
 
 
 def _require_identifiers(values: tuple[str, ...], label: str) -> None:
