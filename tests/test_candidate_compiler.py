@@ -13,6 +13,7 @@ from mentor.candidate_compiler import (
     CandidateSource,
     CandidateSourcePreparer,
     MAX_PREPARED_ANCHOR_CHARS,
+    RemoteArtifactRetention,
     ReconciliationCoverage,
     SynthesisResult,
 )
@@ -30,7 +31,12 @@ from mentor.knowledge import Collection, Source, SourceRevision
 from mentor.orientation import OrientationBudget
 from mentor.storage import Storage
 from mentor.synthesis import ConceptHint
-from mentor.vector_stores import VectorStoreAdapter
+from mentor.vector_stores import FileExpiration, VectorStoreAdapter, VectorStoreExpiration
+
+
+PILOT_RETENTION = RemoteArtifactRetention(
+    VectorStoreExpiration("last_active_at", 1), FileExpiration("created_at", 86_400)
+)
 
 
 class QueueResponses:
@@ -73,7 +79,7 @@ class FakeVectorClient:
         self.next_file = 0
         self.create_failure_at = create_failure_at
         self.attach_exception = attach_exception
-        self.files = SimpleNamespace(create=self.upload)
+        self.files = SimpleNamespace(create=self.upload, delete=self.delete_file)
         self.vector_store_files = SimpleNamespace(
             create=self.attach,
             retrieve=self.retrieve_attachment,
@@ -82,6 +88,8 @@ class FakeVectorClient:
         self.file_batches = SimpleNamespace(create=self.batch, retrieve=self.retrieve_batch)
         self.vector_stores = SimpleNamespace(
             create=self.create_store,
+            retrieve=self.retrieve_store,
+            delete=self.delete_store,
             files=self.vector_store_files,
             file_batches=self.file_batches,
         )
@@ -91,13 +99,25 @@ class FakeVectorClient:
         self.calls.append(("create_store", kwargs))
         if self.next_store == self.create_failure_at:
             raise RuntimeError("Synthetic store setup failure.")
-        return SimpleNamespace(id=f"vs_synthetic_{self.next_store}", status="completed")
+        return SimpleNamespace(
+            id=f"vs_synthetic_{self.next_store}", status="completed", expires_at=123, usage_bytes=0
+        )
+
+    def retrieve_store(self, store_id):
+        self.calls.append(("retrieve_store", store_id))
+        return SimpleNamespace(id=store_id, status="completed", expires_at=123, usage_bytes=4_096)
+
+    def delete_store(self, store_id):
+        self.calls.append(("delete_store", store_id))
+
+    def delete_file(self, file_id):
+        self.calls.append(("delete_file", file_id))
 
     def upload(self, **kwargs):
         self.next_file += 1
         filename, content, media_type = kwargs["file"]
         self.calls.append(("upload", filename, content.decode(), media_type, kwargs["purpose"]))
-        return SimpleNamespace(id=f"file_derived_{self.next_file}")
+        return SimpleNamespace(id=f"file_derived_{self.next_file}", bytes=len(content), expires_at=123)
 
     def attach(self, store_id, **kwargs):
         self.calls.append(("attach", store_id, kwargs))
@@ -609,6 +629,8 @@ def test_replacement_reuses_unaffected_records_and_promotes_only_after_candidate
         run=CompilationRun("run_replacement", "synthetic", "prompt-v1", "schema-v1", 3.0),
         sources=(unchanged, CandidateSource(replacement, replacement_text, {replacement_anchor.anchor_id: replacement_anchor})),
         artifact_scope=ArtifactScope.PILOT,
+        remote_retention=PILOT_RETENTION,
+        remote_storage_observer=lambda _kind, _resource: True,
     )
 
     second_result = second_compiler.build(second_request)
@@ -668,6 +690,8 @@ def test_selective_rebuild_rejects_context_only_paraphrase_and_keeps_valid_highe
         CompilationRun("run_clusters_1", "caller", "caller", "caller", 1.0),
         sources,
         ArtifactScope.PILOT,
+        remote_retention=PILOT_RETENTION,
+        remote_storage_observer=lambda _kind, _resource: True,
     ))
     assert first.ready is True
     storage.transition_snapshot(first.snapshot.snapshot_id, "published", transitioned_at=2.0)
@@ -719,6 +743,8 @@ def test_selective_rebuild_rejects_context_only_paraphrase_and_keeps_valid_highe
         CompilationRun("run_clusters_2", "caller", "caller", "caller", 3.0),
         second_sources,
         ArtifactScope.PILOT,
+        remote_retention=PILOT_RETENTION,
+        remote_storage_observer=lambda _kind, _resource: True,
     ))
 
     assert second.ready is True
@@ -825,6 +851,8 @@ def test_changed_compiler_configuration_forces_reextraction_instead_of_record_re
         run=CompilationRun("run_changed_compiler", "synthetic", "prompt-v1", "schema-v1", 3.0),
         sources=first_request.sources,
         artifact_scope=ArtifactScope.PILOT,
+        remote_retention=PILOT_RETENTION,
+        remote_storage_observer=lambda _kind, _resource: True,
     )
 
     result = second_compiler.build(changed_request)
@@ -909,6 +937,8 @@ def test_validated_concept_aliases_are_searchable_in_bounded_derived_artifacts(t
         run=CompilationRun("run_alias_artifacts", "synthetic", "prompt-v1", "schema-v1", 1.0),
         sources=sources,
         artifact_scope=ArtifactScope.PILOT,
+        remote_retention=PILOT_RETENTION,
+        remote_storage_observer=lambda _kind, _resource: True,
     )
 
     result = candidate_compiler.build(request)
@@ -969,6 +999,8 @@ def test_self_alias_from_source_extraction_is_quarantined_without_rejecting_the_
         run=CompilationRun("run_self_alias", "synthetic", "prompt-v1", "schema-v1", 1.0),
         sources=sources,
         artifact_scope=ArtifactScope.PILOT,
+        remote_retention=PILOT_RETENTION,
+        remote_storage_observer=lambda _kind, _resource: True,
     ))
 
     assert result.ready is True
@@ -1074,6 +1106,8 @@ def compiler(
         run=CompilationRun("run_candidate", "synthetic", "prompt-v1", "schema-v1", 1.0),
         sources=sources,
         artifact_scope=artifact_scope,
+        remote_retention=PILOT_RETENTION if artifact_scope is ArtifactScope.PILOT else None,
+        remote_storage_observer=(lambda _kind, _resource: True) if artifact_scope is ArtifactScope.PILOT else None,
     )
     return storage, candidate_compiler, request, vector_client
 
@@ -1116,6 +1150,24 @@ def test_candidate_source_coverage_succeeds_after_a_bounded_extraction_retry(tmp
     assert extraction.call_count == 3
     assert extraction.failure_count == 0
     assert {item.status for item in storage.snapshot_source_coverage(result.snapshot.snapshot_id)} == {"processed"}
+
+
+def test_pilot_rejects_missing_retention_before_any_provider_operation(tmp_path):
+    _storage, candidate_compiler, request, vector_client = compiler(tmp_path)
+
+    with pytest.raises(ValueError, match="bounded remote retention"):
+        candidate_compiler.build(replace(request, remote_retention=None))
+
+    assert vector_client.calls == []
+
+
+def test_production_cannot_inherit_pilot_retention(tmp_path):
+    _storage, candidate_compiler, request, vector_client = compiler(tmp_path, artifact_scope=ArtifactScope.PRODUCTION)
+
+    with pytest.raises(ValueError, match="cannot inherit pilot"):
+        candidate_compiler.build(replace(request, remote_retention=PILOT_RETENTION))
+
+    assert vector_client.calls == []
 
 
 def test_build_composes_a_ready_unpublished_candidate_with_typed_bounded_artifacts_and_metrics(tmp_path):
@@ -1557,10 +1609,12 @@ def test_partial_remote_setup_is_auditable_and_retry_returns_the_same_failed_run
     assert storage.candidate_artifact_scope(first.snapshot.snapshot_id) == "pilot"
     assert storage.current_snapshot() is None
     assert len(vector_client.calls) == call_count == 2
+    assert vector_client.calls[0][1]["expires_after"] == {"anchor": "last_active_at", "days": 1}
+    assert vector_client.calls[1][1]["expires_after"] == {"anchor": "last_active_at", "days": 1}
     setup = next(metric for metric in first.stage_metrics if metric.stage == "remote_setup")
     assert (setup.call_count, setup.remote_calls, setup.failure_count) == (2, 2, 1)
     assert len(candidate_compiler._extractor._client.responses.calls) == 2
-    with pytest.raises(ValueError, match="runtime scope"):
+    with pytest.raises(ValueError, match="cannot inherit pilot"):
         candidate_compiler.build(replace(request, artifact_scope=ArtifactScope.PRODUCTION))
     assert len(vector_client.calls) == call_count
 

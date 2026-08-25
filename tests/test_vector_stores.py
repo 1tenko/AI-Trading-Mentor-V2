@@ -3,7 +3,7 @@ from types import SimpleNamespace
 import pytest
 
 from mentor.config import ConfigError, load_config
-from mentor.vector_stores import VectorStoreAdapter
+from mentor.vector_stores import FileExpiration, VectorStoreAdapter, VectorStoreExpiration
 
 
 class FakeVectorStoreClient:
@@ -18,7 +18,7 @@ class FakeVectorStoreClient:
         self.retrieved_batch_response = SimpleNamespace(
             id="vsfb_candidate", status="completed", file_counts={"completed": 2}
         )
-        self.files = SimpleNamespace(
+        self.vector_store_files = SimpleNamespace(
             create=self.attach,
             retrieve=self.retrieve,
             delete=self.detach,
@@ -26,14 +26,24 @@ class FakeVectorStoreClient:
         self.file_batches = SimpleNamespace(create=self.create_batch, retrieve=self.retrieve_batch)
         self.vector_stores = SimpleNamespace(
             create=self.create_store,
-            files=self.files,
+            retrieve=self.retrieve_store,
+            files=self.vector_store_files,
             file_batches=self.file_batches,
             search=self.search,
         )
+        self.files = SimpleNamespace(create=self.upload)
 
     def create_store(self, **kwargs):
         self.calls.append(("create_store", (), kwargs))
-        return SimpleNamespace(id="vs_candidate", status="completed")
+        return SimpleNamespace(id="vs_candidate", status="completed", created_at=1, expires_at=86_401, usage_bytes=1234)
+
+    def retrieve_store(self, vector_store_id):
+        self.calls.append(("retrieve_store", (vector_store_id,), {}))
+        return SimpleNamespace(id=vector_store_id, status="completed", created_at=1, expires_at=86_401, usage_bytes=4321)
+
+    def upload(self, **kwargs):
+        self.calls.append(("upload", (), kwargs))
+        return SimpleNamespace(id="file_derived", bytes=42, created_at=1, expires_at=86_401)
 
     def attach(self, vector_store_id, **kwargs):
         self.calls.append(("attach", (vector_store_id,), kwargs))
@@ -91,6 +101,32 @@ def test_adapter_maps_store_attachment_and_batch_statuses_without_a_real_client(
         ("retrieve", ("file_orientation",), {"vector_store_id": "vs_candidate"}),
         ("create_batch", ("vs_candidate",), {"file_ids": ["file_a", "file_b"], "attributes": {"snapshot_id": "snap_candidate"}}),
         ("retrieve_batch", ("vsfb_candidate",), {"vector_store_id": "vs_candidate"}),
+    ]
+
+
+def test_adapter_passes_caller_owned_expiry_and_maps_usage_without_touching_existing_files():
+    client = FakeVectorStoreClient()
+    adapter = VectorStoreAdapter(client)
+
+    store = adapter.create_store(
+        "Pilot", {"artifact_scope": "pilot"},
+        expires_after=VectorStoreExpiration("last_active_at", 1),
+    )
+    uploaded = adapter.upload_text(
+        "derived.json", "{}", expires_after=FileExpiration("created_at", 86_400)
+    )
+    refreshed = adapter.retrieve_store(store.store_id)
+
+    assert store.expires_at == 86_401
+    assert uploaded.expires_at == 86_401
+    assert uploaded.bytes == 42
+    assert refreshed.usage_bytes == 4321
+    assert client.calls == [
+        ("create_store", (), {"name": "Pilot", "metadata": {"artifact_scope": "pilot"},
+         "expires_after": {"anchor": "last_active_at", "days": 1}}),
+        ("upload", (), {"file": ("derived.json", b"{}", "application/json"), "purpose": "assistants",
+         "expires_after": {"anchor": "created_at", "seconds": 86_400}}),
+        ("retrieve_store", ("vs_candidate",), {}),
     ]
 
 

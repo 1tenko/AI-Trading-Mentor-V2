@@ -18,6 +18,48 @@ class VectorStoreLastError:
 class VectorStore:
     store_id: str
     status: str | None
+    created_at: int | None = None
+    expires_at: int | None = None
+    usage_bytes: int | None = None
+    expires_after: dict[str, str | int] | None = None
+
+
+@dataclass(frozen=True)
+class VectorStoreExpiration:
+    """Caller-owned OpenAI vector-store retention policy."""
+
+    anchor: str
+    days: int
+
+    def __post_init__(self) -> None:
+        if self.anchor != "last_active_at" or isinstance(self.days, bool) or not 1 <= self.days <= 365:
+            raise ValueError("vector-store expiration requires last_active_at and 1..365 days")
+
+    def as_request(self) -> dict[str, str | int]:
+        return {"anchor": self.anchor, "days": self.days}
+
+
+@dataclass(frozen=True)
+class FileExpiration:
+    """Caller-owned OpenAI File retention policy."""
+
+    anchor: str
+    seconds: int
+
+    def __post_init__(self) -> None:
+        if self.anchor != "created_at" or isinstance(self.seconds, bool) or not 3_600 <= self.seconds <= 2_592_000:
+            raise ValueError("file expiration requires created_at and 3600..2592000 seconds")
+
+    def as_request(self) -> dict[str, str | int]:
+        return {"anchor": self.anchor, "seconds": self.seconds}
+
+
+@dataclass(frozen=True)
+class UploadedFile:
+    file_id: str
+    bytes: int | None
+    created_at: int | None
+    expires_at: int | None
 
 
 @dataclass(frozen=True)
@@ -63,20 +105,53 @@ class VectorStoreAdapter:
     def __init__(self, client: Any):
         self._client = client
 
-    def create_store(self, name: str, metadata: Mapping[str, MetadataValue]) -> VectorStore:
-        remote = self._client.vector_stores.create(
-            name=name, metadata=_string_metadata(metadata)
-        )
-        return VectorStore(store_id=_required(remote, "id"), status=_optional(remote, "status"))
+    def create_store(
+        self,
+        name: str,
+        metadata: Mapping[str, MetadataValue],
+        *,
+        expires_after: VectorStoreExpiration | None = None,
+    ) -> VectorStore:
+        request: dict[str, Any] = {"name": name, "metadata": _string_metadata(metadata)}
+        if expires_after is not None:
+            request["expires_after"] = expires_after.as_request()
+        return _vector_store(self._client.vector_stores.create(**request))
 
-    def upload_text(self, filename: str, content: str) -> str:
+    def retrieve_store(self, vector_store_id: str) -> VectorStore:
+        return _vector_store(self._client.vector_stores.retrieve(vector_store_id))
+
+    def delete_store(self, vector_store_id: str) -> None:
+        self._client.vector_stores.delete(vector_store_id)
+
+    def upload_text(
+        self, filename: str, content: str, *, expires_after: FileExpiration | None = None
+    ) -> UploadedFile:
         if not isinstance(filename, str) or not filename.strip() or not isinstance(content, str) or not content:
             raise ValueError("derived artifact requires a filename and content")
-        remote = self._client.files.create(
-            file=(filename, content.encode("utf-8"), "application/json"),
-            purpose="assistants",
+        request: dict[str, Any] = {
+            "file": (filename, content.encode("utf-8"), "application/json"),
+            "purpose": "assistants",
+        }
+        if expires_after is not None:
+            request["expires_after"] = expires_after.as_request()
+        remote = self._client.files.create(**request)
+        return UploadedFile(
+            file_id=_required(remote, "id"),
+            bytes=_int_or_none(_value(remote, "bytes")),
+            created_at=_int_or_none(_value(remote, "created_at")),
+            expires_at=_int_or_none(_value(remote, "expires_at")),
         )
-        return _required(remote, "id")
+
+    def delete_file(self, file_id: str) -> None:
+        self._client.files.delete(file_id)
+
+    def retrieve_file(self, file_id: str) -> UploadedFile:
+        remote = self._client.files.retrieve(file_id)
+        return UploadedFile(
+            file_id=_required(remote, "id"), bytes=_int_or_none(_value(remote, "bytes")),
+            created_at=_int_or_none(_value(remote, "created_at")),
+            expires_at=_int_or_none(_value(remote, "expires_at")),
+        )
 
     def attach_file(
         self, vector_store_id: str, file_id: str, attributes: Mapping[str, AttributeValue]
@@ -157,6 +232,17 @@ def _vector_store_file(remote: Any, file_id: str) -> VectorStoreFile:
     )
 
 
+def _vector_store(remote: Any) -> VectorStore:
+    return VectorStore(
+        store_id=_required(remote, "id"),
+        status=_optional(remote, "status"),
+        created_at=_int_or_none(_value(remote, "created_at")),
+        expires_at=_int_or_none(_value(remote, "expires_at")),
+        usage_bytes=_int_or_none(_value(remote, "usage_bytes")),
+        expires_after=_expiration_mapping(_value(remote, "expires_after")),
+    )
+
+
 def _vector_store_batch(remote: Any) -> VectorStoreBatch:
     counts = _value(remote, "file_counts", {})
     if not isinstance(counts, Mapping):
@@ -207,6 +293,18 @@ def _optional(value: Any, key: str) -> str | None:
 
 def _float_or_none(value: Any) -> float | None:
     return float(value) if isinstance(value, int | float) else None
+
+
+def _int_or_none(value: Any) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+
+
+def _expiration_mapping(value: Any) -> dict[str, str | int] | None:
+    if isinstance(value, Mapping):
+        anchor, days = value.get("anchor"), value.get("days")
+    else:
+        anchor, days = _value(value, "anchor"), _value(value, "days")
+    return {"anchor": anchor, "days": days} if isinstance(anchor, str) and isinstance(days, int) else None
 
 
 def _string_metadata(metadata: Mapping[str, MetadataValue]) -> dict[str, str]:

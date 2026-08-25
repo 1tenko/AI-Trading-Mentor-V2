@@ -16,12 +16,14 @@ from mentor.gate1 import (
     HARD_SPEND_CEILING_USD,
     BudgetedOpenAIClient,
     Gate1Runner,
+    PilotRemoteStorageLedger,
     SpendLedger,
     estimate_gate1_cost,
 )
 from mentor.compiler import EXTRACTION_INITIAL_MAX_OUTPUT_TOKENS, ExtractionFailure, SourceExtractor
 from mentor.knowledge import Collection, Source, SourceRevision
 from mentor.storage import Storage
+from mentor.vector_stores import UploadedFile, VectorStore
 
 
 ROLES = (
@@ -410,13 +412,13 @@ def test_budgeted_client_records_transport_versions_and_conservatively_charges_u
 
 
 def test_spend_ledger_counts_a_prior_gate1_run_against_the_same_hard_ceiling():
-    assert GATE1_PRIOR_SPEND_USD == pytest.approx(11.597070)
+    assert GATE1_PRIOR_SPEND_USD == pytest.approx(13.853585)
     assert HARD_SPEND_CEILING_USD == pytest.approx(30.0)
     ledger = SpendLedger(HARD_SPEND_CEILING_USD, CONSERVATIVE_SOL_PRICING, prior_spend_usd=GATE1_PRIOR_SPEND_USD)
 
-    assert ledger.spent_usd == pytest.approx(11.597070)
+    assert ledger.spent_usd == pytest.approx(13.853585)
     with pytest.raises(RuntimeError, match="spend ceiling"):
-        ledger.ensure("extraction", 21.497631)
+        ledger.ensure("extraction", 16.146416)
 
 
 def test_gate1_keeps_its_deliberately_conservative_token_pricing_contract():
@@ -477,6 +479,39 @@ def test_unknown_cost_nonresponses_operation_is_rejected_before_it_can_call_the_
 
     with pytest.raises(RuntimeError, match="no defensible per-operation upper bound"):
         _ = client.vector_stores
+
+
+def test_pilot_storage_ledger_requires_expiry_and_charges_actual_vector_store_usage(tmp_path):
+    ledger = SpendLedger(30.0, CONSERVATIVE_SOL_PRICING)
+    storage = PilotRemoteStorageLedger(tmp_path / "private" / "remote-storage-ledger.json", ledger)
+
+    assert storage.observe("raw_store", VectorStore("vs_raw", "completed", 1, 86_401, 2**30)) is True
+    assert storage.observe("derived_file", UploadedFile("file_derived", 42, 1, 86_401)) is True
+
+    report = json.loads((tmp_path / "private" / "remote-storage-ledger.json").read_text())
+    assert ledger.spent_usd == pytest.approx(0.10)
+    assert {item["resource_kind"] for item in report["resources"]} == {"vector_store", "file"}
+    assert all(item["cleanup_status"] == "automatic_expiry_configured" for item in report["resources"])
+
+    with pytest.raises(RuntimeError, match="unknown storage cost"):
+        storage.observe("derived_store", VectorStore("vs_unknown", "completed", 1, 86_401, None))
+
+    assert storage.observe("derived_file", UploadedFile("file_long", 42, 1, 172_801)) is False
+
+
+def test_bounded_remote_storage_is_opt_in_and_does_not_make_production_calls_expiring():
+    blocked = BudgetedOpenAIClient(
+        SimpleNamespace(responses=SimpleNamespace(), vector_stores=SimpleNamespace()),
+        SpendLedger(30.0, CONSERVATIVE_SOL_PRICING),
+    )
+    with pytest.raises(RuntimeError, match="no defensible per-operation upper bound"):
+        _ = blocked.vector_stores
+
+    permitted = BudgetedOpenAIClient(
+        SimpleNamespace(responses=SimpleNamespace(), vector_stores=SimpleNamespace()),
+        SpendLedger(30.0, CONSERVATIVE_SOL_PRICING), allow_bounded_remote_storage=True,
+    )
+    assert permitted.vector_stores is not None
 
 
 def test_execute_rejects_stale_pricing_before_any_paid_client(tmp_path, monkeypatch):

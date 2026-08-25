@@ -56,6 +56,7 @@ from mentor.synthesis import (
     source_coverage,
     validate_concept_hint_integrity,
 )
+from mentor.vector_stores import FileExpiration, UploadedFile, VectorStore, VectorStoreExpiration
 
 
 _TERMINAL_REMOTE_FAILURES = frozenset({"cancelled", "expired", "failed"})
@@ -65,6 +66,14 @@ MAX_PREPARED_ANCHOR_CHARS = 4_000
 class ArtifactScope(Enum):
     PILOT = "pilot"
     PRODUCTION = "production"
+
+
+@dataclass(frozen=True)
+class RemoteArtifactRetention:
+    """Explicit caller-owned expiry for a bounded candidate's remote artifacts."""
+
+    vector_store: VectorStoreExpiration
+    derived_file: FileExpiration
 
 
 @dataclass(frozen=True)
@@ -138,6 +147,9 @@ class BuildRequest:
     artifact_scope: ArtifactScope
     stale_revision_ids: tuple[str, ...] = ()
     revision_ids: tuple[str, ...] = ()
+    remote_retention: RemoteArtifactRetention | None = None
+    remote_storage_observer: Callable[[str, VectorStore | UploadedFile], bool | None] | None = None
+    remote_storage_cleanup_observer: Callable[[str, str, str], None] | None = None
 
 
 @dataclass(frozen=True)
@@ -647,7 +659,12 @@ class CandidateCompiler:
                 raw_store = self._vector_stores.create_store(
                     f"Phase 3 {scope} raw {request.run.run_id}",
                     {"snapshot_id": snapshot_id, "artifact_scope": scope, "artifact_kind": "raw"},
+                    expires_after=(
+                        request.remote_retention.vector_store
+                        if request.remote_retention is not None else None
+                    ),
                 )
+                self._observe_or_cleanup(request, "raw_store", raw_store)
                 snapshot = self._storage.record_candidate_store(snapshot_id, "raw", raw_store.store_id)
                 _reject_failed_store(raw_store)
             except Exception:
@@ -669,7 +686,12 @@ class CandidateCompiler:
                 derived_store = self._vector_stores.create_store(
                     f"Phase 3 {scope} derived {request.run.run_id}",
                     {"snapshot_id": snapshot_id, "artifact_scope": scope, "artifact_kind": "derived"},
+                    expires_after=(
+                        request.remote_retention.vector_store
+                        if request.remote_retention is not None else None
+                    ),
                 )
+                self._observe_or_cleanup(request, "derived_store", derived_store)
                 snapshot = self._storage.record_candidate_store(
                     snapshot_id, "derived", derived_store.store_id
                 )
@@ -759,6 +781,13 @@ class CandidateCompiler:
                 )
         except Exception as error:
             failures.append(f"raw store readiness failed: {error}")
+        if not failures:
+            try:
+                self._observe_or_cleanup(
+                    request, "raw_store", self._vector_stores.retrieve_store(raw_store.store_id)
+                )
+            except Exception as error:
+                failures.append(f"raw store usage audit failed: {error}")
         raw_artifact = RemoteArtifact("raw", request.artifact_scope, raw_store.store_id, raw_file_ids)
         stage_metrics.append(
             self._record_metric(
@@ -798,10 +827,16 @@ class CandidateCompiler:
                 )
                 file_id = None
                 try:
-                    file_id = self._vector_stores.upload_text(
+                    uploaded_file = self._vector_stores.upload_text(
                         f"{artifact.record_id}.json",
                         artifact.content,
+                        expires_after=(
+                            request.remote_retention.derived_file
+                            if request.remote_retention is not None else None
+                        ),
                     )
+                    self._observe_or_cleanup(request, "derived_file", uploaded_file)
+                    file_id = uploaded_file.file_id
                 except Exception:
                     self._storage.finish_candidate_remote_operation(upload_operation, "failed")
                     raise
@@ -841,6 +876,13 @@ class CandidateCompiler:
                 )
         except Exception as error:
             failures.append(f"derived store readiness failed: {error}")
+        if not failures:
+            try:
+                self._observe_or_cleanup(
+                    request, "derived_store", self._vector_stores.retrieve_store(derived_store.store_id)
+                )
+            except Exception as error:
+                failures.append(f"derived store usage audit failed: {error}")
         derived_artifact = RemoteArtifact(
             "derived", request.artifact_scope, derived_store.store_id, tuple(derived_file_ids)
         )
@@ -934,6 +976,36 @@ class CandidateCompiler:
         if not isinstance(provenance, CompilerProvenance):
             raise ValueError("synthesis stage requires immutable provenance")
         return provenance
+
+    def _observe_or_cleanup(
+        self, request: BuildRequest, kind: str, resource: VectorStore | UploadedFile
+    ) -> None:
+        try:
+            confirmed = _observe_remote_storage(request, kind, resource)
+            if confirmed is False:
+                resource = (
+                    self._vector_stores.retrieve_store(resource.store_id)
+                    if isinstance(resource, VectorStore)
+                    else self._vector_stores.retrieve_file(resource.file_id)
+                )
+                confirmed = _observe_remote_storage(request, kind, resource)
+            if confirmed is not False:
+                return
+        except Exception:
+            pass
+        identifier = resource.store_id if isinstance(resource, VectorStore) else resource.file_id
+        try:
+            if isinstance(resource, VectorStore):
+                self._vector_stores.delete_store(identifier)
+            else:
+                self._vector_stores.delete_file(identifier)
+        except Exception:
+            if request.remote_storage_cleanup_observer is not None:
+                request.remote_storage_cleanup_observer(kind, identifier, "delete_failed")
+            raise RuntimeError("pilot resource expiry was not confirmed; cleanup is unresolved")
+        if request.remote_storage_cleanup_observer is not None:
+            request.remote_storage_cleanup_observer(kind, identifier, "deleted")
+        raise RuntimeError("pilot resource expiry was not confirmed; resource was deleted")
 
     def _build_orientation_artifacts(
         self,
@@ -1229,6 +1301,18 @@ def _validate_request(request: BuildRequest) -> tuple[CandidateSource, ...]:
         raise ValueError("candidate build requires a building compilation run")
     if not isinstance(request.artifact_scope, ArtifactScope):
         raise ValueError("candidate build requires an explicit artifact scope")
+    if request.artifact_scope is ArtifactScope.PILOT and not isinstance(
+        request.remote_retention, RemoteArtifactRetention
+    ):
+        raise ValueError("pilot candidate requires bounded remote retention before provider access")
+    if request.artifact_scope is ArtifactScope.PILOT and request.remote_storage_observer is None:
+        raise ValueError("pilot candidate requires provider expiry confirmation before provider access")
+    if request.artifact_scope is ArtifactScope.PRODUCTION and request.remote_retention is not None:
+        raise ValueError("production candidate cannot inherit pilot remote retention")
+    if request.remote_storage_observer is not None and not callable(request.remote_storage_observer):
+        raise ValueError("remote storage observer must be callable")
+    if request.remote_storage_cleanup_observer is not None and not callable(request.remote_storage_cleanup_observer):
+        raise ValueError("remote storage cleanup observer must be callable")
     if not isinstance(request.sources, tuple) or not isinstance(request.revision_ids, tuple):
         raise ValueError("candidate build selections must be immutable tuples")
     if bool(request.sources) == bool(request.revision_ids):
@@ -1252,6 +1336,12 @@ def _validate_request(request: BuildRequest) -> tuple[CandidateSource, ...]:
     ):
         raise ValueError("stale revision IDs must be unique")
     return request.sources
+
+
+def _observe_remote_storage(request: BuildRequest, kind: str, resource: VectorStore | UploadedFile) -> bool | None:
+    if request.remote_storage_observer is not None:
+        return request.remote_storage_observer(kind, resource)
+    return None
 
 
 def _stale_predecessor_revisions(

@@ -17,6 +17,7 @@ from mentor.candidate_compiler import (
     CandidateCompiler,
     CandidateSource,
     CandidateSourcePreparer,
+    RemoteArtifactRetention,
 )
 from mentor.chat_service import ChatService, EvaluationConfig, FILE_SEARCH_CALL_COST_USD
 from mentor.compilation import CompilationRun, TokenPricing, usage_from_response
@@ -32,7 +33,13 @@ from mentor.evaluation import EvaluationCase, PilotManifest, PilotManifestEntry,
 from mentor.orientation import OrientationBudget
 from mentor.storage import Storage
 from mentor.synthesis import SynthesisReconciler
-from mentor.vector_stores import VectorStoreAdapter
+from mentor.vector_stores import (
+    FileExpiration,
+    UploadedFile,
+    VectorStore,
+    VectorStoreAdapter,
+    VectorStoreExpiration,
+)
 from mentor.structured_response import private_response_diagnostic
 
 
@@ -43,7 +50,7 @@ APPROVED_GATE1_MANIFEST_SHA256 = "3798d537cd486f782449d9833b5fc06dd28fa93aed4564
 # Standard short-context rates are deliberately higher than the current model-page promotion.
 CONSERVATIVE_SOL_PRICING = TokenPricing(5.0, 30.0, 30.0)
 HARD_SPEND_CEILING_USD = 30.0
-GATE1_PRIOR_SPEND_USD = 11.597070
+GATE1_PRIOR_SPEND_USD = 13.853585
 _PRICING_MAX_AGE_DAYS = 7
 _MAX_OUTPUT_TOKENS_BY_STAGE = {
     "extraction": EXTRACTION_RETRY_MAX_OUTPUT_TOKENS,
@@ -54,6 +61,11 @@ _MAX_OUTPUT_TOKENS_BY_STAGE = {
 _MAX_SYNTHESIS_CALLS = 6
 _FILE_SEARCH_INPUT_RESERVE_TOKENS = 50_000
 _FILE_SEARCH_CALL_RESERVE = 8
+_BYTES_PER_GIB = 2**30
+FILE_SEARCH_STORAGE_USD_PER_GIB_DAY = 0.10
+PILOT_REMOTE_RETENTION = RemoteArtifactRetention(
+    VectorStoreExpiration("last_active_at", 1), FileExpiration("created_at", 86_400)
+)
 
 GATE1_EVALUATION_CASES = (
     EvaluationCase(
@@ -206,6 +218,106 @@ class SpendLedger:
             {"stage": stage, "status": "usage_unknown", "cost_usd": reserved}
         )
 
+    def record_projected_maximum(self, stage: str, cost_usd: float) -> None:
+        """Reserve a bounded future provider cost before the next paid operation."""
+        self.ensure(stage, cost_usd)
+        self.spent_usd += cost_usd
+        self.events.append({"stage": stage, "status": "projected_maximum", "cost_usd": cost_usd})
+
+
+class PilotRemoteStorageLedger:
+    """Private, fail-closed accounting for short-lived Gate 1 remote resources."""
+
+    def __init__(self, path: Path, ledger: SpendLedger):
+        self._path = path
+        self._ledger = ledger
+        self._resources: dict[str, dict[str, Any]] = {}
+
+    def observe(self, kind: str, resource: VectorStore | UploadedFile) -> bool:
+        if kind in {"raw_store", "derived_store"}:
+            if not isinstance(resource, VectorStore):
+                raise ValueError("pilot store accounting requires a vector-store response")
+            confirmed = self._store(kind, resource)
+        elif kind == "derived_file":
+            if not isinstance(resource, UploadedFile):
+                raise ValueError("pilot file accounting requires a File response")
+            confirmed = self._file(resource)
+        else:
+            raise ValueError("unknown pilot remote resource kind")
+        self._write()
+        return confirmed
+
+    def report(self) -> dict[str, Any]:
+        return {"resources": tuple(self._resources.values())}
+
+    def mark_cleanup(self, kind: str, remote_id: str, status: str) -> None:
+        key = f"vector_store:{remote_id}" if kind in {"raw_store", "derived_store"} else f"file:{remote_id}"
+        if key in self._resources:
+            self._resources[key]["cleanup_status"] = status
+            self._write()
+
+    def _store(self, kind: str, store: VectorStore) -> bool:
+        key = f"vector_store:{store.store_id}"
+        entry = self._resources.setdefault(key, {
+            "kind": kind,
+            "resource_kind": "vector_store",
+            "remote_id": store.store_id,
+            "expiration_policy": PILOT_REMOTE_RETENTION.vector_store.as_request(),
+            "cleanup_status": "automatic_expiry_configured",
+        })
+        entry.update({"created_at": store.created_at, "expires_at": store.expires_at})
+        confirmed = store.expires_after == PILOT_REMOTE_RETENTION.vector_store.as_request() or (
+            store.created_at is not None
+            and store.expires_at is not None
+            and 0 < store.expires_at - store.created_at <= 86_400
+        )
+        entry["expiry_confirmed"] = confirmed
+        if not confirmed:
+            entry["usage_bytes"] = store.usage_bytes
+            entry["projected_maximum_retention_cost_usd"] = None
+            return False
+        if store.usage_bytes is None:
+            entry["usage_bytes"] = None
+            entry["projected_maximum_retention_cost_usd"] = None
+            raise RuntimeError("pilot vector-store usage_bytes is missing; refusing unknown storage cost")
+        maximum = (
+            store.usage_bytes / _BYTES_PER_GIB * FILE_SEARCH_STORAGE_USD_PER_GIB_DAY
+            * PILOT_REMOTE_RETENTION.vector_store.days
+        )
+        previous = float(entry.get("projected_maximum_retention_cost_usd") or 0.0)
+        if maximum > previous:
+            self._ledger.record_projected_maximum("remote_storage", maximum - previous)
+        entry.update({
+            "usage_bytes": store.usage_bytes,
+            "projected_maximum_retention_cost_usd": maximum,
+        })
+        return True
+
+    def _file(self, file: UploadedFile) -> bool:
+        key = f"file:{file.file_id}"
+        self._resources[key] = {
+            "kind": "derived_file",
+            "resource_kind": "file",
+            "remote_id": file.file_id,
+            "created_at": file.created_at,
+            "expires_at": file.expires_at,
+            "usage_bytes": file.bytes,
+            "expiration_policy": PILOT_REMOTE_RETENTION.derived_file.as_request(),
+            "projected_maximum_retention_cost_usd": 0.0,
+            "cleanup_status": "automatic_expiry_configured",
+        }
+        confirmed = (
+            file.created_at is not None
+            and file.expires_at is not None
+            and 0 < file.expires_at - file.created_at <= 86_400
+        )
+        self._resources[key]["expiry_confirmed"] = confirmed
+        return confirmed
+
+    def _write(self) -> None:
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        self._path.write_text(json.dumps(self.report(), indent=2, sort_keys=True), encoding="utf-8")
+
 
 class _BudgetedResponses:
     def __init__(self, responses: Any, ledger: SpendLedger, diagnostic_path: Path | None = None):
@@ -281,12 +393,20 @@ class _BudgetedResponses:
 class BudgetedOpenAIClient:
     """Delegate every non-Responses API while enforcing the Responses spend boundary."""
 
-    def __init__(self, client: Any, ledger: SpendLedger, diagnostic_path: Path | None = None):
+    def __init__(
+        self,
+        client: Any,
+        ledger: SpendLedger,
+        diagnostic_path: Path | None = None,
+        *,
+        allow_bounded_remote_storage: bool = False,
+    ):
         self._client = client
         self.responses = _BudgetedResponses(client.responses, ledger, diagnostic_path)
+        self._allow_bounded_remote_storage = allow_bounded_remote_storage
 
     def __getattr__(self, name: str):
-        if name in {"files", "vector_stores"}:
+        if name in {"files", "vector_stores"} and not self._allow_bounded_remote_storage:
             raise RuntimeError(
                 f"Gate 1 has no defensible per-operation upper bound for {name}; refusing remote operation"
             )
@@ -354,9 +474,13 @@ class Gate1Runner:
             pilot_sources = CandidateSourcePreparer(pilot.storage).prepare(manifest.revision_ids)
             if tuple(source.revision.revision_id for source in pilot_sources) != manifest.revision_ids:
                 raise ValueError("pilot source order no longer matches the approved manifest")
+            remote_storage = PilotRemoteStorageLedger(
+                pilot.output_directory / "remote-storage-ledger.json", self.ledger
+            )
             paid_client = BudgetedOpenAIClient(
                 self._client_factory(), self.ledger,
                 pilot.output_directory / "response-envelopes.jsonl",
+                allow_bounded_remote_storage=True,
             )
             compiler = self._compiler_factory(pilot.storage, paid_client, self.pricing)
             build = compiler.build(
@@ -370,6 +494,9 @@ class Gate1Runner:
                     ),
                     sources=pilot_sources,
                     artifact_scope=ArtifactScope.PILOT,
+                    remote_retention=PILOT_REMOTE_RETENTION,
+                    remote_storage_observer=remote_storage.observe,
+                    remote_storage_cleanup_observer=remote_storage.mark_cleanup,
                 )
             )
             evaluation = None
@@ -398,6 +525,7 @@ class Gate1Runner:
                     "spent_usd": self.ledger.spent_usd,
                     "events": self.ledger.events,
                 },
+                "remote_storage": remote_storage.report(),
             }
             output_path.write_text(
                 json.dumps(private_result, indent=2, sort_keys=True, default=str),

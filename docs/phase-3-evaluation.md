@@ -434,3 +434,29 @@ Measured incremental spend was `$2.256515`: `$0.628820` extraction,
 is `$13.853585`, leaving `$16.146415` under the unchanged `$30.00` checkpoint.
 The failed candidate and all response/record artifacts remain private and
 ignored.
+
+## Gate 1 pilot remote-storage retention
+
+Before the next authorized candidate, Gate 1 now uses a pilot-only automatic
+retention policy. Both candidate vector stores are created with OpenAI's
+supported `expires_after={anchor: last_active_at, days: 1}` policy. Each
+newly uploaded derived-orientation File uses
+`expires_after={anchor: created_at, seconds: 86400}`. Existing Jacob raw Files
+are only attached to the temporary pilot raw store; their File objects and
+retention are never changed.
+
+The isolated pilot writes a private, ignored remote-storage ledger. It records
+remote resource identity, creation and expiry information, actual vector-store
+`usage_bytes`, the one-day maximum storage projection, and automatic-expiry
+cleanup status. Storage uses the official File Search price of `$0.10/GiB/day`
+without assuming a free allowance. Missing expiry or post-ingestion
+`usage_bytes` fails closed before the next paid operation. The cumulative Gate
+1 baseline is now `$13.853585`, leaving `$16.146415` under the unchanged
+`$30.00` ceiling.
+
+The implementation follows the current official API contracts: vector stores
+support only the `last_active_at` anchor with 1–365 days, while Files support
+the `created_at` anchor with 3,600–2,592,000 seconds. See the [OpenAI vector
+store API reference](https://developers.openai.com/api/reference/resources/vector_stores/methods/create),
+the [Files API reference](https://platform.openai.com/docs/api-reference/files),
+and [OpenAI pricing](https://platform.openai.com/pricing).
