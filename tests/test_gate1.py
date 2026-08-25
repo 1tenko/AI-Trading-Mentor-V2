@@ -19,6 +19,7 @@ from mentor.gate1 import (
     PilotRemoteStorageLedger,
     SpendLedger,
     estimate_gate1_cost,
+    _mentor_evaluation_telemetry,
 )
 from mentor.compiler import EXTRACTION_INITIAL_MAX_OUTPUT_TOKENS, ExtractionFailure, SourceExtractor
 from mentor.knowledge import Collection, Source, SourceRevision
@@ -551,6 +552,29 @@ def test_execute_builds_and_publishes_only_in_pilot_then_runs_evaluation(tmp_pat
     assert production.current_snapshot() == production_snapshot
     assert report.output_path.is_file()
     assert "vs_pilot_raw" in report.output_path.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    ("context", "required", "expected"),
+    (
+        (None, True, "INVALID_ORIENTATION_NOT_ATTEMPTED"),
+        ({"status": "unavailable", "requested": True, "attempted": True, "retrieval_succeeded": False, "used": False, "record_count": 0}, True, "INVALID_FALLBACK_MASKED_FAILURE"),
+        ({"status": "empty", "requested": True, "attempted": True, "retrieval_succeeded": True, "used": False, "record_count": 0}, True, "INVALID_ORIENTATION_EMPTY_OR_UNPROVEN"),
+        ({"status": "used", "requested": True, "attempted": True, "retrieval_succeeded": True, "used": True, "record_count": 2}, True, "VALID_ORIENTATION_USED"),
+        (None, False, "VALID_ORIENTATION_NOT_REQUIRED"),
+    ),
+)
+def test_phase3_evaluation_telemetry_fails_closed_when_required_orientation_was_not_admitted(
+    context, required, expected
+):
+    answer = SimpleNamespace(
+        diagnostics=SimpleNamespace(knowledge_context=context, file_search_calls=1)
+    )
+
+    telemetry = _mentor_evaluation_telemetry(answer, orientation_required=required)
+
+    assert telemetry["validity"] == expected
+    assert telemetry["raw_verification_occurred"] is True
 
 
 def test_budgeted_client_caps_output_and_accounts_actual_usage_before_next_call():

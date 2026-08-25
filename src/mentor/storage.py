@@ -952,6 +952,28 @@ class Storage:
             ).fetchall()
         return [Collection(row[0], row[1], row[2], bool(row[3]), row[4]) for row in rows]
 
+    def snapshot_collection_ids(self, snapshot_id: str) -> tuple[str, ...]:
+        """Return only the canonical collection identities selected by this snapshot."""
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT selected_revision_ids_json FROM corpus_snapshots WHERE snapshot_id = ?",
+                (snapshot_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError("unknown snapshot")
+            revision_ids = tuple(json.loads(row[0]))
+            if not revision_ids:
+                return ()
+            placeholders = ",".join("?" for _ in revision_ids)
+            rows = connection.execute(
+                f"""SELECT DISTINCT library_sources.collection_id
+                    FROM source_revisions JOIN library_sources USING(source_id)
+                    WHERE source_revisions.revision_id IN ({placeholders})
+                    ORDER BY library_sources.collection_id""",
+                revision_ids,
+            ).fetchall()
+        return tuple(str(row[0]) for row in rows)
+
     def compilation_run(self, run_id: str) -> CompilationRun | None:
         with self._connect() as connection:
             row = connection.execute(
@@ -3191,21 +3213,26 @@ def _safe_orientation_context(context: dict) -> dict | None:
     budget = context.get("budget")
     snapshot_id = context.get("snapshot_id")
     schema_version = context.get("snapshot_schema_version")
+    used_tokens = context.get("used_tokens")
+    truncated = context.get("truncated")
+    if isinstance(budget, dict):
+        used_tokens = budget.get("used_tokens", used_tokens)
+        truncated = budget.get("truncated", truncated)
     if (
-        context.get("status") not in {"used", "unavailable"}
+        context.get("status") not in {"used", "empty", "unavailable", "not_called"}
         or not isinstance(context.get("used"), bool)
         or not isinstance(record_ids, list)
         or any(not isinstance(record_id, str) or re.fullmatch(r"rec_[0-9a-f]{64}", record_id) is None for record_id in record_ids)
         or not isinstance(budget, dict)
         or not _nonnegative_int(budget.get("max_records"))
         or not _nonnegative_int(budget.get("max_tokens"))
-        or not _nonnegative_int(context.get("used_tokens"))
-        or not isinstance(context.get("truncated"), bool)
+        or not _nonnegative_int(used_tokens)
+        or not isinstance(truncated, bool)
         or (snapshot_id is not None and (not isinstance(snapshot_id, str) or re.fullmatch(r"snap_[0-9a-f]{64}", snapshot_id) is None))
         or (schema_version is not None and (not isinstance(schema_version, str) or not 0 < len(schema_version) <= 120))
     ):
         return None
-    return {
+    safe = {
         "status": context["status"],
         "used": context["used"],
         "snapshot_id": snapshot_id,
@@ -3213,9 +3240,15 @@ def _safe_orientation_context(context: dict) -> dict | None:
         "record_ids": record_ids,
         "record_count": len(record_ids),
         "budget": {"max_records": budget["max_records"], "max_tokens": budget["max_tokens"]},
-        "used_tokens": context["used_tokens"],
-        "truncated": context["truncated"],
+        "used_tokens": used_tokens,
+        "truncated": truncated,
     }
+    telemetry = ("requested", "attempted", "retrieval_succeeded")
+    if any(key in context for key in telemetry):
+        if not all(isinstance(context.get(key), bool) for key in telemetry):
+            return None
+        safe.update({key: context[key] for key in telemetry})
+    return safe
 
 
 def _validate_anchor_identity(anchor: SourceAnchor, identity_key: object) -> None:

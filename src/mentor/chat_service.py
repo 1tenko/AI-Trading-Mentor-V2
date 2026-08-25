@@ -32,8 +32,6 @@ ORIENTATION_TOOL = {
         "type": "object",
         "properties": {
             "question": {"type": "string", "description": "The bounded topic or question to orient."},
-            "collection_id": {"type": "string", "description": "Optional active collection scope."},
-            "year": {"type": "integer", "description": "Optional active year scope."},
         },
         "required": ["question"],
         "additionalProperties": False,
@@ -169,6 +167,9 @@ class KnowledgeContext:
     """Compact persisted audit for request-scoped derived orientation."""
 
     status: str
+    requested: bool
+    attempted: bool
+    retrieval_succeeded: bool
     used: bool
     snapshot_id: str | None
     snapshot_schema_version: str | None
@@ -179,9 +180,13 @@ class KnowledgeContext:
 
     @classmethod
     def from_result(cls, result: OrientationResult) -> "KnowledgeContext":
+        admitted = bool(result.records)
         return cls(
-            status="used",
-            used=True,
+            status="used" if admitted else "empty",
+            requested=True,
+            attempted=True,
+            retrieval_succeeded=True,
+            used=admitted,
             snapshot_id=result.snapshot_id,
             snapshot_schema_version=result.snapshot_schema_version,
             record_ids=tuple(record.record_id for record in result.records),
@@ -194,6 +199,25 @@ class KnowledgeContext:
     def unavailable(cls, snapshot: Any) -> "KnowledgeContext":
         return cls(
             status="unavailable",
+            requested=True,
+            attempted=True,
+            retrieval_succeeded=False,
+            used=False,
+            snapshot_id=_snapshot_identifier(snapshot, "snapshot_id"),
+            snapshot_schema_version=_snapshot_identifier(snapshot, "schema_version"),
+            record_ids=(),
+            budget=ORIENTATION_BUDGET,
+            used_tokens=0,
+            truncated=False,
+        )
+
+    @classmethod
+    def not_called(cls, snapshot: Any) -> "KnowledgeContext":
+        return cls(
+            status="not_called",
+            requested=True,
+            attempted=False,
+            retrieval_succeeded=False,
             used=False,
             snapshot_id=_snapshot_identifier(snapshot, "snapshot_id"),
             snapshot_schema_version=_snapshot_identifier(snapshot, "schema_version"),
@@ -206,6 +230,9 @@ class KnowledgeContext:
     def audit(self) -> dict[str, Any]:
         return {
             "status": self.status,
+            "requested": self.requested,
+            "attempted": self.attempted,
+            "retrieval_succeeded": self.retrieval_succeeded,
             "used": self.used,
             "snapshot_id": self.snapshot_id,
             "snapshot_schema_version": self.snapshot_schema_version,
@@ -391,14 +418,10 @@ class ChatService:
         function_call = _orientation_function_call(initial_output)
         if function_call is None:
             LOGGER.warning("Orientation tool was not called for a broad Mentor request")
-            return _raw_only_request(request), KnowledgeContext.unavailable(snapshot), initial
+            return _raw_only_request(request), KnowledgeContext.not_called(snapshot), initial
         try:
             arguments = _orientation_arguments(function_call)
-            result = self.orientation_service.consult(
-                arguments["question"],
-                snapshot=snapshot,
-                **{key: value for key, value in arguments.items() if key != "question"},
-            )
+            result = self.orientation_service.consult(arguments["question"], snapshot=snapshot)
             if result.snapshot_id != _snapshot_identifier(snapshot, "snapshot_id"):
                 raise ValueError("orientation result did not match the turn snapshot")
             context = KnowledgeContext.from_result(result)
@@ -553,6 +576,7 @@ def _should_orient(question: str, effective_depth: str) -> bool:
             r"|\b(compare|comparison|difference|differences|changed|change|evolution|evolved|refined)\b"
             r"|\b(relationship|relationships|factor|factors|condition|conditions|affect|affects|influence|influences|interaction|interact)\b"
             r"|\b(whole|overall|entire)\s+system\b"
+            r"|\b(explain|teach).{0,160}\b(major parts|fit together|whole system)\b"
             r"|\b(how do|how does).{0,160}\b(work together|fit together|relate|interact)\b",
             normalized,
         )
@@ -575,21 +599,10 @@ def _orientation_arguments(function_call: dict) -> dict[str, Any]:
     raw_arguments = function_call.get("arguments")
     if isinstance(raw_arguments, str):
         raw_arguments = json.loads(raw_arguments)
-    if not isinstance(raw_arguments, dict) or set(raw_arguments) - {"question", "collection_id", "year"}:
+    if not isinstance(raw_arguments, dict) or set(raw_arguments) - {"question"}:
         raise ValueError("orientation function arguments are invalid")
     question = _question(raw_arguments.get("question", ""))
-    arguments: dict[str, Any] = {"question": question}
-    if "collection_id" in raw_arguments:
-        collection_id = raw_arguments["collection_id"]
-        if not isinstance(collection_id, str) or not collection_id.strip():
-            raise ValueError("orientation collection_id is invalid")
-        arguments["collection_id"] = collection_id
-    if "year" in raw_arguments:
-        year = raw_arguments["year"]
-        if isinstance(year, bool) or not isinstance(year, int):
-            raise ValueError("orientation year is invalid")
-        arguments["year"] = year
-    return arguments
+    return {"question": question}
 
 
 def _raw_only_request(request: dict) -> dict:

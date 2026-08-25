@@ -2,6 +2,8 @@ from dataclasses import replace
 from hashlib import sha256
 from types import SimpleNamespace
 
+import pytest
+
 from mentor.compilation import CompilationRun, CorpusSnapshot
 from mentor.derived_records import Claim, RecordDependency, Relationship
 from mentor.knowledge import Collection, Source, SourceRevision
@@ -15,7 +17,8 @@ SNAPSHOT_ID = "snap_current"
 
 class FakeStorage:
     def __init__(
-        self, snapshot, records, concept_ids=None, source_areas=None, concepts=(), occurrences=()
+        self, snapshot, records, concept_ids=None, source_areas=None, concepts=(), occurrences=(),
+        collection_ids=None,
     ):
         self.snapshot = snapshot
         self.records = list(records)
@@ -23,6 +26,7 @@ class FakeStorage:
         self.source_areas = dict(source_areas or {})
         self.concepts = tuple(concepts)
         self.occurrences = tuple(occurrences)
+        self.collection_ids = collection_ids
 
     def current_snapshot(self):
         return self.snapshot
@@ -46,6 +50,10 @@ class FakeStorage:
     def orientation_concept_occurrences(self, snapshot_id):
         assert snapshot_id == self.snapshot.snapshot_id
         return self.occurrences
+
+    def snapshot_collection_ids(self, snapshot_id):
+        assert snapshot_id == self.snapshot.snapshot_id
+        return self.collection_ids
 
 
 class FakeVectorStores:
@@ -144,6 +152,72 @@ def test_orientation_searches_only_current_derived_store_and_omits_raw_search_te
     assert orientation.records[0].source_area.scope == "local market scope"
     assert "RAW TRANSCRIPT" not in repr(orientation)
     assert "citations" not in orientation.__dataclass_fields__
+
+
+def test_orientation_resolves_the_snapshot_owned_collection_before_searching_its_derived_store():
+    from mentor.orientation import OrientationBudget, OrientationService
+
+    record = claim("pilot orientation")
+    vector_stores = FakeVectorStores([result(record, concept_id="con_pilot")])
+    snapshot = SimpleNamespace(
+        snapshot_id="snap_pilot", status="published", derived_store_id="vs_pilot_derived"
+    )
+    storage = FakeStorage(
+        snapshot,
+        [record],
+        {record.record_id: "con_pilot"},
+        collection_ids=("collection_jacob_2025_2026",),
+    )
+    service = OrientationService(storage, vector_stores, budget=OrientationBudget(2, 1_000))
+
+    service.consult("How do the parts fit together?", snapshot=snapshot)
+
+    assert vector_stores.calls == [
+        (
+            "vs_pilot_derived",
+            "How do the parts fit together?",
+            {
+                "snapshot_id": "snap_pilot",
+                "status": "published",
+                "collection_id": "collection_jacob_2025_2026",
+            },
+            8,
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    "invalid_identifier",
+    (
+        "collection_production",
+        "snap_pilot",
+        "vs_pilot_derived",
+        "Jacob Speculates 2025-2026",
+        "",
+    ),
+)
+def test_orientation_rejects_any_collection_scope_not_owned_by_the_resolved_snapshot(invalid_identifier):
+    from mentor.orientation import OrientationBudget, OrientationService
+
+    record = claim("pilot orientation", snapshot_id="snap_pilot")
+    snapshot = SimpleNamespace(
+        snapshot_id="snap_pilot", status="published", derived_store_id="vs_pilot_derived"
+    )
+    service = OrientationService(
+        FakeStorage(
+            snapshot,
+            [record],
+            {record.record_id: "con_pilot"},
+            collection_ids=("collection_jacob_2025_2026",),
+        ),
+        FakeVectorStores([result(record, snapshot_id="snap_pilot", concept_id="con_pilot")]),
+        budget=OrientationBudget(2, 1_000),
+    )
+
+    with pytest.raises(ValueError, match="collection scope"):
+        service.consult(
+            "How do the parts fit together?", snapshot=snapshot, collection_id=invalid_identifier
+        )
 
 
 def test_orientation_preserves_conclusion_identity_and_exact_direct_lineage():

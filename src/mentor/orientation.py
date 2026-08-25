@@ -110,11 +110,12 @@ class OrientationService:
     ) -> OrientationResult:
         _require_question(question)
         attributes = {"snapshot_id": "", "status": "published"}
-        _add_scope(attributes, collection_id=collection_id, year=year, scope=scope)
         snapshot = self._storage.current_snapshot() if snapshot is None else snapshot
         if snapshot is None or snapshot.status != "published" or not isinstance(snapshot.derived_store_id, str):
             return OrientationResult(None, None, (), 0, self._budget, False, 0, 0)
 
+        collection_id = self._snapshot_collection_scope(snapshot, collection_id)
+        _add_scope(attributes, collection_id=collection_id, year=year, scope=scope)
         attributes["snapshot_id"] = snapshot.snapshot_id
         local_records, invalid_local_ids = self._current_local_records(snapshot.snapshot_id)
         local_concept_ids = self._storage.orientation_concept_ids(snapshot.snapshot_id)
@@ -140,6 +141,17 @@ class OrientationService:
             snapshot, local_records, invalid_local_ids, local_concept_ids,
             local_concept_links, local_concepts, local_occurrences, remote_results,
         )
+
+    def _snapshot_collection_scope(self, snapshot: Any, collection_id: str | None) -> str | None:
+        reader = getattr(self._storage, "snapshot_collection_ids", None)
+        allowed = reader(snapshot.snapshot_id) if callable(reader) else None
+        if allowed is None:
+            return collection_id
+        if collection_id is not None:
+            if not isinstance(collection_id, str) or not collection_id.strip() or collection_id not in allowed:
+                raise ValueError("orientation collection scope is not owned by the resolved snapshot")
+            return collection_id
+        return allowed[0] if len(allowed) == 1 else None
 
     def _current_local_records(self, snapshot_id: str) -> tuple[dict[str, DerivedRecord], set[str]]:
         records: dict[str, DerivedRecord] = {}

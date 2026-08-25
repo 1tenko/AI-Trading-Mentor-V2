@@ -8,8 +8,10 @@ from mentor.chat_service import (
     ChatService,
     EvaluationConfig,
     FILE_SEARCH_RESULT_BUDGETS,
+    ORIENTATION_TOOL,
     _input_item,
     _effective_research_depth,
+    _orientation_arguments,
     _should_orient,
 )
 from mentor.prompts import MENTOR_INSTRUCTIONS
@@ -209,6 +211,9 @@ def test_broad_question_uses_a_server_owned_orientation_function_before_raw_sear
     diagnostics = storage.display_turns(1)[0]["diagnostics"]
     assert diagnostics["knowledge_context"] == {
         "status": "used",
+        "requested": True,
+        "attempted": True,
+        "retrieval_succeeded": True,
         "used": True,
         "snapshot_id": "snap_current",
         "snapshot_schema_version": "derived-schema-v1",
@@ -282,6 +287,97 @@ def test_orientation_continuation_keeps_initial_opaque_output_only_in_the_transi
 )
 def test_orientation_intent_uses_question_and_effective_research_depth(question, requested_depth, expected):
     assert _should_orient(question, _effective_research_depth(question, requested_depth)) is expected
+
+
+def test_broad_system_question_requires_orientation_before_raw_research():
+    assert _should_orient(
+        "Explain how the major parts of Jacob's system fit together.", "normal"
+    ) is True
+
+
+def test_orientation_scope_is_server_owned_and_model_arguments_cannot_supply_identifiers():
+    assert ORIENTATION_TOOL["parameters"] == {
+        "type": "object",
+        "properties": {
+            "question": {"type": "string", "description": "The bounded topic or question to orient."},
+        },
+        "required": ["question"],
+        "additionalProperties": False,
+    }
+    assert _orientation_arguments({"arguments": '{"question":"How do the parts fit together?"}'}) == {
+        "question": "How do the parts fit together?"
+    }
+    with pytest.raises(ValueError, match="orientation function arguments"):
+        _orientation_arguments({"arguments": '{"question":"How do the parts fit together?","collection_id":null}'})
+
+
+def test_empty_orientation_is_audited_as_not_admitted_context(tmp_path, monkeypatch):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    storage.set_vector_store("vs_legacy")
+    monkeypatch.setattr(storage, "current_snapshot", published_snapshot)
+    empty = OrientationResult(
+        snapshot_id="snap_current",
+        snapshot_schema_version="derived-schema-v1",
+        records=(),
+        used_tokens=0,
+        budget=OrientationBudget(max_records=8, max_tokens=4_000),
+        truncated=False,
+        duplicate_result_count=0,
+        discarded_result_count=0,
+    )
+    responses = SequenceResponses(
+        orientation_function_response("Explain how the major parts fit together."),
+        source_response("Raw answer.", []),
+    )
+
+    answer = ChatService(
+        storage,
+        SimpleNamespace(responses=responses),
+        orientation_service=FakeOrientation(empty),
+    ).reply(storage.create_thread("Question"), "Explain how the major parts fit together.")
+
+    assert answer.diagnostics.knowledge_context == {
+        "status": "empty",
+        "requested": True,
+        "attempted": True,
+        "retrieval_succeeded": True,
+        "used": False,
+        "snapshot_id": "snap_current",
+        "snapshot_schema_version": "derived-schema-v1",
+        "record_ids": [],
+        "record_count": 0,
+        "budget": {"max_records": 8, "max_tokens": 4_000, "used_tokens": 0, "truncated": False},
+    }
+
+
+def test_snapshot_bound_raw_and_derived_stores_cannot_cross_runtime_boundaries(tmp_path, monkeypatch):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    pilot_snapshot = SimpleNamespace(
+        snapshot_id="snap_pilot",
+        schema_version="derived-schema-v1",
+        status="published",
+        raw_store_id="vs_pilot_raw",
+        derived_store_id="vs_pilot_derived",
+    )
+    monkeypatch.setattr(storage, "current_snapshot", lambda: pilot_snapshot)
+    responses = SequenceResponses(
+        orientation_function_response("Explain how the major parts fit together."),
+        source_response("Raw answer.", []),
+    )
+    orientation = FakeOrientation(orientation_result())
+
+    ChatService(storage, SimpleNamespace(responses=responses), orientation_service=orientation).reply(
+        storage.create_thread("Question"), "Explain how the major parts fit together."
+    )
+
+    assert orientation.calls == [
+        ("Explain how the major parts fit together.", {"snapshot": pilot_snapshot})
+    ]
+    assert responses.calls[1]["tools"] == [
+        {"type": "file_search", "vector_store_ids": ["vs_pilot_raw"], "max_num_results": 8}
+    ]
 
 
 @pytest.mark.parametrize("orientation_error", [None, RuntimeError("derived lookup failed")])

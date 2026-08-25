@@ -20,7 +20,13 @@ from mentor.candidate_compiler import (
     CandidateSourcePreparer,
     RemoteArtifactRetention,
 )
-from mentor.chat_service import ChatService, EvaluationConfig, FILE_SEARCH_CALL_COST_USD
+from mentor.chat_service import (
+    ChatService,
+    EvaluationConfig,
+    FILE_SEARCH_CALL_COST_USD,
+    _effective_research_depth,
+    _should_orient,
+)
 from mentor.compilation import CompilationRun, TokenPricing, usage_from_response
 from mentor.compiler import SourceExtractor
 from mentor.compiler_prompts import (
@@ -1182,9 +1188,57 @@ def _live_evaluation(pilot: PilotRuntime, client: Any) -> dict[str, Any]:
                 "case": asdict(case),
                 "baseline": _json_value(baseline_answer),
                 "assimilated": _json_value(assimilated_answer),
+                "baseline_telemetry": _mentor_evaluation_telemetry(
+                    baseline_answer, orientation_required=False
+                ),
+                "assimilated_telemetry": _mentor_evaluation_telemetry(
+                    assimilated_answer,
+                    orientation_required=_should_orient(
+                        case.prompt, _effective_research_depth(case.prompt, evaluation.research_depth)
+                    ),
+                ),
             }
         )
     return {"cases": results}
+
+
+def _mentor_evaluation_telemetry(answer: Any, *, orientation_required: bool) -> dict[str, Any]:
+    """Safe experiment telemetry; response text and private orientation payloads never enter it."""
+    diagnostics = getattr(answer, "diagnostics", None)
+    context = getattr(diagnostics, "knowledge_context", None)
+    raw_search_calls = getattr(diagnostics, "file_search_calls", 0)
+    raw_verification = isinstance(raw_search_calls, int) and raw_search_calls > 0
+    if not orientation_required:
+        validity = "VALID_ORIENTATION_NOT_REQUIRED"
+    elif not isinstance(context, dict):
+        validity = "INVALID_ORIENTATION_NOT_ATTEMPTED"
+    elif (
+        context.get("status") == "used"
+        and context.get("requested") is True
+        and context.get("attempted") is True
+        and context.get("retrieval_succeeded") is True
+        and context.get("used") is True
+        and isinstance(context.get("record_count"), int)
+        and context["record_count"] > 0
+        and raw_verification
+    ):
+        validity = "VALID_ORIENTATION_USED"
+    elif context.get("status") in {"unavailable", "not_called"}:
+        validity = "INVALID_FALLBACK_MASKED_FAILURE"
+    else:
+        validity = "INVALID_ORIENTATION_EMPTY_OR_UNPROVEN"
+    return {
+        "orientation_required": orientation_required,
+        "orientation_requested": isinstance(context, dict) and context.get("requested") is True,
+        "orientation_attempted": isinstance(context, dict) and context.get("attempted") is True,
+        "orientation_retrieval_succeeded": (
+            isinstance(context, dict) and context.get("retrieval_succeeded") is True
+        ),
+        "orientation_context_admitted": isinstance(context, dict) and context.get("used") is True,
+        "orientation_record_count": 0 if not isinstance(context, dict) else context.get("record_count", 0),
+        "raw_verification_occurred": raw_verification,
+        "validity": validity,
+    }
 
 
 def _build_summary(build: Any) -> dict[str, Any]:
