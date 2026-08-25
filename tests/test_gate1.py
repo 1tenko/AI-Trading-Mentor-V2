@@ -11,10 +11,10 @@ from mentor.compilation import CompilationRun, CorpusSnapshot, SourceProcessingR
 from mentor.derived_records import Claim, RecordDependency
 from mentor.gate1 import (
     CONSERVATIVE_SOL_PRICING,
-    GATE1_PRIOR_SPEND_USD,
     GATE1_PRICING_CHECKED_ON,
     HARD_SPEND_CEILING_USD,
     BudgetedOpenAIClient,
+    CumulativeSpendLedger,
     Gate1Runner,
     PilotRemoteStorageLedger,
     SpendLedger,
@@ -38,6 +38,19 @@ ROLES = (
 
 def _manifest_hash(path: Path) -> str:
     return sha256(path.read_bytes()).hexdigest()
+
+
+def _usd(value) -> float:
+    return float(value)
+
+
+def _state_amounts_for_test(state):
+    return (
+        state.actual_incurred_usd,
+        state.reserved_pending_usd,
+        state.bounded_storage_exposure_usd,
+        state.unknown_liability_usd,
+    )
 
 
 def _production_runtime(tmp_path: Path):
@@ -129,6 +142,279 @@ def _production_runtime(tmp_path: Path):
     return database_path, manifest_path, storage, production_snapshot
 
 
+def _historical_result(path: Path, run_id: str, *costs: float) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "run_id": run_id,
+                "status": "candidate_failed",
+                "spend": {
+                    "events": [
+                        {"stage": "extraction", "status": "settled", "cost_usd": cost}
+                        for cost in costs
+                    ]
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_cumulative_spend_ledger_imports_private_historical_runs_once_and_exactly(tmp_path):
+    root = tmp_path / "private-pilots"
+    _historical_result(root / "gate1-one" / "outputs" / "gate1-result.json", "gate1-one", 1.25)
+    _historical_result(root / "gate1-two" / "outputs" / "gate1-result.json", "gate1-two", 2.75, 0.5)
+
+    ledger = CumulativeSpendLedger(root / "gate1-cumulative-spend.json", root)
+
+    assert _usd(ledger.reconcile().spent_usd) == pytest.approx(4.5)
+    assert _usd(ledger.reconcile().spent_usd) == pytest.approx(4.5)
+    saved = json.loads((root / "gate1-cumulative-spend.json").read_text(encoding="utf-8"))
+    assert {entry["run_id"] for entry in saved["entries"]} == {"gate1-one", "gate1-two"}
+
+
+def test_cumulative_spend_ledger_counts_failed_run_and_private_probe_without_manual_baseline(tmp_path):
+    root = tmp_path / "private-pilots"
+    _historical_result(root / "gate1-failed" / "outputs" / "gate1-result.json", "gate1-failed", 2.32396)
+    accounting_path = root / "gate1-cumulative-spend.json"
+    accounting_path.parent.mkdir(parents=True, exist_ok=True)
+    accounting_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "gate1-cumulative-spend-v1",
+                "entries": [
+                    {
+                        "entry_id": "probe:contract-debug",
+                        "kind": "probe",
+                        "status": "settled",
+                        "incurred_usd": 0.5,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    state = CumulativeSpendLedger(accounting_path, root).reconcile()
+
+    assert _usd(state.spent_usd) == pytest.approx(2.82396)
+    assert _usd(state.remaining_usd(HARD_SPEND_CEILING_USD)) == pytest.approx(27.17604)
+
+
+def test_cumulative_spend_ledger_fails_closed_on_duplicate_or_conflicting_historical_accounting(tmp_path):
+    root = tmp_path / "private-pilots"
+    _historical_result(root / "gate1-one" / "outputs" / "gate1-result.json", "gate1-one", 1.0)
+    accounting_path = root / "gate1-cumulative-spend.json"
+    accounting_path.parent.mkdir(parents=True, exist_ok=True)
+    accounting_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "gate1-cumulative-spend-v1",
+                "entries": [
+                    {
+                        "entry_id": "historical:gate1-one",
+                        "kind": "historical_run",
+                        "run_id": "gate1-one",
+                        "status": "settled",
+                        "incurred_usd": 0.9,
+                    },
+                    {
+                        "entry_id": "historical:gate1-one",
+                        "kind": "historical_run",
+                        "run_id": "gate1-one",
+                        "status": "settled",
+                        "incurred_usd": 1.1,
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="duplicate cumulative spend entry"):
+        CumulativeSpendLedger(accounting_path, root).reconcile()
+
+    accounting_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "gate1-cumulative-spend-v1",
+                "entries": [
+                    {
+                        "entry_id": "historical:gate1-one",
+                        "kind": "historical_run",
+                        "run_id": "gate1-one",
+                        "status": "settled",
+                        "incurred_usd": 1.1,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="disagrees with historical result"):
+        CumulativeSpendLedger(accounting_path, root).reconcile()
+
+
+def test_cumulative_spend_ledger_fails_closed_when_a_historical_result_has_no_auditable_cost(tmp_path):
+    root = tmp_path / "private-pilots"
+    result = root / "gate1-unknown" / "outputs" / "gate1-result.json"
+    result.parent.mkdir(parents=True)
+    result.write_text(json.dumps({"run_id": "gate1-unknown", "status": "stopped"}), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="no auditable cost"):
+        CumulativeSpendLedger(root / "gate1-cumulative-spend.json", root).reconcile()
+
+
+def test_historical_candidate_total_must_equal_its_operation_events(tmp_path):
+    root = tmp_path / "private-pilots"
+    result = root / "gate1-bad-total" / "outputs" / "gate1-result.json"
+    result.parent.mkdir(parents=True)
+    result.write_text(
+        json.dumps(
+            {
+                "run_id": "gate1-bad-total",
+                "spend": {
+                    "prior_spend_usd": 1.0,
+                    "spent_usd": 2.1,
+                    "events": [{"stage": "extraction", "status": "settled", "cost_usd": 1.0}],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="total disagrees with operation events"):
+        CumulativeSpendLedger(root / "gate1-cumulative-spend.json", root).reconcile()
+
+
+def test_historical_probe_is_imported_once_with_exact_decimal_cost(tmp_path):
+    root = tmp_path / "private-pilots"
+    summary = root / "response-envelope-probe-synthetic" / "probe-summary.json"
+    summary.parent.mkdir(parents=True)
+    summary.write_text(
+        json.dumps({"status": "completed", "probe_cost_usd": 0.0008150000000002322}),
+        encoding="utf-8",
+    )
+
+    ledger = CumulativeSpendLedger(root / "gate1-cumulative-spend.json", root)
+    assert _usd(ledger.reconcile().spent_usd) == pytest.approx(0.000815)
+    assert _usd(ledger.reconcile().spent_usd) == pytest.approx(0.000815)
+
+
+def test_bounded_storage_exposure_survives_candidate_completion_and_restart_without_becoming_actual(tmp_path):
+    root = tmp_path / "private-pilots"
+    accounting = CumulativeSpendLedger(root / "gate1-cumulative-spend.json", root)
+    ledger = SpendLedger(
+        HARD_SPEND_CEILING_USD,
+        CONSERVATIVE_SOL_PRICING,
+        accounting=accounting,
+        run_id="gate1-storage",
+    )
+
+    ledger.record_projected_maximum("remote_storage", 0.1)
+    result = root / "gate1-storage" / "outputs" / "gate1-result.json"
+    result.parent.mkdir(parents=True)
+    result.write_text(
+        json.dumps({"run_id": "gate1-storage", "spend": {"events": ledger.events}}, default=str),
+        encoding="utf-8",
+    )
+
+    state = CumulativeSpendLedger(root / "gate1-cumulative-spend.json", root).reconcile()
+    assert _usd(state.actual_incurred_usd) == pytest.approx(0.0)
+    assert _usd(state.reserved_pending_usd) == pytest.approx(0.0)
+    assert _usd(state.bounded_storage_exposure_usd) == pytest.approx(0.1)
+    assert _usd(state.effective_budget_exposure_usd) == pytest.approx(0.1)
+
+
+def test_omitted_legacy_candidate_imports_actual_and_storage_once_across_restart(tmp_path):
+    root = tmp_path / "private-pilots"
+    result = root / "gate1-legacy-storage" / "outputs" / "gate1-result.json"
+    result.parent.mkdir(parents=True)
+    result.write_text(
+        json.dumps(
+            {
+                "run_id": "gate1-legacy-storage",
+                "spend": {
+                    "prior_spend_usd": 0,
+                    "spent_usd": 2.03,
+                    "events": [
+                        {"stage": "extraction", "status": "settled", "cost_usd": 2.0},
+                        {"stage": "remote_storage", "status": "projected_maximum", "cost_usd": 0.03},
+                    ],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    path = root / "gate1-cumulative-spend.json"
+
+    first = CumulativeSpendLedger(path, root).reconcile()
+    second = CumulativeSpendLedger(path, root).reconcile()
+
+    assert _usd(first.actual_incurred_usd) == pytest.approx(2.0)
+    assert _usd(first.bounded_storage_exposure_usd) == pytest.approx(0.03)
+    assert _usd(first.effective_budget_exposure_usd) == pytest.approx(2.03)
+    assert _state_amounts_for_test(first) == _state_amounts_for_test(second)
+    assert len(json.loads(path.read_text(encoding="utf-8"))["entries"]) == 2
+
+
+def test_runner_uses_reconciled_private_spend_before_the_first_paid_operation(tmp_path):
+    database_path, manifest_path, _production, _snapshot = _production_runtime(tmp_path)
+    root = tmp_path / "private-pilots"
+    _historical_result(
+        root / "gate1-latest" / "outputs" / "gate1-result.json", "gate1-latest", 16.177545
+    )
+
+    report = Gate1Runner(
+        production_database_path=database_path,
+        manifest_path=manifest_path,
+        pilot_root=root,
+        expected_manifest_sha256=_manifest_hash(manifest_path),
+    ).run()
+
+    assert _usd(report.spent_usd) == pytest.approx(16.177545)
+    assert _usd(report.remaining_usd) == pytest.approx(13.822455)
+
+
+def test_durable_settlement_and_unknown_operation_cost_advance_next_run_baseline(tmp_path):
+    root = tmp_path / "private-pilots"
+    accounting = CumulativeSpendLedger(root / "gate1-cumulative-spend.json", root)
+    ledger = SpendLedger(
+        HARD_SPEND_CEILING_USD,
+        CONSERVATIVE_SOL_PRICING,
+        accounting=accounting,
+        run_id="gate1-next",
+    )
+    first = ledger.reserve("extraction", 1.0)
+    ledger.settle(first, stage="extraction", actual_cost_usd=0.25)
+    second = ledger.reserve("validation", 0.5)
+    ledger.settle_unknown(second, stage="validation")
+
+    state = CumulativeSpendLedger(root / "gate1-cumulative-spend.json", root).reconcile()
+    assert _usd(state.spent_usd) == pytest.approx(0.25)
+    assert _usd(state.unknown_liability_usd) == pytest.approx(0.5)
+    assert _usd(state.effective_budget_exposure_usd) == pytest.approx(0.75)
+
+
+def test_reconciled_spend_blocks_the_first_operation_above_the_real_remaining_ceiling(tmp_path):
+    root = tmp_path / "private-pilots"
+    _historical_result(
+        root / "gate1-latest" / "outputs" / "gate1-result.json", "gate1-latest", 16.177545
+    )
+    accounting = CumulativeSpendLedger(root / "gate1-cumulative-spend.json", root)
+    ledger = SpendLedger(
+        HARD_SPEND_CEILING_USD,
+        CONSERVATIVE_SOL_PRICING,
+        prior_spend_usd=accounting.reconcile().spent_usd,
+        accounting=accounting,
+        run_id="gate1-next",
+    )
+
+    with pytest.raises(RuntimeError, match="spend ceiling"):
+        ledger.reserve("extraction", 13.822456)
+
+
 def test_gate1_preflight_reports_a_pathological_whole_run_without_blocking_a_dry_run(tmp_path):
     database_path, manifest_path, production, production_snapshot = _production_runtime(tmp_path)
     client_calls = []
@@ -146,7 +432,8 @@ def test_gate1_preflight_reports_a_pathological_whole_run_without_blocking_a_dry
 
     assert report.estimated_upper_bound_usd > 25.0
     assert client_calls == []
-    assert not pilot_root.exists()
+    assert (pilot_root / "gate1-cumulative-spend.json").is_file()
+    assert report.spent_usd == 0.0
     assert production.current_snapshot() == production_snapshot
 
 
@@ -180,8 +467,7 @@ def test_gate1_rejects_manifest_metadata_drift_instead_of_substituting(tmp_path)
     assert production.current_snapshot() == production_snapshot
 
 
-def test_execute_builds_and_publishes_only_in_pilot_then_runs_evaluation(tmp_path, monkeypatch):
-    monkeypatch.setattr(gate1_module, "GATE1_PRIOR_SPEND_USD", 0.0)
+def test_execute_builds_and_publishes_only_in_pilot_then_runs_evaluation(tmp_path):
     database_path, manifest_path, production, production_snapshot = _production_runtime(tmp_path)
     observed = {}
 
@@ -293,7 +579,7 @@ def test_budgeted_client_caps_output_and_accounts_actual_usage_before_next_call(
     )
 
     assert calls[0]["max_output_tokens"] == EXTRACTION_INITIAL_MAX_OUTPUT_TOKENS
-    assert ledger.spent_usd == pytest.approx(CONSERVATIVE_SOL_PRICING.cost(
+    assert _usd(ledger.spent_usd) == pytest.approx(CONSERVATIVE_SOL_PRICING.cost(
         input_tokens=100, output_tokens=20, reasoning_tokens=10
     ))
 
@@ -412,13 +698,12 @@ def test_budgeted_client_records_transport_versions_and_conservatively_charges_u
 
 
 def test_spend_ledger_counts_a_prior_gate1_run_against_the_same_hard_ceiling():
-    assert GATE1_PRIOR_SPEND_USD == pytest.approx(13.853585)
     assert HARD_SPEND_CEILING_USD == pytest.approx(30.0)
-    ledger = SpendLedger(HARD_SPEND_CEILING_USD, CONSERVATIVE_SOL_PRICING, prior_spend_usd=GATE1_PRIOR_SPEND_USD)
+    ledger = SpendLedger(HARD_SPEND_CEILING_USD, CONSERVATIVE_SOL_PRICING, prior_spend_usd=16.177545)
 
-    assert ledger.spent_usd == pytest.approx(13.853585)
+    assert _usd(ledger.spent_usd) == pytest.approx(16.177545)
     with pytest.raises(RuntimeError, match="spend ceiling"):
-        ledger.ensure("extraction", 16.146416)
+        ledger.ensure("extraction", 13.822456)
 
 
 def test_gate1_keeps_its_deliberately_conservative_token_pricing_contract():
@@ -453,9 +738,9 @@ def test_actual_cheap_call_releases_its_unused_reservation_for_the_next_call():
     ledger.settle(first, stage="extraction", actual_cost_usd=0.01)
     second = ledger.reserve("validation", 0.9)
 
-    assert ledger.spent_usd == pytest.approx(0.01)
+    assert _usd(ledger.spent_usd) == pytest.approx(0.01)
     ledger.settle(second, stage="validation", actual_cost_usd=0.01)
-    assert ledger.spent_usd == pytest.approx(0.02)
+    assert _usd(ledger.spent_usd) == pytest.approx(0.02)
 
 
 def test_multiple_incrementally_bounded_calls_proceed_but_an_expensive_later_call_stops_safely():
@@ -467,7 +752,7 @@ def test_multiple_incrementally_bounded_calls_proceed_but_an_expensive_later_cal
     with pytest.raises(RuntimeError, match="spend ceiling"):
         ledger.reserve("synthesis", 0.8)
 
-    assert ledger.spent_usd == pytest.approx(29.3)
+    assert _usd(ledger.spent_usd) == pytest.approx(29.3)
     assert ledger.spent_usd <= HARD_SPEND_CEILING_USD
 
 
@@ -489,7 +774,7 @@ def test_pilot_storage_ledger_requires_expiry_and_charges_actual_vector_store_us
     assert storage.observe("derived_file", UploadedFile("file_derived", 42, 1, 86_401)) is True
 
     report = json.loads((tmp_path / "private" / "remote-storage-ledger.json").read_text())
-    assert ledger.spent_usd == pytest.approx(0.10)
+    assert _usd(ledger.spent_usd) == pytest.approx(0.10)
     assert {item["resource_kind"] for item in report["resources"]} == {"vector_store", "file"}
     assert all(item["cleanup_status"] == "automatic_expiry_configured" for item in report["resources"])
 
@@ -514,8 +799,7 @@ def test_bounded_remote_storage_is_opt_in_and_does_not_make_production_calls_exp
     assert permitted.vector_stores is not None
 
 
-def test_execute_rejects_stale_pricing_before_any_paid_client(tmp_path, monkeypatch):
-    monkeypatch.setattr(gate1_module, "GATE1_PRIOR_SPEND_USD", 0.0)
+def test_execute_rejects_stale_pricing_before_any_paid_client(tmp_path):
     database_path, manifest_path, production, production_snapshot = _production_runtime(tmp_path)
     client_calls = []
 

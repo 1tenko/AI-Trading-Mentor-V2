@@ -2,6 +2,7 @@
 
 from dataclasses import asdict, dataclass, is_dataclass
 from datetime import date, datetime, timezone
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 import json
 import math
 import os
@@ -50,7 +51,7 @@ APPROVED_GATE1_MANIFEST_SHA256 = "3798d537cd486f782449d9833b5fc06dd28fa93aed4564
 # Standard short-context rates are deliberately higher than the current model-page promotion.
 CONSERVATIVE_SOL_PRICING = TokenPricing(5.0, 30.0, 30.0)
 HARD_SPEND_CEILING_USD = 30.0
-GATE1_PRIOR_SPEND_USD = 13.853585
+_MONEY_QUANTUM = Decimal("0.000000001")
 _PRICING_MAX_AGE_DAYS = 7
 _MAX_OUTPUT_TOKENS_BY_STAGE = {
     "extraction": EXTRACTION_RETRY_MAX_OUTPUT_TOKENS,
@@ -132,6 +133,7 @@ class Gate1RunReport:
     revision_ids: tuple[str, ...]
     estimated_upper_bound_usd: float
     spent_usd: float
+    remaining_usd: float
     pilot_directory: Path | None = None
     output_path: Path | None = None
 
@@ -143,10 +145,328 @@ class _ProductionPointers:
     derived_store_id: str | None
 
 
+@dataclass(frozen=True)
+class CumulativeSpendState:
+    actual_incurred_usd: Decimal
+    reserved_pending_usd: Decimal
+    bounded_storage_exposure_usd: Decimal
+    unknown_liability_usd: Decimal
+    entry_count: int
+
+    @property
+    def spent_usd(self) -> Decimal:
+        """Compatibility name: strictly settled/actual cost only."""
+        return self.actual_incurred_usd
+
+    @property
+    def effective_budget_exposure_usd(self) -> Decimal:
+        return (
+            self.actual_incurred_usd
+            + self.reserved_pending_usd
+            + self.bounded_storage_exposure_usd
+            + self.unknown_liability_usd
+        )
+
+    def remaining_usd(self, ceiling_usd: float | Decimal) -> Decimal:
+        return _money(ceiling_usd) - self.effective_budget_exposure_usd
+
+
+class CumulativeSpendLedger:
+    """Private, fail-closed cumulative Gate 1 accounting.
+
+    Historical run reports are immutable evidence.  This compact journal imports
+    each report once and durably reserves every future paid operation before it
+    is sent, so a later run never starts below auditable incurred spend.
+    """
+
+    _SCHEMA_VERSION = "gate1-cumulative-spend-v1"
+    _COUNTED_STATUSES = {"settled", "usage_unknown", "storage_exposure"}
+    _LEGACY_STORAGE_STATUS = "projected_maximum"
+
+    def __init__(self, path: Path, pilot_root: Path):
+        self._path = Path(path)
+        self._pilot_root = Path(pilot_root)
+        self._entries = self._load()
+
+    def reconcile(self) -> CumulativeSpendState:
+        entries_by_id = {entry["entry_id"]: entry for entry in self._entries}
+        if len(entries_by_id) != len(self._entries):
+            raise ValueError("duplicate cumulative spend entry")
+        entries_by_run: dict[str, list[dict[str, Any]]] = {}
+        for entry in self._entries:
+            run_id = entry.get("run_id")
+            if isinstance(run_id, str):
+                entries_by_run.setdefault(run_id, []).append(entry)
+        changed = False
+        for result_path in sorted(self._pilot_root.glob("gate1-*/outputs/gate1-result.json")):
+            payload = _read_private_json(result_path)
+            run_id = payload.get("run_id")
+            if not isinstance(run_id, str) or not run_id:
+                raise ValueError(f"historical Gate 1 result lacks run_id: {result_path}")
+            audited_cost = _historical_run_cost(payload, result_path)
+            existing = entries_by_run.get(run_id, [])
+            existing_cost = _state_from_entries(existing)
+            components = (
+                ("actual", "settled", "incurred_usd", audited_cost.actual_incurred_usd),
+                ("storage", "storage_exposure", "exposure_usd", audited_cost.bounded_storage_exposure_usd),
+                ("unknown", "usage_unknown", "incurred_usd", audited_cost.unknown_liability_usd),
+            )
+            for suffix, status, field, expected in components:
+                observed = {
+                    "actual": existing_cost.actual_incurred_usd,
+                    "storage": existing_cost.bounded_storage_exposure_usd,
+                    "unknown": existing_cost.unknown_liability_usd,
+                }[suffix]
+                if observed > expected:
+                    raise ValueError(f"cumulative spend disagrees with historical result for {run_id}")
+                if observed == expected:
+                    continue
+                entry_id = f"historical:{run_id}:{suffix}"
+                if entry_id in entries_by_id:
+                    raise ValueError("duplicate cumulative spend entry")
+                entry = {
+                    "entry_id": entry_id,
+                    "kind": "historical_run",
+                    "run_id": run_id,
+                    "stage": "remote_storage" if suffix == "storage" else "historical",
+                    "status": status,
+                    field: _money_text(expected - observed),
+                }
+                self._entries.append(entry)
+                entries_by_id[entry_id] = entry
+                entries_by_run.setdefault(run_id, []).append(entry)
+                changed = True
+        for probe_path in sorted(self._pilot_root.glob("response-envelope-probe-*/probe-summary.json")):
+            payload = _read_private_json(probe_path)
+            cost = payload.get("probe_cost_usd")
+            if payload.get("status") != "completed":
+                raise ValueError(f"historical Gate 1 probe is not completed: {probe_path}")
+            try:
+                amount = _money(cost)
+            except ValueError as error:
+                raise ValueError(f"historical Gate 1 probe has no auditable cost: {probe_path}") from error
+            entry_id = f"probe:{probe_path.parent.name}"
+            existing = entries_by_id.get(entry_id)
+            if existing is not None:
+                if _entry_cost(existing) != amount:
+                    raise ValueError(f"cumulative spend disagrees with historical probe: {probe_path}")
+                continue
+            entry = {
+                "entry_id": entry_id,
+                "kind": "probe",
+                "status": "settled",
+                "incurred_usd": _money_text(amount),
+            }
+            self._entries.append(entry)
+            entries_by_id[entry_id] = entry
+            changed = True
+        state = self._state()
+        if state.effective_budget_exposure_usd > _money(HARD_SPEND_CEILING_USD):
+            raise ValueError("auditable Gate 1 spend exceeds the hard ceiling")
+        if changed or not self._path.exists():
+            self._write()
+        return state
+
+    def reserve(self, *, run_id: str, operation_id: int, stage: str, cost_usd: float) -> None:
+        self._append(
+            {
+                "entry_id": f"operation:{run_id}:{operation_id}",
+                "kind": "operation",
+                "run_id": run_id,
+                "stage": stage,
+                "status": "reserved",
+                "reserved_usd": _money_text(cost_usd),
+            }
+        )
+
+    def settle(
+        self, *, run_id: str, operation_id: int, status: str, incurred_usd: float
+    ) -> None:
+        if status not in self._COUNTED_STATUSES:
+            raise ValueError("invalid cumulative spend settlement status")
+        entry_id = f"operation:{run_id}:{operation_id}"
+        for index, entry in enumerate(self._entries):
+            if entry["entry_id"] == entry_id:
+                if entry.get("status") != "reserved":
+                    raise ValueError("cumulative spend operation is not reserved")
+                replacement = dict(entry)
+                replacement["status"] = status
+                replacement["incurred_usd"] = _money_text(incurred_usd)
+                self._entries[index] = replacement
+                self._write()
+                return
+        raise ValueError("cumulative spend reservation is missing")
+
+    def record_projected_maximum(self, *, run_id: str, operation_id: int, stage: str, cost_usd: float) -> None:
+        self._append(
+            {
+                "entry_id": f"operation:{run_id}:fixed:{operation_id}",
+                "kind": "operation",
+                "run_id": run_id,
+                "stage": stage,
+                "status": "storage_exposure",
+                "exposure_usd": _money_text(cost_usd),
+            }
+        )
+
+    def _append(self, entry: dict[str, Any]) -> None:
+        if any(existing["entry_id"] == entry["entry_id"] for existing in self._entries):
+            raise ValueError("duplicate cumulative spend entry")
+        self._entries.append(entry)
+        self._write()
+
+    def _load(self) -> list[dict[str, Any]]:
+        if not self._path.exists():
+            return []
+        payload = _read_private_json(self._path)
+        if payload.get("schema_version") != self._SCHEMA_VERSION:
+            raise ValueError("unrecognized cumulative spend ledger schema")
+        entries = payload.get("entries")
+        if not isinstance(entries, list) or not all(isinstance(entry, dict) for entry in entries):
+            raise ValueError("invalid cumulative spend ledger entries")
+        return [dict(entry) for entry in entries]
+
+    def _state(self) -> CumulativeSpendState:
+        return _state_from_entries(self._entries)
+
+    def _write(self) -> None:
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self._path.with_suffix(".tmp")
+        temporary.write_text(
+            json.dumps(
+                {"schema_version": self._SCHEMA_VERSION, "entries": self._entries},
+                indent=2,
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
+        temporary.replace(self._path)
+
+
+def _read_private_json(path: Path) -> dict[str, Any]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(f"unreadable private Gate 1 accounting: {path}") from error
+    if not isinstance(payload, dict):
+        raise ValueError(f"invalid private Gate 1 accounting: {path}")
+    return payload
+
+
+def _money(value: Any) -> Decimal:
+    try:
+        amount = Decimal(str(value)).quantize(_MONEY_QUANTUM, rounding=ROUND_HALF_UP)
+    except (InvalidOperation, ValueError) as error:
+        raise ValueError("invalid Gate 1 money value") from error
+    if not amount.is_finite() or amount < 0:
+        raise ValueError("invalid Gate 1 money value")
+    return amount
+
+
+def _money_text(value: Any) -> str:
+    return format(_money(value), "f")
+
+
+def _historical_run_cost(payload: dict[str, Any], path: Path) -> CumulativeSpendState:
+    spend = payload.get("spend")
+    accounting = spend if isinstance(spend, dict) else payload
+    events = accounting.get("events")
+    if not isinstance(events, list):
+        raise ValueError(f"historical Gate 1 result has no auditable cost: {path}")
+    actual = Decimal()
+    storage = Decimal()
+    unknown = Decimal()
+    for event in events:
+        if not isinstance(event, dict):
+            raise ValueError(f"historical Gate 1 event is invalid: {path}")
+        status = event.get("status")
+        if status == "reserved":
+            continue
+        if status == CumulativeSpendLedger._LEGACY_STORAGE_STATUS:
+            if event.get("stage") != "remote_storage":
+                raise ValueError(f"ambiguous legacy storage accounting event: {path}")
+            status = "storage_exposure"
+        if status not in CumulativeSpendLedger._COUNTED_STATUSES:
+            raise ValueError(f"historical Gate 1 event has unknown accounting status: {path}")
+        cost = event.get("cost_usd")
+        try:
+            amount = _money(cost)
+        except ValueError as error:
+            raise ValueError(f"historical Gate 1 event has invalid cost: {path}") from error
+        if status == "usage_unknown":
+            unknown += amount
+        elif status == "storage_exposure":
+            storage += amount
+        else:
+            actual += amount
+    state = CumulativeSpendState(actual, Decimal(), storage, unknown, 0)
+    reported_total = accounting.get("spent_usd")
+    reported_prior = accounting.get("prior_spend_usd")
+    if reported_total is not None:
+        prior = Decimal() if reported_prior is None else _money(reported_prior)
+        if _money(reported_total) - prior != state.effective_budget_exposure_usd:
+            raise ValueError(f"historical Gate 1 result total disagrees with operation events: {path}")
+    elif reported_prior is not None:
+        raise ValueError(f"historical Gate 1 result has incomplete cumulative total: {path}")
+    return state
+
+
+def _entry_cost(entry: dict[str, Any]) -> Decimal:
+    status = entry.get("status")
+    field = (
+        "reserved_usd" if status == "reserved" else
+        "exposure_usd" if status == "storage_exposure" else
+        "incurred_usd"
+    )
+    value = entry.get(field)
+    if (
+        status not in {"reserved", *CumulativeSpendLedger._COUNTED_STATUSES}
+        or isinstance(value, bool)
+    ):
+        raise ValueError("invalid cumulative spend entry")
+    return _money(value)
+
+
+def _state_from_entries(entries: list[dict[str, Any]]) -> CumulativeSpendState:
+    actual = Decimal()
+    reserved = Decimal()
+    storage = Decimal()
+    unknown = Decimal()
+    for entry in entries:
+        status = entry.get("status")
+        amount = _entry_cost(entry)
+        if status == "reserved":
+            reserved += amount
+        elif status == "storage_exposure":
+            storage += amount
+        elif status == "usage_unknown":
+            unknown += amount
+        else:
+            actual += amount
+    return CumulativeSpendState(actual, reserved, storage, unknown, len(entries))
+
+
+def _state_amounts(state: CumulativeSpendState) -> tuple[Decimal, Decimal, Decimal]:
+    return (
+        state.actual_incurred_usd,
+        state.reserved_pending_usd,
+        state.bounded_storage_exposure_usd,
+        state.unknown_liability_usd,
+    )
+
+
 class SpendLedger:
     """Sequential hard ceiling checked before every paid Responses call."""
 
-    def __init__(self, limit_usd: float, pricing: TokenPricing, *, prior_spend_usd: float = 0.0):
+    def __init__(
+        self,
+        limit_usd: float,
+        pricing: TokenPricing,
+        *,
+        prior_spend_usd: float = 0.0,
+        accounting: CumulativeSpendLedger | None = None,
+        run_id: str | None = None,
+    ):
         if (
             isinstance(limit_usd, bool)
             or not isinstance(limit_usd, int | float)
@@ -156,24 +476,25 @@ class SpendLedger:
             raise ValueError("Gate 1 spend limit must be positive and no more than $30")
         if (
             isinstance(prior_spend_usd, bool)
-            or not isinstance(prior_spend_usd, int | float)
-            or not math.isfinite(prior_spend_usd)
-            or prior_spend_usd < 0
-            or prior_spend_usd > limit_usd
+            or not isinstance(prior_spend_usd, int | float | Decimal)
+            or _money(prior_spend_usd) > _money(limit_usd)
         ):
             raise ValueError("prior Gate 1 spend must be finite and within the cumulative ceiling")
         pricing.require_complete("Gate 1")
-        self.limit_usd = float(limit_usd)
+        self.limit_usd = _money(limit_usd)
         self.pricing = pricing
-        self.prior_spend_usd = float(prior_spend_usd)
+        self.prior_spend_usd = _money(prior_spend_usd)
         self.spent_usd = self.prior_spend_usd
-        self._reservations: dict[int, tuple[str, float]] = {}
+        if (accounting is None) != (run_id is None):
+            raise ValueError("durable accounting requires both ledger and run ID")
+        self._accounting = accounting
+        self._run_id = run_id
+        self._reservations: dict[int, tuple[str, Decimal]] = {}
         self._next_ticket = 1
         self.events: list[dict[str, Any]] = []
 
-    def ensure(self, stage: str, projected_cost_usd: float) -> None:
-        if projected_cost_usd < 0 or not math.isfinite(projected_cost_usd):
-            raise ValueError("projected Gate 1 cost must be finite and non-negative")
+    def ensure(self, stage: str, projected_cost_usd: float | Decimal) -> None:
+        projected_cost_usd = _money(projected_cost_usd)
         reserved = sum(value for _stage, value in self._reservations.values())
         if self.spent_usd + reserved + projected_cost_usd > self.limit_usd:
             raise RuntimeError(
@@ -181,22 +502,33 @@ class SpendLedger:
                 f"projected additional ${projected_cost_usd:.4f}, limit ${self.limit_usd:.2f}"
             )
 
-    def reserve(self, stage: str, projected_cost_usd: float) -> int:
+    def reserve(self, stage: str, projected_cost_usd: float | Decimal) -> int:
+        projected_cost_usd = _money(projected_cost_usd)
         self.ensure(stage, projected_cost_usd)
         ticket = self._next_ticket
         self._next_ticket += 1
+        if self._accounting is not None:
+            self._accounting.reserve(
+                run_id=self._run_id, operation_id=ticket, stage=stage, cost_usd=projected_cost_usd
+            )
         self._reservations[ticket] = (stage, projected_cost_usd)
         self.events.append(
             {"stage": stage, "status": "reserved", "cost_usd": projected_cost_usd}
         )
         return ticket
 
-    def settle(self, ticket: int, *, stage: str, actual_cost_usd: float) -> None:
+    def settle(self, ticket: int, *, stage: str, actual_cost_usd: float | Decimal) -> None:
         reserved_stage, reserved = self._reservations.pop(ticket)
         if reserved_stage != stage:
             raise RuntimeError("Gate 1 spend reservation stage mismatch")
-        if actual_cost_usd < 0 or not math.isfinite(actual_cost_usd):
-            raise ValueError("actual Gate 1 cost must be finite and non-negative")
+        actual_cost_usd = _money(actual_cost_usd)
+        if self._accounting is not None:
+            self._accounting.settle(
+                run_id=self._run_id,
+                operation_id=ticket,
+                status="settled",
+                incurred_usd=actual_cost_usd,
+            )
         self.spent_usd += actual_cost_usd
         self.events.append(
             {
@@ -213,16 +545,37 @@ class SpendLedger:
         reserved_stage, reserved = self._reservations.pop(ticket)
         if reserved_stage != stage:
             raise RuntimeError("Gate 1 spend reservation stage mismatch")
+        if self._accounting is not None:
+            self._accounting.settle(
+                run_id=self._run_id,
+                operation_id=ticket,
+                status="usage_unknown",
+                incurred_usd=reserved,
+            )
         self.spent_usd += reserved
         self.events.append(
             {"stage": stage, "status": "usage_unknown", "cost_usd": reserved}
         )
 
-    def record_projected_maximum(self, stage: str, cost_usd: float) -> None:
-        """Reserve a bounded future provider cost before the next paid operation."""
+    def record_projected_maximum(self, stage: str, cost_usd: float | Decimal) -> None:
+        """Record bounded storage exposure; candidate completion does not settle it."""
+        cost_usd = _money(cost_usd)
         self.ensure(stage, cost_usd)
+        ticket = self._next_ticket
+        self._next_ticket += 1
+        if self._accounting is not None:
+            self._accounting.record_projected_maximum(
+                run_id=self._run_id, operation_id=ticket, stage=stage, cost_usd=cost_usd
+            )
         self.spent_usd += cost_usd
-        self.events.append({"stage": stage, "status": "projected_maximum", "cost_usd": cost_usd})
+        self.events.append(
+            {
+                "event_id": f"operation:{self._run_id}:fixed:{ticket}",
+                "stage": stage,
+                "status": "storage_exposure",
+                "cost_usd": cost_usd,
+            }
+        )
 
 
 class PilotRemoteStorageLedger:
@@ -435,8 +788,16 @@ class Gate1Runner:
         self.run_id = run_id or datetime.now(timezone.utc).strftime(
             "gate1-%Y%m%dT%H%M%SZ-"
         ) + uuid4().hex[:8]
+        self.accounting = CumulativeSpendLedger(
+            self.pilot_root / "gate1-cumulative-spend.json", self.pilot_root
+        )
+        prior_spend = self.accounting.reconcile().effective_budget_exposure_usd
         self.ledger = SpendLedger(
-            spend_limit_usd, pricing, prior_spend_usd=GATE1_PRIOR_SPEND_USD
+            spend_limit_usd,
+            pricing,
+            prior_spend_usd=prior_spend,
+            accounting=self.accounting,
+            run_id=self.run_id,
         )
         self.pricing = pricing
         self._client_factory = client_factory or _live_openai_client
@@ -464,6 +825,7 @@ class Gate1Runner:
                 manifest.revision_ids,
                 plan.estimated_upper_bound_usd,
                 self.ledger.spent_usd,
+                _money(HARD_SPEND_CEILING_USD) - self.ledger.spent_usd,
             )
         pilot = PilotRuntime.create(
             self.production_database_path, self.pilot_root, run_id=self.run_id
@@ -506,6 +868,7 @@ class Gate1Runner:
                 published = True
                 _require_unchanged(self.production_database_path, before)
                 evaluation = self._evaluator(pilot, paid_client)
+            accounting_state = self.accounting.reconcile()
             private_result = {
                 "run_id": self.run_id,
                 "status": "completed" if build.ready and evaluation is not None else "candidate_failed",
@@ -523,6 +886,11 @@ class Gate1Runner:
                     "limit_usd": self.ledger.limit_usd,
                     "prior_spend_usd": self.ledger.prior_spend_usd,
                     "spent_usd": self.ledger.spent_usd,
+                    "actual_incurred_usd": accounting_state.actual_incurred_usd,
+                    "reserved_pending_usd": accounting_state.reserved_pending_usd,
+                    "bounded_storage_exposure_usd": accounting_state.bounded_storage_exposure_usd,
+                    "unknown_liability_usd": accounting_state.unknown_liability_usd,
+                    "effective_budget_exposure_usd": accounting_state.effective_budget_exposure_usd,
                     "events": self.ledger.events,
                 },
                 "remote_storage": remote_storage.report(),
@@ -539,6 +907,7 @@ class Gate1Runner:
                 manifest.revision_ids,
                 plan.estimated_upper_bound_usd,
                 self.ledger.spent_usd,
+                _money(HARD_SPEND_CEILING_USD) - self.ledger.spent_usd,
                 pilot.run_directory,
                 output_path,
             )
@@ -840,6 +1209,8 @@ def _build_summary(build: Any) -> dict[str, Any]:
 
 
 def _json_value(value: Any):
+    if isinstance(value, Decimal):
+        return _money_text(value)
     if is_dataclass(value):
         return {key: _json_value(item) for key, item in asdict(value).items()}
     if isinstance(value, dict):
@@ -867,12 +1238,14 @@ def main() -> None:
     parser.add_argument("--pilot-root", type=Path, default=Path("data/pilots"))
     parser.add_argument("--max-spend", type=float, default=HARD_SPEND_CEILING_USD)
     args = parser.parse_args()
-    report = Gate1Runner(
+    runner = Gate1Runner(
         production_database_path=args.production_db,
         manifest_path=args.manifest,
         pilot_root=args.pilot_root,
         spend_limit_usd=args.max_spend,
-    ).run(execute=args.execute)
+    )
+    report = runner.run(execute=args.execute)
+    accounting = runner.accounting.reconcile()
     print(
         json.dumps(
             {
@@ -880,7 +1253,13 @@ def main() -> None:
                 "published": report.published,
                 "source_count": report.source_count,
                 "estimated_upper_bound_usd": report.estimated_upper_bound_usd,
-                "spent_usd": report.spent_usd,
+                "spent_usd": _money_text(report.spent_usd),
+                "remaining_usd": _money_text(report.remaining_usd),
+                "settled_actual_usd": _money_text(accounting.actual_incurred_usd),
+                "pending_request_reservations_usd": _money_text(accounting.reserved_pending_usd),
+                "bounded_storage_exposure_usd": _money_text(accounting.bounded_storage_exposure_usd),
+                "unknown_liability_usd": _money_text(accounting.unknown_liability_usd),
+                "effective_exposure_usd": _money_text(accounting.effective_budget_exposure_usd),
                 "pilot_directory": None
                 if report.pilot_directory is None
                 else str(report.pilot_directory),
