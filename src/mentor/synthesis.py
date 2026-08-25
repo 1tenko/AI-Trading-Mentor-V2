@@ -37,13 +37,12 @@ MAX_ALIASES = 8
 MAX_SCOPE_LENGTH = 160
 MAX_CONDITION_LENGTH = 160
 MAX_JUSTIFICATION_LENGTH = 280
-SYNTHESIS_PROMPT_VERSION = "cross-source-synthesis-v8"
-SYNTHESIS_SCHEMA_VERSION = "cross-source-synthesis-schema-v9"
+SYNTHESIS_PROMPT_VERSION = "cross-source-synthesis-v10"
+SYNTHESIS_SCHEMA_VERSION = "cross-source-synthesis-schema-v11"
 SOL_MODEL = "gpt-5.6-sol"
 MAX_SYNTHESIS_RECORDS_PER_CALL = 64
 MAX_SYNTHESIS_RECORDS_PER_CANDIDATE = 4_096
 MAX_RECONCILIATION_CALLS = 1_024
-MAX_SYNTHESIS_ANCHORS = MAX_SYNTHESIS_RECORDS_PER_CALL * 8
 _REJECTABLE_EVOLUTION_EVIDENCE_ERRORS = frozenset({
     "introduced classifications require source asserted absence",
     "supported evolution classifications require positive or coverage evidence",
@@ -60,9 +59,14 @@ _SYNTHESIS_INPUT_IDS_SCHEMA = {
     "type": "array", "maxItems": MAX_SYNTHESIS_RECORDS_PER_CALL,
     "items": _SYNTHESIS_ID_SCHEMA,
 }
-_SYNTHESIS_ANCHORS_SCHEMA = {
-    "type": "array", "minItems": 1, "maxItems": MAX_SYNTHESIS_ANCHORS,
-    "items": _SYNTHESIS_ID_SCHEMA,
+_SYNTHESIS_EVIDENCE_SELECTION_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["record_ids", "conclusion_ids"],
+    "properties": {
+        "record_ids": _SYNTHESIS_INPUT_IDS_SCHEMA,
+        "conclusion_ids": _SYNTHESIS_INPUT_IDS_SCHEMA,
+    },
 }
 _SYNTHESIS_TEXT_SCHEMA = {
     "type": "string", "minLength": 1, "maxLength": MAX_TYPED_CONTENT_LENGTH,
@@ -94,10 +98,8 @@ _SYNTHESIS_COMMON_PROPERTIES = {
     "qualification": {
         "type": "string", "minLength": 1, "maxLength": MAX_JUSTIFICATION_LENGTH,
     },
-    "anchors": _SYNTHESIS_ANCHORS_SCHEMA,
     "input_record_ids": _SYNTHESIS_INPUT_IDS_SCHEMA,
     "input_conclusion_ids": _SYNTHESIS_INPUT_IDS_SCHEMA,
-    "source_revision_ids": _SYNTHESIS_INPUT_IDS_SCHEMA | {"minItems": 1},
 }
 
 
@@ -121,21 +123,15 @@ def _synthesis_evolution_schemas() -> tuple[dict[str, object], ...]:
         "subject": _SYNTHESIS_OCCURRENCE_SCHEMA,
         "previous": _SYNTHESIS_OCCURRENCE_SCHEMA,
         "current": _SYNTHESIS_OCCURRENCE_SCHEMA,
-        "earlier_source_set": _SYNTHESIS_INPUT_IDS_SCHEMA | {"minItems": 1},
-        "later_source_set": _SYNTHESIS_INPUT_IDS_SCHEMA | {"minItems": 1},
-        "competing_anchors": _SYNTHESIS_ANCHORS_SCHEMA | {"minItems": 0},
-        "deprecation_evidence_anchors": _SYNTHESIS_ANCHORS_SCHEMA | {"minItems": 0},
+        "earlier_evidence": _SYNTHESIS_EVIDENCE_SELECTION_SCHEMA,
+        "later_evidence": _SYNTHESIS_EVIDENCE_SELECTION_SCHEMA,
+        "competing_evidence": _SYNTHESIS_EVIDENCE_SELECTION_SCHEMA,
+        "deprecation_evidence": _SYNTHESIS_EVIDENCE_SELECTION_SCHEMA,
     }
-    def legal_variant(
-        classifications: list[str], evidence_states: list[str], *, requires_deprecation_anchor: bool = False
-    ) -> dict[str, object]:
+    def legal_variant(classifications: list[str], evidence_states: list[str]) -> dict[str, object]:
         return _synthesis_family_schema("evolution", **(properties | {
             "classification": {"enum": classifications},
             "negative_evidence_state": {"enum": evidence_states},
-            "deprecation_evidence_anchors": (
-                _SYNTHESIS_ANCHORS_SCHEMA if requires_deprecation_anchor
-                else properties["deprecation_evidence_anchors"]
-            ),
         }))
 
     return (
@@ -148,10 +144,7 @@ def _synthesis_evolution_schemas() -> tuple[dict[str, object], ...]:
             ["apparently_contradictory", "uncertain_chronology", "no_supported_classification"],
             sorted(NEGATIVE_EVIDENCE_STATES),
         ),
-        legal_variant(
-            ["deprecated_or_deemphasized"], ["positive_teaching"],
-            requires_deprecation_anchor=True,
-        ),
+        legal_variant(["deprecated_or_deemphasized"], ["positive_teaching"]),
     )
 
 
@@ -452,7 +445,11 @@ class SynthesisReconciler:
                     "Every record must use exactly one supplied family shape and include every required "
                     "lineage field. "
                     "Keep procedure prerequisites, conditions, and conditional branches structured. "
-                    "Use only supplied record, anchor, and revision IDs. Preserve uncertainty; do not claim raw authority. "
+                    "Choose only supplied record and conclusion IDs. The compiler derives anchors, source revisions, "
+                    "and typed provenance dependencies from those exact selections; never author raw provenance. "
+                    "For Evolution, choose distinct role-distinguishing earlier and later evidence; a shared context "
+                    "is valid only when later-selected evidence adds a genuinely later source context. "
+                    "Preserve uncertainty; do not claim raw authority. "
                     "Prior cluster summaries contain independently addressable validated conclusions. Connect them "
                     "when relevant, but do not restate lower-level conclusions. Every output must identify only the "
                     "direct input_record_ids and input_conclusion_ids it actually uses. Never select a whole summary; "
@@ -462,11 +459,9 @@ class SynthesisReconciler:
                     {
                         "snapshot_id": snapshot_id,
                         "reconciliation_batch": {"kind": planned_batch.kind},
-                        "records": [asdict(record) for record in batch],
-                        "revision_ids": list(batch_revision_ids),
-                        "sources": [
-                            asdict(canonical_sources[revision_id])
-                            for revision_id in batch_revision_ids
+                        "records": [
+                            _model_record_payload(record, canonical_sources)
+                            for record in batch
                         ],
                         "prior_cluster_summaries": [
                             _cluster_summary_payload(
@@ -476,9 +471,6 @@ class SynthesisReconciler:
                             )
                             for summary in prior_summaries
                         ],
-                        "supporting_spans": {
-                            anchor_id: anchor_spans[anchor_id] for anchor_id in batch_anchor_ids
-                        },
                     },
                     sort_keys=True,
                     separators=(",", ":"),
@@ -641,19 +633,8 @@ def _synthesis_record(
         for dependency in record.dependencies
         if dependency.kind == "source_revision"
     ))
-    declared_anchors = _required_reference_ids(
-        payload, "anchors", lineage_anchor_ids
-    )
-    declared_sources = _required_reference_ids(
-        payload, "source_revision_ids", lineage_revision_ids
-    )
-    if (
-        set(declared_anchors) != set(lineage_anchor_ids)
-        or set(declared_sources) != set(lineage_revision_ids)
-    ):
-        raise ValueError("synthesis evidence references must exactly match explicit input lineage")
-    anchors = tuple(dict.fromkeys(declared_anchors))
-    sources = tuple(dict.fromkeys(declared_sources))
+    anchors = lineage_anchor_ids
+    sources = lineage_revision_ids
     common = {
         "snapshot_id": snapshot_id,
         "anchors": anchors,
@@ -668,8 +649,7 @@ def _synthesis_record(
         "compiler_provenance": provenance,
     }
     base_fields = {
-        "family", "qualification", "anchors", "input_record_ids", "input_conclusion_ids",
-        "source_revision_ids"
+        "family", "qualification", "input_record_ids", "input_conclusion_ids",
     }
     if family == "relationship":
         _allow_synthesis_fields(payload, base_fields | {"left", "relation", "right"})
@@ -705,18 +685,34 @@ def _synthesis_record(
         return record, _record_concept_hints(record, (*term_hints, *prerequisite_hints, *branch_hints))
     if family == "evolution":
         fields = base_fields | {
-            "subject", "previous", "current", "earlier_source_set", "later_source_set",
-            "classification", "negative_evidence_state", "competing_anchors",
-            "earlier_coverage_id", "later_coverage_id", "earlier_observed_years",
-            "later_observed_years", "deprecation_evidence_anchors",
+            "subject", "previous", "current", "earlier_evidence", "later_evidence",
+            "classification", "negative_evidence_state", "competing_evidence",
+            "deprecation_evidence",
         }
         _allow_synthesis_fields(payload, fields)
-        earlier = _required_reference_ids(
-            payload, "earlier_source_set", lineage_revision_ids
+        earlier_records = _evolution_evidence_records(
+            payload, "earlier_evidence", records_by_id, summary_records_by_id,
+            input_record_ids=inputs, input_conclusion_ids=conclusion_ids, required=True,
         )
-        later = _required_reference_ids(
-            payload, "later_source_set", lineage_revision_ids
+        later_records = _evolution_evidence_records(
+            payload, "later_evidence", records_by_id, summary_records_by_id,
+            input_record_ids=inputs, input_conclusion_ids=conclusion_ids, required=True,
         )
+        _validate_evolution_role_distinction(
+            earlier_records, later_records,
+            classification=payload.get("classification"),
+            source_metadata=source_metadata,
+        )
+        competing_records = _evolution_evidence_records(
+            payload, "competing_evidence", records_by_id, summary_records_by_id,
+            input_record_ids=inputs, input_conclusion_ids=conclusion_ids,
+        )
+        deprecation_records = _evolution_evidence_records(
+            payload, "deprecation_evidence", records_by_id, summary_records_by_id,
+            input_record_ids=inputs, input_conclusion_ids=conclusion_ids,
+        )
+        earlier = _source_revision_ids(earlier_records)
+        later = _source_revision_ids(later_records)
         earlier_coverage = _source_coverage(earlier, source_metadata)
         later_coverage = _source_coverage(later, source_metadata)
         if (
@@ -740,16 +736,12 @@ def _synthesis_record(
                 later_source_set=later,
                 classification=payload.get("classification"),
                 negative_evidence_state=payload.get("negative_evidence_state"),
-                competing_anchors=_optional_reference_ids(
-                    payload, "competing_anchors", lineage_anchor_ids
-                ),
+                competing_anchors=_anchor_ids(competing_records),
                 earlier_coverage_id=earlier_coverage[0],
                 later_coverage_id=later_coverage[0],
                 earlier_observed_years=earlier_coverage[1],
                 later_observed_years=later_coverage[1],
-                deprecation_evidence_anchors=_optional_reference_ids(
-                    payload, "deprecation_evidence_anchors", lineage_anchor_ids
-                ),
+                deprecation_evidence_anchors=_anchor_ids(deprecation_records),
             )
         except ValueError as error:
             if str(error) not in _REJECTABLE_EVOLUTION_EVIDENCE_ERRORS:
@@ -1092,18 +1084,34 @@ def _conclusion_payload(record: DerivedRecord) -> dict[str, object]:
     return {
         "conclusion_id": record.record_id,
         "statement": _compact_conclusions((record,))[0],
-        "input_record_ids": [
-            dependency.identifier
-            for dependency in record.dependencies
-            if dependency.kind == "derived_record"
-        ],
-        "anchor_ids": list(record.anchors),
-        "source_revision_ids": [
-            dependency.identifier
-            for dependency in record.dependencies
-            if dependency.kind == "source_revision"
-        ],
     }
+
+
+def _model_record_payload(
+    record: DerivedRecord, source_metadata: Mapping[str, ReconciliationSource]
+) -> dict[str, object]:
+    """Expose semantic record content without compiler-owned provenance topology."""
+    payload = asdict(record)
+    for key in (
+        "snapshot_id", "anchors", "dependencies", "validation_state", "lifecycle_state",
+        "evidence_state", "compiler_provenance",
+    ):
+        payload.pop(key, None)
+    source_scopes = tuple(dict.fromkeys(
+        dependency.identifier
+        for dependency in record.dependencies
+        if dependency.kind == "source_revision"
+    ))
+    payload["source_scope"] = [
+        {
+            "author": source_metadata[source_id].author,
+            "course": source_metadata[source_id].course,
+            "lesson_title": source_metadata[source_id].lesson_title,
+            "year": source_metadata[source_id].year,
+        }
+        for source_id in source_scopes
+    ]
+    return payload
 
 
 def record_reaches_any(
@@ -1244,6 +1252,82 @@ def _required_reference_ids(
     if not set(values) <= set(allowed):
         raise ValueError(f"synthesis {field} contains an unsupported reference")
     return values
+
+
+def _evolution_evidence_records(
+    payload: dict[str, object],
+    field: str,
+    records_by_id: Mapping[str, DerivedRecord],
+    summary_records_by_id: Mapping[str, DerivedRecord],
+    *,
+    input_record_ids: tuple[str, ...],
+    input_conclusion_ids: tuple[str, ...],
+    required: bool = False,
+) -> tuple[DerivedRecord, ...]:
+    value = payload.get(field)
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"record_ids", "conclusion_ids"}
+    ):
+        raise ValueError(f"synthesis {field} must select typed input records or conclusions")
+    record_ids = _optional_reference_ids(value, "record_ids", tuple(records_by_id))
+    conclusion_ids = _optional_reference_ids(
+        value, "conclusion_ids", tuple(summary_records_by_id)
+    )
+    if required and not (record_ids or conclusion_ids):
+        raise ValueError(f"synthesis {field} requires at least one selected input")
+    if not set(record_ids) <= set(input_record_ids) or not set(conclusion_ids) <= set(input_conclusion_ids):
+        raise ValueError(f"synthesis {field} must select only direct semantic inputs")
+    return tuple(dict.fromkeys(
+        tuple(records_by_id[record_id] for record_id in record_ids)
+        + tuple(summary_records_by_id[record_id] for record_id in conclusion_ids)
+    ))
+
+
+def _validate_evolution_role_distinction(
+    earlier_records: Sequence[DerivedRecord],
+    later_records: Sequence[DerivedRecord],
+    *,
+    classification: object,
+    source_metadata: Mapping[str, ReconciliationSource],
+) -> None:
+    """Require role-specific evidence before an Evolution can be admitted."""
+    earlier_record_ids = frozenset(record.record_id for record in earlier_records)
+    later_record_ids = frozenset(record.record_id for record in later_records)
+    if earlier_record_ids == later_record_ids:
+        raise _RejectedEvolutionConclusion(
+            "evolution requires role-distinguishing earlier and later evidence"
+        )
+    earlier_sources = frozenset(_source_revision_ids(earlier_records))
+    later_sources = frozenset(_source_revision_ids(later_records))
+    if earlier_sources == later_sources:
+        raise _RejectedEvolutionConclusion(
+            "evolution roles have no distinct source context"
+        )
+    if classification not in {
+        "repeated", "refined", "expanded", "reframed", "introduced", "deprecated_or_deemphasized",
+    }:
+        return
+    later_only = later_sources - earlier_sources
+    if not later_only or min(source_metadata[source_id].year for source_id in later_only) <= max(
+        source_metadata[source_id].year for source_id in earlier_sources
+    ):
+        raise _RejectedEvolutionConclusion(
+            "evolution requires genuinely later role-distinguishing source evidence"
+        )
+
+
+def _anchor_ids(records: Sequence[DerivedRecord]) -> tuple[str, ...]:
+    return tuple(dict.fromkeys(anchor for record in records for anchor in record.anchors))
+
+
+def _source_revision_ids(records: Sequence[DerivedRecord]) -> tuple[str, ...]:
+    return tuple(dict.fromkeys(
+        dependency.identifier
+        for record in records
+        for dependency in record.dependencies
+        if dependency.kind == "source_revision"
+    ))
 
 
 def _optional_reference_ids(

@@ -8,6 +8,7 @@ from openai.lib._pydantic import _ensure_strict_json_schema
 
 from mentor.derived_records import (
     Claim,
+    CompilerProvenance,
     ConflictUnresolved,
     Facet,
     ProcedureSequenceHierarchy,
@@ -23,6 +24,7 @@ from mentor.synthesis import (
     SynthesisCandidate,
     SynthesisReconciler,
     SYNTHESIS_RESPONSE_SCHEMA,
+    _synthesis_record,
     _replace_legacy_synthesis_hints,
     concept_hint_from_record_selector,
     reconcile_concept_hints,
@@ -131,19 +133,17 @@ def evolution_payload(
     return {
         "family": "evolution",
         "qualification": qualification,
-        "anchors": [*earlier.anchors, *later.anchors],
         "input_record_ids": [earlier.record_id, later.record_id],
         "input_conclusion_ids": [],
-        "source_revision_ids": ["rev_earlier", "rev_later"],
         "subject": synthesis_occurrence("Synthetic concept"),
         "previous": synthesis_occurrence("Earlier form"),
         "current": synthesis_occurrence("Later form"),
-        "earlier_source_set": ["rev_earlier"],
-        "later_source_set": ["rev_later"],
+        "earlier_evidence": {"record_ids": [earlier.record_id], "conclusion_ids": []},
+        "later_evidence": {"record_ids": [later.record_id], "conclusion_ids": []},
         "classification": classification,
         "negative_evidence_state": negative_evidence_state,
-        "competing_anchors": [],
-        "deprecation_evidence_anchors": [],
+        "competing_evidence": {"record_ids": [], "conclusion_ids": []},
+        "deprecation_evidence": {"record_ids": [], "conclusion_ids": []},
     }
 
 
@@ -162,6 +162,301 @@ def synthesize_payload(records: list[dict[str, object]], first: Claim, second: C
     )
 
 
+def synthesize_evolution(
+    payload: dict[str, object], records: tuple[Claim, ...], years: dict[str, int],
+):
+    revision_ids = tuple(dict.fromkeys(
+        dependency.identifier
+        for record in records
+        for dependency in record.dependencies
+        if dependency.kind == "source_revision"
+    ))
+    return SynthesisReconciler(
+        SimpleNamespace(responses=RecordingResponses(lambda _request: {"records": [payload]}))
+    ).synthesize(
+        snapshot_id=SNAPSHOT_ID,
+        records=records,
+        revisions=tuple(SimpleNamespace(revision_id=revision_id) for revision_id in revision_ids),
+        source_metadata=tuple(
+            reconciliation_source(revision_id, year=years[revision_id])
+            for revision_id in revision_ids
+        ),
+        anchor_spans={anchor: "synthetic span" for record in records for anchor in record.anchors},
+    )
+
+
+@pytest.mark.parametrize(
+    "classification,evidence",
+    [
+        ("repeated", "positive_teaching"),
+        ("refined", "positive_teaching"),
+        ("expanded", "positive_teaching"),
+        ("reframed", "positive_teaching"),
+        ("introduced", "source_asserted_absence"),
+        ("deprecated_or_deemphasized", "positive_teaching"),
+        ("apparently_contradictory", "unresolved"),
+        ("uncertain_chronology", "unresolved"),
+        ("no_supported_classification", "unresolved"),
+    ],
+)
+def test_evolution_rejects_identical_canonical_earlier_and_later_evidence(
+    classification, evidence,
+):
+    first = claim(
+        subject="Earlier", anchors=("anc_earlier",),
+        dependencies=(RecordDependency("source_revision", "rev_earlier"),),
+    )
+    second = claim(
+        subject="Later", anchors=("anc_later",),
+        dependencies=(RecordDependency("source_revision", "rev_later"),),
+    )
+    payload = evolution_payload(
+        first, second, classification=classification, negative_evidence_state=evidence,
+    )
+    payload["later_evidence"] = {"record_ids": [first.record_id], "conclusion_ids": []}
+    if classification == "deprecated_or_deemphasized":
+        payload["deprecation_evidence"] = {"record_ids": [first.record_id], "conclusion_ids": []}
+
+    result = synthesize_evolution(
+        payload, (first, second), {"rev_earlier": 2025, "rev_later": 2026},
+    )
+
+    assert result.records == ()
+    assert result.admission_audit.rejected_evolution_evidence == 1
+
+
+def test_evolution_rejects_same_lower_conclusion_for_both_roles():
+    lower = claim(
+        subject="Lower", anchors=("anc_lower",),
+        dependencies=(RecordDependency("source_revision", "rev_lower"),),
+    )
+    payload = evolution_payload(lower, lower)
+    payload["input_record_ids"] = []
+    payload["input_conclusion_ids"] = [lower.record_id]
+    payload["earlier_evidence"] = {"record_ids": [], "conclusion_ids": [lower.record_id]}
+    payload["later_evidence"] = {"record_ids": [], "conclusion_ids": [lower.record_id]}
+
+    with pytest.raises(ValueError, match="role-distinguishing"):
+        _synthesis_record(
+            payload,
+            snapshot_id=SNAPSHOT_ID,
+            provenance=CompilerProvenance("synthetic", "test", "test"),
+            records_by_id={},
+            summary_records_by_id={lower.record_id: lower},
+            source_metadata={"rev_lower": reconciliation_source("rev_lower", year=2025)},
+        )
+
+
+def test_evolution_rejects_same_canonical_evidence_selected_as_record_and_conclusion():
+    lower = claim(
+        subject="Lower", anchors=("anc_lower",),
+        dependencies=(RecordDependency("source_revision", "rev_lower"),),
+    )
+    payload = evolution_payload(lower, lower)
+    payload["input_record_ids"] = [lower.record_id]
+    payload["input_conclusion_ids"] = [lower.record_id]
+    payload["earlier_evidence"] = {"record_ids": [lower.record_id], "conclusion_ids": []}
+    payload["later_evidence"] = {"record_ids": [], "conclusion_ids": [lower.record_id]}
+
+    with pytest.raises(ValueError, match="role-distinguishing"):
+        _synthesis_record(
+            payload,
+            snapshot_id=SNAPSHOT_ID,
+            provenance=CompilerProvenance("synthetic", "test", "test"),
+            records_by_id={lower.record_id: lower},
+            summary_records_by_id={lower.record_id: lower},
+            source_metadata={"rev_lower": reconciliation_source("rev_lower", year=2025)},
+        )
+
+
+def test_evolution_allows_partial_overlap_with_a_genuinely_later_source():
+    earlier = claim(
+        subject="Earlier", anchors=("anc_earlier",),
+        dependencies=(RecordDependency("source_revision", "rev_2025"),),
+    )
+    later = claim(
+        subject="Later", anchors=("anc_later",),
+        dependencies=(RecordDependency("source_revision", "rev_2026"),),
+    )
+    payload = evolution_payload(earlier, later)
+    payload["later_evidence"] = {
+        "record_ids": [earlier.record_id, later.record_id], "conclusion_ids": [],
+    }
+
+    result = synthesize_evolution(
+        payload, (earlier, later), {"rev_2025": 2025, "rev_2026": 2026},
+    )
+
+    assert len(result.records) == 1
+    assert result.records[0].earlier_source_set == ("rev_2025",)
+    assert result.records[0].later_source_set == ("rev_2025", "rev_2026")
+
+
+def test_evolution_rejects_partial_overlap_without_later_temporal_distinction():
+    first = claim(
+        subject="First", anchors=("anc_first",),
+        dependencies=(RecordDependency("source_revision", "rev_first"),),
+    )
+    second = claim(
+        subject="Second", anchors=("anc_second",),
+        dependencies=(RecordDependency("source_revision", "rev_second"),),
+    )
+    payload = evolution_payload(first, second)
+    payload["later_evidence"] = {
+        "record_ids": [first.record_id, second.record_id], "conclusion_ids": [],
+    }
+
+    result = synthesize_evolution(
+        payload, (first, second), {"rev_first": 2025, "rev_second": 2025},
+    )
+
+    assert result.records == ()
+    assert result.admission_audit.rejected_evolution_evidence == 1
+
+
+def test_evolution_rejects_equal_evidence_sets_despite_different_ordering():
+    first = claim(
+        subject="First", anchors=("anc_first",),
+        dependencies=(RecordDependency("source_revision", "rev_first"),),
+    )
+    second = claim(
+        subject="Second", anchors=("anc_second",),
+        dependencies=(RecordDependency("source_revision", "rev_second"),),
+    )
+    payload = evolution_payload(first, second)
+    payload["earlier_evidence"] = {
+        "record_ids": [first.record_id, second.record_id], "conclusion_ids": [],
+    }
+    payload["later_evidence"] = {
+        "record_ids": [second.record_id, first.record_id], "conclusion_ids": [],
+    }
+
+    result = synthesize_evolution(
+        payload, (first, second), {"rev_first": 2025, "rev_second": 2025},
+    )
+
+    assert result.records == ()
+    assert result.admission_audit.rejected_evolution_evidence == 1
+
+
+def test_evolution_rejects_duplicate_role_ids_before_canonicalization():
+    first = claim(
+        subject="First", anchors=("anc_first",),
+        dependencies=(RecordDependency("source_revision", "rev_first"),),
+    )
+    second = claim(
+        subject="Second", anchors=("anc_second",),
+        dependencies=(RecordDependency("source_revision", "rev_second"),),
+    )
+    payload = evolution_payload(first, second)
+    payload["earlier_evidence"] = {
+        "record_ids": [first.record_id, first.record_id], "conclusion_ids": [],
+    }
+
+    with pytest.raises(ValueError, match="unique non-empty IDs"):
+        synthesize_evolution(
+            payload, (first, second), {"rev_first": 2025, "rev_second": 2026},
+        )
+
+
+def test_hierarchical_conclusion_derives_exact_lineage_from_selected_lower_conclusions():
+    lower_x = relationship(
+        left="X", right="Context",
+        anchors=("anc_x",),
+        dependencies=(RecordDependency("source_revision", "rev_x"),),
+    )
+    lower_y = relationship(
+        left="Y", right="Context",
+        anchors=("anc_y",),
+        dependencies=(RecordDependency("source_revision", "rev_y"),),
+    )
+    lower_z = relationship(
+        left="Z", right="Context",
+        anchors=("anc_z",),
+        dependencies=(RecordDependency("source_revision", "rev_z"),),
+    )
+    payload = {
+        "family": "procedure_sequence_hierarchy",
+        "qualification": "Synthetic hierarchical conclusion.",
+        "input_record_ids": [],
+        "input_conclusion_ids": [lower_x.record_id, lower_y.record_id, lower_z.record_id],
+        "kind": "procedure",
+        "terms": [synthesis_occurrence("Observe"), synthesis_occurrence("Act")],
+        "prerequisites": [],
+        "conditions": [],
+        "branches": [],
+    }
+
+    record, _hints = _synthesis_record(
+        payload,
+        snapshot_id=SNAPSHOT_ID,
+        provenance=CompilerProvenance("synthetic", "test", "test"),
+        records_by_id={},
+        summary_records_by_id={
+            lower_x.record_id: lower_x,
+            lower_y.record_id: lower_y,
+            lower_z.record_id: lower_z,
+        },
+        source_metadata={},
+    )
+
+    assert record.anchors == ("anc_x", "anc_y", "anc_z")
+    assert {
+        dependency.identifier
+        for dependency in record.dependencies
+        if dependency.kind == "source_revision"
+    } == {"rev_x", "rev_y", "rev_z"}
+
+
+def test_hierarchical_evolution_allows_shared_context_with_later_distinguishing_lineage():
+    earlier = relationship(
+        left="Shared context", right="Earlier teaching",
+        anchors=("anc_shared",),
+        dependencies=(RecordDependency("source_revision", "rev_2025"),),
+    )
+    later = relationship(
+        left="Shared context", right="Later teaching",
+        anchors=("anc_shared", "anc_later"),
+        dependencies=(
+            RecordDependency("source_revision", "rev_2025"),
+            RecordDependency("source_revision", "rev_2026"),
+        ),
+    )
+    payload = {
+        "family": "evolution",
+        "qualification": "A bounded hierarchical refinement.",
+        "input_record_ids": [],
+        "input_conclusion_ids": [earlier.record_id, later.record_id],
+        "subject": synthesis_occurrence("Shared context"),
+        "previous": synthesis_occurrence("Earlier teaching"),
+        "current": synthesis_occurrence("Later teaching"),
+        "earlier_evidence": {"record_ids": [], "conclusion_ids": [earlier.record_id]},
+        "later_evidence": {
+            "record_ids": [], "conclusion_ids": [earlier.record_id, later.record_id],
+        },
+        "classification": "refined",
+        "negative_evidence_state": "positive_teaching",
+        "competing_evidence": {"record_ids": [], "conclusion_ids": []},
+        "deprecation_evidence": {"record_ids": [], "conclusion_ids": []},
+    }
+
+    record, _hints = _synthesis_record(
+        payload,
+        snapshot_id=SNAPSHOT_ID,
+        provenance=CompilerProvenance("synthetic", "test", "test"),
+        records_by_id={},
+        summary_records_by_id={earlier.record_id: earlier, later.record_id: later},
+        source_metadata={
+            "rev_2025": reconciliation_source("rev_2025", year=2025),
+            "rev_2026": reconciliation_source("rev_2026", year=2026),
+        },
+    )
+
+    assert record.anchors == ("anc_shared", "anc_later")
+    assert record.earlier_source_set == ("rev_2025",)
+    assert record.later_source_set == ("rev_2025", "rev_2026")
+
+
 def test_isolated_negative_evidence_evolution_is_rejected_without_losing_valid_sibling():
     first = claim(
         subject="Earlier", anchors=("anc_earlier",),
@@ -174,10 +469,8 @@ def test_isolated_negative_evidence_evolution_is_rejected_without_losing_valid_s
     valid = {
         "family": "relationship",
         "qualification": "Synthetic relationship.",
-        "anchors": ["anc_earlier", "anc_later"],
         "input_record_ids": [first.record_id, second.record_id],
         "input_conclusion_ids": [],
-        "source_revision_ids": ["rev_earlier", "rev_later"],
         "left": synthesis_occurrence("Earlier"),
         "relation": "supports",
         "right": synthesis_occurrence("Later"),
@@ -246,7 +539,7 @@ def test_synthesis_reference_error_remains_fatal_not_a_record_rejection():
     malformed = evolution_payload(first, second)
     malformed["anchors"] = ["anc_missing"]
 
-    with pytest.raises(ValueError, match="synthesis anchors"):
+    with pytest.raises(ValueError, match="unsupported fields"):
         synthesize_payload([malformed], first, second)
 
 
@@ -273,10 +566,8 @@ def test_rejected_evolution_never_becomes_a_higher_round_summary_conclusion():
             {
                 "family": "relationship",
                 "qualification": "Synthetic sibling conclusion.",
-                "anchors": [first["anchors"][0]],
                 "input_record_ids": [first["record_id"]],
                 "input_conclusion_ids": [],
-                "source_revision_ids": [first["dependencies"][0]["identifier"]],
                 "left": synthesis_occurrence(first["subject"]),
                 "relation": "supports",
                 "right": synthesis_occurrence("Surviving conclusion"),
@@ -284,19 +575,17 @@ def test_rejected_evolution_never_becomes_a_higher_round_summary_conclusion():
             {
                 "family": "evolution",
                 "qualification": "Later teaching is new and absent earlier.",
-                "anchors": [item["anchors"][0] for item in batch_records],
                 "input_record_ids": [item["record_id"] for item in batch_records],
                 "input_conclusion_ids": [],
-                "source_revision_ids": [item["dependencies"][0]["identifier"] for item in batch_records],
                 "subject": synthesis_occurrence("Rejected evolution"),
                 "previous": synthesis_occurrence("Earlier"),
                 "current": synthesis_occurrence("Later"),
-                "earlier_source_set": [first["dependencies"][0]["identifier"]],
-                "later_source_set": [second["dependencies"][0]["identifier"]],
+                "earlier_evidence": {"record_ids": [first["record_id"]], "conclusion_ids": []},
+                "later_evidence": {"record_ids": [second["record_id"]], "conclusion_ids": []},
                 "classification": "introduced",
                 "negative_evidence_state": "not_found_in_observed_evidence",
-                "competing_anchors": [],
-                "deprecation_evidence_anchors": [],
+                "competing_evidence": {"record_ids": [], "conclusion_ids": []},
+                "deprecation_evidence": {"record_ids": [], "conclusion_ids": []},
             },
         ]}
 
@@ -327,7 +616,8 @@ def test_synthesis_schema_encodes_evolution_evidence_matrix():
         if item["properties"]["classification"]["enum"] == ["deprecated_or_deemphasized"]
     )
     assert deprecated["properties"]["negative_evidence_state"] == {"enum": ["positive_teaching"]}
-    assert deprecated["properties"]["deprecation_evidence_anchors"]["minItems"] == 1
+    assert "deprecation_evidence_anchors" not in deprecated["properties"]
+    assert "deprecation_evidence" in deprecated["properties"]
 
 
 def test_synthesis_response_schema_is_a_closed_typed_union_under_the_openai_strict_contract():
@@ -347,7 +637,9 @@ def test_synthesis_response_schema_is_a_closed_typed_union_under_the_openai_stri
     for item in record_schemas:
         assert item["additionalProperties"] is False
         assert set(item["required"]) == set(item["properties"])
-        assert {"family", "qualification", "anchors", "input_record_ids", "input_conclusion_ids", "source_revision_ids"} <= set(item["required"])
+        assert {"family", "qualification", "input_record_ids", "input_conclusion_ids"} <= set(item["required"])
+        assert "anchors" not in item["properties"]
+        assert "source_revision_ids" not in item["properties"]
 
 
 def test_synthesis_response_schema_closes_family_and_concept_hint_shapes():
@@ -379,10 +671,8 @@ def test_synthesis_inline_occurrences_attach_aliases_to_typed_record_terms():
         "records": [{
             "family": "procedure_sequence_hierarchy",
             "qualification": "Synthetic bounded reconciliation.",
-            "anchors": ["anc_earlier", "anc_later"],
             "input_record_ids": [first.record_id, second.record_id],
             "input_conclusion_ids": [],
-            "source_revision_ids": ["rev_earlier", "rev_later"],
             "kind": "procedure",
             "terms": [occurrence("Observe", ("Inspect",)), occurrence("Act")],
             "prerequisites": [occurrence("Context")],
@@ -466,10 +756,12 @@ def test_legacy_hint_replacement_rejects_conflicting_duplicate_selectors():
         },
         lambda first, second: {
             "family": "evolution", "subject": synthesis_occurrence("Synthetic concept"), "previous": synthesis_occurrence("Earlier form"),
-            "current": synthesis_occurrence("Later form"), "earlier_source_set": ["rev_earlier"],
-            "later_source_set": ["rev_later"], "classification": "refined",
-            "negative_evidence_state": "positive_teaching", "competing_anchors": [],
-            "deprecation_evidence_anchors": [],
+            "current": synthesis_occurrence("Later form"),
+            "earlier_evidence": {"record_ids": [first.record_id], "conclusion_ids": []},
+            "later_evidence": {"record_ids": [second.record_id], "conclusion_ids": []},
+            "classification": "refined", "negative_evidence_state": "positive_teaching",
+            "competing_evidence": {"record_ids": [], "conclusion_ids": []},
+            "deprecation_evidence": {"record_ids": [], "conclusion_ids": []},
         },
         lambda first, second: {
             "family": "conflict_unresolved", "kind": "unresolved", "subject": synthesis_occurrence("Synthetic question"),
@@ -494,10 +786,8 @@ def test_each_strict_synthesis_family_shape_reaches_the_typed_parser(family_payl
     payload = {
         **family_payload(first, second),
         "qualification": "Synthetic bounded reconciliation.",
-        "anchors": ["anc_earlier", "anc_later"],
         "input_record_ids": [first.record_id, second.record_id],
         "input_conclusion_ids": [],
-        "source_revision_ids": ["rev_earlier", "rev_later"],
     }
     responses = RecordingResponses(lambda _request: {"records": [payload], "concept_hints": []})
 
@@ -531,24 +821,24 @@ def test_evolution_scope_and_coverage_are_derived_from_canonical_source_metadata
     )
 
     def response(request):
-        assert {item["year"] for item in request["sources"]} == {2025, 2026}
+        assert {
+            scope["year"]
+            for record in request["records"]
+            for scope in record["source_scope"]
+        } == {2025, 2026}
         return {"records": [{
             "family": "evolution",
             "qualification": "Synthetic comparison.",
-            "anchors": ["anc_earlier", "anc_later"],
             "input_record_ids": [earlier.record_id, later.record_id],
-            "source_revision_ids": ["rev_earlier", "rev_later"],
             "subject": "Synthetic form",
             "previous": "Earlier",
             "current": "Later",
-            "earlier_source_set": ["rev_earlier"],
-            "later_source_set": ["rev_later"],
+            "earlier_evidence": {"record_ids": [earlier.record_id], "conclusion_ids": []},
+            "later_evidence": {"record_ids": [later.record_id], "conclusion_ids": []},
             "classification": "refined",
             "negative_evidence_state": "positive_teaching",
-            "earlier_coverage_id": "model-invented-earlier",
-            "later_coverage_id": "model-invented-later",
-            "earlier_observed_years": [1900],
-            "later_observed_years": [1901],
+            "competing_evidence": {"record_ids": [], "conclusion_ids": []},
+            "deprecation_evidence": {"record_ids": [], "conclusion_ids": []},
         }]}
 
     responses = RecordingResponses(response)
@@ -594,10 +884,10 @@ def test_concrete_reconciliation_batches_every_record_and_filters_anchor_spans()
     assert {
         record["record_id"] for request in requests for record in request["records"]
     } == {record.record_id for record in records}
+    assert all("supporting_spans" not in request for request in requests)
     assert all(
-        set(request["supporting_spans"])
-        == {anchor for record in request["records"] for anchor in record["anchors"]}
-        for request in requests
+        "anchors" not in record and "dependencies" not in record
+        for request in requests for record in request["records"]
     )
     reduction_requests = [
         request for request in requests
@@ -635,9 +925,7 @@ def test_reconciliation_uses_unchanged_lower_synthesis_as_context_not_primary_ta
         return {"records": [{
             "family": "relationship",
             "qualification": "Synthetic rebuilt higher relationship.",
-            "anchors": ["anc_affected", "anc_context"],
             "input_record_ids": [target.record_id, context.record_id],
-            "source_revision_ids": ["rev_affected", "rev_context"],
             "left": "Affected claim",
             "relation": "depends_on",
             "right": "Unchanged cluster",
@@ -709,19 +997,15 @@ def test_reconciliation_filters_context_only_paraphrase_and_preserves_selected_s
         return {"records": [
             common | {
                 "qualification": "Paraphrased unchanged B-only conclusion.",
-                "anchors": ["anc_context"],
                 "input_record_ids": [context.record_id],
                 "input_conclusion_ids": [],
-                "source_revision_ids": ["rev_context"],
                 "left": "Reworded B framework",
                 "right": "B-only context",
             },
             common | {
                 "qualification": "Affected A reconciled with unchanged B.",
-                "anchors": ["anc_context", "anc_affected"],
                 "input_record_ids": [context.record_id],
                 "input_conclusion_ids": [target_conclusion["conclusion_id"]],
-                "source_revision_ids": ["rev_context", "rev_affected"],
                 "left": "Affected A framework",
                 "right": "Unchanged B cluster",
             },
@@ -800,13 +1084,11 @@ def test_reconciliation_does_not_expose_an_omitted_child_conclusion_without_its_
             return {"records": [{
                 "family": "relationship",
                 "qualification": "Affected target reconciled with selected context.",
-                "anchors": [selected_context.anchors[0], "anc_target"],
                 "input_record_ids": [],
                 "input_conclusion_ids": [
                     selected_conclusion["conclusion_id"],
                     target_conclusion["conclusion_id"],
                 ],
-                "source_revision_ids": [f"rev_context_{selected_index}", "rev_target"],
                 "left": "Affected target",
                 "relation": "depends_on",
                 "right": selected_context.subject,
@@ -927,9 +1209,7 @@ def test_reconciliation_can_emit_more_than_sixty_four_candidate_records_with_bou
             outputs.append({
                 "family": "relationship",
                 "qualification": "Synthetic per-record relationship.",
-                "anchors": record["anchors"],
                 "input_record_ids": [record["record_id"]],
-                "source_revision_ids": ["rev_synthetic"],
                 "left": record["subject"],
                 "relation": "supports",
                 "right": "bounded meaning",
@@ -963,15 +1243,12 @@ def test_concrete_reconciliation_emits_structured_procedure_and_alias_hint():
 
     def response(request):
         record_ids = [record["record_id"] for record in request["records"]]
-        anchors = [anchor for record in request["records"] for anchor in record["anchors"]]
         return {
             "records": [
                 {
                     "family": "procedure_sequence_hierarchy",
                     "qualification": "Synthetic cross-source procedure.",
-                    "anchors": anchors,
                     "input_record_ids": record_ids,
-                    "source_revision_ids": ["rev_synthetic"],
                     "kind": "procedure",
                     "terms": ["Observe", "Act"],
                     "prerequisites": ["Context"],

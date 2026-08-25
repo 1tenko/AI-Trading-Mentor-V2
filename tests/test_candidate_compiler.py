@@ -451,16 +451,18 @@ def synthesis_response(request):
     supplied = json.loads(request["input"])
     records = supplied["records"]
     record_ids = [record["record_id"] for record in records]
-    anchor_ids = list(dict.fromkeys(anchor for record in records for anchor in record["anchors"]))
-    revision_ids = supplied["revision_ids"]
-    revision_years = {source["revision_id"]: source["year"] for source in supplied["sources"]}
-    earlier_revisions = [revision_id for revision_id in revision_ids if revision_years[revision_id] == 2025]
-    later_revisions = [revision_id for revision_id in revision_ids if revision_years[revision_id] == 2026]
+    earlier_records = [
+        record["record_id"] for record in records
+        if any(scope["year"] == 2025 for scope in record["source_scope"])
+    ]
+    later_records = [
+        record["record_id"] for record in records
+        if any(scope["year"] == 2026 for scope in record["source_scope"])
+    ]
     common = {
         "qualification": "Synthetic reconciled evidence.",
-        "anchors": anchor_ids,
         "input_record_ids": record_ids,
-        "source_revision_ids": revision_ids,
+        "input_conclusion_ids": [],
     }
     return {"records": [
         common | {
@@ -474,14 +476,12 @@ def synthesis_response(request):
             "subject": "Synthetic framework",
             "previous": "Earlier bounded form",
             "current": "Later qualified form",
-            "earlier_source_set": earlier_revisions,
-            "later_source_set": later_revisions,
+            "earlier_evidence": {"record_ids": earlier_records, "conclusion_ids": []},
+            "later_evidence": {"record_ids": later_records, "conclusion_ids": []},
             "classification": "refined",
             "negative_evidence_state": "positive_teaching",
-            "earlier_coverage_id": "coverage_earlier",
-            "later_coverage_id": "coverage_later",
-            "earlier_observed_years": [2025],
-            "later_observed_years": [2026],
+            "competing_evidence": {"record_ids": [], "conclusion_ids": []},
+            "deprecation_evidence": {"record_ids": [], "conclusion_ids": []},
         },
         common | {
             "family": "conflict_unresolved",
