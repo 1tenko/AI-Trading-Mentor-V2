@@ -220,7 +220,7 @@ def test_orientation_rejects_any_collection_scope_not_owned_by_the_resolved_snap
         )
 
 
-def test_orientation_preserves_conclusion_identity_and_exact_direct_lineage():
+def test_orientation_preserves_conclusion_lineage_locally_but_excludes_it_from_model_context():
     from mentor.chat_service import _orientation_output
     from mentor.orientation import OrientationBudget, OrientationService
 
@@ -253,8 +253,9 @@ def test_orientation_preserves_conclusion_identity_and_exact_direct_lineage():
     assert getattr(record, "source_revision_ids", ()) == ("rev_synthetic",)
     payload = _orientation_output(orientation)["records"][0]
     assert payload["record_id"] == conclusion.record_id
-    assert payload["input_record_ids"] == [source_claim.record_id]
-    assert payload["source_revision_ids"] == ["rev_synthetic"]
+    assert "input_record_ids" not in payload
+    assert "source_revision_ids" not in payload
+    assert "anchor_ids" not in payload
 
 
 def test_orientation_returns_safe_canonical_labels_aliases_and_occurrence_summaries():
@@ -365,7 +366,7 @@ def test_orientation_enforces_a_hard_token_budget_and_reports_truncation():
     assert orientation.truncated is True
 
 
-def test_orientation_budget_counts_dependency_heavy_conclusion_lineage():
+def test_orientation_budget_does_not_charge_model_context_for_private_conclusion_lineage():
     from mentor.orientation import OrientationBudget, OrientationService
 
     inputs = tuple(
@@ -408,9 +409,9 @@ def test_orientation_budget_counts_dependency_heavy_conclusion_lineage():
 
     orientation = service.consult("How do all the inputs support the conclusion?")
 
-    assert orientation.records == ()
-    assert orientation.used_tokens == 0
-    assert orientation.truncated is True
+    assert [record.record_id for record in orientation.records] == [conclusion.record_id]
+    assert orientation.used_tokens < 1_000
+    assert orientation.truncated is False
 
 
 def test_orientation_rejects_invalid_or_wrong_snapshot_local_records():

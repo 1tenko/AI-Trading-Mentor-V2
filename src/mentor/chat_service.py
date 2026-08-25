@@ -9,7 +9,7 @@ from typing import Any
 from uuid import uuid4
 
 from mentor.prompts import MENTOR_INSTRUCTIONS
-from mentor.orientation import OrientationBudget, OrientationResult, OrientationService
+from mentor.orientation import OrientationBudget, OrientationResult, OrientationService, orientation_model_record
 from mentor.storage import Storage
 from mentor.vector_stores import VectorStoreAdapter
 
@@ -19,24 +19,8 @@ MAX_OUTPUT_TOKENS = 25_000
 COMPACTION_TOKEN_THRESHOLD = 50_000
 FILE_SEARCH_RESULT_BUDGETS = {"normal": 8, "deep": 20, "exhaustive": 20}
 FILE_SEARCH_CALL_COST_USD = 0.0025
-ORIENTATION_FUNCTION_NAME = "consult_assimilated_knowledge"
-ORIENTATION_BUDGET = OrientationBudget(max_records=8, max_tokens=4_000)
-ORIENTATION_TOOL = {
-    "type": "function",
-    "name": ORIENTATION_FUNCTION_NAME,
-    "description": (
-        "Return bounded derived orientation for a broad question. This is not raw source text "
-        "and cannot establish a factual teaching or citation."
-    ),
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "question": {"type": "string", "description": "The bounded topic or question to orient."},
-        },
-        "required": ["question"],
-        "additionalProperties": False,
-    },
-}
+ORIENTATION_BUDGET = OrientationBudget(max_records=4, max_tokens=1_400)
+ORIENTATION_CONTEXT_PREFIX = "Derived orientation (non-authoritative; verify with raw File Search):"
 DIRECT_SOURCE_CLAIM = re.compile(
     r"(?:\*{1,2})?Direct source teaching"
     r"(?:\*{1,2})?\s*(?::|[-\u2013\u2014]|\n)\s*\S",
@@ -272,7 +256,7 @@ class ChatService:
     ) -> Answer:
         user_item, request, effective_depth, snapshot = self._request(thread_id, question, evaluation)
         started_at = perf_counter()
-        request, knowledge_context, orientation_response = self._orientation_request(request, snapshot)
+        request, knowledge_context = self._orientation_request(request, snapshot, question)
         response = self.client.responses.create(**request)
         response, evidence_output, draft_response = self._citation_repaired_response(
             request, response, user_item["content"][0]["text"]
@@ -287,7 +271,6 @@ class ChatService:
             evidence_output=evidence_output,
             draft_response=draft_response,
             knowledge_context=knowledge_context,
-            orientation_response=orientation_response,
         )
 
     def stream_reply(
@@ -299,7 +282,7 @@ class ChatService:
         try:
             user_item, request, effective_depth, snapshot = self._request(thread_id, question, evaluation)
             started_at = perf_counter()
-            request, knowledge_context, orientation_response = self._orientation_request(request, snapshot)
+            request, knowledge_context = self._orientation_request(request, snapshot, question)
             stream = self.client.responses.create(**request, stream=True)
             for event in stream:
                 if event.type == "response.output_text.delta":
@@ -318,7 +301,6 @@ class ChatService:
                         evidence_output=evidence_output,
                         draft_response=draft_response,
                         knowledge_context=knowledge_context,
-                        orientation_response=orientation_response,
                     )
                     if answer.incomplete_reason:
                         yield StreamEvent(
@@ -396,7 +378,6 @@ class ChatService:
                     "vector_store_ids": [vector_store_id],
                     "max_num_results": FILE_SEARCH_RESULT_BUDGETS[effective_depth],
                 },
-                *([ORIENTATION_TOOL] if should_orient else []),
             ],
             "include": ["reasoning.encrypted_content", "file_search_call.results"],
             "reasoning": evaluation.request_value(),
@@ -404,45 +385,28 @@ class ChatService:
             "max_output_tokens": MAX_OUTPUT_TOKENS,
             "store": False,
         }
-        if should_orient:
-            request["tool_choice"] = {"type": "function", "name": ORIENTATION_FUNCTION_NAME}
         return user_item, request, effective_depth, snapshot if should_orient else None
 
     def _orientation_request(
-        self, request: dict, snapshot: Any | None
-    ) -> tuple[dict, KnowledgeContext | None, Any | None]:
+        self, request: dict, snapshot: Any | None, question: str
+    ) -> tuple[dict, KnowledgeContext | None]:
         if snapshot is None:
-            return request, None, None
-        initial = self.client.responses.create(**request)
-        initial_output = [_as_dict(item) for item in initial.output]
-        function_call = _orientation_function_call(initial_output)
-        if function_call is None:
-            LOGGER.warning("Orientation tool was not called for a broad Mentor request")
-            return _raw_only_request(request), KnowledgeContext.not_called(snapshot), initial
+            return request, None
         try:
-            arguments = _orientation_arguments(function_call)
-            result = self.orientation_service.consult(arguments["question"], snapshot=snapshot)
+            result = self.orientation_service.consult(question, snapshot=snapshot)
             if result.snapshot_id != _snapshot_identifier(snapshot, "snapshot_id"):
                 raise ValueError("orientation result did not match the turn snapshot")
             context = KnowledgeContext.from_result(result)
+            if not result.records:
+                return request, context
             output = json.dumps(_orientation_output(result), separators=(",", ":"))
+            return {
+                **request,
+                "instructions": f"{request['instructions']}\n\n{ORIENTATION_CONTEXT_PREFIX}\n{output}",
+            }, context
         except Exception:
             LOGGER.warning("Derived orientation was unavailable", exc_info=True)
-            context = KnowledgeContext.unavailable(snapshot)
-            output = json.dumps(
-                {
-                    "status": "unavailable",
-                    "message": "Derived orientation was unavailable; verify with raw File Search.",
-                },
-                separators=(",", ":"),
-            )
-        continuation = _raw_only_request(request)
-        continuation["input"] = [
-            *request["input"],
-            *(_input_item(item) for item in initial_output),
-            {"type": "function_call_output", "call_id": function_call["call_id"], "output": output},
-        ]
-        return continuation, context, initial
+            return request, KnowledgeContext.unavailable(snapshot)
 
     def _finalize(
         self,
@@ -583,87 +547,10 @@ def _should_orient(question: str, effective_depth: str) -> bool:
     )
 
 
-def _orientation_function_call(output: list[dict]) -> dict | None:
-    for candidate in output:
-        if (
-            candidate.get("type") == "function_call"
-            and candidate.get("name") == ORIENTATION_FUNCTION_NAME
-            and isinstance(candidate.get("call_id"), str)
-            and candidate["call_id"]
-        ):
-            return candidate
-    return None
-
-
-def _orientation_arguments(function_call: dict) -> dict[str, Any]:
-    raw_arguments = function_call.get("arguments")
-    if isinstance(raw_arguments, str):
-        raw_arguments = json.loads(raw_arguments)
-    if not isinstance(raw_arguments, dict) or set(raw_arguments) - {"question"}:
-        raise ValueError("orientation function arguments are invalid")
-    question = _question(raw_arguments.get("question", ""))
-    return {"question": question}
-
-
-def _raw_only_request(request: dict) -> dict:
-    return {
-        key: value
-        for key, value in request.items()
-        if key != "tool_choice"
-    } | {
-        "tools": [tool for tool in request["tools"] if tool.get("type") != "function"],
-    }
-
-
 def _orientation_output(result: OrientationResult) -> dict[str, Any]:
     return {
         "type": "derived_orientation",
-        "snapshot_id": result.snapshot_id,
-        "snapshot_schema_version": result.snapshot_schema_version,
-        "records": [
-            {
-                "record_id": record.record_id,
-                "concept_id": record.concept_id,
-                "family": record.family,
-                "derived_kind": record.derived_kind,
-                "evidence_state": record.evidence_state,
-                "qualification": record.qualification,
-                "statement": record.statement,
-                "anchor_ids": list(record.anchor_ids),
-                "input_record_ids": list(record.input_record_ids),
-                "source_revision_ids": list(record.source_revision_ids),
-                "source_area": {
-                    "collection_id": record.source_area.collection_id,
-                    "year": record.source_area.year,
-                    "scope": record.source_area.scope,
-                },
-                "concepts": [
-                    {
-                        "canonical_label": concept.canonical_label,
-                        "aliases": list(concept.aliases),
-                        "scope": concept.scope,
-                        "supporting_record_count": concept.supporting_record_count,
-                        "supporting_anchor_count": concept.supporting_anchor_count,
-                        "occurrences": [
-                            {
-                                "role": occurrence.role,
-                                "position": occurrence.position,
-                                "label": occurrence.label,
-                            }
-                            for occurrence in concept.occurrences
-                        ],
-                    }
-                    for concept in record.concepts
-                ],
-            }
-            for record in result.records
-        ],
-        "budget": {
-            "max_records": result.budget.max_records,
-            "max_tokens": result.budget.max_tokens,
-            "used_tokens": result.used_tokens,
-            "truncated": result.truncated,
-        },
+        "records": [orientation_model_record(record) for record in result.records],
     }
 
 

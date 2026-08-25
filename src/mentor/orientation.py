@@ -73,6 +73,7 @@ class OrientationRecord:
     semantic_subtype: str = "unspecified"
     concept_ids: tuple[str, ...] = ()
     concepts: tuple[OrientationConceptSummary, ...] = ()
+    cues: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -345,6 +346,7 @@ def _orientation_record(
         source_area=OrientationSourceArea(*_safe_source_area(source_area)),
         concept_ids=concept_ids,
         concepts=concepts,
+        cues=_orientation_cues(record),
     )
 
 
@@ -436,6 +438,45 @@ def _statement(record: DerivedRecord) -> str:
     raise ValueError("unknown derived record family")
 
 
+def orientation_model_record(record: OrientationRecord) -> dict[str, object]:
+    """Compact model-facing navigation cue; full lineage remains local-only."""
+    return {
+        "record_id": record.record_id,
+        "family": record.family,
+        "derived_kind": record.derived_kind,
+        "evidence_state": record.evidence_state,
+        "statement": _brief(record.statement, 180),
+        "qualification": _brief(record.qualification, 100),
+        "source_area": {
+            "year": record.source_area.year,
+            "scope": _brief(record.source_area.scope, 80),
+        },
+        "concept": _brief(record.concepts[0].canonical_label, 100) if record.concepts else None,
+        "cues": [
+            {"kind": kind, "value": _brief(value, 120)}
+            for kind, value in record.cues[:2]
+        ],
+    }
+
+
+def _orientation_cues(record: DerivedRecord) -> tuple[tuple[str, str], ...]:
+    cues = [(facet.name, facet.value) for facet in record.facets]
+    if isinstance(record, ProcedureSequenceHierarchy):
+        cues.extend(("prerequisite", value) for value in record.prerequisites)
+        cues.extend(("condition", value) for value in record.conditions)
+    elif isinstance(record, Evolution):
+        cues.append(("evolution", record.classification))
+    elif isinstance(record, ConflictUnresolved):
+        cues.append(("reconciliation", record.reconciliation_state))
+    return tuple(cues)
+
+
+def _brief(value: str | None, limit: int) -> str | None:
+    if value is None:
+        return None
+    return value if len(value) <= limit else f"{value[:limit - 1].rstrip()}…"
+
+
 def _safe_metadata_text(value: object) -> str | None:
     if not isinstance(value, str) or not value.strip() or len(value) > 160:
         return None
@@ -469,37 +510,5 @@ def _safe_source_area(
 
 
 def _conservative_token_upper_bound(record: OrientationRecord) -> int:
-    """UTF-8 bytes conservatively bound tokens without a local tokenizer dependency."""
-    fields = (
-        record.record_id,
-        record.concept_id or "",
-        record.family,
-        record.derived_kind,
-        record.semantic_subtype,
-        record.evidence_state,
-        record.qualification,
-        record.statement,
-        *record.anchor_ids,
-        *record.input_record_ids,
-        *record.source_revision_ids,
-        *record.concept_ids,
-        record.source_area.collection_id or "",
-        str(record.source_area.year or ""),
-        record.source_area.scope or "",
-        *(
-            value
-            for concept in record.concepts
-            for value in (
-                concept.canonical_label,
-                *concept.aliases,
-                concept.scope or "",
-                str(concept.supporting_record_count),
-                str(concept.supporting_anchor_count),
-                *(
-                    f"{occurrence.role}:{occurrence.position}:{occurrence.label}"
-                    for occurrence in concept.occurrences
-                ),
-            )
-        ),
-    )
-    return len("\n".join(fields).encode("utf-8"))
+    """Bound the exact compact payload admitted to the model, not local lineage."""
+    return len(json.dumps(orientation_model_record(record), separators=(",", ":")).encode("utf-8"))

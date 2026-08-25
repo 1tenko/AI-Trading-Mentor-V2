@@ -8,10 +8,8 @@ from mentor.chat_service import (
     ChatService,
     EvaluationConfig,
     FILE_SEARCH_RESULT_BUDGETS,
-    ORIENTATION_TOOL,
     _input_item,
     _effective_research_depth,
-    _orientation_arguments,
     _should_orient,
 )
 from mentor.prompts import MENTOR_INSTRUCTIONS
@@ -130,21 +128,7 @@ def source_response(text, annotations, *, status="completed", usage=None):
     )
 
 
-def orientation_function_response(question):
-    return SimpleNamespace(
-        status="completed",
-        output=[
-            {
-                "type": "function_call",
-                "name": "consult_assimilated_knowledge",
-                "call_id": "call_orientation",
-                "arguments": json.dumps({"question": question}),
-            }
-        ],
-    )
-
-
-def test_broad_question_uses_a_server_owned_orientation_function_before_raw_search_and_persists_only_audit(
+def test_broad_question_injects_lean_server_owned_orientation_before_raw_search_and_persists_only_audit(
     tmp_path, monkeypatch
 ):
     storage = Storage(tmp_path / "mentor.sqlite3")
@@ -162,18 +146,7 @@ def test_broad_question_uses_a_server_owned_orientation_function_before_raw_sear
             output_tokens_details=SimpleNamespace(reasoning_tokens=9),
         ),
     )
-    orientation_call = orientation_function_response("Compare SMT and TPD across 2025 and 2026.")
-    orientation_call.usage = SimpleNamespace(
-        input_tokens=11,
-        output_tokens=7,
-        total_tokens=18,
-        input_tokens_details=SimpleNamespace(cached_tokens=2, cache_write_tokens=3),
-        output_tokens_details=SimpleNamespace(reasoning_tokens=4),
-    )
-    responses = SequenceResponses(
-        orientation_call,
-        response,
-    )
+    responses = FakeResponses(response)
     orientation = FakeOrientation(orientation_result())
 
     answer = ChatService(
@@ -183,31 +156,22 @@ def test_broad_question_uses_a_server_owned_orientation_function_before_raw_sear
     ).reply(storage.create_thread("Compare"), "Compare SMT and TPD across 2025 and 2026.")
 
     assert answer.text == "Direct source teaching: The raw source controls this answer."
-    assert len(responses.calls) == 2
-    assert responses.calls[0]["tool_choice"] == {
-        "type": "function",
-        "name": "consult_assimilated_knowledge",
-    }
-    assert any(tool["type"] == "file_search" for tool in responses.calls[0]["tools"])
-    assert all(tool["type"] != "function" for tool in responses.calls[1]["tools"])
-    assert responses.calls[1]["tools"] == [
+    assert len(responses.calls) == 1
+    assert responses.calls[0]["tools"] == [
         {"type": "file_search", "vector_store_ids": ["vs_raw_current"], "max_num_results": 20}
     ]
+    assert "tool_choice" not in responses.calls[0]
     assert orientation.calls == [
         ("Compare SMT and TPD across 2025 and 2026.", {"snapshot": published_snapshot()})
     ]
-    function_output = responses.calls[1]["input"][-1]
-    assert function_output["type"] == "function_call_output"
-    oriented_record = json.loads(function_output["output"])["records"][0]
+    orientation_context = responses.calls[0]["instructions"]
+    assert "Derived orientation (non-authoritative; verify with raw File Search):" in orientation_context
+    oriented_record = json.loads(orientation_context.rsplit("\n", 1)[-1])["records"][0]
     assert oriented_record["record_id"] == "rec_orientation"
-    assert oriented_record["concepts"] == [{
-        "canonical_label": "Canonical timing",
-        "aliases": ["Timing alias"],
-        "scope": "timing",
-        "supporting_record_count": 2,
-        "supporting_anchor_count": 2,
-        "occurrences": [{"role": "left", "position": None, "label": "canonical timing"}],
-    }]
+    assert oriented_record["concept"] == "Canonical timing"
+    assert "anchor_ids" not in oriented_record
+    assert "input_record_ids" not in oriented_record
+    assert "source_revision_ids" not in oriented_record
     diagnostics = storage.display_turns(1)[0]["diagnostics"]
     assert diagnostics["knowledge_context"] == {
         "status": "used",
@@ -221,35 +185,22 @@ def test_broad_question_uses_a_server_owned_orientation_function_before_raw_sear
         "record_count": 1,
         "budget": {"max_records": 8, "max_tokens": 4_000, "used_tokens": 96, "truncated": False},
     }
-    assert (diagnostics["input_tokens"], diagnostics["output_tokens"], diagnostics["total_tokens"]) == (111, 27, 138)
-    assert (diagnostics["cached_input_tokens"], diagnostics["cache_write_tokens"], diagnostics["reasoning_tokens"]) == (7, 11, 13)
+    assert (diagnostics["input_tokens"], diagnostics["output_tokens"], diagnostics["total_tokens"]) == (100, 20, 120)
+    assert (diagnostics["cached_input_tokens"], diagnostics["cache_write_tokens"], diagnostics["reasoning_tokens"]) == (5, 8, 9)
     saved = json.dumps(storage.thread_items(1)) + json.dumps(storage.display_turns(1))
     assert "Derived orientation cue that must not persist in replay." not in saved
     assert "anc_orientation" not in saved
 
 
-def test_orientation_continuation_keeps_initial_opaque_output_only_in_the_transient_responses_input(
+def test_direct_orientation_never_enters_thread_or_replay_state(
     tmp_path, monkeypatch
 ):
     storage = Storage(tmp_path / "mentor.sqlite3")
     storage.initialize()
     storage.set_vector_store("vs_legacy")
     monkeypatch.setattr(storage, "current_snapshot", published_snapshot)
-    reasoning = {
-        "type": "reasoning",
-        "id": "rs_orientation",
-        "encrypted_content": "opaque-orientation-reasoning",
-        "status": "completed",
-    }
-    function_call = {
-        "type": "function_call",
-        "name": "consult_assimilated_knowledge",
-        "call_id": "call_orientation",
-        "arguments": json.dumps({"question": "How do SMT and TPD work together?"}),
-    }
-    initial = SimpleNamespace(status="completed", output=[reasoning, function_call])
     final = source_response("Raw answer.", [])
-    responses = SequenceResponses(initial, final)
+    responses = FakeResponses(final)
 
     ChatService(
         storage,
@@ -257,12 +208,9 @@ def test_orientation_continuation_keeps_initial_opaque_output_only_in_the_transi
         orientation_service=FakeOrientation(orientation_result()),
     ).reply(storage.create_thread("Question"), "How do SMT and TPD work together?")
 
-    transient = responses.calls[1]["input"]
-    assert transient[-3:-1] == [_input_item(reasoning), _input_item(function_call)]
-    assert transient[-1]["type"] == "function_call_output"
-    assert "opaque-orientation-reasoning" in json.dumps(transient)
+    assert len(responses.calls) == 1
+    assert "Derived orientation cue that must not persist in replay." in responses.calls[0]["instructions"]
     saved = json.dumps(storage.thread_items(1)) + json.dumps(storage.replay_items(1))
-    assert "opaque-orientation-reasoning" not in saved
     assert "Derived orientation cue that must not persist in replay." not in saved
 
 
@@ -295,22 +243,6 @@ def test_broad_system_question_requires_orientation_before_raw_research():
     ) is True
 
 
-def test_orientation_scope_is_server_owned_and_model_arguments_cannot_supply_identifiers():
-    assert ORIENTATION_TOOL["parameters"] == {
-        "type": "object",
-        "properties": {
-            "question": {"type": "string", "description": "The bounded topic or question to orient."},
-        },
-        "required": ["question"],
-        "additionalProperties": False,
-    }
-    assert _orientation_arguments({"arguments": '{"question":"How do the parts fit together?"}'}) == {
-        "question": "How do the parts fit together?"
-    }
-    with pytest.raises(ValueError, match="orientation function arguments"):
-        _orientation_arguments({"arguments": '{"question":"How do the parts fit together?","collection_id":null}'})
-
-
 def test_empty_orientation_is_audited_as_not_admitted_context(tmp_path, monkeypatch):
     storage = Storage(tmp_path / "mentor.sqlite3")
     storage.initialize()
@@ -326,10 +258,7 @@ def test_empty_orientation_is_audited_as_not_admitted_context(tmp_path, monkeypa
         duplicate_result_count=0,
         discarded_result_count=0,
     )
-    responses = SequenceResponses(
-        orientation_function_response("Explain how the major parts fit together."),
-        source_response("Raw answer.", []),
-    )
+    responses = FakeResponses(source_response("Raw answer.", []))
 
     answer = ChatService(
         storage,
@@ -362,10 +291,7 @@ def test_snapshot_bound_raw_and_derived_stores_cannot_cross_runtime_boundaries(t
         derived_store_id="vs_pilot_derived",
     )
     monkeypatch.setattr(storage, "current_snapshot", lambda: pilot_snapshot)
-    responses = SequenceResponses(
-        orientation_function_response("Explain how the major parts fit together."),
-        source_response("Raw answer.", []),
-    )
+    responses = FakeResponses(source_response("Raw answer.", []))
     orientation = FakeOrientation(orientation_result())
 
     ChatService(storage, SimpleNamespace(responses=responses), orientation_service=orientation).reply(
@@ -375,7 +301,7 @@ def test_snapshot_bound_raw_and_derived_stores_cannot_cross_runtime_boundaries(t
     assert orientation.calls == [
         ("Explain how the major parts fit together.", {"snapshot": pilot_snapshot})
     ]
-    assert responses.calls[1]["tools"] == [
+    assert responses.calls[0]["tools"] == [
         {"type": "file_search", "vector_store_ids": ["vs_pilot_raw"], "max_num_results": 8}
     ]
 
@@ -396,17 +322,14 @@ def test_orientation_latency_covers_the_orientation_attempt_and_raw_continuation
             clock["value"] = 0.1
             return super().consult(question, **kwargs)
 
-    class TimedResponses(SequenceResponses):
+    class TimedResponses(FakeResponses):
         def create(self, **kwargs):
             response = super().create(**kwargs)
-            if len(self.calls) == 2:
+            if len(self.calls) == 1:
                 clock["value"] = 0.25
             return response
 
-    responses = TimedResponses(
-        orientation_function_response("How do SMT and TPD work together?"),
-        source_response("Raw answer.", []),
-    )
+    responses = TimedResponses(source_response("Raw answer.", []))
     answer = ChatService(
         storage,
         SimpleNamespace(responses=responses),
@@ -473,13 +396,10 @@ def test_orientation_tool_failure_is_auditable_and_recovers_with_raw_search(tmp_
     storage.initialize()
     storage.set_vector_store("vs_legacy")
     monkeypatch.setattr(storage, "current_snapshot", published_snapshot)
-    responses = SequenceResponses(
-        orientation_function_response("How do SMT and TPD work together?"),
-        source_response(
-            "Direct source teaching: Raw File Search verified this.",
-            [{"type": "file_citation", "file_id": "file_jacob", "filename": "lesson.txt"}],
-        ),
-    )
+    responses = FakeResponses(source_response(
+        "Direct source teaching: Raw File Search verified this.",
+        [{"type": "file_citation", "file_id": "file_jacob", "filename": "lesson.txt"}],
+    ))
 
     answer = ChatService(
         storage,
@@ -488,9 +408,8 @@ def test_orientation_tool_failure_is_auditable_and_recovers_with_raw_search(tmp_
     ).reply(storage.create_thread("Question"), "How do SMT and TPD work together?")
 
     assert answer.citations[0].file_id == "file_jacob"
-    assert len(responses.calls) == 2
-    function_output = json.loads(responses.calls[1]["input"][-1]["output"])
-    assert function_output == {"status": "unavailable", "message": "Derived orientation was unavailable; verify with raw File Search."}
+    assert len(responses.calls) == 1
+    assert "Derived orientation" not in responses.calls[0]["instructions"]
     diagnostics = storage.response_diagnostics(1)[0]["knowledge_context"]
     assert diagnostics["status"] == "unavailable"
     assert diagnostics["used"] is False
@@ -509,13 +428,10 @@ def test_broad_streaming_preserves_native_compaction_without_replaying_orientati
             {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Raw answer."}]},
         ],
     )
-    responses = SequenceResponses(
-        orientation_function_response("How does Jacob's system fit together?"),
-        [
-            SimpleNamespace(type="response.output_text.delta", delta="Raw answer."),
-            SimpleNamespace(type="response.completed", response=final),
-        ],
-    )
+    responses = SequenceResponses([
+        SimpleNamespace(type="response.output_text.delta", delta="Raw answer."),
+        SimpleNamespace(type="response.completed", response=final),
+    ])
 
     events = list(
         ChatService(
@@ -526,7 +442,7 @@ def test_broad_streaming_preserves_native_compaction_without_replaying_orientati
     )
 
     assert [event.type for event in events] == ["delta", "complete"]
-    assert responses.calls[1]["stream"] is True
+    assert responses.calls[0]["stream"] is True
     assert storage.replay_items(1) == final.output
     replay = json.dumps(storage.replay_items(1))
     assert "Derived orientation cue that must not persist in replay." not in replay
