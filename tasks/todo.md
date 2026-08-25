@@ -1,103 +1,93 @@
-# Phase 2 Task Checklist
+# Phase 4 Task Checklist: Trader Profile / Editable Memory
 
-The binding design is
-[2026-08-20-trading-mentor-phase-2-design.md](../docs/superpowers/specs/2026-08-20-trading-mentor-phase-2-design.md).
+The binding proposed design is
+[2026-08-25-trading-mentor-phase-4-design.md](../docs/superpowers/specs/2026-08-25-trading-mentor-phase-4-design.md).
 The detailed proposed execution plan is [plan.md](plan.md).
 
-**Status:** Phase 2 passed Theo's final human acceptance evaluation on
-2026-08-21. The accepted implementation remains on
-feature/phase-2-unified-mentor; do not begin Phase 3 or merge to main without
-separate approval.
+**Status:** Design and plan complete; awaiting Theo's implementation approval.
+Phase 4 is based on Phase 2 closure `f809193ef2749dbe53c0af14e5d3196420c896f9`.
+Phase 3/3B remains archived on `feature/phase-3-knowledge-assimilation` and is
+not part of this branch.
 
-## conversation-lifecycle
+## profile-storage
 
-- [x] **Task 1 — Idempotent display-turn migration and deletion primitive**
-  - Acceptance: legacy Phase 1 threads backfill safely; one transaction deletes
-    all thread-owned state and preserves sources/vector-store settings.
-  - Verify: focused storage migration/deletion tests; full pytest.
+- [ ] **Task 1 — Local profile schema and transactional lifecycle**
+  - Acceptance: constrained versioned records and origin fields migrate safely;
+    global profile state survives thread deletion; destructive actions are
+    atomic and replacement identity is unambiguous.
+  - Verify: focused storage tests and full pytest.
   - Depends on: none.
 
-- [x] **Task 2 — Persist browser-safe display turns for new responses**
-  - Acceptance: every completed/incomplete turn has Markdown, evidence,
-    diagnostics, historical configuration, and raw replay positions; encrypted
-    reasoning remains server-only.
-  - Verify: API-shaped chat-service fixtures; full pytest.
+## profile-context
+
+- [ ] **Task 2 — Profile service and bounded deterministic selection**
+  - Acceptance: only confirmed current items select; relevance is deterministic,
+    deduplicated, and within the six-item/1,200-character cap.
+  - Verify: focused profile tests and full pytest.
   - Depends on: Task 1.
 
-- [x] **Task 3 — Safe restore and permanent-delete HTTP API**
-  - Acceptance: timeline GET is browser-safe and side-effect free; DELETE is
-    local-only, transactional, and preserves sources.
-  - Verify: HTTP restore/delete/security tests; full pytest.
-  - Depends on: Tasks 1–2.
+## mentor-profile-integration
 
-### Checkpoint A — Conversation storage and API contract
+- [ ] **Task 3 — Sol profile context and controlled explicit write tool**
+  - Acceptance: user context is bounded and non-authoritative; each turn has at
+    most one idempotent validated write/proposal; Phase 2 raw-source contracts
+    remain unchanged.
+  - Verify: Responses-shaped fixtures, citation/compaction regressions, full
+    pytest, and current official tool-schema check.
+  - Depends on: Task 2.
 
-- [x] A migrated Phase 1 thread restores through the safe timeline route.
-- [x] Deletion persists after reread/reload and shared source state survives.
-- [x] Encrypted reasoning state never appears in browser JSON.
-- [x] Full pytest passes.
+## profile-api
 
-## mentor-orchestration
+- [ ] **Task 4 — Safe loopback Profile API**
+  - Acceptance: local browser-safe projections and validated mutations; no raw
+    replay/tool reasoning disclosure.
+  - Verify: focused server tests and full pytest.
+  - Depends on: Tasks 1–3.
 
-- [x] **Task 4 — Unified turn composition and research-depth policy**
-  - Acceptance: one Jacob capability seam; Auto/Normal/Deep/Exhaustive remains
-    independent from reasoning effort/mode; no future capability is built.
-  - Verify: request/policy/provenance fixtures; full pytest.
+### Checkpoint A — Profile foundation
+
+- [ ] Cross-thread relevant context works; irrelevant context stays out.
+- [ ] Edit/delete/supersede/conflict changes active context deterministically.
+- [ ] Full pytest passes; Phase 2 boundaries remain intact.
+
+## profile-ui
+
+- [ ] **Task 5 — Restrained static Trader Profile panel**
+  - Acceptance: grouped current items, separate tentative proposals, history,
+    provenance, and explicit edit/confirm/reject/archive/delete controls.
+  - Verify: static/server tests, full pytest, local desktop/mobile browser smoke.
   - Depends on: Checkpoint A.
 
-- [x] **Task 5 — Compact evidence and truthful usage diagnostics**
-  - Acceptance: retain all native evidence and research counts; retain accurate
-    historical configuration; do not invent unavailable platform cost.
-  - Verify: multi-search and missing-usage fixtures; full pytest.
-  - Depends on: Task 4.
+- [ ] **Task 6 — Compact chat profile-update affordances**
+  - Acceptance: chat acknowledges saved/proposed updates without turning the
+    conversation into an admin interface or reactivating history.
+  - Verify: fixtures, full pytest, and two-thread browser smoke.
+  - Depends on: Task 5.
 
-### Checkpoint B — Mentor policy and observability contract
+### Checkpoint B — User-controlled personalisation
 
-- [x] Phase 1 exhaustive-search safeguards remain intact.
-- [x] Auto/manual depth and reasoning controls are independently historical.
-- [x] Full pytest passes.
+- [ ] Profile is inspectable/editable/deletable and remains local.
+- [ ] Deleted/superseded/inferred records do not influence later prompts or
+  cause historic chat/replay statements to become current profile truth.
+- [ ] Direct source teaching still needs native raw citations.
 
-## chat-foundation-ui
+## profile-evaluation
 
-- [x] **Task 6 — Restored conversations, switching, titles, and delete UI**
-  - Acceptance: history restores through reload/switch; title is useful; delete
-    is confirmed, keyboard reachable, and permanent locally.
-  - Verify: full pytest plus two-chat browser restore/delete smoke flow.
+- [ ] **Task 7 — Deterministic Phase 4 regression suite**
+  - Acceptance: profile lifecycle, relevance, provenance, source authority,
+    context budget, thread boundary, and Phase 2 regressions are covered.
+  - Verify: full pytest, browser smoke, diff/secret review; no paid calls.
   - Depends on: Checkpoint B.
 
-- [x] **Task 7 — Research-depth control and compact disclosures**
-  - Acceptance: future-turn depth control; historical settings remain intact;
-    evidence/diagnostics are compact; NaN. is diagnosed before any fix.
-  - Verify: fixtures/static tests, full pytest, desktop/mobile browser smoke.
-  - Depends on: Task 6.
+- [ ] **Task 8 — Theo's explicit Phase 4 human quality gate**
+  - Acceptance: Theo evaluates cross-thread recall, control, research guidance,
+    source integrity, UX, and cost/context quality, then records pass/fail.
+  - Verify: full pytest before Theo's local private evaluation.
+  - Depends on: Task 7.
 
-### Checkpoint C — Persistent-chat user flow
+### Final checkpoint — Await Theo's Phase 4 decision
 
-- [x] New and restored turns show their own settings/evidence.
-- [x] Delete survives reload and leaves shared sources available.
-- [x] Static responsive chat remains intact; full pytest passes.
-
-## phase-2-regression
-
-- [x] **Task 8 — Deterministic Phase 2 regression suite**
-  - Acceptance: lifecycle, migration, replay, provenance, security, semantic
-    prompts, and resolved NaN. behavior are covered without paid API calls.
-  - Verify: full pytest, diff check, secret scan, local browser smoke.
-  - Depends on: Checkpoint C.
-
-- [x] **Task 9 — Explicit Phase 2 human quality checkpoint**
-  - Acceptance: a small private paid evaluation confirms persistent-chat,
-    normal/exhaustive research, evidence/diagnostics, and deletion behavior.
-  - Verify: Theo's browser evaluation and pass/fail decision.
-  - Depends on: Task 8.
-
-### Final checkpoint — Phase 2 accepted
-
-- [x] All deterministic and browser checks pass.
-- [x] Native replay compaction, prompt-cache diagnostics, File Search result
-  budgets, evidence disclosure, table overflow, long-thread recovery, and the
-  controlled Terra/Sol comparison have passed technical and controlled paid
-  verification; see `docs/phase-2-evaluation.md`.
-- [x] The branch is committed and pushed.
-- [x] Theo completed the human acceptance decision: **Phase 2 passed**.
-- [x] Stop: do not merge to main or begin Phase 3.
+- [ ] All deterministic and browser checks pass.
+- [ ] The feature branch is committed and pushed.
+- [ ] Theo has made the human acceptance decision.
+- [ ] Stop: do not start Phase 5 or merge to main.

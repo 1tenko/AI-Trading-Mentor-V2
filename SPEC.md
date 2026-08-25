@@ -108,10 +108,14 @@ before the next phase starts:
 
 1. Intelligence proof — Jacob teaching quality in private browser chat.
 2. Base unified mentor — polished conversational foundation.
-3. Extensible knowledge library — user-managed sources and source scopes.
-4. Trader profile and editable long-term memory.
-5. Strategy Lab — structured data import and deterministic analysis.
-6. Versioned Strategy Projects.
+3. Extensible knowledge/assimilation experiment — completed and abandoned after
+   Phase 3B showed no material benefit over GPT-5.6 Sol with scoped raw source
+   search. The archived record remains on
+   `feature/phase-3-knowledge-assimilation`; it is not continuing product
+   architecture.
+4. Trader profile and editable memory.
+5. Backtest and data analysis — structured import and deterministic analysis.
+6. Strategy Projects.
 7. Scientific strategy-development workflow.
 8. Mindset and development sources.
 9. Evals, hardening, and productization.

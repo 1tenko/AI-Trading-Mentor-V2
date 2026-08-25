@@ -1,453 +1,212 @@
-# Implementation Plan: Phase 2 Unified Trading Mentor Foundation
+# Implementation Plan: Phase 4 Trader Profile / Editable Memory
 
 **Status:** Proposed — requires Theo's approval before implementation.
 
-## Scope
+## Scope and Base
 
-Implement only the approved Phase 2 design at
-[2026-08-20-trading-mentor-phase-2-design.md](../docs/superpowers/specs/2026-08-20-trading-mentor-phase-2-design.md).
-
-The work makes the proven mentor a reliable personal chat application. It does
-not alter the Phase 1 intelligence architecture and does not begin Phase 3 or
-later capabilities.
-
-## Phase 1 Closure and Branch
-
-- Phase 1 human Intelligence Proof: **passed** by Theo.
-- Acceptance record: [phase-1-acceptance.md](../docs/phase-1-acceptance.md).
-- Implementation branch: feature/phase-2-unified-mentor.
-- Base contract: local replay state, GPT-5.6 Sol, Responses API, store=false,
-  native File Search, raw Jacob source authority, and loopback-only serving.
-
-## Verified Integration Constraints
-
-- GPT-5.6 Sol remains OpenAI's frontier model. It supports high, xhigh, and
-  max reasoning effort; Pro is an independent reasoning mode. The plan retains
-  the existing evaluated controls instead of automatically escalating them.
-  [OpenAI model guidance](https://developers.openai.com/api/docs/guides/latest-model)
-- When local code manages conversation state with store=false, OpenAI documents
-  preserving previous user inputs and every response output item, including
-  encrypted reasoning items, for later turns. This remains the raw replay
-  record; it must never be returned to the browser.
-  [OpenAI model guidance](https://developers.openai.com/api/docs/guides/latest-model)
-- Native File Search results are absent by default unless
-  file_search_call.results is requested through include. The response item
-  contains the model's File Search queries, and the tool supports a
-  max_num_results setting. Phase 2 retains all returned results without custom
-  ranking.
-  [OpenAI File Search guide](https://developers.openai.com/api/docs/guides/tools-file-search)
+Implement only [the Phase 4 design](../docs/superpowers/specs/2026-08-25-trading-mentor-phase-4-design.md) on `feature/phase-4-trader-profile`, based on
+Phase 2 closure `f809193ef2749dbe53c0af14e5d3196420c896f9`. Preserve the
+Phase 3 archive branch; no Phase 3 runtime, artifacts, or implementation is
+part of this plan.
 
 ## Architecture Decisions
 
-1. **Dual local records:** retain raw thread_items for stateless replay and add
-   a browser-safe display-turn projection. Do not make the browser parse or
-   receive encrypted reasoning state.
-2. **Physical local deletion:** delete a thread and all thread-owned rows in
-   one SQLite transaction. Never touch sources, source registry settings, local
-   transcripts, OpenAI Files, or the shared vector store.
-3. **Minimal unified boundary:** add one private request-composition seam for
-   an active Jacob-source capability. It supplies request policy/context only;
-   it does not create a capability registry, future tool, or another bot.
-4. **Two independent axes:** research depth controls source-research policy;
-   reasoning effort/mode controls GPT-5.6 configuration. Auto depth resolves
-   via transparent local intent rules and is recorded. No automatic effort or
-   Pro escalation occurs.
-5. **Static frontend retained:** the existing static UI can satisfy the
-   approved flows. No framework or dependency is planned.
+1. A small versioned SQLite profile record is canonical; no opaque summary,
+   external memory, vector store, or custom retrieval system is needed.
+2. Only confirmed records enter a bounded deterministic request selector. They
+   are marked user context, never source evidence or instructions.
+3. Explicit UI actions and unambiguous explicit chat memory requests are the
+   write path. Tentative model proposals require confirmation before use.
+4. An edit creates a successor and atomically supersedes its predecessor;
+   conflicts stay out of active context and permanent delete removes the item.
+5. The current Python/SQLite/static-browser architecture remains sufficient.
 
 ## Dependency Graph
 
-    Task 1: migrate storage + atomic deletion primitive
-      -> Task 2: persist safe display turns and historical configuration
-          -> Task 3: safe restore/delete HTTP API
-              -> Checkpoint A
-                  -> Task 4: unified turn composition + research depth
-                      -> Task 5: evidence and diagnostics aggregation
-                          -> Checkpoint B
-                              -> Task 6: restored conversation UI
-                                  -> Task 7: controls and compact disclosure UI
-                                      -> Checkpoint C
-                                          -> Task 8: deterministic regressions
-                                              -> Task 9: explicit human quality checkpoint
-
-Tasks are deliberately sequential because the shared storage and API contracts
-must settle before static UI work begins. No parallel implementation is planned.
+```text
+Task 1 profile schema/lifecycle
+  -> Task 2 profile service + context selection
+      -> Task 3 Sol tool/request integration
+      -> Task 4 loopback profile API
+          -> Checkpoint A
+              -> Task 5 static Profile panel
+                  -> Task 6 chat mutation affordances
+                      -> Checkpoint B
+                          -> Task 7 deterministic regression
+                              -> Task 8 Theo human quality gate
+```
 
 ## Task List
 
-### Module: conversation-lifecycle
-
-## Task 1: Add an idempotent display-turn migration and deletion primitive
-
-**Purpose:** Extend SQLite with the minimum display-turn structure needed to
-restore Phase 1 conversations, backfill legacy threads without losing raw replay
-items, and provide one atomic local deletion operation.
+## Task 1: Add the local profile schema and transactional lifecycle
 
 **Dependencies:** None.
-
-**Files/components likely affected:**
-
-- src/mentor/storage.py
-- tests/test_storage.py
-- tests/fixtures/phase1_thread_state.json
+**Files likely touched:** `src/mentor/storage.py`, `tests/test_storage.py`.
 
 **Acceptance criteria:**
 
-- [ ] Initializing a Phase 1-shaped database creates/backfills display turns
-  idempotently while retaining the original chronological raw item sequence.
-- [ ] A display turn identifies its user content, answer Markdown, evidence,
-  diagnostics/configuration, completion state, and raw replay-item positions.
-- [ ] One storage deletion operation removes every thread-owned row
-  transactionally while source registry rows and vector-store settings survive.
+- [ ] Idempotent migration creates constrained versioned profile records without
+  changing Phase 2 source, thread, replay, display-turn, or diagnostics data.
+- [ ] Create, supersede, archive, conflict, and permanent delete are atomic;
+  `category + subject_key` prevents ambiguous active duplicates; thread deletion
+  preserves global profile state but sets its structured origin availability
+  false in the same transaction.
+- [ ] Tests prove migration, rollback, delete, and current-state filtering.
 
-**Automated verification:**
+**Verification:** focused storage tests; `.\.venv\Scripts\python -m pytest -q`.
 
-- [ ] Focused storage tests cover fresh initialization, legacy migration rerun,
-  transaction rollback/failure behavior, and source/settings survival.
-- [ ] Full suite: .\.venv\Scripts\python -m pytest -q.
-
-**Browser verification:** None; this is a local storage contract.
-
-**Estimated scope:** Medium.
-
-## Task 2: Persist new turns as safe display projections without changing replay
-
-**Purpose:** Make each new completed or incomplete response write both its
-existing raw replay state and a safe display projection containing the actual
-historical configuration that produced it.
+## Task 2: Build the profile service and bounded local selector
 
 **Dependencies:** Task 1.
-
-**Files/components likely affected:**
-
-- src/mentor/chat_service.py
-- src/mentor/storage.py
-- tests/test_chat_service.py
+**Files likely touched:** `src/mentor/profile.py`, `src/mentor/storage.py`,
+`tests/test_profile.py`.
 
 **Acceptance criteria:**
 
-- [ ] A streamed completed or incomplete response stores a matching display
-  turn with citations, all returned evidence, diagnostics, and exact historical
-  model/reasoning/research settings.
-- [ ] Replay input remains the complete raw output sequence required by the
-  Responses API, including encrypted reasoning items when present.
-- [ ] No browser-facing representation includes encrypted reasoning content or
-  opaque raw response items.
+- [ ] Validation enforces category/kind/provenance/state vocabularies, bounded
+  fields, explicit provenance, and unambiguous successor targets.
+- [ ] Only confirmed current records can be selected; conflicts, tentative,
+  superseded, archived, and deleted values never appear in active context.
+- [ ] Relevance selection is deterministic, deduplicated, and capped at six
+  records or 1,200 characters.
 
-**Automated verification:**
+**Verification:** focused profile tests; full pytest.
 
-- [ ] API-shaped fixtures assert display projection, incomplete handling, and
-  unchanged raw replay input.
-- [ ] Full suite: .\.venv\Scripts\python -m pytest -q.
+## Task 3: Integrate bounded profile context and controlled profile writes
 
-**Browser verification:** None; HTTP exposure follows Task 3.
-
-**Estimated scope:** Medium.
-
-## Task 3: Expose safe thread restoration and permanent-delete routes
-
-**Purpose:** Add the smallest loopback API surface for loading a thread's safe
-timeline and permanently deleting one local conversation.
-
-**Dependencies:** Tasks 1–2.
-
-**Files/components likely affected:**
-
-- src/mentor/server.py
-- src/mentor/storage.py
-- tests/test_server.py
+**Dependencies:** Task 2.
+**Files likely touched:** `src/mentor/chat_service.py`, `src/mentor/prompts.py`,
+`src/mentor/profile.py`, `tests/test_chat_service.py`.
 
 **Acceptance criteria:**
 
-- [ ] GET /api/threads/{id} returns chronological display turns only and never
-  contacts OpenAI or reveals raw/encrypted replay state.
-- [ ] DELETE /api/threads/{id} uses the storage transaction, returns a clear
-  success/not-found result, and does not affect sources or vector-store state.
-- [ ] Existing list/create/message/source routes and loopback-only binding
-  continue to behave as before.
+- [ ] Relevant confirmed records are added as marked user context beside the
+  unchanged native raw File Search path; no selected profile payload enters
+  historical replay items.
+- [ ] A Responses function tool can only request validated explicit write or
+  tentative-proposal operations; it allows one idempotent mutation/proposal and
+  one terminal continuation per turn, and citation repair/retry never reruns it.
+- [ ] Direct source citations, exhaustive research, streaming, and compaction
+  retain their Phase 2 contracts.
 
-**Automated verification:**
+**Verification:** API-shaped tool fixtures, profile budget assertions, citation
+regressions, full pytest. Recheck current official Responses tool schema before
+implementation; stop for Theo if it changes this contract.
 
-- [ ] HTTP tests cover restore, malformed/missing IDs, delete persistence, and
-  absence of encrypted reasoning/API keys in JSON.
-- [ ] Full suite: .\.venv\Scripts\python -m pytest -q.
+## Task 4: Add safe local profile API projections and mutations
 
-**Browser verification:** Request one existing thread endpoint from the local
-browser and confirm it returns no raw reasoning content.
+**Dependencies:** Tasks 1–3.
+**Files likely touched:** `src/mentor/server.py`, `src/mentor/storage.py`,
+`src/mentor/profile.py`, `tests/test_server.py`.
 
-**Estimated scope:** Medium.
+**Acceptance criteria:**
 
-### Checkpoint A: Conversation storage and API contract
+- [ ] Loopback-only GET/POST/PATCH/DELETE profile routes expose safe profile
+  projections, validated user actions, clear errors, and no replay/reasoning
+  state.
+- [ ] A terminal chat response can safely disclose a saved/proposed profile
+  mutation without exposing model tool transcripts.
+- [ ] Malformed, oversized, unknown, and stale updates fail safely.
 
-- [ ] All tests pass.
-- [ ] A representative Phase 1 thread migrates and can be read through the
-  safe timeline route.
-- [ ] Deleting a representative thread removes it after reread/reload while
-  the Jacob source registry and vector-store setting remain intact.
-- [ ] No browser route exposes encrypted reasoning state.
+**Verification:** focused server tests; full pytest.
 
-### Module: mentor-orchestration
+### Checkpoint A: Profile foundation
 
-## Task 4: Add minimal unified turn composition and research-depth policy
+- [ ] Full pytest passes.
+- [ ] A Thread A profile record influences a relevant Thread B request only.
+- [ ] Edit/delete/supersede/conflict transitions leave no stale active context.
+- [ ] Existing source/vector-store/replay/thread deletion boundaries survive.
 
-**Purpose:** Separate current Jacob source-research policy from future
-capability attachment without implementing a generic registry or any future
-capability. Add Auto, Normal, Deep, and Exhaustive depth handling independently
-of existing reasoning controls.
+## Task 5: Add the restrained static Trader Profile panel
 
 **Dependencies:** Checkpoint A.
-
-**Files/components likely affected:**
-
-- src/mentor/chat_service.py
-- src/mentor/prompts.py
-- tests/test_chat_service.py
+**Files likely touched:** `src/mentor/static/index.html`,
+`src/mentor/static/app.js`, `src/mentor/static/app.css`, `tests/test_server.py`.
 
 **Acceptance criteria:**
 
-- [ ] One server-owned turn-composition path builds the existing Jacob
-  instructions, native File Search tool, include fields, and research-depth
-  policy; no user-facing bot or future capability is created.
-- [ ] Auto deterministically resolves to Normal, Deep, or Exhaustive from
-  transparent intent criteria; an explicit manual depth cannot be downgraded.
-- [ ] Research depth is stored separately from reasoning effort/mode and does
-  not automatically raise effort or enable Pro.
+- [ ] One accessible Profile control opens grouped current items, separate
+  tentative proposals, and collapsed history/conflicts.
+- [ ] Theo can add/edit/confirm/reject/archive/delete with a destructive-action
+  confirmation; provenance and origin availability are clear.
+- [ ] The static responsive chat layout and existing controls remain intact.
 
-**Automated verification:**
+**Verification:** static/server tests, full pytest, desktop/mobile local browser
+smoke without paid model messages.
 
-- [ ] Fixtures assert policy resolution, request composition, preserved native
-  File Search configuration, and unchanged provenance/exhaustive safeguards.
-- [ ] Full suite: .\.venv\Scripts\python -m pytest -q.
+## Task 6: Surface compact chat profile-update affordances
 
-**Browser verification:** None; UI control follows Task 7.
-
-**Estimated scope:** Medium.
-
-## Task 5: Retain compact evidence and truthful usage diagnostics
-
-**Purpose:** Record the native research details needed for compact display:
-returned evidence count, cited count, File Search calls/queries/results, and
-known response usage—without inventing total platform cost.
-
-**Dependencies:** Task 4.
-
-**Files/components likely affected:**
-
-- src/mentor/chat_service.py
-- src/mentor/storage.py
-- tests/test_chat_service.py
+**Dependencies:** Task 5.
+**Files likely touched:** `src/mentor/static/app.js`, `src/mentor/static/app.css`,
+`tests/test_server.py`.
 
 **Acceptance criteria:**
 
-- [ ] Each display turn retains all returned source evidence and enough
-  aggregate metadata to show research/citation counts.
-- [ ] Historical diagnostics retain requested/effective depth, model,
-  effort/mode, status, latency, available tokens, and clearly labelled
-  text-token estimate.
-- [ ] Unknown File Search/platform charges remain unknown; no custom ranking,
-  summarization, or quote rewriting is introduced.
+- [ ] A saved or proposed mutation has one compact, actionable acknowledgement
+  in chat; ordinary answers do not expose or repeat profile data.
+- [ ] Reloading/switching threads does not turn historical chat text into a new
+  profile write or reactivate deleted/superseded records; retained historic
+  personal text is never treated as current profile truth.
+- [ ] Keyboard and error states work without a framework or new dependency.
 
-**Automated verification:**
+**Verification:** fixtures/static route tests, full pytest, two-thread browser
+smoke with manual panel changes.
 
-- [ ] Fixtures cover multiple File Search calls, absent usage fields, and
-  historical diagnostics fidelity.
-- [ ] Full suite: .\.venv\Scripts\python -m pytest -q.
+### Checkpoint B: User-controlled personalisation
 
-**Browser verification:** Inspect the safe timeline JSON for counts and all
-evidence records; verify no raw reasoning item is present.
+- [ ] Full pytest passes.
+- [ ] The Profile panel is inspectable, editable, and permanently deletable.
+- [ ] A deleted item is absent from a subsequent relevant request.
+- [ ] Raw source claims still require native citations.
 
-**Estimated scope:** Medium.
-
-### Checkpoint B: Unified mentor policy and observability contract
-
-- [ ] All tests pass.
-- [ ] The existing Phase 1 exhaustive-query policy still requires a
-  complementary omission/falsification search.
-- [ ] Auto/manual depth, effort, and mode are independently persisted.
-- [ ] Evidence and usage metadata are complete enough for the approved UI but
-  do not expose reasoning state or misstate costs.
-
-### Module: chat-foundation-ui
-
-## Task 6: Restore conversations, switching, reload, titles, and delete flow
-
-**Purpose:** Use the safe timeline API in the existing static chat page so
-saved conversations faithfully reappear and can be deleted through a restrained
-confirmed action.
+## Task 7: Complete deterministic Phase 4 regression coverage
 
 **Dependencies:** Checkpoint B.
-
-**Files/components likely affected:**
-
-- src/mentor/static/index.html
-- src/mentor/static/app.js
-- src/mentor/static/app.css
+**Files likely touched:** `tests/test_profile.py`, `tests/test_storage.py`,
+`tests/test_chat_service.py`, `tests/test_server.py`, `tests/fixtures/`.
 
 **Acceptance criteria:**
 
-- [ ] Selecting a saved thread and reloading the page render historical Theo
-  and Mentor messages, Markdown, citations/evidence, diagnostics, and
-  incomplete state in chronological order.
-- [ ] Sidebar titles use the persisted first meaningful question and switch
-  reliably without clearing historical content.
-- [ ] A keyboard-accessible delete affordance confirms intent, removes the
-  conversation immediately on success, and leaves sources untouched.
+- [ ] Cover cross-thread recall, relevance/non-relevance, edit, delete,
+  contradiction, provenance, source-authority separation, budget, migration,
+  thread deletion, historic replay after profile deletion, tool idempotence,
+  and all Phase 2 regressions without paid calls.
+- [ ] Secret/diff checks confirm no local profile runtime, transcript, or API
+  secret enters Git.
 
-**Automated verification:**
+**Verification:** `.\.venv\Scripts\python -m pytest -q`; local browser smoke;
+Git diff/secret review.
 
-- [ ] Existing server tests continue to pass; add browser-safe route fixtures
-  needed by the static flow.
-- [ ] Full suite: .\.venv\Scripts\python -m pytest -q.
+## Task 8: Run Theo's Phase 4 human quality gate
 
-**Browser verification:** Create two chats, add a follow-up to one, switch both
-ways, reload, delete one with confirmation, reload again, and verify the other
-still restores.
-
-**Estimated scope:** Medium.
-
-## Task 7: Add research-depth control and compact historical disclosures
-
-**Purpose:** Extend the static UI—not the intelligence architecture—with an
-advanced research-depth control, historical configuration display, compact
-evidence disclosure, and the approved NaN. diagnosis.
-
-**Dependencies:** Task 6.
-
-**Files/components likely affected:**
-
-- src/mentor/static/index.html
-- src/mentor/static/app.js
-- src/mentor/static/app.css
-- tests/test_server.py
+**Dependencies:** Task 7.
+**Files likely touched:** `docs/phase-4-evaluation.md`,
+`docs/phase-4-acceptance.md` only after Theo's decision.
 
 **Acceptance criteria:**
 
-- [ ] Auto/Normal/Deep/Exhaustive is sent only for future turns and does not
-  relabel historical turns; the existing effort/mode controls remain separate.
-- [ ] Evidence is collapsed by default with cited results first, a compact
-  researched/cited count, and an explicit way to reveal all retained evidence.
-- [ ] Live UI and a saved fixture determine whether NaN. is an application
-  defect; only a reproducible in-app defect receives a minimal code fix and
-  regression.
+- [ ] The private evaluation covers every Phase 4 scenario in the approved
+  design, including personalised research guidance and source-authority
+  separation.
+- [ ] Theo records the pass/fail decision; routine tests and browser smoke do
+  not make paid requests.
 
-**Automated verification:**
+**Verification:** full pytest first; Theo performs the local human evaluation.
 
-- [ ] HTTP/static asset tests pass and fixture coverage protects any confirmed
-  NaN. rendering fix.
-- [ ] Full suite: .\.venv\Scripts\python -m pytest -q.
-
-**Browser verification:** At desktop and mobile widths, verify controls,
-streaming, Markdown tables, collapsed evidence/diagnostics, no console errors,
-and no horizontal sidebar-button pile.
-
-**Estimated scope:** Medium.
-
-### Checkpoint C: Persistent-chat user flow
-
-- [ ] All tests pass.
-- [ ] A new streamed answer and a restored historical answer display their own
-  distinct historical settings and evidence.
-- [ ] Browser deletion persists through reload without affecting a different
-  conversation or shared source access.
-- [ ] The UI remains a static, responsive personal chat—not a dashboard.
-
-### Module: phase-2-regression
-
-## Task 8: Complete deterministic Phase 2 regression coverage
-
-**Purpose:** Consolidate migration, lifecycle, provenance, security, and
-semantic behavior into small deterministic fixtures so routine tests do not
-make paid model requests.
-
-**Dependencies:** Checkpoint C.
-
-**Files/components likely affected:**
-
-- tests/test_storage.py
-- tests/test_chat_service.py
-- tests/test_server.py
-- tests/fixtures/
-
-**Acceptance criteria:**
-
-- [ ] Tests cover create/list/title/restore/reload/switch/delete, shared-source
-  survival, raw replay continuity, historical configuration fidelity, and
-  incomplete responses.
-- [ ] Tests retain the Phase 1 semantic fixtures: SMT, TPD, all
-  reversion-level alignments, exhaustive SMT teaching, false attribution, and
-  correction/follow-up.
-- [ ] Tests cover loopback-only routing, API-key secrecy, source restrictions,
-  provenance, Auto/manual depth, and the resolved NaN. finding.
-
-**Automated verification:**
-
-- [ ] Full suite: .\.venv\Scripts\python -m pytest -q.
-- [ ] Diff check and secret scan before the task commit.
-
-**Browser verification:** Run the defined smoke flow once against a local
-server; do not send paid model requests during ordinary regression runs.
-
-**Estimated scope:** Medium.
-
-## Task 9: Run the explicit Phase 2 human quality checkpoint
-
-**Purpose:** Prepare and run a small paid browser evaluation only after all
-deterministic checks pass. Theo, not the agent, decides whether Phase 2 passes.
-
-**Dependencies:** Task 8.
-
-**Files/components likely affected:**
-
-- docs/phase-2-evaluation.md
-- README.md
-
-**Acceptance criteria:**
-
-- [ ] The worksheet combines persistent-chat lifecycle checks with the compact
-  Phase 1 semantic regression prompts and records configuration/observability.
-- [ ] It explicitly checks normal versus exhaustive research behavior, restored
-  history fidelity, permanent deletion boundaries, and evidence/diagnostics UX.
-- [ ] Private full transcripts, runtime data, and API secrets remain outside
-  Git; Theo records the final pass/fail decision.
-
-**Automated verification:**
-
-- [ ] Full suite: .\.venv\Scripts\python -m pytest -q before the real run.
-- [ ] No paid API request is added to pytest or a routine browser smoke test.
-
-**Browser verification:** Theo performs the approved paid/local human
-checkpoint and decides Phase 2 pass/fail.
-
-**Estimated scope:** Small.
-
-### Final checkpoint: Await Theo's Phase 2 decision
-
-- [ ] All deterministic tests and browser smoke checks pass.
-- [ ] The explicit paid quality checkpoint is complete.
-- [ ] The completed branch is committed and pushed.
-- [ ] Theo has made the human acceptance decision.
-- [ ] Stop. Do not start Phase 3, merge to main, or add future capabilities.
-
-## Migration and Data Risks
+## Risks and Mitigations
 
 | Risk | Mitigation |
-|---|---|
-| Legacy thread grouping cannot associate all historical diagnostics | Preserve raw items; associate diagnostics in recorded response order; explicitly label genuinely absent fields unavailable. |
-| Partial deletion causes a deleted chat to reappear | Use one SQLite transaction, enabled foreign keys, explicit dependent-row deletes, and reread/reload tests. |
-| Browser-safe display data drifts from replay data | Persist both in one service finalization path and test exact historical configuration/evidence. |
-| Auto depth creates surprise cost or weak research | Use transparent deterministic baselines, manual override, stored effective depth, and actual native-search counts. |
-| Evidence disclosure hides critical sources | Keep all original returned results; show cited results first; expose explicit expand-all. |
-| A planned UI change becomes a framework migration | Stop and ask Theo; the static UI is the approved approach. |
-
-## ADRs
-
-No standalone ADR is created at planning time. The approved Phase 2 design is
-the binding decision record for dual records, physical deletion, independent
-research depth, the unified capability seam, and retention of the static UI.
-Creating duplicate ADR files now would add documentation without a new decision.
+| --- | --- |
+| Casual language becomes hidden memory | Explicit command/UI writes; at most one visible tentative proposal; confirmed-only injection. |
+| Old preference leaks into advice | Versioned supersession, conflict exclusion, permanent delete, and selector tests. |
+| Profile turns into source authority | Mark data as user context; preserve raw File Search/citation path; add false-attribution regression. |
+| Profile bloats Sol context | Local relevance selection, dedupe, six-item/1,200-character cap, and diagnostics. |
+| Thread deletion damages global state | Separate ownership and atomic origin-unavailability update tests. |
+| Phase 3 complexity leaks in | Base/diff review before each Phase 4 implementation checkpoint. |
 
 ## Approval Gate
 
 Do not implement any task until Theo approves this plan and
-[todo.md](todo.md). On approval, work tasks in order, commit/push each
-significant coherent slice, and stop at Task 9 for Theo's human decision.
+[todo.md](todo.md). After approval, complete tasks in order, test and commit
+each coherent slice, push the feature branch, and stop at Task 8 for Theo's
+human decision.
