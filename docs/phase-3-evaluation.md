@@ -339,10 +339,26 @@ failure so CandidateCompiler metrics cannot erase it. Future diagnostics include
 `output_tokens_details.reasoning_tokens` when the SDK supplies that count, not
 reasoning content.
 
-The new cost preflight reserves the bounded retry and semantic validation for
-all 12 schema-permitted candidates per source. It is deliberately conservative:
-the resulting remaining-run upper bound is `$31.5451`, which alone exceeds the
-fixed `$30.00` ceiling and is far above the `$20.020390` remaining after the
-permanent `$9.979610` prior spend. The preflight therefore blocks another paid
-rerun before any client, pilot runtime, vector store, or production state can
-be touched. No new paid call is authorized by this hardening alone.
+### Incremental hard-spend admission
+
+The `$31.5451` value is a pathological whole-run forecast, not an admission
+test. Gate 1 now checks only the next remote operation immediately before it
+is sent: actual cumulative spend plus that operation's conservative upper bound
+must be at most `$30.00`. Its reservation is then replaced by provider-reported
+actual cost, or retained in full if the provider does not report usable usage.
+This admits a clean run when its next bounded call fits while preserving the
+same absolute cumulative ceiling and the permanent `$9.979610` prior spend.
+
+The first actual extraction has a `$0.651920` maximum under the explicit
+`16,384` cap, so it fits within the `$20.020390` remaining budget. The
+`32,768` retry is independently checked only if its exact
+`incomplete/max_output_tokens` condition occurs. Forecasts remain available for
+planning: the pathological full-pipeline maximum is `$31.5451`; it does not
+authorize or veto an individual call.
+
+Responses/File Search calls have explicit bounded requests and conservative
+token/tool pricing. Remote `files` and `vector_stores` calls are fail-closed:
+their ongoing storage charge has no bounded per-operation lifetime under the
+current pilot retention policy, so the runner refuses them before provider
+access. This preserves the hard ceiling; a separate approved storage-retention
+and cost-bound policy is required before the pilot can create remote stores.

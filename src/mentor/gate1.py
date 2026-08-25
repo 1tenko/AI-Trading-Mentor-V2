@@ -156,8 +156,6 @@ class SpendLedger:
         self.prior_spend_usd = float(prior_spend_usd)
         self.spent_usd = self.prior_spend_usd
         self._reservations: dict[int, tuple[str, float]] = {}
-        self._stage_limits: dict[str, float] = {}
-        self._stage_spend: dict[str, float] = {}
         self._next_ticket = 1
         self.events: list[dict[str, Any]] = []
 
@@ -170,24 +168,6 @@ class SpendLedger:
                 f"Gate 1 spend ceiling blocks {stage}: spent ${self.spent_usd:.4f}, "
                 f"projected additional ${projected_cost_usd:.4f}, limit ${self.limit_usd:.2f}"
             )
-        stage_reserved = sum(
-            value for reserved_stage, value in self._reservations.values()
-            if reserved_stage == stage
-        )
-        stage_limit = self._stage_limits.get(stage)
-        if (
-            stage_limit is not None
-            and self._stage_spend.get(stage, 0.0) + stage_reserved + projected_cost_usd
-            > stage_limit
-        ):
-            raise RuntimeError(f"Gate 1 {stage} stage budget is exhausted")
-
-    def set_stage_limits(self, limits: dict[str, float]) -> None:
-        if self._stage_spend or self._reservations:
-            raise RuntimeError("Gate 1 stage budgets must be fixed before paid work")
-        if any(cost <= 0 or not math.isfinite(cost) for cost in limits.values()):
-            raise ValueError("Gate 1 stage budgets must be finite and positive")
-        self._stage_limits = dict(limits)
 
     def reserve(self, stage: str, projected_cost_usd: float) -> int:
         self.ensure(stage, projected_cost_usd)
@@ -206,7 +186,6 @@ class SpendLedger:
         if actual_cost_usd < 0 or not math.isfinite(actual_cost_usd):
             raise ValueError("actual Gate 1 cost must be finite and non-negative")
         self.spent_usd += actual_cost_usd
-        self._stage_spend[stage] = self._stage_spend.get(stage, 0.0) + actual_cost_usd
         self.events.append(
             {
                 "stage": stage,
@@ -223,7 +202,6 @@ class SpendLedger:
         if reserved_stage != stage:
             raise RuntimeError("Gate 1 spend reservation stage mismatch")
         self.spent_usd += reserved
-        self._stage_spend[stage] = self._stage_spend.get(stage, 0.0) + reserved
         self.events.append(
             {"stage": stage, "status": "usage_unknown", "cost_usd": reserved}
         )
@@ -308,6 +286,10 @@ class BudgetedOpenAIClient:
         self.responses = _BudgetedResponses(client.responses, ledger, diagnostic_path)
 
     def __getattr__(self, name: str):
+        if name in {"files", "vector_stores"}:
+            raise RuntimeError(
+                f"Gate 1 has no defensible per-operation upper bound for {name}; refusing remote operation"
+            )
         return getattr(self._client, name)
 
 
@@ -352,12 +334,6 @@ class Gate1Runner:
         if execute:
             _require_fresh_pricing(self._today())
         plan = estimate_gate1_cost(sources, self.pricing)
-        if self.ledger.spent_usd + plan.estimated_upper_bound_usd > self.ledger.limit_usd:
-            raise ValueError(
-                f"estimated Gate 1 cost ${plan.estimated_upper_bound_usd:.4f} plus prior spend "
-                f"${self.ledger.prior_spend_usd:.4f} exceeds the ${self.ledger.limit_usd:.2f} cumulative limit"
-            )
-        self.ledger.set_stage_limits({stage.stage: stage.cost_usd for stage in plan.stages})
         if not execute:
             _require_unchanged(self.production_database_path, before)
             return Gate1RunReport(
@@ -383,10 +359,6 @@ class Gate1Runner:
                 pilot.output_directory / "response-envelopes.jsonl",
             )
             compiler = self._compiler_factory(pilot.storage, paid_client, self.pricing)
-            self.ledger.ensure(
-                "compiler",
-                plan.cost_for("extraction", "validation", "synthesis"),
-            )
             build = compiler.build(
                 BuildRequest(
                     run=CompilationRun(
@@ -403,7 +375,6 @@ class Gate1Runner:
             evaluation = None
             published = False
             if build.ready:
-                self.ledger.ensure("mentor_evaluation", plan.cost_for("mentor_evaluation"))
                 pilot.publish(build.snapshot.snapshot_id)
                 published = True
                 _require_unchanged(self.production_database_path, before)

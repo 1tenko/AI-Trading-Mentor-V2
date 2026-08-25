@@ -15,10 +15,8 @@ from mentor.gate1 import (
     GATE1_PRICING_CHECKED_ON,
     HARD_SPEND_CEILING_USD,
     BudgetedOpenAIClient,
-    Gate1CostPlan,
     Gate1Runner,
     SpendLedger,
-    StageEstimate,
     estimate_gate1_cost,
 )
 from mentor.compiler import EXTRACTION_INITIAL_MAX_OUTPUT_TOKENS, ExtractionFailure, SourceExtractor
@@ -129,43 +127,22 @@ def _production_runtime(tmp_path: Path):
     return database_path, manifest_path, storage, production_snapshot
 
 
-def test_gate1_preflight_blocks_an_over_ceiling_dry_run_without_creating_a_pilot(tmp_path):
+def test_gate1_preflight_reports_a_pathological_whole_run_without_blocking_a_dry_run(tmp_path):
     database_path, manifest_path, production, production_snapshot = _production_runtime(tmp_path)
     client_calls = []
     pilot_root = tmp_path / "private-pilots"
 
-    with pytest.raises(ValueError, match="estimated Gate 1 cost"):
-        Gate1Runner(
-            production_database_path=database_path,
-            manifest_path=manifest_path,
-            pilot_root=pilot_root,
-            spend_limit_usd=25.0,
-            client_factory=lambda: client_calls.append("called"),
-            today=lambda: GATE1_PRICING_CHECKED_ON,
-            expected_manifest_sha256=_manifest_hash(manifest_path),
-        ).run()
+    report = Gate1Runner(
+        production_database_path=database_path,
+        manifest_path=manifest_path,
+        pilot_root=pilot_root,
+        spend_limit_usd=25.0,
+        client_factory=lambda: client_calls.append("called"),
+        today=lambda: GATE1_PRICING_CHECKED_ON,
+        expected_manifest_sha256=_manifest_hash(manifest_path),
+    ).run()
 
-    assert client_calls == []
-    assert not pilot_root.exists()
-    assert production.current_snapshot() == production_snapshot
-
-
-def test_gate1_stops_before_runtime_or_client_when_estimate_exceeds_limit(tmp_path):
-    database_path, manifest_path, production, production_snapshot = _production_runtime(tmp_path)
-    client_calls = []
-    pilot_root = tmp_path / "private-pilots"
-
-    with pytest.raises(ValueError, match="estimated Gate 1 cost"):
-        Gate1Runner(
-            production_database_path=database_path,
-            manifest_path=manifest_path,
-            pilot_root=pilot_root,
-            spend_limit_usd=25.0,
-            client_factory=lambda: client_calls.append("called"),
-            today=lambda: GATE1_PRICING_CHECKED_ON,
-            expected_manifest_sha256=_manifest_hash(manifest_path),
-        ).run(execute=True)
-
+    assert report.estimated_upper_bound_usd > 25.0
     assert client_calls == []
     assert not pilot_root.exists()
     assert production.current_snapshot() == production_snapshot
@@ -203,17 +180,6 @@ def test_gate1_rejects_manifest_metadata_drift_instead_of_substituting(tmp_path)
 
 def test_execute_builds_and_publishes_only_in_pilot_then_runs_evaluation(tmp_path, monkeypatch):
     monkeypatch.setattr(gate1_module, "GATE1_PRIOR_SPEND_USD", 0.0)
-    monkeypatch.setattr(
-        gate1_module,
-        "estimate_gate1_cost",
-        lambda sources, _pricing: Gate1CostPlan(
-            len(sources), 0, 0,
-            tuple(StageEstimate(stage, 1, 1, 1, 0.01) for stage in (
-                "extraction", "validation", "synthesis", "mentor_evaluation",
-            )),
-            0.04,
-        ),
-    )
     database_path, manifest_path, production, production_snapshot = _production_runtime(tmp_path)
     observed = {}
 
@@ -288,6 +254,7 @@ def test_execute_builds_and_publishes_only_in_pilot_then_runs_evaluation(tmp_pat
     ).run(execute=True)
 
     assert report.executed is True
+    assert report.estimated_upper_bound_usd > HARD_SPEND_CEILING_USD
     assert observed["runtime_scope"] == "pilot"
     assert observed["pricing"] == CONSERVATIVE_SOL_PRICING
     assert observed["request"].artifact_scope.value == "pilot"
@@ -439,6 +406,7 @@ def test_budgeted_client_records_transport_versions_and_conservatively_charges_u
     assert diagnostic["schema_version"] == "source-extraction-schema-v5"
     assert diagnostic["requested_max_output_tokens"] == EXTRACTION_INITIAL_MAX_OUTPUT_TOKENS
     assert ledger.events[-1]["status"] == "usage_unknown"
+    assert ledger.spent_usd == ledger.events[-1]["cost_usd"]
 
 
 def test_spend_ledger_counts_a_prior_gate1_run_against_the_same_hard_ceiling():
@@ -451,7 +419,11 @@ def test_spend_ledger_counts_a_prior_gate1_run_against_the_same_hard_ceiling():
         ledger.ensure("extraction", 21.497631)
 
 
-def test_budgeted_client_enforces_stage_budget_before_a_paid_call():
+def test_gate1_keeps_its_deliberately_conservative_token_pricing_contract():
+    assert CONSERVATIVE_SOL_PRICING == TokenPricing(5.0, 30.0, 30.0)
+
+
+def test_budgeted_client_blocks_the_next_operation_when_its_own_bound_exceeds_remaining_ceiling():
     calls = []
 
     class Responses:
@@ -459,11 +431,10 @@ def test_budgeted_client_enforces_stage_budget_before_a_paid_call():
             calls.append(request)
             return SimpleNamespace(usage=None, output=())
 
-    ledger = SpendLedger(20.0, CONSERVATIVE_SOL_PRICING)
-    ledger.set_stage_limits({"extraction": 0.01})
+    ledger = SpendLedger(30.0, CONSERVATIVE_SOL_PRICING, prior_spend_usd=29.99)
     client = BudgetedOpenAIClient(SimpleNamespace(responses=Responses()), ledger)
 
-    with pytest.raises(RuntimeError, match="extraction stage budget"):
+    with pytest.raises(RuntimeError, match="spend ceiling"):
         client.responses.create(
             model="gpt-5.6-sol",
             instructions="Prompt version: source-extraction-v1",
@@ -471,6 +442,41 @@ def test_budgeted_client_enforces_stage_budget_before_a_paid_call():
         )
 
     assert calls == []
+
+
+def test_actual_cheap_call_releases_its_unused_reservation_for_the_next_call():
+    ledger = SpendLedger(1.0, CONSERVATIVE_SOL_PRICING)
+
+    first = ledger.reserve("extraction", 0.9)
+    ledger.settle(first, stage="extraction", actual_cost_usd=0.01)
+    second = ledger.reserve("validation", 0.9)
+
+    assert ledger.spent_usd == pytest.approx(0.01)
+    ledger.settle(second, stage="validation", actual_cost_usd=0.01)
+    assert ledger.spent_usd == pytest.approx(0.02)
+
+
+def test_multiple_incrementally_bounded_calls_proceed_but_an_expensive_later_call_stops_safely():
+    ledger = SpendLedger(30.0, CONSERVATIVE_SOL_PRICING, prior_spend_usd=29.0)
+    for stage in ("extraction", "validation", "validation"):
+        ticket = ledger.reserve(stage, 0.5)
+        ledger.settle(ticket, stage=stage, actual_cost_usd=0.1)
+
+    with pytest.raises(RuntimeError, match="spend ceiling"):
+        ledger.reserve("synthesis", 0.8)
+
+    assert ledger.spent_usd == pytest.approx(29.3)
+    assert ledger.spent_usd <= HARD_SPEND_CEILING_USD
+
+
+def test_unknown_cost_nonresponses_operation_is_rejected_before_it_can_call_the_provider():
+    client = BudgetedOpenAIClient(
+        SimpleNamespace(responses=SimpleNamespace(), vector_stores=SimpleNamespace()),
+        SpendLedger(30.0, CONSERVATIVE_SOL_PRICING),
+    )
+
+    with pytest.raises(RuntimeError, match="no defensible per-operation upper bound"):
+        _ = client.vector_stores
 
 
 def test_execute_rejects_stale_pricing_before_any_paid_client(tmp_path, monkeypatch):
