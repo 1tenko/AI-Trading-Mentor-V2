@@ -410,11 +410,11 @@ def test_budgeted_client_records_transport_versions_and_conservatively_charges_u
 
 
 def test_spend_ledger_counts_a_prior_gate1_run_against_the_same_hard_ceiling():
-    assert GATE1_PRIOR_SPEND_USD == pytest.approx(9.979610)
+    assert GATE1_PRIOR_SPEND_USD == pytest.approx(11.597070)
     assert HARD_SPEND_CEILING_USD == pytest.approx(30.0)
     ledger = SpendLedger(HARD_SPEND_CEILING_USD, CONSERVATIVE_SOL_PRICING, prior_spend_usd=GATE1_PRIOR_SPEND_USD)
 
-    assert ledger.spent_usd == pytest.approx(9.979610)
+    assert ledger.spent_usd == pytest.approx(11.597070)
     with pytest.raises(RuntimeError, match="spend ceiling"):
         ledger.ensure("extraction", 21.497631)
 

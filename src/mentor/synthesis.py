@@ -37,13 +37,20 @@ MAX_ALIASES = 8
 MAX_SCOPE_LENGTH = 160
 MAX_CONDITION_LENGTH = 160
 MAX_JUSTIFICATION_LENGTH = 280
-SYNTHESIS_PROMPT_VERSION = "cross-source-synthesis-v7"
-SYNTHESIS_SCHEMA_VERSION = "cross-source-synthesis-schema-v8"
+SYNTHESIS_PROMPT_VERSION = "cross-source-synthesis-v8"
+SYNTHESIS_SCHEMA_VERSION = "cross-source-synthesis-schema-v9"
 SOL_MODEL = "gpt-5.6-sol"
 MAX_SYNTHESIS_RECORDS_PER_CALL = 64
 MAX_SYNTHESIS_RECORDS_PER_CANDIDATE = 4_096
 MAX_RECONCILIATION_CALLS = 1_024
 MAX_SYNTHESIS_ANCHORS = MAX_SYNTHESIS_RECORDS_PER_CALL * 8
+_REJECTABLE_EVOLUTION_EVIDENCE_ERRORS = frozenset({
+    "introduced classifications require source asserted absence",
+    "supported evolution classifications require positive or coverage evidence",
+    "not-found evidence cannot support an evolution classification",
+    "deprecated classifications require direct deprecation evidence",
+    "evolution negative claim wording requires supporting classification and evidence",
+})
 
 
 _SYNTHESIS_ID_SCHEMA = {
@@ -108,6 +115,46 @@ def _synthesis_family_schema(family: str, **properties: object) -> dict[str, obj
     }
 
 
+def _synthesis_evolution_schemas() -> tuple[dict[str, object], ...]:
+    """Keep deterministic evolution evidence rules visible at the model boundary."""
+    properties = {
+        "subject": _SYNTHESIS_OCCURRENCE_SCHEMA,
+        "previous": _SYNTHESIS_OCCURRENCE_SCHEMA,
+        "current": _SYNTHESIS_OCCURRENCE_SCHEMA,
+        "earlier_source_set": _SYNTHESIS_INPUT_IDS_SCHEMA | {"minItems": 1},
+        "later_source_set": _SYNTHESIS_INPUT_IDS_SCHEMA | {"minItems": 1},
+        "competing_anchors": _SYNTHESIS_ANCHORS_SCHEMA | {"minItems": 0},
+        "deprecation_evidence_anchors": _SYNTHESIS_ANCHORS_SCHEMA | {"minItems": 0},
+    }
+    def legal_variant(
+        classifications: list[str], evidence_states: list[str], *, requires_deprecation_anchor: bool = False
+    ) -> dict[str, object]:
+        return _synthesis_family_schema("evolution", **(properties | {
+            "classification": {"enum": classifications},
+            "negative_evidence_state": {"enum": evidence_states},
+            "deprecation_evidence_anchors": (
+                _SYNTHESIS_ANCHORS_SCHEMA if requires_deprecation_anchor
+                else properties["deprecation_evidence_anchors"]
+            ),
+        }))
+
+    return (
+        legal_variant(["introduced"], ["source_asserted_absence"]),
+        legal_variant(
+            ["repeated", "refined", "expanded", "reframed"],
+            ["positive_teaching", "coverage_supported_synthesis"],
+        ),
+        legal_variant(
+            ["apparently_contradictory", "uncertain_chronology", "no_supported_classification"],
+            sorted(NEGATIVE_EVIDENCE_STATES),
+        ),
+        legal_variant(
+            ["deprecated_or_deemphasized"], ["positive_teaching"],
+            requires_deprecation_anchor=True,
+        ),
+    )
+
+
 SYNTHESIS_RESPONSE_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
@@ -147,18 +194,7 @@ SYNTHESIS_RESPONSE_SCHEMA = {
                             },
                         },
                     ),
-                    _synthesis_family_schema(
-                        "evolution",
-                        subject=_SYNTHESIS_OCCURRENCE_SCHEMA,
-                        previous=_SYNTHESIS_OCCURRENCE_SCHEMA,
-                        current=_SYNTHESIS_OCCURRENCE_SCHEMA,
-                        earlier_source_set=_SYNTHESIS_INPUT_IDS_SCHEMA | {"minItems": 1},
-                        later_source_set=_SYNTHESIS_INPUT_IDS_SCHEMA | {"minItems": 1},
-                        classification={"enum": sorted(EVOLUTION_CLASSIFICATIONS)},
-                        negative_evidence_state={"enum": sorted(NEGATIVE_EVIDENCE_STATES)},
-                        competing_anchors=_SYNTHESIS_ANCHORS_SCHEMA | {"minItems": 0},
-                        deprecation_evidence_anchors=_SYNTHESIS_ANCHORS_SCHEMA | {"minItems": 0},
-                    ),
+                    *_synthesis_evolution_schemas(),
                     _synthesis_family_schema(
                         "conflict_unresolved",
                         kind={"enum": ["conflict", "unresolved"]},
@@ -221,6 +257,27 @@ class _ClusterSummary:
 
 
 @dataclass(frozen=True)
+class SynthesisAdmissionAudit:
+    """Aggregate-only accounting; individual rejected payloads stay private."""
+
+    proposed: int = 0
+    accepted: int = 0
+    rejected_evolution_evidence: int = 0
+    rejected_semantic_contract: int = 0
+    fatal_structural_failures: int = 0
+
+
+@dataclass(frozen=True)
+class SynthesisRecordRejection:
+    family: str
+    reason: str
+
+
+class _RejectedEvolutionConclusion(ValueError):
+    pass
+
+
+@dataclass(frozen=True)
 class SynthesisResult:
     records: tuple[DerivedRecord, ...]
     provenance: CompilerProvenance
@@ -228,6 +285,8 @@ class SynthesisResult:
     hints: tuple[Any, ...] = ()
     call_count: int = 0
     coverage: ReconciliationCoverage | None = None
+    admission_audit: SynthesisAdmissionAudit = SynthesisAdmissionAudit()
+    rejected_records: tuple[SynthesisRecordRejection, ...] = ()
 
 
 class SynthesisReconciler:
@@ -350,6 +409,8 @@ class SynthesisReconciler:
             record.record_id: record for record in (*record_values, *context_values)
         }
         hints: list[ConceptHint] = []
+        rejected_records: list[SynthesisRecordRejection] = []
+        proposed_count = accepted_count = rejected_evolution_count = 0
         usage = CallUsage()
         call_count = 0
 
@@ -432,18 +493,24 @@ class SynthesisReconciler:
                 },
             )
             output, legacy_hint_payloads = _synthesis_output(response, allow_synthetic=not self._live_mode)
-            parsed = tuple(
-                _synthesis_record(
-                    payload,
-                    snapshot_id=snapshot_id,
-                    provenance=self._provenance,
-                    records_by_id={record.record_id: record for record in batch},
-                    summary_records_by_id=summary_records_by_id,
-                    source_metadata=canonical_sources,
-                    allow_legacy=not self._live_mode,
-                )
-                for payload in output
-            )
+            nonlocal proposed_count, accepted_count, rejected_evolution_count
+            parsed: list[tuple[DerivedRecord, tuple[ConceptHint, ...]]] = []
+            for payload in output:
+                proposed_count += 1
+                try:
+                    parsed.append(_synthesis_record(
+                        payload,
+                        snapshot_id=snapshot_id,
+                        provenance=self._provenance,
+                        records_by_id={record.record_id: record for record in batch},
+                        summary_records_by_id=summary_records_by_id,
+                        source_metadata=canonical_sources,
+                        allow_legacy=not self._live_mode,
+                    ))
+                except _RejectedEvolutionConclusion as error:
+                    rejected_evolution_count += 1
+                    rejected_records.append(SynthesisRecordRejection("evolution", str(error)))
+            accepted_count += len(parsed)
             parsed_records = tuple(record for record, _hints in parsed)
             lineage_records_by_id = input_records_by_id | synthesized_by_id | {
                 record.record_id: record for record in parsed_records
@@ -511,7 +578,14 @@ class SynthesisReconciler:
             raise ValueError("reconciliation coverage is incomplete")
         return SynthesisResult(
             tuple(synthesized_by_id.values()), self._provenance, usage, tuple(hints),
-            call_count=call_count, coverage=coverage,
+            call_count=call_count,
+            coverage=coverage,
+            admission_audit=SynthesisAdmissionAudit(
+                proposed=proposed_count,
+                accepted=accepted_count,
+                rejected_evolution_evidence=rejected_evolution_count,
+            ),
+            rejected_records=tuple(rejected_records),
         )
 
 
@@ -656,26 +730,31 @@ def _synthesis_record(
         subject, subject_hint = _synthesis_occurrence(payload.get("subject"), "subject", allow_legacy=allow_legacy)
         previous, previous_hint = _synthesis_occurrence(payload.get("previous"), "previous", allow_legacy=allow_legacy)
         current, current_hint = _synthesis_occurrence(payload.get("current"), "current", allow_legacy=allow_legacy)
-        record = Evolution.create(
-            **(common | {"dependencies": dependencies}),
-            subject=subject,
-            previous=previous,
-            current=current,
-            earlier_source_set=earlier,
-            later_source_set=later,
-            classification=payload.get("classification"),
-            negative_evidence_state=payload.get("negative_evidence_state"),
-            competing_anchors=_optional_reference_ids(
-                payload, "competing_anchors", lineage_anchor_ids
-            ),
-            earlier_coverage_id=earlier_coverage[0],
-            later_coverage_id=later_coverage[0],
-            earlier_observed_years=earlier_coverage[1],
-            later_observed_years=later_coverage[1],
-            deprecation_evidence_anchors=_optional_reference_ids(
-                payload, "deprecation_evidence_anchors", lineage_anchor_ids
-            ),
-        )
+        try:
+            record = Evolution.create(
+                **(common | {"dependencies": dependencies}),
+                subject=subject,
+                previous=previous,
+                current=current,
+                earlier_source_set=earlier,
+                later_source_set=later,
+                classification=payload.get("classification"),
+                negative_evidence_state=payload.get("negative_evidence_state"),
+                competing_anchors=_optional_reference_ids(
+                    payload, "competing_anchors", lineage_anchor_ids
+                ),
+                earlier_coverage_id=earlier_coverage[0],
+                later_coverage_id=later_coverage[0],
+                earlier_observed_years=earlier_coverage[1],
+                later_observed_years=later_coverage[1],
+                deprecation_evidence_anchors=_optional_reference_ids(
+                    payload, "deprecation_evidence_anchors", lineage_anchor_ids
+                ),
+            )
+        except ValueError as error:
+            if str(error) not in _REJECTABLE_EVOLUTION_EVIDENCE_ERRORS:
+                raise
+            raise _RejectedEvolutionConclusion(str(error)) from error
         return record, _record_concept_hints(record, (subject_hint, previous_hint, current_hint))
     if family == "conflict_unresolved":
         fields = base_fields | {

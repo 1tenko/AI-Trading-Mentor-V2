@@ -47,6 +47,7 @@ from mentor.synthesis import (
     ConceptHint,
     ReconciliationSource,
     ReconciliationCoverage,
+    SynthesisAdmissionAudit,
     SynthesisCandidate,
     SynthesisResult,
     concept_hint_from_record_selector,
@@ -172,6 +173,7 @@ class CandidateBuildResult:
     excluded_record_ids: tuple[str, ...] = ()
     reconciliation_coverage: ReconciliationCoverage | None = None
     alias_audit: AliasAudit = AliasAudit()
+    synthesis_admission_audit: SynthesisAdmissionAudit = SynthesisAdmissionAudit()
 
 
 class CandidateCompiler:
@@ -460,6 +462,7 @@ class CandidateCompiler:
         synthesized_count = 0
         synthesis_invoked = False
         synthesized: SynthesisResult | None = None
+        synthesis_admission_audit = SynthesisAdmissionAudit()
         hints: tuple[ConceptHint, ...] = reused_hints + tuple(extraction_hints)
         alias_audit = AliasAudit(
             rejected_semantically_unsupported=rejected_semantically_unsupported_aliases
@@ -530,6 +533,7 @@ class CandidateCompiler:
             if not isinstance(synthesized, SynthesisResult):
                 raise ValueError("synthesis stage must return SynthesisResult")
             synthesis_usage = synthesized.usage
+            synthesis_admission_audit = synthesized.admission_audit
             _validate_synthesis_result(
                 synthesized,
                 snapshot.snapshot_id,
@@ -609,6 +613,7 @@ class CandidateCompiler:
                 empty_derived,
                 excluded_record_ids,
                 alias_audit=alias_audit,
+                synthesis_admission_audit=synthesis_admission_audit,
             )
 
         try:
@@ -627,6 +632,7 @@ class CandidateCompiler:
                 empty_raw,
                 empty_derived,
                 alias_audit=alias_audit,
+                synthesis_admission_audit=synthesis_admission_audit,
             )
 
         setup_started = self._clock()
@@ -706,6 +712,7 @@ class CandidateCompiler:
                 empty_raw,
                 empty_derived,
                 alias_audit=alias_audit,
+                synthesis_admission_audit=synthesis_admission_audit,
             )
 
         raw_started = self._clock()
@@ -777,6 +784,7 @@ class CandidateCompiler:
                 raw_artifact,
                 empty_derived,
                 alias_audit=alias_audit,
+                synthesis_admission_audit=synthesis_admission_audit,
             )
 
         derived_started = self._clock()
@@ -860,6 +868,7 @@ class CandidateCompiler:
                 raw_artifact,
                 derived_artifact,
                 alias_audit=alias_audit,
+                synthesis_admission_audit=synthesis_admission_audit,
             )
 
         snapshot = self._storage.transition_snapshot(snapshot.snapshot_id, "validating", transitioned_at=self._now())
@@ -880,6 +889,7 @@ class CandidateCompiler:
                 synthesized.coverage if isinstance(synthesized, SynthesisResult) else None
             ),
             alias_audit=alias_audit,
+            synthesis_admission_audit=synthesis_admission_audit,
         )
 
     def _preflight_live_pricing(self) -> None:
@@ -1128,6 +1138,7 @@ class CandidateCompiler:
         derived_artifact: RemoteArtifact,
         excluded_record_ids: tuple[str, ...] = (),
         alias_audit: AliasAudit = AliasAudit(),
+        synthesis_admission_audit: SynthesisAdmissionAudit = SynthesisAdmissionAudit(),
     ) -> CandidateBuildResult:
         snapshot_id = gate.snapshot_id if gate is not None else CorpusSnapshot.identity_for(
             request.run.run_id,
@@ -1166,6 +1177,7 @@ class CandidateCompiler:
             tuple(failures),
             excluded_record_ids,
             alias_audit=alias_audit,
+            synthesis_admission_audit=synthesis_admission_audit,
         )
 
     def _existing_failed_result(

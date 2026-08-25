@@ -19,6 +19,7 @@ from mentor.synthesis import (
     ConceptHint,
     ProcedureBranch,
     ReconciliationSource,
+    SynthesisAdmissionAudit,
     SynthesisCandidate,
     SynthesisReconciler,
     SYNTHESIS_RESPONSE_SCHEMA,
@@ -117,6 +118,216 @@ def reconciliation_source(revision_id: str, *, year: int) -> ReconciliationSourc
         year=year,
         original_filename=f"{revision_id}.txt",
     )
+
+
+def evolution_payload(
+    earlier: Claim,
+    later: Claim,
+    *,
+    classification: str = "refined",
+    negative_evidence_state: str = "positive_teaching",
+    qualification: str = "Synthetic bounded evolution.",
+) -> dict[str, object]:
+    return {
+        "family": "evolution",
+        "qualification": qualification,
+        "anchors": [*earlier.anchors, *later.anchors],
+        "input_record_ids": [earlier.record_id, later.record_id],
+        "input_conclusion_ids": [],
+        "source_revision_ids": ["rev_earlier", "rev_later"],
+        "subject": synthesis_occurrence("Synthetic concept"),
+        "previous": synthesis_occurrence("Earlier form"),
+        "current": synthesis_occurrence("Later form"),
+        "earlier_source_set": ["rev_earlier"],
+        "later_source_set": ["rev_later"],
+        "classification": classification,
+        "negative_evidence_state": negative_evidence_state,
+        "competing_anchors": [],
+        "deprecation_evidence_anchors": [],
+    }
+
+
+def synthesize_payload(records: list[dict[str, object]], first: Claim, second: Claim):
+    return SynthesisReconciler(
+        SimpleNamespace(responses=RecordingResponses(lambda _request: {"records": records}))
+    ).synthesize(
+        snapshot_id=SNAPSHOT_ID,
+        records=(first, second),
+        revisions=(SimpleNamespace(revision_id="rev_earlier"), SimpleNamespace(revision_id="rev_later")),
+        source_metadata=(
+            reconciliation_source("rev_earlier", year=2025),
+            reconciliation_source("rev_later", year=2026),
+        ),
+        anchor_spans={first.anchors[0]: "earlier span", second.anchors[0]: "later span"},
+    )
+
+
+def test_isolated_negative_evidence_evolution_is_rejected_without_losing_valid_sibling():
+    first = claim(
+        subject="Earlier", anchors=("anc_earlier",),
+        dependencies=(RecordDependency("source_revision", "rev_earlier"),),
+    )
+    second = claim(
+        subject="Later", anchors=("anc_later",),
+        dependencies=(RecordDependency("source_revision", "rev_later"),),
+    )
+    valid = {
+        "family": "relationship",
+        "qualification": "Synthetic relationship.",
+        "anchors": ["anc_earlier", "anc_later"],
+        "input_record_ids": [first.record_id, second.record_id],
+        "input_conclusion_ids": [],
+        "source_revision_ids": ["rev_earlier", "rev_later"],
+        "left": synthesis_occurrence("Earlier"),
+        "relation": "supports",
+        "right": synthesis_occurrence("Later"),
+    }
+    rejected = evolution_payload(
+        first, second,
+        qualification="Later teaching expands the topic; no deprecation is stated.",
+        classification="expanded",
+    )
+
+    result = synthesize_payload([valid, rejected], first, second)
+
+    assert len(result.records) == 1
+    assert result.records[0].family == "relationship"
+    assert result.hints and {hint.record_id for hint in result.hints} == {result.records[0].record_id}
+    assert result.admission_audit == SynthesisAdmissionAudit(
+        proposed=2, accepted=1, rejected_evolution_evidence=1
+    )
+
+
+@pytest.mark.parametrize(
+    "classification,evidence,qualification",
+    [
+        ("introduced", "not_found_in_observed_evidence", "The topic is new and absent earlier."),
+        ("refined", "positive_teaching", "The topic was never taught before."),
+        ("deprecated_or_deemphasized", "positive_teaching", "The prior teaching was removed."),
+    ],
+)
+def test_unsupported_evolution_negative_claims_are_rejected_individually(
+    classification, evidence, qualification,
+):
+    first = claim(
+        subject="Earlier", anchors=("anc_earlier",),
+        dependencies=(RecordDependency("source_revision", "rev_earlier"),),
+    )
+    second = claim(
+        subject="Later", anchors=("anc_later",),
+        dependencies=(RecordDependency("source_revision", "rev_later"),),
+    )
+
+    result = synthesize_payload(
+        [evolution_payload(
+            first, second, classification=classification,
+            negative_evidence_state=evidence, qualification=qualification,
+        )],
+        first,
+        second,
+    )
+
+    assert result.records == ()
+    assert result.hints == ()
+    assert result.admission_audit == SynthesisAdmissionAudit(
+        proposed=1, rejected_evolution_evidence=1
+    )
+
+
+def test_synthesis_reference_error_remains_fatal_not_a_record_rejection():
+    first = claim(
+        subject="Earlier", anchors=("anc_earlier",),
+        dependencies=(RecordDependency("source_revision", "rev_earlier"),),
+    )
+    second = claim(
+        subject="Later", anchors=("anc_later",),
+        dependencies=(RecordDependency("source_revision", "rev_later"),),
+    )
+    malformed = evolution_payload(first, second)
+    malformed["anchors"] = ["anc_missing"]
+
+    with pytest.raises(ValueError, match="synthesis anchors"):
+        synthesize_payload([malformed], first, second)
+
+
+def test_rejected_evolution_never_becomes_a_higher_round_summary_conclusion():
+    records = tuple(
+        claim(
+            subject=f"Input {index}", anchors=(f"anc_{index}",),
+            dependencies=(RecordDependency("source_revision", f"rev_{index}"),),
+        )
+        for index in range(3)
+    )
+    reduction_summaries = []
+
+    def response(request):
+        batch = request["reconciliation_batch"]["kind"]
+        if batch.startswith("hierarchical"):
+            reduction_summaries.extend(request["prior_cluster_summaries"])
+            return {"records": []}
+        batch_records = request["records"]
+        if len(batch_records) != 2:
+            return {"records": []}
+        first, second = batch_records
+        return {"records": [
+            {
+                "family": "relationship",
+                "qualification": "Synthetic sibling conclusion.",
+                "anchors": [first["anchors"][0]],
+                "input_record_ids": [first["record_id"]],
+                "input_conclusion_ids": [],
+                "source_revision_ids": [first["dependencies"][0]["identifier"]],
+                "left": synthesis_occurrence(first["subject"]),
+                "relation": "supports",
+                "right": synthesis_occurrence("Surviving conclusion"),
+            },
+            {
+                "family": "evolution",
+                "qualification": "Later teaching is new and absent earlier.",
+                "anchors": [item["anchors"][0] for item in batch_records],
+                "input_record_ids": [item["record_id"] for item in batch_records],
+                "input_conclusion_ids": [],
+                "source_revision_ids": [item["dependencies"][0]["identifier"] for item in batch_records],
+                "subject": synthesis_occurrence("Rejected evolution"),
+                "previous": synthesis_occurrence("Earlier"),
+                "current": synthesis_occurrence("Later"),
+                "earlier_source_set": [first["dependencies"][0]["identifier"]],
+                "later_source_set": [second["dependencies"][0]["identifier"]],
+                "classification": "introduced",
+                "negative_evidence_state": "not_found_in_observed_evidence",
+                "competing_anchors": [],
+                "deprecation_evidence_anchors": [],
+            },
+        ]}
+
+    result = SynthesisReconciler(
+        SimpleNamespace(responses=RecordingResponses(response)), max_records_per_call=2
+    ).synthesize(
+        snapshot_id=SNAPSHOT_ID,
+        records=records,
+        revisions=tuple(SimpleNamespace(revision_id=f"rev_{index}") for index in range(3)),
+        source_metadata=tuple(reconciliation_source(f"rev_{index}", year=2025) for index in range(3)),
+        anchor_spans={f"anc_{index}": "synthetic span" for index in range(3)},
+    )
+
+    assert result.admission_audit.rejected_evolution_evidence == 1
+    assert all("Rejected evolution" not in conclusion["statement"]
+               for summary in reduction_summaries for conclusion in summary["conclusions"])
+    assert all("Rejected evolution" not in hint.label for hint in result.hints)
+
+
+def test_synthesis_schema_encodes_evolution_evidence_matrix():
+    legal_variants = [
+        schema for schema in SYNTHESIS_RESPONSE_SCHEMA["properties"]["records"]["items"]["anyOf"]
+        if schema["properties"]["family"]["enum"] == ["evolution"]
+    ]
+    assert len(legal_variants) == 4
+    deprecated = next(
+        item for item in legal_variants
+        if item["properties"]["classification"]["enum"] == ["deprecated_or_deemphasized"]
+    )
+    assert deprecated["properties"]["negative_evidence_state"] == {"enum": ["positive_teaching"]}
+    assert deprecated["properties"]["deprecation_evidence_anchors"]["minItems"] == 1
 
 
 def test_synthesis_response_schema_is_a_closed_typed_union_under_the_openai_strict_contract():

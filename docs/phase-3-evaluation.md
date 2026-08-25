@@ -385,3 +385,28 @@ The run stopped without an automatic repair or rerun. A future explicit
 authorization must decide whether to harden the alias/concept-integrity
 contract and how to establish a bounded remote-storage policy before the pilot
 can progress beyond readiness.
+
+## Gate 1 evolution-admission hardening
+
+The subsequent isolated candidate completed six extraction calls, produced 69
+extracted candidates and 60 validated records, then stopped on its first
+synthesis response. One evolution conclusion used unsupported negative wording
+while otherwise classifying the teaching as an expansion. The deterministic
+evolution validator correctly rejected that conclusion; the former synthesis
+parser, however, treated one isolated semantic overclaim as a terminal batch
+failure.
+
+The synthesis contract now admits records individually only for the five
+existing evolution evidence-rule failures. It excludes the rejected conclusion
+and its hints from later synthesis, concepts, storage, and orientation. Schema,
+anchor, lineage, source-revision, ownership, chronology, and other structural
+errors remain terminal. The model-facing schema and instructions now mirror the
+legal evolution evidence matrix, while deterministic wording validation remains
+authoritative.
+
+An ignored, zero-network replay of the retained response admitted three valid
+sibling conclusions and rejected the one invalid evolution conclusion. The
+existing 83-record downstream pilot replay also retained valid lineage and
+bounded orientation retrieval. The updated cumulative Gate 1 spend baseline is
+`$11.597070` against the unchanged `$30.00` ceiling; no new paid call was made
+by this hardening work.

@@ -43,7 +43,7 @@ APPROVED_GATE1_MANIFEST_SHA256 = "3798d537cd486f782449d9833b5fc06dd28fa93aed4564
 # Standard short-context rates are deliberately higher than the current model-page promotion.
 CONSERVATIVE_SOL_PRICING = TokenPricing(5.0, 30.0, 30.0)
 HARD_SPEND_CEILING_USD = 30.0
-GATE1_PRIOR_SPEND_USD = 9.979610
+GATE1_PRIOR_SPEND_USD = 11.597070
 _PRICING_MAX_AGE_DAYS = 7
 _MAX_OUTPUT_TOKENS_BY_STAGE = {
     "extraction": EXTRACTION_RETRY_MAX_OUTPUT_TOKENS,
@@ -705,6 +705,9 @@ def _build_summary(build: Any) -> dict[str, Any]:
         "total_metric": _json_value(getattr(build, "total_metric", None)),
         "raw_artifact": _json_value(getattr(build, "raw_artifact", None)),
         "derived_artifact": _json_value(getattr(build, "derived_artifact", None)),
+        "synthesis_admission_audit": _json_value(
+            getattr(build, "synthesis_admission_audit", None)
+        ),
     }
 
 
