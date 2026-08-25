@@ -362,3 +362,26 @@ their ongoing storage charge has no bounded per-operation lifetime under the
 current pilot retention policy, so the runner refuses them before provider
 access. This preserves the hard ceiling; a separate approved storage-retention
 and cost-bound policy is required before the pilot can create remote stores.
+
+## Incremental-guard six-source rerun
+
+The authorized fresh isolated rerun passed the first-call admission check and
+spent `$1.322180`, bringing cumulative Gate 1 R&D spend to `$11.301790` with
+`$18.698210` remaining. It made six extraction calls (no output-budget retry)
+and 57 validation calls. Measured stage cost was `$0.657530` for extraction and
+`$0.664650` for validation. No synthesis, orientation, Mentor comparison,
+publication, vector store, uploaded file, or production mutation occurred.
+
+The candidate stopped at the normal readiness gate because one 2026 Asset
+Synchronization extraction emitted aliases that did not satisfy the existing
+unique-resolution rule. This is a deterministic compiler-contract defect that
+the prior replay/tests did not cover, not an output-budget failure, paid-service
+failure, or cost-ceiling stop. The partial candidate remains private and
+unpublished, with 50 validated records (22 claims, 21 procedures/sequences/
+hierarchies, and 7 relationships). No semantic quality or Phase 2-versus-Phase
+3 conclusion is valid from this failed candidate.
+
+The run stopped without an automatic repair or rerun. A future explicit
+authorization must decide whether to harden the alias/concept-integrity
+contract and how to establish a bounded remote-storage policy before the pilot
+can progress beyond readiness.
