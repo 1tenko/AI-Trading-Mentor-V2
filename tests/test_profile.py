@@ -2,7 +2,13 @@ from dataclasses import replace
 
 import pytest
 
-from mentor.profile import ProfileService, ProfileValidationError, select_profile_context
+from mentor.profile import (
+    QUESTIONNAIRE_FIELDS,
+    ProfileService,
+    ProfileValidationError,
+    select_profile_context,
+    strategy_profile_context,
+)
 from mentor.storage import Storage
 
 
@@ -570,3 +576,61 @@ def test_profile_selector_does_not_treat_general_trading_advice_as_an_execution_
     )
 
     assert select_profile_context("Give me general trading advice.", [market, session, risk]).item_ids == ()
+
+
+def test_questionnaire_has_all_fixed_human_fields_and_never_exposes_schema_choices():
+    assert len(QUESTIONNAIRE_FIELDS) == 21
+    assert [field.key for field in QUESTIONNAIRE_FIELDS[:20]] == [f"q{number}" for number in range(1, 21)]
+    assert QUESTIONNAIRE_FIELDS[-1].key == "additional_information"
+    assert QUESTIONNAIRE_FIELDS[0].subject == "trading objective"
+    assert QUESTIONNAIRE_FIELDS[1].subject == "markets willing to trade"
+
+
+def test_questionnaire_batch_save_is_atomic_versioned_and_preserves_explicit_unknown(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    profile = ProfileService(storage)
+
+    saved = profile.save_questionnaire_answers({"q1": "Build steady income.", "q4": "idk", "q2": "ES"})
+
+    assert saved["q1"].value == "Build steady income."
+    assert saved["q4"].value == "idk"
+    assert profile.questionnaire_answers()["q4"].unknown is True
+    revised = profile.save_questionnaire_answers({"q1": "Pass a prop evaluation.", "q2": "NQ"})
+    assert revised["q1"].supersedes_item_id == saved["q1"].id
+    assert profile.questionnaire_answers()["q1"].item.value == "Pass a prop evaluation."
+    with pytest.raises(ProfileValidationError):
+        profile.save_questionnaire_answers({"q1": "x" * 501, "q3": "London open"})
+    assert profile.questionnaire_answers()["q3"] is None
+
+
+def test_questionnaire_blank_new_answer_is_absent_and_clearing_archives_current_answer(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    profile = ProfileService(storage)
+
+    assert profile.save_questionnaire_answers({"q5": "   "}) == {}
+    current = profile.save_questionnaire_answers({"q5": "20 minutes"})["q5"]
+    assert profile.save_questionnaire_answers({"q5": ""}) == {}
+    assert profile.questionnaire_answers()["q5"] is None
+    assert storage.profile_item(current.id).state == "archived"
+
+
+def test_strategy_profile_context_is_bounded_and_represents_unknowns_without_asserting_them(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    profile = ProfileService(storage)
+    profile.save_questionnaire_answers({
+        "q1": "Build a consistent strategy.",
+        "q2": "ES and NQ",
+        "q4": "I don't know",
+        "q13": "One percent maximum risk.",
+        "q19": "A simple repeatable system.",
+    })
+
+    context = strategy_profile_context(storage.current_confirmed_profile_items())
+
+    assert "Trader Strategy Profile" in context.context
+    assert "preferred trading style: User is currently unsure" in context.context
+    assert "I don't know" not in context.context
+    assert context.character_count <= 6000

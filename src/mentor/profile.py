@@ -7,6 +7,58 @@ from typing import Iterable
 from .storage import Storage, TraderProfileItem
 
 
+@dataclass(frozen=True)
+class QuestionnaireField:
+    key: str
+    section: str
+    question: str
+    helper: str
+    category: str
+    subject: str
+    kind: str
+    priority: int
+
+
+@dataclass(frozen=True)
+class QuestionnaireAnswer:
+    item: TraderProfileItem
+    unknown: bool
+
+
+@dataclass(frozen=True)
+class StrategyProfileSelection:
+    items: tuple[TraderProfileItem, ...]
+    context: str
+    character_count: int
+
+
+QUESTIONNAIRE_FIELDS = (
+    QuestionnaireField("q1", "Your goals", "What are you actually trying to achieve with trading?", "What would success look like for you?", "goals/research", "trading objective", "goal", 1),
+    QuestionnaireField("q2", "Your goals", "What markets are you willing or interested in trading?", "For example: ES, NQ, YM, GC, crypto, forex.", "markets/instruments", "markets willing to trade", "preference", 2),
+    QuestionnaireField("q3", "Your trading life", "When can you realistically be at the screen to trade?", "Which sessions or times work for you?", "schedule/horizon", "trading availability", "constraint", 3),
+    QuestionnaireField("q4", "Your trading life", "What kind of trader do you think you want to be?", "For example: scalper, intraday, swing trader.", "style/methodology", "preferred trading style", "preference", 4),
+    QuestionnaireField("q5", "Your trading life", "How long would you ideally like your trades to last?", "Seconds, minutes, hours, or longer. 'idk' is fine.", "schedule/horizon", "preferred holding duration", "preference", 5),
+    QuestionnaireField("q6", "Your trading life", "How many trades would you ideally like to take?", "Include how you feel about no-trade days.", "execution/risk/constraints", "preferred trade frequency", "preference", 12),
+    QuestionnaireField("q7", "How you like to trade", "How much discretion do you want in your strategy?", "Mechanical rules, some judgement, or highly discretionary.", "preferences/discretion", "discretion preference", "preference", 6),
+    QuestionnaireField("q8", "How you like to trade", "What do you think you are naturally good at in trading?", "'I don't know yet' is a valid answer.", "strengths/difficulties/principles", "trading strengths", "fact", 16),
+    QuestionnaireField("q9", "How you like to trade", "What tends to go wrong for you in trading?", "For example: overtrading, hesitation, impatience, or breaking risk rules.", "strengths/difficulties/principles", "recurring trading difficulties", "fact", 17),
+    QuestionnaireField("q10", "How you like to trade", "What trading concepts or models do you want your eventual strategy to draw from?", "List what you want to work with right now.", "style/methodology", "concepts/models to build from", "learning-state", 15),
+    QuestionnaireField("q11", "How you like to trade", "Which concepts do you currently trust most, and which are you still unsure about?", "It is fine if the answer is 'I don't know'.", "experience/learning", "trusted and uncertain concepts", "learning-state", 18),
+    QuestionnaireField("q12", "How you like to trade", "What does your ideal trade or setup look like?", "Describe the kind of trade you would like to take repeatedly.", "style/methodology", "ideal setup", "preference", 14),
+    QuestionnaireField("q13", "How you like to trade", "What risk or funding constraints should your strategy respect?", "For example: drawdown rules, risk per trade, daily loss limit.", "execution/risk/constraints", "risk and funding constraints", "constraint", 7),
+    QuestionnaireField("q14", "How you like to trade", "What matters most to you in a strategy?", "Think about win rate, reward:risk, simplicity, drawdown, or consistency.", "goals/research", "strategy priorities", "preference", 8),
+    QuestionnaireField("q15", "How you like to trade", "What are your absolute strategy deal-breakers?", "For example: too much screen time or overnight positions.", "execution/risk/constraints", "strategy deal-breakers", "constraint", 9),
+    QuestionnaireField("q16", "Your research process", "How much backtesting or data collection are you realistically willing to do?", "For example: manual replay, spreadsheets, or 30 examples at a time.", "goals/research", "backtesting commitment", "constraint", 13),
+    QuestionnaireField("q17", "Your research process", "What do you currently suspect might actually have an edge?", "This is an unproven hypothesis, not a fact.", "goals/research", "suspected edge", "learning-state", 19),
+    QuestionnaireField("q18", "Your research process", "What are you most confused or uncertain about right now?", "For example: setup focus, bias, or which variables matter.", "strengths/difficulties/principles", "current trading uncertainties", "learning-state", 11),
+    QuestionnaireField("q19", "Your ideal system", "If someone could design your perfect trading strategy tomorrow, what would it look like?", "Describe it without worrying whether it is realistic yet.", "style/methodology", "ideal strategy", "preference", 10),
+    QuestionnaireField("q20", "Your ideal system", "When there are trade-offs, what should the Mentor optimise around for you?", "For example: simplicity, consistency, mechanical rules, or fewer trades.", "strengths/difficulties/principles", "optimisation principles", "principle", 20),
+    QuestionnaireField("additional_information", "Additional information", "Anything else the Mentor should know about you as a trader?", "You can leave this blank.", "strengths/difficulties/principles", "additional trader context", "fact", 21),
+)
+QUESTIONNAIRE_BY_KEY = {field.key: field for field in QUESTIONNAIRE_FIELDS}
+_UNKNOWN_ANSWER = re.compile(r"^(idk|i\s*(do not|don't|dont)\s*know|not sure|unsure|not decided|haven'?t decided|have not decided)$", re.I)
+
+
 CATEGORIES = (
     "goals/research",
     "markets/instruments",
@@ -256,6 +308,41 @@ class ProfileService:
         self._item(item_id)
         return self.storage.delete_profile_item(item_id)
 
+    def questionnaire_answers(self) -> dict[str, QuestionnaireAnswer | None]:
+        current = {
+            (item.category, item.subject_key): item
+            for item in self.storage.current_confirmed_profile_items()
+        }
+        return {
+            field.key: (
+                None
+                if (item := current.get((field.category, _subject_key(field.subject)))) is None
+                else QuestionnaireAnswer(item, _is_unknown(item.value))
+            )
+            for field in QUESTIONNAIRE_FIELDS
+        }
+
+    def save_questionnaire_answers(self, answers: dict[str, str]) -> dict[str, TraderProfileItem]:
+        if not isinstance(answers, dict):
+            raise ProfileValidationError("questionnaire answers must be an object")
+        unknown = set(answers).difference(QUESTIONNAIRE_BY_KEY)
+        if unknown:
+            raise ProfileValidationError("unknown questionnaire field")
+        changes = []
+        for key, value in answers.items():
+            if not isinstance(value, str):
+                raise ProfileValidationError("questionnaire answers must be text")
+            field = QUESTIONNAIRE_BY_KEY[key]
+            normalized = value.strip()
+            if normalized:
+                _bounded_text("value", normalized, 500)
+            changes.append((field, normalized))
+        try:
+            saved = self.storage.save_questionnaire_answers(changes)
+        except (KeyError, ValueError) as error:
+            raise ProfileValidationError(str(error)) from error
+        return {key: item for key, item in saved.items()}
+
     def forget_item(
         self,
         *,
@@ -350,6 +437,35 @@ def select_profile_context(
         tuple(reasons),
         tuple(tiers),
     )
+
+
+def strategy_profile_context(confirmed_items: Iterable[TraderProfileItem]) -> StrategyProfileSelection:
+    """Render current questionnaire answers for an explicit strategy-design request."""
+    fields = {
+        (field.category, _subject_key(field.subject)): field
+        for field in QUESTIONNAIRE_FIELDS
+    }
+    pairs = [
+        (fields[(item.category, item.subject_key)], item)
+        for item in confirmed_items
+        if item.state == "confirmed" and (item.category, item.subject_key) in fields
+    ]
+    pairs.sort(key=lambda pair: (pair[0].priority, pair[0].key, pair[1].id))
+    lines = ["Trader Strategy Profile — user context, not source evidence:"]
+    selected: list[TraderProfileItem] = []
+    for field, item in pairs:
+        value = "User is currently unsure / has not decided." if _is_unknown(item.value) else item.value
+        line = f"- {field.subject}: {value}"
+        if len("\n".join([*lines, line])) > 6000:
+            continue
+        lines.append(line)
+        selected.append(item)
+    context = "\n".join(lines) if selected else ""
+    return StrategyProfileSelection(tuple(selected), context, len(context))
+
+
+def _is_unknown(value: str) -> bool:
+    return bool(_UNKNOWN_ANSWER.fullmatch(" ".join(value.casefold().split())))
 
 
 def _validate_item(

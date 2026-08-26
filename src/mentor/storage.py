@@ -519,6 +519,47 @@ class Storage:
             ).fetchall()
         return [_profile_item_from_row(row) for row in rows]
 
+    def save_questionnaire_answers(self, changes) -> dict[str, TraderProfileItem]:
+        """Apply validated fixed questionnaire fields as one local transaction."""
+        saved: dict[str, TraderProfileItem] = {}
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            for field, value in changes:
+                subject_key = _profile_subject_key(field.subject)
+                row = connection.execute(
+                    "SELECT id, category, subject_key, subject, value, kind, provenance, state, "
+                    "origin_kind, origin_thread_id, origin_turn_number, origin_available, "
+                    "supersedes_item_id FROM trader_profile_items "
+                    "WHERE category = ? AND subject_key = ? AND state = 'confirmed'",
+                    (field.category, subject_key),
+                ).fetchone()
+                current = None if row is None else _profile_item_from_row(row)
+                if not value:
+                    if current is not None:
+                        connection.execute("UPDATE trader_profile_items SET state = 'archived' WHERE id = ?", (current.id,))
+                    continue
+                if current is not None and current.value == value:
+                    saved[field.key] = current
+                    continue
+                if current is not None:
+                    connection.execute("UPDATE trader_profile_items SET state = 'superseded' WHERE id = ?", (current.id,))
+                saved[field.key] = self._insert_profile_item(
+                    connection,
+                    category=field.category,
+                    subject=field.subject,
+                    value=value,
+                    kind=field.kind,
+                    provenance="USER_STATED",
+                    state="confirmed",
+                    origin_kind="profile-editor",
+                    origin_thread_id=None,
+                    origin_turn_number=None,
+                    origin_available=None,
+                    supersedes_item_id=None if current is None else current.id,
+                    tool_call_id=None,
+                )
+        return saved
+
     def supersede_profile_item(
         self,
         item_id: int,
