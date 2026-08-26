@@ -130,6 +130,118 @@ def test_selected_profile_context_is_marked_on_only_the_new_request(tmp_path):
     assert all(marker not in json.dumps(item) for item in storage.replay_items(thread_id))
 
 
+def test_personalization_changes_only_bounded_profile_input_not_raw_source_configuration(tmp_path):
+    question = "What should I backtest first?"
+    requests = []
+    for market in ("ES", "NQ"):
+        storage = Storage(tmp_path / f"{market}.sqlite3")
+        storage.initialize()
+        storage.set_vector_store("vs_jacob")
+        ProfileService(storage).create_item(
+            category="markets/instruments",
+            subject="Primary market",
+            value=market,
+            kind="fact",
+            provenance="USER_STATED",
+            state="confirmed",
+            origin_kind="profile-editor",
+        )
+        responses = FakeResponses(SimpleNamespace(status="completed", output=[]))
+        ChatService(storage, SimpleNamespace(responses=responses)).reply(storage.create_thread("Question"), question)
+        requests.append(responses.calls[0])
+
+    profile_a, profile_b = requests
+    assert "Primary market: ES" in profile_a["instructions"]
+    assert "Primary market: NQ" in profile_b["instructions"]
+    assert profile_a["input"] == profile_b["input"]
+    assert profile_a["tools"] == profile_b["tools"]
+    assert profile_a["include"] == profile_b["include"]
+    assert profile_a["reasoning"] == profile_b["reasoning"]
+    assert profile_a["context_management"] == profile_b["context_management"]
+
+
+def test_current_profile_survives_cross_thread_then_old_chat_cannot_restore_deleted_or_superseded_values(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    storage.set_vector_store("vs_jacob")
+    profile = ProfileService(storage)
+    old_thread = storage.create_thread("Original profile statement")
+    original = profile.create_item(
+        category="markets/instruments",
+        subject="Primary market",
+        value="ES",
+        kind="fact",
+        provenance="USER_STATED",
+        state="confirmed",
+        origin_kind="chat",
+        origin_thread_id=old_thread,
+        origin_turn_number=1,
+    )
+    storage.record_display_turn(
+        old_thread,
+        user_text="Remember that I only trade ES.",
+        answer_markdown="Saved.",
+        citations=[],
+        evidence=[],
+        diagnostics=None,
+        response_id=None,
+        status="completed",
+        incomplete_reason=None,
+        profile_update={"kind": "saved"},
+    )
+    replacement = profile.supersede_item(
+        original.id, value="NQ", provenance="USER_DECISION", origin_kind="profile-editor"
+    )
+    responses = SequenceResponses(
+        SimpleNamespace(status="completed", output=[]),
+        SimpleNamespace(status="completed", output=[]),
+    )
+    service = ChatService(storage, SimpleNamespace(responses=responses))
+
+    service.reply(storage.create_thread("Cross-thread question"), "What market should I backtest first?")
+    assert "Primary market: NQ" in responses.calls[0]["instructions"]
+    assert "Primary market: ES" not in responses.calls[0]["instructions"]
+
+    assert profile.delete_item(replacement.id) is True
+    service.reply(old_thread, "What market should I backtest first?")
+
+    assert storage.display_turns(old_thread)[0]["user_text"] == "Remember that I only trade ES."
+    assert "Trader Profile — user context" not in responses.calls[1]["instructions"]
+    assert storage.current_confirmed_profile_items() == []
+
+
+def test_profile_held_source_attribution_cannot_bypass_raw_source_lookup_or_citations(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    storage.set_vector_store("vs_jacob")
+    ProfileService(storage).create_item(
+        category="style/methodology",
+        subject="Methodology",
+        value="Jacob teaches that Asset Synchronization guarantees direction.",
+        kind="preference",
+        provenance="USER_STATED",
+        state="confirmed",
+        origin_kind="profile-editor",
+    )
+    responses = FakeResponses(
+        source_response(
+            "Direct source teaching: Jacob discusses Asset Synchronization.",
+            [{"type": "file_citation", "file_id": "file_jacob", "filename": "lesson.txt"}],
+        )
+    )
+
+    answer = ChatService(storage, SimpleNamespace(responses=responses)).reply(
+        storage.create_thread("Source lookup"), "What does Jacob say about Asset Synchronization?"
+    )
+
+    request = responses.calls[0]
+    assert "Trader Profile — user context" not in request["instructions"]
+    assert "guarantees direction" not in request["instructions"]
+    assert request["tools"][0]["type"] == "file_search"
+    assert request["tools"][0]["vector_store_ids"] == ["vs_jacob"]
+    assert [citation.file_id for citation in answer.citations] == ["file_jacob"]
+
+
 def test_explicit_profile_tool_call_writes_once_then_uses_one_terminal_continuation(tmp_path):
     storage = Storage(tmp_path / "mentor.sqlite3")
     storage.initialize()

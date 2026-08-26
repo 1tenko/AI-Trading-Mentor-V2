@@ -50,9 +50,9 @@ not part of this branch.
 
 ### Checkpoint A — Profile foundation
 
-- [ ] Cross-thread relevant context works; irrelevant context stays out.
-- [ ] Edit/delete/supersede/conflict changes active context deterministically.
-- [ ] Full pytest passes; Phase 2 boundaries remain intact.
+- [x] Cross-thread relevant context works; irrelevant context stays out.
+- [x] Edit/delete/supersede/conflict changes active context deterministically.
+- [x] Full pytest passes; Phase 2 boundaries remain intact.
 
 ## profile-ui
 
@@ -70,14 +70,14 @@ not part of this branch.
 
 ### Checkpoint B — User-controlled personalisation
 
-- [ ] Profile is inspectable/editable/deletable and remains local.
-- [ ] Deleted/superseded/inferred records do not influence later prompts or
+- [x] Profile is inspectable/editable/deletable and remains local.
+- [x] Deleted/superseded/inferred records do not influence later prompts or
   cause historic chat/replay statements to become current profile truth.
-- [ ] Direct source teaching still needs native raw citations.
+- [x] Direct source teaching still needs native raw citations.
 
 ## profile-evaluation
 
-- [ ] **Task 7 — Deterministic Phase 4 regression suite**
+- [x] **Task 7 — Deterministic Phase 4 regression suite**
   - Acceptance: profile lifecycle, relevance, provenance, source authority,
     context budget, thread boundary, and Phase 2 regressions are covered.
   - Verify: full pytest, browser smoke, diff/secret review; no paid calls.
