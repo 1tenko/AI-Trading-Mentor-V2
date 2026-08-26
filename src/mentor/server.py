@@ -10,6 +10,7 @@ from typing import Any
 from urllib.parse import unquote, urlparse
 
 from mentor.chat_service import Answer, EvaluationConfig, StreamEvent
+from mentor.profile import ProfileService, ProfileValidationError
 from mentor.storage import Storage
 
 LOGGER = logging.getLogger(__name__)
@@ -53,6 +54,12 @@ class _Handler(BaseHTTPRequestHandler):
                 {"threads": [thread.__dict__ for thread in self.storage.threads()]},
             )
             return
+        if path == "/api/profile":
+            groups = {"current": [], "tentative": [], "history": [], "conflicts": []}
+            for item in self.storage.profile_items():
+                groups[_profile_group(item.state)].append(_profile_item_json(item))
+            self._send_json(HTTPStatus.OK, groups)
+            return
         match = re.fullmatch(r"/api/threads/(\d+)", path)
         if match:
             thread = self.storage.thread(int(match.group(1)))
@@ -71,7 +78,18 @@ class _Handler(BaseHTTPRequestHandler):
         self._send_json(HTTPStatus.NOT_FOUND, {"error": "Not found."})
 
     def do_DELETE(self) -> None:  # noqa: N802
-        match = re.fullmatch(r"/api/threads/(\d+)", urlparse(self.path).path)
+        path = urlparse(self.path).path
+        profile_match = re.fullmatch(r"/api/profile/items/(\d+)", path)
+        if profile_match:
+            item_id = int(profile_match.group(1))
+            try:
+                ProfileService(self.storage).delete_item(item_id)
+            except ProfileValidationError:
+                self._send_json(HTTPStatus.NOT_FOUND, {"error": "Profile item not found."})
+                return
+            self._send_json(HTTPStatus.OK, {"deleted": True})
+            return
+        match = re.fullmatch(r"/api/threads/(\d+)", path)
         if match is None:
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "Not found."})
             return
@@ -88,6 +106,10 @@ class _Handler(BaseHTTPRequestHandler):
                 title = _title(body.get("title"))
                 thread_id = self.storage.create_thread(title)
                 self._send_json(HTTPStatus.CREATED, {"id": thread_id, "title": title})
+                return
+            if path == "/api/profile/items":
+                item = _create_profile_item(ProfileService(self.storage), body)
+                self._send_json(HTTPStatus.CREATED, {"item": _profile_item_json(item)})
                 return
             match = re.fullmatch(r"/api/threads/(\d+)/messages", path)
             if match:
@@ -110,6 +132,29 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "The mentor is unavailable."})
             return
         self._send_json(HTTPStatus.NOT_FOUND, {"error": "Not found."})
+
+    def do_PATCH(self) -> None:  # noqa: N802
+        match = re.fullmatch(r"/api/profile/items/(\d+)", urlparse(self.path).path)
+        if match is None:
+            self._send_json(HTTPStatus.NOT_FOUND, {"error": "Not found."})
+            return
+        item_id = int(match.group(1))
+        profile = ProfileService(self.storage)
+        try:
+            if self.storage.profile_item(item_id) is None:
+                self._send_json(HTTPStatus.NOT_FOUND, {"error": "Profile item not found."})
+                return
+            result = _update_profile_item(profile, item_id, self._json_body())
+        except ValueError as error:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
+            return
+        except Exception:
+            self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "The mentor is unavailable."})
+            return
+        if isinstance(result, int):
+            self._send_json(HTTPStatus.OK, {"updated": result})
+        else:
+            self._send_json(HTTPStatus.OK, {"item": _profile_item_json(result)})
 
     def _source(self, file_id: str) -> None:
         source = self.storage.source_for_file(file_id)
@@ -215,3 +260,103 @@ def _evaluation(value: object) -> EvaluationConfig:
     if not isinstance(effort, str) or not isinstance(mode, str) or not isinstance(research_depth, str):
         raise ValueError("Evaluation settings must be text.")
     return EvaluationConfig(effort, mode, research_depth)
+
+
+def _create_profile_item(profile: ProfileService, body: dict):
+    _only_fields(body, {"category", "subject", "value", "kind", "provenance"})
+    required = ("category", "subject", "value", "kind")
+    if any(field not in body for field in required):
+        raise ValueError("Profile category, subject, value, and kind are required.")
+    provenance = body.get("provenance", "USER_STATED")
+    if provenance not in {"USER_STATED", "USER_DECISION"}:
+        raise ValueError("Direct profile items must use USER_STATED or USER_DECISION provenance.")
+    return profile.create_item(
+        category=body["category"],
+        subject=body["subject"],
+        value=body["value"],
+        kind=body["kind"],
+        provenance=provenance,
+        state="confirmed",
+        origin_kind="profile-editor",
+    )
+
+
+def _update_profile_item(profile: ProfileService, item_id: int, body: dict):
+    action = body.get("action")
+    if not isinstance(action, str):
+        raise ValueError("Profile action must be text.")
+    if action == "edit":
+        _only_fields(body, {"action", "value", "provenance"})
+        if "value" not in body:
+            raise ValueError("Profile edit value is required.")
+        provenance = body.get("provenance", "USER_DECISION")
+        if provenance not in {"USER_STATED", "USER_DECISION"}:
+            raise ValueError("Profile edits must use USER_STATED or USER_DECISION provenance.")
+        return profile.supersede_item(
+            item_id,
+            value=body["value"],
+            provenance=provenance,
+            origin_kind="profile-editor",
+        )
+    if action == "confirm":
+        _only_fields(body, {"action"})
+        return profile.confirm_item(item_id, origin_kind="confirmation")
+    if action == "reject":
+        _only_fields(body, {"action"})
+        if profile.storage.profile_item(item_id).state != "tentative":
+            raise ProfileValidationError("only a tentative profile item can be rejected")
+        profile.archive_item(item_id)
+        return profile.storage.profile_item(item_id)
+    if action == "archive":
+        _only_fields(body, {"action"})
+        if profile.storage.profile_item(item_id).state != "confirmed":
+            raise ProfileValidationError("only a confirmed profile item can be archived")
+        profile.archive_item(item_id)
+        return profile.storage.profile_item(item_id)
+    if action == "conflict":
+        _only_fields(body, {"action", "item_ids"})
+        item_ids = body.get("item_ids")
+        if not isinstance(item_ids, list) or len(item_ids) < 2 or any(
+            not isinstance(candidate, int) or candidate <= 0 for candidate in item_ids
+        ):
+            raise ValueError("Conflict item_ids must contain at least two positive item ids.")
+        if item_id not in item_ids:
+            raise ValueError("Conflict item_ids must include the route profile item.")
+        return profile.conflict_items(item_ids)
+    if action == "resolve":
+        _only_fields(body, {"action"})
+        return profile.resolve_conflict(item_id)
+    raise ValueError("Unknown profile action.")
+
+
+def _only_fields(body: dict, allowed: set[str]) -> None:
+    unknown = set(body).difference(allowed)
+    if unknown:
+        raise ValueError("Unknown profile field.")
+
+
+def _profile_group(state: str) -> str:
+    if state == "confirmed":
+        return "current"
+    if state == "tentative":
+        return "tentative"
+    if state == "conflicting":
+        return "conflicts"
+    return "history"
+
+
+def _profile_item_json(item: Any) -> dict[str, object]:
+    return {
+        "id": item.id,
+        "category": item.category,
+        "subject": item.subject,
+        "value": item.value,
+        "kind": item.kind,
+        "provenance": item.provenance,
+        "state": item.state,
+        "origin_kind": item.origin_kind,
+        "origin_thread_id": item.origin_thread_id,
+        "origin_turn_number": item.origin_turn_number,
+        "origin_available": item.origin_available,
+        "supersedes_item_id": item.supersedes_item_id,
+    }

@@ -42,7 +42,7 @@ not part of this branch.
 
 ## profile-api
 
-- [ ] **Task 4 — Safe loopback Profile API**
+- [x] **Task 4 — Safe loopback Profile API**
   - Acceptance: local browser-safe projections and validated mutations; no raw
     replay/tool reasoning disclosure.
   - Verify: focused server tests and full pytest.

@@ -232,10 +232,25 @@ class ProfileService:
         return self.storage.archive_profile_item(item_id)
 
     def conflict_items(self, item_ids: Iterable[int]) -> int:
-        unique_ids = tuple(dict.fromkeys(item_ids))
-        for item_id in unique_ids:
-            self._item(item_id)
-        return self.storage.conflict_profile_items(list(unique_ids))
+        requested_ids = list(dict.fromkeys(item_ids))
+        try:
+            return self.storage.conflict_profile_items(requested_ids)
+        except ValueError as error:
+            raise ProfileValidationError(str(error)) from error
+
+    def resolve_conflict(self, item_id: int) -> TraderProfileItem:
+        """Make the user's explicitly chosen conflicting item current again."""
+        predecessor = self._item(item_id)
+        if predecessor.state != "conflicting":
+            raise ProfileValidationError("only a conflicting profile item can be resolved")
+        if self._current_for(predecessor.category, predecessor.subject):
+            raise ProfileValidationError("a confirmed record already exists for this subject")
+        return self.storage.supersede_profile_item(
+            item_id,
+            value=predecessor.value,
+            provenance="USER_DECISION",
+            origin_kind="confirmation",
+        )
 
     def delete_item(self, item_id: int) -> bool:
         self._item(item_id)

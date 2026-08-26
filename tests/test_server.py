@@ -3,6 +3,7 @@ import json
 import threading
 
 from mentor.chat_service import Answer, StreamEvent
+from mentor.profile import ProfileService
 from mentor.server import create_server
 from mentor.storage import Storage
 
@@ -286,6 +287,212 @@ def test_server_restores_only_safe_display_turns_and_permanently_deletes_one_thr
         assert storage.vector_store_id() == "vs_jacob"
         assert request(server, "DELETE", f"/api/threads/{thread_id}")[0] == 404
         assert request(server, "DELETE", "/api/threads/not-an-id")[0] == 404
+    finally:
+        server.shutdown()
+        worker.join()
+
+
+def test_profile_api_projects_safe_groups_and_applies_explicit_lifecycle_actions(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    profile = ProfileService(storage)
+    current = profile.create_item(
+        category="schedule/horizon",
+        subject="Available session",
+        value="London open",
+        kind="constraint",
+        provenance="USER_STATED",
+        state="confirmed",
+        origin_kind="profile-editor",
+    )
+    proposal = profile.propose_item(
+        category="goals/research",
+        subject="Research goal",
+        value="Study reversals",
+        kind="goal",
+        origin_kind="chat",
+    )
+    hidden_thread = storage.create_thread("Private profile origin")
+    storage.append_thread_items(
+        hidden_thread, [{"type": "reasoning", "encrypted_content": "never expose this"}]
+    )
+    server = create_server(storage, FakeChatService(), port=0)
+    worker = threading.Thread(target=server.serve_forever)
+    worker.start()
+    try:
+        status, _, body = request(server, "GET", "/api/profile")
+        payload = json.loads(body)
+        assert status == 200
+        assert [item["id"] for item in payload["current"]] == [current.id]
+        assert [item["id"] for item in payload["tentative"]] == [proposal.id]
+        assert payload["history"] == []
+        assert payload["conflicts"] == []
+        assert b"encrypted_content" not in body
+        assert b"never expose this" not in body
+
+        status, _, body = request(
+            server,
+            "POST",
+            "/api/profile/items",
+            b'{"category":"markets/instruments","subject":"Primary market","value":"ES","kind":"preference","provenance":"USER_DECISION"}',
+        )
+        created = json.loads(body)["item"]
+        assert status == 201
+        assert (created["state"], created["provenance"], created["origin_kind"]) == (
+            "confirmed",
+            "USER_DECISION",
+            "profile-editor",
+        )
+
+        status, _, body = request(
+            server,
+            "PATCH",
+            f"/api/profile/items/{current.id}",
+            b'{"action":"edit","value":"New York open","provenance":"USER_DECISION"}',
+        )
+        edited = json.loads(body)["item"]
+        assert status == 200
+        assert edited["supersedes_item_id"] == current.id
+        assert storage.profile_item(current.id).state == "superseded"
+
+        status, _, body = request(
+            server, "PATCH", f"/api/profile/items/{proposal.id}", b'{"action":"confirm"}'
+        )
+        assert status == 200
+        assert json.loads(body)["item"]["provenance"] == "USER_CONFIRMED"
+
+        rejected = profile.propose_item(
+            category="experience/learning",
+            subject="Learning state",
+            value="Needs more chart time",
+            kind="learning-state",
+            origin_kind="chat",
+        )
+        assert request(
+            server, "PATCH", f"/api/profile/items/{rejected.id}", b'{"action":"reject"}'
+        )[0] == 200
+        assert storage.profile_item(rejected.id).state == "archived"
+
+        conflict_first = profile.propose_item(
+            category="style/methodology",
+            subject="Entry style",
+            value="I prefer breakouts.",
+            kind="preference",
+            origin_kind="chat",
+        )
+        conflict_second = profile.propose_item(
+            category="style/methodology",
+            subject="Entry style",
+            value="I prefer mean reversion.",
+            kind="preference",
+            origin_kind="chat",
+        )
+
+        status, _, body = request(
+            server,
+            "PATCH",
+            f"/api/profile/items/{conflict_first.id}",
+            json.dumps({"action": "conflict", "item_ids": [conflict_first.id, conflict_second.id]}).encode(),
+        )
+        assert (status, json.loads(body)) == (200, {"updated": 2})
+        status, _, body = request(server, "GET", "/api/profile")
+        assert status == 200
+        assert {item["id"] for item in json.loads(body)["conflicts"]} == {conflict_first.id, conflict_second.id}
+        status, _, body = request(
+            server, "PATCH", f"/api/profile/items/{conflict_first.id}", b'{"action":"resolve"}'
+        )
+        resolved = json.loads(body)["item"]
+        assert (status, resolved["state"], resolved["provenance"], resolved["supersedes_item_id"]) == (
+            200,
+            "confirmed",
+            "USER_DECISION",
+            conflict_first.id,
+        )
+    finally:
+        server.shutdown()
+        worker.join()
+
+
+def test_profile_api_rejects_malformed_oversized_unknown_and_stale_mutations(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    item = ProfileService(storage).create_item(
+        category="execution/risk/constraints",
+        subject="Maximum risk",
+        value="One percent",
+        kind="constraint",
+        provenance="USER_STATED",
+        state="confirmed",
+        origin_kind="profile-editor",
+    )
+    server = create_server(storage, FakeChatService(), port=0)
+    worker = threading.Thread(target=server.serve_forever)
+    worker.start()
+    try:
+        assert request(server, "POST", "/api/profile/items", b"not json")[0] == 400
+        assert request(
+            server,
+            "POST",
+            "/api/profile/items",
+            b'{"category":"schedule/horizon","subject":"Risk","value":"One","kind":"constraint","state":"confirmed"}',
+        )[0] == 400
+        assert request(
+            server,
+            "POST",
+            "/api/profile/items",
+            b'{"category":"schedule/horizon","subject":"Risk","value":"One","kind":"constraint","provenance":"UNKNOWN"}',
+        )[0] == 400
+        assert request(
+            server,
+            "POST",
+            "/api/profile/items",
+            json.dumps(
+                {
+                    "category": "schedule/horizon",
+                    "subject": "Available session",
+                    "value": "x" * 501,
+                    "kind": "constraint",
+                }
+            ).encode(),
+        )[0] == 400
+        assert request(server, "PATCH", f"/api/profile/items/{item.id}", b'{"action":"unknown"}')[0] == 400
+        assert request(server, "PATCH", "/api/profile/items/999", b'{"action":"archive"}')[0] == 404
+        assert request(server, "PATCH", f"/api/profile/items/{item.id}", b'{"action":"archive"}')[0] == 200
+        status, _, body = request(server, "PATCH", f"/api/profile/items/{item.id}", b'{"action":"archive"}')
+        assert status == 400
+        assert b"confirmed" in body
+    finally:
+        server.shutdown()
+        worker.join()
+
+
+def test_profile_api_permanent_delete_does_not_cross_the_thread_boundary(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    thread_id = storage.create_thread("Origin")
+    item = ProfileService(storage).create_item(
+        category="schedule/horizon",
+        subject="Available session",
+        value="London open",
+        kind="constraint",
+        provenance="USER_STATED",
+        state="confirmed",
+        origin_kind="chat",
+        origin_thread_id=thread_id,
+        origin_turn_number=1,
+        origin_available=True,
+    )
+    server = create_server(storage, FakeChatService(), port=0)
+    worker = threading.Thread(target=server.serve_forever)
+    worker.start()
+    try:
+        assert request(server, "DELETE", f"/api/threads/{thread_id}")[0] == 200
+        status, _, body = request(server, "GET", "/api/profile")
+        assert status == 200
+        assert json.loads(body)["current"][0]["origin_available"] is False
+        assert request(server, "DELETE", f"/api/profile/items/{item.id}")[0] == 200
+        assert request(server, "GET", "/api/profile")[2] == b'{"current": [], "tentative": [], "history": [], "conflicts": []}'
+        assert request(server, "DELETE", f"/api/profile/items/{item.id}")[0] == 404
     finally:
         server.shutdown()
         worker.join()

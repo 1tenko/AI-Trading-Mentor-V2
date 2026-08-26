@@ -348,6 +348,51 @@ def test_storage_archives_conflicts_and_permanently_deletes_profile_items(tmp_pa
     assert storage.profile_item(first.id) is None
 
 
+def test_storage_rejects_invalid_conflict_sets_without_partial_state_changes(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    first = storage.create_profile_item(
+        category="style/methodology",
+        subject="Entry style",
+        value="I prefer breakouts.",
+        kind="preference",
+        provenance="AI_INFERRED",
+        state="tentative",
+        origin_kind="chat",
+    )
+    stale = storage.create_profile_item(
+        category="style/methodology",
+        subject="Entry style",
+        value="I previously used pullbacks.",
+        kind="preference",
+        provenance="AI_INFERRED",
+        state="archived",
+        origin_kind="chat",
+    )
+    different_subject = storage.create_profile_item(
+        category="style/methodology",
+        subject="Exit style",
+        value="I use fixed targets.",
+        kind="preference",
+        provenance="AI_INFERRED",
+        state="tentative",
+        origin_kind="chat",
+    )
+
+    for item_ids in (
+        [first.id, 999_999],
+        [first.id, stale.id],
+        [first.id, different_subject.id],
+    ):
+        with pytest.raises(ValueError):
+            storage.conflict_profile_items(item_ids)
+        assert [storage.profile_item(item.id).state for item in (first, stale, different_subject)] == [
+            "tentative",
+            "archived",
+            "tentative",
+        ]
+
+
 def test_storage_thread_deletion_keeps_profile_record_and_marks_its_origin_unavailable(tmp_path):
     storage = Storage(tmp_path / "mentor.sqlite3")
     storage.initialize()

@@ -502,6 +502,16 @@ class Storage:
             ).fetchall()
         return [_profile_item_from_row(row) for row in rows]
 
+    def profile_items(self) -> list[TraderProfileItem]:
+        """Return local profile records for the browser-safe profile projection."""
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT id, category, subject_key, subject, value, kind, provenance, state, "
+                "origin_kind, origin_thread_id, origin_turn_number, origin_available, "
+                "supersedes_item_id FROM trader_profile_items ORDER BY id"
+            ).fetchall()
+        return [_profile_item_from_row(row) for row in rows]
+
     def supersede_profile_item(
         self,
         item_id: int,
@@ -548,12 +558,31 @@ class Storage:
         return self._set_profile_state(item_id, "archived")
 
     def conflict_profile_items(self, item_ids: list[int]) -> int:
-        if not item_ids:
-            return 0
+        if len(item_ids) < 2:
+            raise ValueError("a conflict requires at least two distinct profile items")
         with self._connect() as connection:
-            cursor = connection.executemany(
-                "UPDATE trader_profile_items SET state = 'conflicting' WHERE id = ?",
-                [(item_id,) for item_id in item_ids],
+            connection.execute("BEGIN IMMEDIATE")
+            placeholders = ", ".join("?" for _ in item_ids)
+            rows = connection.execute(
+                "SELECT id, category, subject_key, state FROM trader_profile_items "
+                f"WHERE id IN ({placeholders})",
+                item_ids,
+            ).fetchall()
+            if len(rows) != len(item_ids):
+                raise ValueError("all conflicting profile items must exist and be distinct")
+            category, subject_key = rows[0][1:3]
+            if any(
+                row[3] not in ("confirmed", "tentative")
+                or row[1] != category
+                or row[2] != subject_key
+                for row in rows
+            ):
+                raise ValueError(
+                    "conflicting profile items must be current or tentative with the same category and subject"
+                )
+            cursor = connection.execute(
+                f"UPDATE trader_profile_items SET state = 'conflicting' WHERE id IN ({placeholders})",
+                item_ids,
             )
         return cursor.rowcount
 

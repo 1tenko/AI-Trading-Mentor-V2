@@ -114,6 +114,95 @@ def test_profile_service_confirms_only_a_tentative_inference_and_preserves_histo
         profile.confirm_item(confirmed.id, origin_kind="confirmation")
 
 
+def test_profile_service_conflict_requires_distinct_current_competitors_and_is_atomic(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    profile = ProfileService(storage)
+    first = profile.propose_item(
+        category="style/methodology",
+        subject="Entry style",
+        value="I prefer breakouts.",
+        kind="preference",
+        origin_kind="chat",
+    )
+    second = profile.propose_item(
+        category="style/methodology",
+        subject="Entry style",
+        value="I prefer mean reversion.",
+        kind="preference",
+        origin_kind="chat",
+    )
+    different_subject = profile.propose_item(
+        category="style/methodology",
+        subject="Exit style",
+        value="I use fixed targets.",
+        kind="preference",
+        origin_kind="chat",
+    )
+    different_category = profile.propose_item(
+        category="markets/instruments",
+        subject="Primary market",
+        value="I trade ES.",
+        kind="preference",
+        origin_kind="chat",
+    )
+    historical = profile.create_item(
+        category="schedule/horizon",
+        subject="Available session",
+        value="London open",
+        kind="constraint",
+        provenance="USER_STATED",
+        state="archived",
+        origin_kind="profile-editor",
+    )
+
+    for invalid_ids in (
+        [first.id, different_subject.id],
+        [first.id, different_category.id],
+        [first.id, historical.id],
+        [first.id, first.id],
+    ):
+        with pytest.raises(ProfileValidationError):
+            profile.conflict_items(invalid_ids)
+        assert [storage.profile_item(item.id).state for item in (first, second, different_subject, different_category, historical)] == [
+            "tentative",
+            "tentative",
+            "tentative",
+            "tentative",
+            "archived",
+        ]
+
+    assert profile.conflict_items([first.id, second.id]) == 2
+    assert [storage.profile_item(item.id).state for item in (first, second)] == [
+        "conflicting",
+        "conflicting",
+    ]
+
+
+def test_profile_service_defers_conflict_eligibility_to_atomic_storage(tmp_path, monkeypatch):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    profile = ProfileService(storage)
+    first = profile.propose_item(
+        category="style/methodology",
+        subject="Entry style",
+        value="I prefer breakouts.",
+        kind="preference",
+        origin_kind="chat",
+    )
+    second = profile.propose_item(
+        category="style/methodology",
+        subject="Entry style",
+        value="I prefer mean reversion.",
+        kind="preference",
+        origin_kind="chat",
+    )
+
+    monkeypatch.setattr(storage, "profile_item", lambda _item_id: pytest.fail("preflight read"))
+
+    assert profile.conflict_items([first.id, second.id]) == 2
+
+
 def test_profile_selection_uses_only_relevant_current_records_and_never_source_questions(tmp_path):
     storage = Storage(tmp_path / "mentor.sqlite3")
     storage.initialize()
