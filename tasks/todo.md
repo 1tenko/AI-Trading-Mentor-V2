@@ -56,7 +56,7 @@ not part of this branch.
 
 ## profile-ui
 
-- [ ] **Task 5 — Restrained static Trader Profile panel**
+- [x] **Task 5 — Restrained static Trader Profile panel**
   - Acceptance: grouped current items, separate tentative proposals, history,
     provenance, and explicit edit/confirm/reject/archive/delete controls.
   - Verify: static/server tests, full pytest, local desktop/mobile browser smoke.

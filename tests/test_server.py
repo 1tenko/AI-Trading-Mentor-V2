@@ -292,6 +292,50 @@ def test_server_restores_only_safe_display_turns_and_permanently_deletes_one_thr
         worker.join()
 
 
+def test_server_serves_the_accessible_local_trader_profile_panel(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    server = create_server(storage, FakeChatService(), port=0)
+    worker = threading.Thread(target=server.serve_forever)
+    worker.start()
+    try:
+        status, _, page = request(server, "GET", "/")
+        assert status == 200
+        assert b'id="profile-toggle"' in page
+        assert b'aria-controls="profile-panel"' in page
+        assert b'id="profile-panel"' in page
+        assert b'role="dialog"' in page
+        assert b'aria-modal="true"' in page
+        assert b'aria-labelledby="profile-title"' in page
+        assert b'id="profile-backdrop"' in page
+        assert b'id="profile-add-form"' in page
+        assert b"Needs confirmation" in page
+        assert b"Current profile" in page
+
+        status, _, script = request(server, "GET", "/app.js")
+        assert status == 200
+        assert b'profileRequest("/api/profile")' in script
+        assert b'profileRequest("/api/profile/items"' in script
+        assert b'method: "PATCH"' in script
+        assert b'method: "DELETE"' in script
+        assert b"Permanently delete" in script
+        assert b"profileClose.focus()" in script
+        assert b"event.key === \"Escape\"" in script
+        assert b"event.key !== \"Tab\"" in script
+        assert b"profileOpener" in script
+        assert b"profileFocusable()" in script
+
+        status, _, stylesheet = request(server, "GET", "/app.css")
+        assert status == 200
+        assert b".profile-panel" in stylesheet
+        assert b".profile-record" in stylesheet
+        assert b".profile-backdrop" in stylesheet
+        assert b"@media (max-width: 760px)" in stylesheet
+    finally:
+        server.shutdown()
+        worker.join()
+
+
 def test_profile_api_projects_safe_groups_and_applies_explicit_lifecycle_actions(tmp_path):
     storage = Storage(tmp_path / "mentor.sqlite3")
     storage.initialize()

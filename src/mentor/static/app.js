@@ -9,10 +9,21 @@ const send = form.querySelector("button[type=submit]");
 const effort = document.querySelector("#reasoning-effort");
 const mode = document.querySelector("#reasoning-mode");
 const researchDepth = document.querySelector("#research-depth");
+const profileToggle = document.querySelector("#profile-toggle");
+const profilePanel = document.querySelector("#profile-panel");
+const profileBackdrop = document.querySelector("#profile-backdrop");
+const profileClose = document.querySelector("#profile-close");
+const profileStatus = document.querySelector("#profile-status");
+const profileAddForm = document.querySelector("#profile-add-form");
+const profileCurrent = document.querySelector("#profile-current");
+const profileTentative = document.querySelector("#profile-tentative");
+const profileHistory = document.querySelector("#profile-history");
+const profileConflicts = document.querySelector("#profile-conflicts");
 const SETTINGS_KEY = "trading-mentor-evaluation-settings";
 const ACTIVE_THREAD_KEY = "trading-mentor-active-thread";
 const CONTINUE_PROMPT = "Continue the previous response from where it stopped. Do not repeat completed material.";
 let activeThreadId;
+let profileOpener = null;
 
 function showEmpty() {
   messages.replaceChildren();
@@ -360,6 +371,199 @@ async function createThread(title = "New conversation") {
   await loadThreads();
 }
 
+const PROFILE_CATEGORY_LABELS = {
+  "goals/research": "Goals and research",
+  "markets/instruments": "Markets and instruments",
+  "schedule/horizon": "Schedule and horizon",
+  "style/methodology": "Style and methodology",
+  "execution/risk/constraints": "Execution and risk",
+  "experience/learning": "Experience and learning",
+  "preferences/discretion": "Preferences and discretion",
+  "strengths/difficulties/principles": "Strengths, difficulties and principles",
+};
+const PROFILE_PROVENANCE_LABELS = {
+  USER_STATED: "You stated this",
+  USER_CONFIRMED: "You confirmed this",
+  AI_INFERRED: "Mentor proposal",
+  USER_DECISION: "Your decision",
+};
+const PROFILE_STATE_LABELS = {
+  confirmed: "Current",
+  tentative: "Needs confirmation",
+  superseded: "Superseded",
+  conflicting: "Conflicting",
+  archived: "Archived",
+};
+
+function profileMessage(message, error = false) {
+  profileStatus.textContent = message;
+  profileStatus.dataset.error = String(error);
+}
+
+async function profileRequest(path, options = {}) {
+  const response = await fetch(path, options);
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(data.error || "Could not update the Trader Profile.");
+  return data;
+}
+
+function profileButton(label, action) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.textContent = label;
+  button.addEventListener("click", () => action().catch((error) => profileMessage(error.message, true)));
+  return button;
+}
+
+function profileEmpty(message) {
+  const empty = document.createElement("p");
+  empty.className = "profile-empty";
+  empty.textContent = message;
+  return empty;
+}
+
+function profileOrigin(item) {
+  if (item.origin_kind === "profile-editor") return "Added in Trader Profile";
+  if (item.origin_kind === "confirmation") return "Confirmed in Trader Profile";
+  if (!item.origin_available) return "Original conversation is unavailable";
+  return `Chat · conversation ${item.origin_thread_id}, turn ${item.origin_turn_number}`;
+}
+
+function renderProfileRecord(item, actions = []) {
+  const record = document.createElement("article");
+  record.className = "profile-record";
+  const subject = document.createElement("strong");
+  subject.textContent = item.subject;
+  const value = document.createElement("p");
+  value.textContent = item.value;
+  const meta = document.createElement("small");
+  meta.textContent = `${PROFILE_STATE_LABELS[item.state] || item.state} · ${PROFILE_PROVENANCE_LABELS[item.provenance] || item.provenance} · ${profileOrigin(item)}`;
+  record.append(subject, value, meta);
+  if (actions.length) {
+    const controls = document.createElement("div");
+    controls.className = "profile-record-actions";
+    actions.forEach((action) => controls.append(action));
+    record.append(controls);
+  }
+  return record;
+}
+
+function destructiveDelete(item) {
+  return async () => {
+    if (!window.confirm(`Permanently delete “${item.subject}”? This removes this local profile item.`)) return;
+    await profileRequest(`/api/profile/items/${item.id}`, { method: "DELETE" });
+    await loadProfile();
+    profileMessage("Profile item permanently deleted.");
+  };
+}
+
+function editProfileItem(item) {
+  return async () => {
+    const value = window.prompt(`Update ${item.subject}`, item.value);
+    if (value === null) return;
+    await profileRequest(`/api/profile/items/${item.id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "edit", value, provenance: "USER_DECISION" }),
+    });
+    await loadProfile();
+    profileMessage("Profile item updated.");
+  };
+}
+
+function renderProfileGroups(target, items, emptyMessage, actionsFor) {
+  target.replaceChildren();
+  if (!items.length) {
+    target.append(profileEmpty(emptyMessage));
+    return;
+  }
+  const groups = new Map();
+  items.forEach((item) => {
+    const group = groups.get(item.category) || [];
+    group.push(item);
+    groups.set(item.category, group);
+  });
+  [...groups.entries()].sort(([left], [right]) => left.localeCompare(right)).forEach(([category, records]) => {
+    const heading = document.createElement("h4");
+    heading.textContent = PROFILE_CATEGORY_LABELS[category] || category;
+    target.append(heading);
+    records.forEach((item) => target.append(renderProfileRecord(item, actionsFor(item))));
+  });
+}
+
+function renderProfile(data) {
+  renderProfileGroups(profileCurrent, data.current, "No confirmed profile items yet.", (item) => [
+    profileButton("Edit", editProfileItem(item)),
+    profileButton("Archive", async () => {
+      if (!window.confirm(`Archive “${item.subject}”? It will stop affecting future advice.`)) return;
+      await profileRequest(`/api/profile/items/${item.id}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "archive" }) });
+      await loadProfile();
+      profileMessage("Profile item archived.");
+    }),
+    profileButton("Delete", destructiveDelete(item)),
+  ]);
+  renderProfileGroups(profileTentative, data.tentative, "No profile updates need confirmation.", (item) => [
+    profileButton("Confirm", async () => {
+      await profileRequest(`/api/profile/items/${item.id}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "confirm" }) });
+      await loadProfile();
+      profileMessage("Profile item confirmed.");
+    }),
+    profileButton("Reject", async () => {
+      if (!window.confirm(`Reject “${item.subject}”? It will be archived.`)) return;
+      await profileRequest(`/api/profile/items/${item.id}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "reject" }) });
+      await loadProfile();
+      profileMessage("Profile proposal rejected.");
+    }),
+    profileButton("Delete", destructiveDelete(item)),
+  ]);
+  renderProfileGroups(profileHistory, data.history, "No profile history.", (item) => [profileButton("Delete", destructiveDelete(item))]);
+  renderProfileGroups(profileConflicts, data.conflicts, "No unresolved profile conflicts.", (item) => [profileButton("Delete", destructiveDelete(item))]);
+}
+
+async function loadProfile() {
+  profileMessage("Loading profile…");
+  const data = await profileRequest("/api/profile");
+  renderProfile(data);
+  profileMessage("");
+}
+
+async function openProfile() {
+  profileOpener = document.activeElement instanceof HTMLElement ? document.activeElement : profileToggle;
+  profilePanel.hidden = false;
+  profileBackdrop.hidden = false;
+  profileToggle.setAttribute("aria-expanded", "true");
+  profileClose.focus();
+  try { await loadProfile(); }
+  catch (error) { profileMessage(error.message, true); }
+}
+
+function closeProfile() {
+  profilePanel.hidden = true;
+  profileBackdrop.hidden = true;
+  profileToggle.setAttribute("aria-expanded", "false");
+  (profileOpener?.isConnected ? profileOpener : profileToggle).focus();
+}
+
+function profileFocusable() {
+  return [...profilePanel.querySelectorAll("button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), a[href], [tabindex]:not([tabindex=\"-1\"])")];
+}
+
+function trapProfileFocus(event) {
+  if (profilePanel.hidden || event.key !== "Tab") return;
+  const focusable = profileFocusable();
+  if (!focusable.length) {
+    event.preventDefault();
+    profilePanel.focus();
+    return;
+  }
+  const first = focusable[0];
+  const last = focusable.at(-1);
+  if (event.shiftKey ? document.activeElement === first || !profilePanel.contains(document.activeElement) : document.activeElement === last || !profilePanel.contains(document.activeElement)) {
+    event.preventDefault();
+    (event.shiftKey ? last : first).focus();
+  }
+}
+
 function parseEventBuffer(buffer, onEvent) {
   const events = buffer.split("\n\n");
   events.slice(0, -1).forEach((event) => onEvent(JSON.parse(event.slice(5))));
@@ -431,6 +635,23 @@ async function sendMessage(text, showUser = true) {
 }
 
 document.querySelector("#new-thread").addEventListener("click", () => createThread().catch((error) => { status.textContent = error.message; }));
+profileToggle.addEventListener("click", openProfile);
+profileClose.addEventListener("click", closeProfile);
+profileBackdrop.addEventListener("click", closeProfile);
+document.addEventListener("keydown", (event) => {
+  if (!profilePanel.hidden && event.key === "Escape") closeProfile();
+  else trapProfileFocus(event);
+});
+profileAddForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const values = Object.fromEntries(new FormData(profileAddForm));
+  try {
+    await profileRequest("/api/profile/items", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(values) });
+    profileAddForm.reset();
+    await loadProfile();
+    profileMessage("Profile item added.");
+  } catch (error) { profileMessage(error.message, true); }
+});
 form.addEventListener("submit", async (event) => {
   event.preventDefault();
   const text = question.value.trim();
