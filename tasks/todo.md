@@ -32,7 +32,7 @@ not part of this branch.
 
 ## mentor-profile-integration
 
-- [ ] **Task 3 — Sol profile context and controlled explicit write tool**
+- [x] **Task 3 — Sol profile context and controlled explicit write tool**
   - Acceptance: user context is bounded and non-authoritative; each turn has at
     most one idempotent validated write/proposal; Phase 2 raw-source contracts
     remain unchanged.

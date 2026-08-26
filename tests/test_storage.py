@@ -497,3 +497,91 @@ def test_storage_rolls_back_thread_deletion_after_profile_origin_update_fails(tm
     assert storage.profile_item(item.id).origin_available is True
     assert storage.has_thread(thread_id)
     assert storage.thread_items(thread_id)
+
+
+def test_thread_deletion_removes_thread_owned_profile_tool_operations_only(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    thread_id = storage.create_thread("Forget profile item")
+    target = storage.create_profile_item(
+        category="schedule/horizon",
+        subject="Holding period",
+        value="I hold for days.",
+        kind="preference",
+        provenance="USER_STATED",
+        state="confirmed",
+        origin_kind="profile-editor",
+    )
+    global_item = storage.create_profile_item(
+        category="markets/instruments",
+        subject="Primary market",
+        value="ES",
+        kind="fact",
+        provenance="USER_STATED",
+        state="confirmed",
+        origin_kind="profile-editor",
+    )
+    assert storage.apply_profile_forget_operation(
+        tool_call_id="call_forget",
+        operation="archive",
+        target_item_id=target.id,
+        origin_thread_id=thread_id,
+        origin_turn_number=1,
+    ) == "archived"
+
+    assert storage.delete_thread(thread_id) is True
+
+    with sqlite3.connect(storage.database_path) as connection:
+        assert connection.execute("SELECT * FROM profile_tool_operations").fetchall() == []
+    assert storage.profile_item(target.id).state == "archived"
+    assert storage.current_confirmed_profile_items() == [global_item]
+
+
+def test_storage_migrates_existing_profile_table_before_creating_tool_call_index(tmp_path):
+    database_path = tmp_path / "mentor.sqlite3"
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE trader_profile_items (
+                id INTEGER PRIMARY KEY,
+                category TEXT NOT NULL,
+                subject_key TEXT NOT NULL,
+                subject TEXT NOT NULL,
+                value TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                provenance TEXT NOT NULL,
+                state TEXT NOT NULL,
+                origin_kind TEXT NOT NULL,
+                origin_thread_id INTEGER,
+                origin_turn_number INTEGER,
+                origin_available INTEGER NOT NULL,
+                supersedes_item_id INTEGER
+            )
+            """
+        )
+
+    storage = Storage(database_path)
+    storage.initialize()
+    first = storage.create_profile_item(
+        category="markets/instruments",
+        subject="Primary market",
+        value="ES",
+        kind="fact",
+        provenance="USER_STATED",
+        state="confirmed",
+        origin_kind="profile-editor",
+        tool_call_id="call_profile",
+    )
+    second = storage.create_profile_item(
+        category="markets/instruments",
+        subject="Other market",
+        value="NQ",
+        kind="fact",
+        provenance="USER_STATED",
+        state="confirmed",
+        origin_kind="profile-editor",
+        tool_call_id="call_profile",
+    )
+
+    assert storage.profile_item_for_tool_call("call_profile") == first
+    assert second == first

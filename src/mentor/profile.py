@@ -121,6 +121,7 @@ class ProfileService:
         origin_thread_id: int | None = None,
         origin_turn_number: int | None = None,
         origin_available: bool | None = None,
+        tool_call_id: str | None = None,
     ) -> TraderProfileItem:
         category, subject, value, kind, provenance, state, origin_kind = _validate_item(
             category=category,
@@ -136,6 +137,10 @@ class ProfileService:
         )
         if provenance == "USER_CONFIRMED":
             raise ProfileValidationError("USER_CONFIRMED records must use confirm_item")
+        if tool_call_id:
+            existing = self.storage.profile_item_for_tool_call(tool_call_id)
+            if existing is not None:
+                return existing
         if state == "confirmed" and self._current_for(category, subject):
             raise ProfileValidationError("a confirmed record already exists; use supersede_item")
         return self.storage.create_profile_item(
@@ -149,6 +154,7 @@ class ProfileService:
             origin_thread_id=origin_thread_id,
             origin_turn_number=origin_turn_number,
             origin_available=origin_available,
+            tool_call_id=tool_call_id,
         )
 
     def propose_item(self, **item: str) -> TraderProfileItem:
@@ -234,6 +240,33 @@ class ProfileService:
     def delete_item(self, item_id: int) -> bool:
         self._item(item_id)
         return self.storage.delete_profile_item(item_id)
+
+    def forget_item(
+        self,
+        *,
+        item_id: int,
+        operation: str,
+        tool_call_id: str,
+        origin_thread_id: int,
+        origin_turn_number: int,
+    ) -> str:
+        if operation not in {"archive", "delete"}:
+            raise ProfileValidationError("chat may only archive or delete a profile item")
+        if not isinstance(item_id, int) or item_id <= 0:
+            raise ProfileValidationError("profile target must be a positive item id")
+        if not isinstance(tool_call_id, str) or not tool_call_id:
+            raise ProfileValidationError("profile tool call id is required")
+        _validate_origin("chat", origin_thread_id, origin_turn_number, True)
+        try:
+            return self.storage.apply_profile_forget_operation(
+                tool_call_id=tool_call_id,
+                operation=operation,
+                target_item_id=item_id,
+                origin_thread_id=origin_thread_id,
+                origin_turn_number=origin_turn_number,
+            )
+        except (KeyError, ValueError) as error:
+            raise ProfileValidationError(str(error)) from error
 
     def _item(self, item_id: int) -> TraderProfileItem:
         item = self.storage.profile_item(item_id)

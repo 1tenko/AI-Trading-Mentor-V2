@@ -12,6 +12,7 @@ from mentor.chat_service import (
     _effective_research_depth,
 )
 from mentor.prompts import MENTOR_INSTRUCTIONS
+from mentor.profile import ProfileService
 from mentor.storage import Storage
 
 
@@ -59,6 +60,371 @@ def source_response(text, annotations, *, status="completed", usage=None):
             },
         ],
     )
+
+
+def profile_tool_call(*, call_id="call_profile", name="update_trader_profile", arguments=None):
+    return SimpleNamespace(
+        status="completed",
+        output=[
+            {
+                "type": "function_call",
+                "call_id": call_id,
+                "name": name,
+                "arguments": json.dumps(arguments if arguments is not None else {}),
+            }
+        ],
+    )
+
+
+def profile_write_arguments(*, operation="save"):
+    return {
+        "operation": operation,
+        "category": "markets/instruments",
+        "subject": "Primary market",
+        "value": "ES",
+        "kind": "fact",
+        "provenance": "USER_STATED",
+        "target_id": None,
+    }
+
+
+def profile_forget_arguments(*, operation, target_id):
+    return {
+        "operation": operation,
+        "category": None,
+        "subject": None,
+        "value": None,
+        "kind": None,
+        "provenance": None,
+        "target_id": target_id,
+    }
+
+
+def test_selected_profile_context_is_marked_on_only_the_new_request(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    storage.set_vector_store("vs_jacob")
+    profile = ProfileService(storage)
+    profile.create_item(
+        category="goals/research",
+        subject="Research goal",
+        value="I am building a backtest.",
+        kind="goal",
+        provenance="USER_STATED",
+        state="confirmed",
+        origin_kind="profile-editor",
+    )
+    thread_id = storage.create_thread("Question")
+    responses = SequenceResponses(SimpleNamespace(status="completed", output=[]), SimpleNamespace(status="completed", output=[]))
+    service = ChatService(storage, SimpleNamespace(responses=responses))
+
+    service.reply(thread_id, "How should I research this setup?")
+    service.reply(thread_id, "What should I research next?")
+
+    first, second = responses.calls
+    marker = "Trader Profile — user context, not source evidence"
+    assert marker in first["instructions"]
+    assert "Research goal: I am building a backtest." in first["instructions"]
+    assert all("Research goal" not in json.dumps(item) for item in first["input"])
+    assert all("Research goal" not in json.dumps(item) for item in second["input"])
+    assert all(marker not in json.dumps(item) for item in storage.replay_items(thread_id))
+
+
+def test_explicit_profile_tool_call_writes_once_then_uses_one_terminal_continuation(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    storage.set_vector_store("vs_jacob")
+    thread_id = storage.create_thread("Question")
+    terminal = SimpleNamespace(
+        status="completed",
+        output=[{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Saved."}]}],
+    )
+    responses = SequenceResponses(profile_tool_call(arguments=profile_write_arguments()), terminal)
+
+    answer = ChatService(storage, SimpleNamespace(responses=responses)).reply(thread_id, "Remember that I only trade ES.")
+
+    assert answer.text == "Saved."
+    assert len(storage.current_confirmed_profile_items()) == 1
+    assert len(responses.calls) == 2
+    continuation = responses.calls[1]
+    assert any(item.get("type") == "function_call" for item in continuation["input"])
+    output = next(item for item in continuation["input"] if item.get("type") == "function_call_output")
+    assert output["call_id"] == "call_profile"
+    assert json.loads(output["output"])["status"] == "saved"
+    assert all(tool["type"] != "function" for tool in continuation["tools"])
+
+
+def test_citation_repair_after_profile_mutation_keeps_only_raw_search_and_no_dangling_call(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    storage.set_vector_store("vs_jacob")
+    thread_id = storage.create_thread("Question")
+    uncited = source_response("Direct source teaching: Jacob teaches this.", [])
+    repaired = source_response(
+        "Direct source teaching: Jacob teaches this.",
+        [{"type": "file_citation", "file_id": "file_jacob", "filename": "lesson.txt"}],
+    )
+    responses = SequenceResponses(profile_tool_call(arguments=profile_write_arguments()), uncited, repaired)
+
+    ChatService(storage, SimpleNamespace(responses=responses)).reply(thread_id, "Remember that I only trade ES.")
+
+    assert len(storage.current_confirmed_profile_items()) == 1
+    assert len(responses.calls) == 3
+    assert all(tool["type"] != "function" for tool in responses.calls[1]["tools"])
+    assert all(tool["type"] != "function" for tool in responses.calls[2]["tools"])
+    replay = storage.replay_items(thread_id)
+    call_index = next(index for index, item in enumerate(replay) if item.get("type") == "function_call")
+    assert replay[call_index + 1]["type"] == "function_call_output"
+
+
+def test_ordinary_citation_repair_strips_profile_mutation_tool(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    storage.set_vector_store("vs_jacob")
+    thread_id = storage.create_thread("Question")
+    uncited = source_response("Direct source teaching: Jacob teaches this.", [])
+    repaired = source_response(
+        "Direct source teaching: Jacob teaches this.",
+        [{"type": "file_citation", "file_id": "file_jacob", "filename": "lesson.txt"}],
+    )
+    responses = SequenceResponses(uncited, repaired)
+
+    ChatService(storage, SimpleNamespace(responses=responses)).reply(thread_id, "What does Jacob teach?")
+
+    assert len(responses.calls) == 2
+    assert all(tool["type"] != "function" for tool in responses.calls[1]["tools"])
+
+
+@pytest.mark.parametrize(
+    "response, expected_call_ids",
+    [
+        (profile_tool_call(name="unknown_tool", arguments=profile_write_arguments()), ("call_profile",)),
+        (profile_tool_call(arguments=None), ("call_profile",)),
+        (
+            SimpleNamespace(
+                status="completed",
+                output=[
+                    {
+                        "type": "function_call",
+                        "call_id": "call_one",
+                        "name": "update_trader_profile",
+                        "arguments": json.dumps(profile_write_arguments()),
+                    },
+                    {
+                        "type": "function_call",
+                        "call_id": "call_two",
+                        "name": "update_trader_profile",
+                        "arguments": json.dumps(profile_write_arguments()),
+                    },
+                ],
+            ),
+            ("call_one", "call_two"),
+        ),
+    ],
+)
+def test_invalid_or_duplicate_profile_tool_calls_receive_outputs_and_a_terminal_answer(
+    tmp_path, response, expected_call_ids
+):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    storage.set_vector_store("vs_jacob")
+    thread_id = storage.create_thread("Question")
+    terminal = SimpleNamespace(
+        status="completed",
+        output=[{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "I could not update that profile item."}]}],
+    )
+    responses = SequenceResponses(response, terminal)
+
+    answer = ChatService(storage, SimpleNamespace(responses=responses)).reply(
+        thread_id, "Remember that I only trade ES."
+    )
+
+    assert storage.current_confirmed_profile_items() == []
+    assert answer.text == "I could not update that profile item."
+    assert len(responses.calls) == 2
+    outputs = [item for item in responses.calls[1]["input"] if item.get("type") == "function_call_output"]
+    assert tuple(item["call_id"] for item in outputs) == expected_call_ids
+    assert all(json.loads(item["output"])["status"] == "rejected" for item in outputs)
+    assert all(tool["type"] != "function" for tool in responses.calls[1]["tools"])
+    replay = storage.replay_items(thread_id)
+    assert sum(item.get("type") == "function_call" for item in replay) == len(expected_call_ids)
+    assert sum(item.get("type") == "function_call_output" for item in replay) == len(expected_call_ids)
+
+
+@pytest.mark.parametrize("call_id", [None, ""])
+def test_profile_tool_call_without_a_usable_id_is_not_persisted_or_replayed(tmp_path, call_id):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    storage.set_vector_store("vs_jacob")
+    thread_id = storage.create_thread("Question")
+    malformed_call = {
+        "type": "function_call",
+        "name": "update_trader_profile",
+        "arguments": json.dumps(profile_write_arguments()),
+    }
+    if call_id is not None:
+        malformed_call["call_id"] = call_id
+    response = SimpleNamespace(status="completed", output=[malformed_call])
+    responses = FakeResponses(response)
+
+    answer = ChatService(storage, SimpleNamespace(responses=responses)).reply(
+        thread_id, "Remember that I only trade ES."
+    )
+
+    assert answer.text == "I could not update that profile item. Please try again."
+    assert len(responses.calls) == 1
+    assert storage.current_confirmed_profile_items() == []
+    assert all(item.get("type") != "function_call" for item in storage.thread_items(thread_id))
+    assert all(item.get("type") != "function_call" for item in storage.replay_items(thread_id))
+    assert storage.display_turns(thread_id)[0]["answer_markdown"] == answer.text
+
+
+def test_malformed_profile_tool_call_keeps_an_existing_cited_answer(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    storage.set_vector_store("vs_jacob")
+    thread_id = storage.create_thread("Question")
+    answer_item = source_response(
+        "Direct source teaching: Jacob teaches patience.",
+        [{"type": "file_citation", "file_id": "file_jacob", "filename": "lesson.txt"}],
+    ).output[1]
+    response = SimpleNamespace(
+        status="completed",
+        output=[
+            profile_tool_call(call_id="").output[0],
+            answer_item,
+        ],
+    )
+
+    answer = ChatService(storage, SimpleNamespace(responses=FakeResponses(response))).reply(
+        thread_id, "Remember that I only trade ES."
+    )
+
+    assert answer.text == "Direct source teaching: Jacob teaches patience."
+    assert answer.citations[0].file_id == "file_jacob"
+    assert all(item.get("type") != "function_call" for item in storage.replay_items(thread_id))
+
+
+def test_explicit_forget_archives_only_the_exact_profile_item_once(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    storage.set_vector_store("vs_jacob")
+    profile = ProfileService(storage)
+    target = profile.create_item(
+        category="markets/instruments",
+        subject="Primary market",
+        value="ES",
+        kind="fact",
+        provenance="USER_STATED",
+        state="confirmed",
+        origin_kind="profile-editor",
+    )
+    thread_id = storage.create_thread("Question")
+    terminal = SimpleNamespace(
+        status="completed",
+        output=[{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Archived the requested profile item."}]}],
+    )
+    responses = SequenceResponses(
+        profile_tool_call(arguments=profile_forget_arguments(operation="archive", target_id=target.id)), terminal
+    )
+
+    answer = ChatService(storage, SimpleNamespace(responses=responses)).reply(
+        thread_id, f"Forget profile item {target.id}."
+    )
+
+    assert answer.text == "Archived the requested profile item."
+    assert storage.profile_item(target.id).state == "archived"
+    output = next(item for item in responses.calls[1]["input"] if item.get("type") == "function_call_output")
+    assert json.loads(output["output"])["status"] == "archived"
+
+
+def test_explicit_forget_deletes_only_the_exact_profile_item_once(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    storage.set_vector_store("vs_jacob")
+    target = ProfileService(storage).create_item(
+        category="markets/instruments",
+        subject="Primary market",
+        value="ES",
+        kind="fact",
+        provenance="USER_STATED",
+        state="confirmed",
+        origin_kind="profile-editor",
+    )
+    thread_id = storage.create_thread("Question")
+    terminal = SimpleNamespace(
+        status="completed",
+        output=[{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Deleted the requested profile item."}]}],
+    )
+    responses = SequenceResponses(
+        profile_tool_call(
+            call_id="delete_profile", arguments=profile_forget_arguments(operation="delete", target_id=target.id)
+        ),
+        terminal,
+    )
+
+    ChatService(storage, SimpleNamespace(responses=responses)).reply(thread_id, f"Delete profile item {target.id}.")
+
+    assert storage.profile_item(target.id) is None
+    output = next(item for item in responses.calls[1]["input"] if item.get("type") == "function_call_output")
+    assert json.loads(output["output"])["status"] == "deleted"
+
+
+@pytest.mark.parametrize(
+    "question, arguments",
+    [
+        ("Forget that preference.", profile_forget_arguments(operation="archive", target_id=1)),
+        ("Forget profile item one.", profile_forget_arguments(operation="delete", target_id="one")),
+    ],
+)
+def test_ambiguous_or_malformed_forget_never_mutates_and_still_terminates(tmp_path, question, arguments):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    storage.set_vector_store("vs_jacob")
+    profile = ProfileService(storage)
+    target = profile.create_item(
+        category="markets/instruments",
+        subject="Primary market",
+        value="ES",
+        kind="fact",
+        provenance="USER_STATED",
+        state="confirmed",
+        origin_kind="profile-editor",
+    )
+    thread_id = storage.create_thread("Question")
+    terminal = SimpleNamespace(
+        status="completed",
+        output=[{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Please identify the profile item explicitly."}]}],
+    )
+    responses = SequenceResponses(profile_tool_call(arguments=arguments), terminal)
+
+    answer = ChatService(storage, SimpleNamespace(responses=responses)).reply(thread_id, question)
+
+    assert answer.text == "Please identify the profile item explicitly."
+    assert storage.profile_item(target.id).state == "confirmed"
+    output = next(item for item in responses.calls[1]["input"] if item.get("type") == "function_call_output")
+    assert json.loads(output["output"])["status"] == "rejected"
+
+
+def test_profile_tool_call_id_is_idempotent_across_replayed_requests(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    storage.set_vector_store("vs_jacob")
+    first_thread = storage.create_thread("First")
+    second_thread = storage.create_thread("Second")
+    terminal = SimpleNamespace(status="completed", output=[])
+    responses = SequenceResponses(
+        profile_tool_call(arguments=profile_write_arguments()),
+        terminal,
+        profile_tool_call(arguments=profile_write_arguments()),
+        terminal,
+    )
+    service = ChatService(storage, SimpleNamespace(responses=responses))
+
+    service.reply(first_thread, "Remember that I only trade ES.")
+    service.reply(second_thread, "Remember that I only trade ES.")
+
+    assert len(storage.current_confirmed_profile_items()) == 1
 
 
 def test_reply_persists_continuation_state_and_extracts_evidence(tmp_path):
@@ -166,9 +532,11 @@ def test_reply_persists_continuation_state_and_extracts_evidence(tmp_path):
         "reasoning.encrypted_content",
         "file_search_call.results",
     ]
-    assert request["tools"] == [
-        {"type": "file_search", "vector_store_ids": ["vs_jacob"], "max_num_results": 8}
-    ]
+    assert request["tools"][0] == {
+        "type": "file_search", "vector_store_ids": ["vs_jacob"], "max_num_results": 8
+    }
+    assert request["tools"][1]["name"] == "update_trader_profile"
+    assert request["tools"][1]["strict"] is True
     assert request["max_output_tokens"] == 25_000
     assert request["reasoning"] == {"effort": "high"}
     assert request["context_management"] == [{"type": "compaction", "compact_threshold": 50_000}]

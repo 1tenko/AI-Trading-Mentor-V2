@@ -125,6 +125,7 @@ class Storage:
                     origin_turn_number INTEGER,
                     origin_available INTEGER NOT NULL CHECK(origin_available IN (0, 1)),
                     supersedes_item_id INTEGER REFERENCES trader_profile_items(id) ON DELETE SET NULL,
+                    tool_call_id TEXT,
                     CHECK(
                         (origin_thread_id IS NULL AND origin_turn_number IS NULL AND origin_available = 0)
                         OR (origin_thread_id IS NOT NULL AND origin_turn_number > 0)
@@ -134,11 +135,28 @@ class Storage:
                     ON trader_profile_items(category, subject_key) WHERE state = 'confirmed';
                 CREATE INDEX IF NOT EXISTS profile_origin_thread
                     ON trader_profile_items(origin_thread_id);
+                CREATE TABLE IF NOT EXISTS profile_tool_operations (
+                    tool_call_id TEXT PRIMARY KEY,
+                    operation TEXT NOT NULL CHECK(operation IN ('archive', 'delete')),
+                    target_item_id INTEGER NOT NULL,
+                    status TEXT NOT NULL CHECK(status IN ('archived', 'deleted')),
+                    origin_thread_id INTEGER NOT NULL,
+                    origin_turn_number INTEGER NOT NULL
+                );
                 """
             )
             columns = {row[1] for row in connection.execute("PRAGMA table_info(sources)")}
             if "modified_at" not in columns:
                 connection.execute("ALTER TABLE sources ADD COLUMN modified_at REAL")
+            profile_columns = {
+                row[1] for row in connection.execute("PRAGMA table_info(trader_profile_items)")
+            }
+            if "tool_call_id" not in profile_columns:
+                connection.execute("ALTER TABLE trader_profile_items ADD COLUMN tool_call_id TEXT")
+            connection.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS unique_profile_tool_call "
+                "ON trader_profile_items(tool_call_id) WHERE tool_call_id IS NOT NULL"
+            )
             self._backfill_display_turns(connection)
 
     def set_vector_store(self, vector_store_id: str) -> None:
@@ -426,8 +444,18 @@ class Storage:
         origin_turn_number: int | None = None,
         origin_available: bool | None = None,
         supersedes_item_id: int | None = None,
+        tool_call_id: str | None = None,
     ) -> TraderProfileItem:
         with self._connect() as connection:
+            if tool_call_id is not None:
+                row = connection.execute(
+                    "SELECT id, category, subject_key, subject, value, kind, provenance, state, "
+                    "origin_kind, origin_thread_id, origin_turn_number, origin_available, "
+                    "supersedes_item_id FROM trader_profile_items WHERE tool_call_id = ?",
+                    (tool_call_id,),
+                ).fetchone()
+                if row is not None:
+                    return _profile_item_from_row(row)
             return self._insert_profile_item(
                 connection,
                 category=category,
@@ -441,6 +469,7 @@ class Storage:
                 origin_turn_number=origin_turn_number,
                 origin_available=origin_available,
                 supersedes_item_id=supersedes_item_id,
+                tool_call_id=tool_call_id,
             )
 
     def profile_item(self, item_id: int) -> TraderProfileItem | None:
@@ -450,6 +479,16 @@ class Storage:
                 "origin_kind, origin_thread_id, origin_turn_number, origin_available, "
                 "supersedes_item_id FROM trader_profile_items WHERE id = ?",
                 (item_id,),
+            ).fetchone()
+        return None if row is None else _profile_item_from_row(row)
+
+    def profile_item_for_tool_call(self, tool_call_id: str) -> TraderProfileItem | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT id, category, subject_key, subject, value, kind, provenance, state, "
+                "origin_kind, origin_thread_id, origin_turn_number, origin_available, "
+                "supersedes_item_id FROM trader_profile_items WHERE tool_call_id = ?",
+                (tool_call_id,),
             ).fetchone()
         return None if row is None else _profile_item_from_row(row)
 
@@ -502,6 +541,7 @@ class Storage:
                 origin_turn_number=origin_turn_number,
                 origin_available=origin_available,
                 supersedes_item_id=item_id,
+                tool_call_id=None,
             )
 
     def archive_profile_item(self, item_id: int) -> bool:
@@ -522,6 +562,49 @@ class Storage:
             cursor = connection.execute("DELETE FROM trader_profile_items WHERE id = ?", (item_id,))
         return cursor.rowcount == 1
 
+    def apply_profile_forget_operation(
+        self,
+        *,
+        tool_call_id: str,
+        operation: str,
+        target_item_id: int,
+        origin_thread_id: int,
+        origin_turn_number: int,
+    ) -> str:
+        with self._connect() as connection:
+            existing = connection.execute(
+                "SELECT operation, target_item_id, status FROM profile_tool_operations WHERE tool_call_id = ?",
+                (tool_call_id,),
+            ).fetchone()
+            if existing is not None:
+                if existing[0] != operation or existing[1] != target_item_id:
+                    raise ValueError("tool call id cannot target a different profile operation")
+                return str(existing[2])
+            row = connection.execute(
+                "SELECT state FROM trader_profile_items WHERE id = ?", (target_item_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(target_item_id)
+            if operation == "archive":
+                if row[0] != "confirmed":
+                    raise ValueError("only a confirmed profile item can be archived by chat")
+                connection.execute(
+                    "UPDATE trader_profile_items SET state = 'archived' WHERE id = ?", (target_item_id,)
+                )
+                status = "archived"
+            elif operation == "delete":
+                connection.execute("DELETE FROM trader_profile_items WHERE id = ?", (target_item_id,))
+                status = "deleted"
+            else:
+                raise ValueError("unsupported profile operation")
+            connection.execute(
+                "INSERT INTO profile_tool_operations(\n"
+                "tool_call_id, operation, target_item_id, status, origin_thread_id, origin_turn_number\n"
+                ") VALUES (?, ?, ?, ?, ?, ?)",
+                (tool_call_id, operation, target_item_id, status, origin_thread_id, origin_turn_number),
+            )
+            return status
+
     def delete_thread(self, thread_id: int) -> bool:
         with self._connect() as connection:
             exists = connection.execute(
@@ -532,6 +615,9 @@ class Storage:
             connection.execute(
                 "UPDATE trader_profile_items SET origin_available = 0 WHERE origin_thread_id = ?",
                 (thread_id,),
+            )
+            connection.execute(
+                "DELETE FROM profile_tool_operations WHERE origin_thread_id = ?", (thread_id,)
             )
             connection.execute("DELETE FROM display_turns WHERE thread_id = ?", (thread_id,))
             connection.execute("DELETE FROM response_diagnostics WHERE thread_id = ?", (thread_id,))
@@ -562,6 +648,7 @@ class Storage:
         origin_turn_number: int | None,
         origin_available: bool | None,
         supersedes_item_id: int | None,
+        tool_call_id: str | None,
     ) -> TraderProfileItem:
         subject = " ".join(subject.split())
         value = value.strip()
@@ -569,8 +656,8 @@ class Storage:
             """
             INSERT INTO trader_profile_items(
                 category, subject_key, subject, value, kind, provenance, state, origin_kind,
-                origin_thread_id, origin_turn_number, origin_available, supersedes_item_id
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                origin_thread_id, origin_turn_number, origin_available, supersedes_item_id, tool_call_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 category,
@@ -585,6 +672,7 @@ class Storage:
                 origin_turn_number,
                 int(origin_thread_id is not None if origin_available is None else origin_available),
                 supersedes_item_id,
+                tool_call_id,
             ),
         )
         row = connection.execute(
