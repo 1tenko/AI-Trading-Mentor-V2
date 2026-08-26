@@ -246,6 +246,7 @@ def _answer_json(answer: Answer) -> dict:
         "evidence": [evidence.__dict__ for evidence in answer.evidence],
         "diagnostics": None if answer.diagnostics is None else answer.diagnostics.__dict__,
         "incomplete_reason": answer.incomplete_reason,
+        "profile_update": answer.profile_update,
     }
 
 

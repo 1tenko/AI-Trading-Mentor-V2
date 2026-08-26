@@ -245,6 +245,24 @@ function showDiagnostics(diagnostics) {
   messages.append(block);
 }
 
+function showProfileUpdate(update) {
+  if (!update?.kind) return;
+  const block = document.createElement("aside");
+  block.className = "profile-update";
+  block.setAttribute("aria-live", "polite");
+  if (update.kind === "proposed") {
+    block.append("Profile update needs confirmation. It is not active memory yet. ");
+    const review = document.createElement("button");
+    review.type = "button";
+    review.textContent = "Review in Trader Profile";
+    review.addEventListener("click", openProfile);
+    block.append(review);
+  } else {
+    block.textContent = update.kind === "saved" ? "Saved to Trader Profile." : "Removed from Trader Profile.";
+  }
+  messages.append(block);
+}
+
 function showIncomplete(answer, mentor) {
   mentor.heading.textContent = "Mentor — incomplete";
   const block = document.createElement("section");
@@ -342,6 +360,7 @@ function renderTimeline(turns) {
     showMessage("Theo", turn.user_text);
     if (!turn.answer_markdown && !turn.incomplete_reason) return;
     const mentor = showMessage("Mentor", turn.answer_markdown || "");
+    showProfileUpdate(turn.profile_update);
     showEvidence(turn.evidence || [], turn.citations || []);
     showDiagnostics(turn.diagnostics);
     if (turn.incomplete_reason) showIncomplete(turn, mentor);
@@ -599,6 +618,7 @@ async function sendMessage(text, showUser = true) {
           if (event.type === "complete" || event.type === "incomplete") {
             terminal = true;
             renderMarkdown(mentor.content, event.answer.text);
+            showProfileUpdate(event.answer.profile_update);
             showEvidence(event.answer.evidence, event.answer.citations);
             showDiagnostics(event.answer.diagnostics);
             if (event.type === "incomplete") showIncomplete(event.answer, mentor);
@@ -621,6 +641,7 @@ async function sendMessage(text, showUser = true) {
     } else {
       const answer = await response.json();
       const mentor = showMessage("Mentor", answer.text);
+      showProfileUpdate(answer.profile_update);
       showEvidence(answer.evidence, answer.citations);
       showDiagnostics(answer.diagnostics);
       if (answer.incomplete_reason) showIncomplete(answer, mentor);

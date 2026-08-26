@@ -209,6 +209,10 @@ def test_server_serves_the_persistent_chat_controls(tmp_path):
         assert b"Applied for future model replay" in script
         assert b'event.type === "error"' in script
         assert b"Mentor unavailable. You can retry." in script
+        assert b"showProfileUpdate" in script
+        assert b"Profile update needs confirmation" in script
+        assert b"Review in Trader Profile" in script
+        assert b"profile_update" in script
         status, _, stylesheet = request(server, "GET", "/app.css")
         assert b".markdown-table-scroll" in stylesheet
         assert b"overflow-wrap: normal" in stylesheet
@@ -287,6 +291,38 @@ def test_server_restores_only_safe_display_turns_and_permanently_deletes_one_thr
         assert storage.vector_store_id() == "vs_jacob"
         assert request(server, "DELETE", f"/api/threads/{thread_id}")[0] == 404
         assert request(server, "DELETE", "/api/threads/not-an-id")[0] == 404
+    finally:
+        server.shutdown()
+        worker.join()
+
+
+def test_server_keeps_profile_acknowledgement_safe_and_historical_only(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    thread_id = storage.create_thread("Question")
+    storage.record_display_turn(
+        thread_id,
+        user_text="Remember that I only trade ES.",
+        answer_markdown="Done.",
+        citations=[],
+        evidence=[],
+        diagnostics=None,
+        response_id=None,
+        status="completed",
+        incomplete_reason=None,
+        profile_update={"kind": "proposed"},
+    )
+    server = create_server(storage, FakeChatService(), port=0)
+    worker = threading.Thread(target=server.serve_forever)
+    worker.start()
+    try:
+        status, _, body = request(server, "GET", f"/api/threads/{thread_id}")
+        assert status == 200
+        profile_update = json.loads(body)["turns"][0]["profile_update"]
+        assert profile_update == {"kind": "proposed"}
+        assert "ES" not in json.dumps(profile_update)
+        assert "tool_call" not in json.dumps(profile_update)
+        assert storage.current_confirmed_profile_items() == []
     finally:
         server.shutdown()
         worker.join()

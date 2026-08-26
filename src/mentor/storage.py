@@ -90,6 +90,7 @@ class Storage:
                     citations_json TEXT NOT NULL,
                     evidence_json TEXT NOT NULL,
                     diagnostic_json TEXT,
+                    profile_update_json TEXT,
                     response_id TEXT,
                     status TEXT NOT NULL,
                     incomplete_reason TEXT,
@@ -153,6 +154,9 @@ class Storage:
             }
             if "tool_call_id" not in profile_columns:
                 connection.execute("ALTER TABLE trader_profile_items ADD COLUMN tool_call_id TEXT")
+            display_turn_columns = {row[1] for row in connection.execute("PRAGMA table_info(display_turns)")}
+            if "profile_update_json" not in display_turn_columns:
+                connection.execute("ALTER TABLE display_turns ADD COLUMN profile_update_json TEXT")
             connection.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS unique_profile_tool_call "
                 "ON trader_profile_items(tool_call_id) WHERE tool_call_id IS NOT NULL"
@@ -372,6 +376,7 @@ class Storage:
         response_id: str | None,
         status: str,
         incomplete_reason: str | None,
+        profile_update: dict[str, str] | None = None,
         raw_start_position: int | None = None,
         raw_end_position: int | None = None,
     ) -> None:
@@ -384,9 +389,9 @@ class Storage:
                 """
                 INSERT INTO display_turns(
                     thread_id, turn_number, user_text, answer_markdown,
-                    citations_json, evidence_json, diagnostic_json, response_id,
+                    citations_json, evidence_json, diagnostic_json, profile_update_json, response_id,
                     status, incomplete_reason, raw_start_position, raw_end_position
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     thread_id,
@@ -396,6 +401,7 @@ class Storage:
                     json.dumps(citations),
                     json.dumps(evidence),
                     None if diagnostics is None else json.dumps(diagnostics),
+                    None if profile_update is None else json.dumps(profile_update),
                     response_id,
                     status,
                     incomplete_reason,
@@ -409,7 +415,7 @@ class Storage:
             rows = connection.execute(
                 """
                 SELECT turn_number, user_text, answer_markdown, citations_json,
-                       evidence_json, diagnostic_json, response_id, status,
+                       evidence_json, diagnostic_json, profile_update_json, response_id, status,
                        incomplete_reason
                 FROM display_turns WHERE thread_id = ? ORDER BY turn_number
                 """,
@@ -423,9 +429,10 @@ class Storage:
                 "citations": json.loads(row[3]),
                 "evidence": json.loads(row[4]),
                 "diagnostics": None if row[5] is None else json.loads(row[5]),
-                "response_id": row[6],
-                "status": row[7],
-                "incomplete_reason": row[8],
+                "response_id": row[7],
+                "status": row[8],
+                "incomplete_reason": row[9],
+                **({"profile_update": json.loads(row[6])} if row[6] is not None else {}),
             }
             for row in rows
         ]
@@ -633,6 +640,23 @@ class Storage:
                 (tool_call_id, operation, target_item_id, status, origin_thread_id, origin_turn_number),
             )
             return status
+
+    def profile_operation_status(self, tool_call_id: str) -> str | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT status FROM profile_tool_operations WHERE tool_call_id = ?", (tool_call_id,)
+            ).fetchone()
+        return None if row is None else str(row[0])
+
+    def profile_mutation_exists_for_origin(self, thread_id: int, turn_number: int) -> bool:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT 1 FROM trader_profile_items WHERE origin_thread_id = ? AND origin_turn_number = ? "
+                "UNION SELECT 1 FROM profile_tool_operations WHERE origin_thread_id = ? AND origin_turn_number = ? "
+                "LIMIT 1",
+                (thread_id, turn_number, thread_id, turn_number),
+            ).fetchone()
+        return row is not None
 
     def delete_thread(self, thread_id: int) -> bool:
         with self._connect() as connection:

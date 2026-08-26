@@ -169,6 +169,7 @@ class Answer:
     evidence: list[Evidence]
     diagnostics: ResponseDiagnostics | None = None
     incomplete_reason: str | None = None
+    profile_update: dict[str, str] | None = None
 
 
 @dataclass(frozen=True)
@@ -195,7 +196,7 @@ class ChatService:
         user_item, request, effective_depth = self._request(thread_id, question, evaluation)
         started_at = perf_counter()
         response = self.client.responses.create(**request)
-        response, leading_output, response_request = self._profile_continued_response(
+        response, leading_output, response_request, profile_update = self._profile_continued_response(
             thread_id, request, response, user_item["content"][0]["text"]
         )
         response, evidence_output, draft_response = self._citation_repaired_response(
@@ -211,6 +212,7 @@ class ChatService:
             evidence_output=[*leading_output, *evidence_output],
             draft_response=draft_response,
             leading_output=leading_output,
+            profile_update=profile_update,
         )
 
     def stream_reply(
@@ -227,7 +229,7 @@ class ChatService:
                 if event.type == "response.output_text.delta":
                     yield StreamEvent("delta", event.delta)
                 elif event.type in {"response.completed", "response.incomplete"}:
-                    response, leading_output, response_request = self._profile_continued_response(
+                    response, leading_output, response_request, profile_update = self._profile_continued_response(
                         thread_id, request, event.response, user_item["content"][0]["text"]
                     )
                     response, evidence_output, draft_response = self._citation_repaired_response(
@@ -243,6 +245,7 @@ class ChatService:
                         evidence_output=[*leading_output, *evidence_output],
                         draft_response=draft_response,
                         leading_output=leading_output,
+                        profile_update=profile_update,
                     )
                     if answer.incomplete_reason:
                         yield StreamEvent(
@@ -296,11 +299,11 @@ class ChatService:
 
     def _profile_continued_response(
         self, thread_id: int, request: dict, response: Any, question: str
-    ) -> tuple[Any, list[dict], dict]:
+    ) -> tuple[Any, list[dict], dict, dict[str, str] | None]:
         output = [_as_dict(item) for item in response.output]
         calls = [item for item in output if item.get("type") == "function_call"]
         if not calls:
-            return response, [], request
+            return response, [], request, None
         if any(not isinstance(call.get("call_id"), str) or not call["call_id"] for call in calls):
             LOGGER.warning("Profile function call missing a usable call id")
             safe_output = [item for item in output if item.get("type") != "function_call"]
@@ -317,7 +320,7 @@ class ChatService:
                         ],
                     }
                 )
-            return _response_with_output(response, safe_output), [], request
+            return _response_with_output(response, safe_output), [], request, None
         if len(calls) > 1:
             results = [_profile_tool_rejection("multiple_function_calls") for _ in calls]
         else:
@@ -340,7 +343,12 @@ class ChatService:
             ],
             "tools": _raw_file_search_tools(request["tools"]),
         }
-        return self.client.responses.create(**continuation_request), [*output, *tool_outputs], continuation_request
+        return (
+            self.client.responses.create(**continuation_request),
+            [*output, *tool_outputs],
+            continuation_request,
+            _profile_update(results[0]) if len(results) == 1 else None,
+        )
 
     def _execute_profile_tool(self, thread_id: int, question: str, call: dict) -> dict:
         call_id = call.get("call_id")
@@ -358,6 +366,10 @@ class ChatService:
                 "origin_turn_number": len(self.storage.display_turns(thread_id)) + 1,
                 "tool_call_id": call_id,
             }
+            if self.storage.profile_mutation_exists_for_origin(
+                origin["origin_thread_id"], origin["origin_turn_number"]
+            ):
+                return _profile_tool_rejection("already_processed_turn")
             if operation == "save":
                 if (
                     not EXPLICIT_PROFILE_WRITE.search(question)
@@ -404,6 +416,7 @@ class ChatService:
                     or not _question_names_profile_target(question, target_id)
                 ):
                     return _profile_tool_rejection("explicit_target_required")
+                existing_status = self.storage.profile_operation_status(call_id)
                 status = profile.forget_item(
                     item_id=target_id,
                     operation=operation,
@@ -411,6 +424,8 @@ class ChatService:
                     origin_thread_id=origin["origin_thread_id"],
                     origin_turn_number=origin["origin_turn_number"],
                 )
+                if existing_status is not None:
+                    status = f"already_{status}"
                 return {"status": status, "item_id": target_id}
             else:
                 return _profile_tool_rejection("invalid_operation")
@@ -472,6 +487,7 @@ class ChatService:
         evidence_output: list[dict] | None = None,
         draft_response: Any | None = None,
         leading_output: list[dict] | None = None,
+        profile_update: dict[str, str] | None = None,
     ) -> Answer:
         output = [*(leading_output or []), *(_as_dict(item) for item in response.output)]
         raw_positions = self.storage.append_thread_items(thread_id, [user_item, *output])
@@ -525,6 +541,7 @@ class ChatService:
             evidence=answer.evidence,
             diagnostics=diagnostics,
             incomplete_reason=answer.incomplete_reason,
+            profile_update=profile_update,
         )
         self.storage.record_display_turn(
             thread_id,
@@ -536,6 +553,7 @@ class ChatService:
             response_id=diagnostics.response_id,
             status=diagnostics.status,
             incomplete_reason=answer.incomplete_reason,
+            profile_update=profile_update,
             raw_start_position=None if raw_positions is None else raw_positions[0],
             raw_end_position=None if raw_positions is None else raw_positions[1],
         )
@@ -581,6 +599,12 @@ def _raw_file_search_tools(tools: list[dict]) -> list[dict]:
 
 def _profile_tool_rejection(reason: str) -> dict[str, str]:
     return {"status": "rejected", "reason": reason}
+
+
+def _profile_update(result: dict) -> dict[str, str] | None:
+    """Expose only a completed local change, never profile content or tool data."""
+    status = result.get("status")
+    return {"kind": status} if status in {"saved", "proposed", "archived", "deleted"} else None
 
 
 def _question_names_profile_target(question: str, target_id: Any) -> bool:

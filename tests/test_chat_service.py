@@ -154,6 +154,149 @@ def test_explicit_profile_tool_call_writes_once_then_uses_one_terminal_continuat
     assert all(tool["type"] != "function" for tool in continuation["tools"])
 
 
+def test_confirmed_profile_mutation_exposes_one_safe_persisted_acknowledgement(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    storage.set_vector_store("vs_jacob")
+    thread_id = storage.create_thread("Question")
+    terminal = SimpleNamespace(
+        status="completed",
+        output=[{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Saved."}]}],
+    )
+    answer = ChatService(
+        storage, SimpleNamespace(responses=SequenceResponses(profile_tool_call(arguments=profile_write_arguments()), terminal))
+    ).reply(thread_id, "Remember that I only trade ES.")
+
+    assert answer.profile_update == {"kind": "saved"}
+    turn = storage.display_turns(thread_id)[0]
+    assert turn["profile_update"] == {"kind": "saved"}
+    safe_metadata = json.dumps(turn["profile_update"])
+    assert "ES" not in safe_metadata
+    assert "call_profile" not in safe_metadata
+    assert "item_id" not in safe_metadata
+
+
+def test_tentative_profile_proposal_is_acknowledged_as_inactive(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    storage.set_vector_store("vs_jacob")
+    thread_id = storage.create_thread("Question")
+    terminal = SimpleNamespace(status="completed", output=[])
+    arguments = profile_write_arguments(operation="propose")
+    answer = ChatService(
+        storage, SimpleNamespace(responses=SequenceResponses(profile_tool_call(arguments=arguments), terminal))
+    ).reply(thread_id, "Remember that I only trade ES.")
+
+    assert answer.profile_update == {"kind": "proposed"}
+    assert storage.current_confirmed_profile_items() == []
+
+
+def test_ordinary_turn_and_replayed_profile_call_do_not_create_new_acknowledgements(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    storage.set_vector_store("vs_jacob")
+    first_thread = storage.create_thread("First")
+    second_thread = storage.create_thread("Second")
+    terminal = SimpleNamespace(status="completed", output=[])
+    responses = SequenceResponses(
+        SimpleNamespace(status="completed", output=[]),
+        profile_tool_call(arguments=profile_write_arguments()),
+        terminal,
+        profile_tool_call(arguments=profile_write_arguments()),
+        terminal,
+    )
+    service = ChatService(storage, SimpleNamespace(responses=responses))
+
+    ordinary = service.reply(first_thread, "What does Jacob teach?")
+    saved = service.reply(first_thread, "Remember that I only trade ES.")
+    replayed = service.reply(second_thread, "Remember that I only trade ES.")
+
+    assert ordinary.profile_update is None
+    assert saved.profile_update == {"kind": "saved"}
+    assert replayed.profile_update is None
+    assert len(storage.current_confirmed_profile_items()) == 1
+
+
+def test_retry_after_a_failed_terminal_response_cannot_repeat_a_profile_mutation(tmp_path):
+    class FailingContinuationResponses:
+        def __init__(self, *responses):
+            self.responses = list(responses)
+            self.calls = []
+            self.failed = False
+
+        def create(self, **kwargs):
+            self.calls.append(kwargs)
+            if len(self.calls) == 2 and not self.failed:
+                self.failed = True
+                raise RuntimeError("terminal failure")
+            return self.responses.pop(0)
+
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    storage.set_vector_store("vs_jacob")
+    thread_id = storage.create_thread("Question")
+    terminal = SimpleNamespace(status="completed", output=[])
+    responses = FailingContinuationResponses(
+        profile_tool_call(call_id="first", arguments=profile_write_arguments(operation="propose")),
+        profile_tool_call(call_id="retry", arguments=profile_write_arguments(operation="propose")),
+        terminal,
+    )
+    service = ChatService(storage, SimpleNamespace(responses=responses))
+
+    with pytest.raises(RuntimeError, match="terminal failure"):
+        service.reply(thread_id, "Remember that I only trade ES.")
+    answer = service.reply(thread_id, "Remember that I only trade ES.")
+
+    assert answer.profile_update is None
+    assert len([item for item in storage.profile_items() if item.state == "tentative"]) == 1
+
+
+def test_citation_repair_keeps_one_profile_acknowledgement_without_replaying_the_write(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    storage.set_vector_store("vs_jacob")
+    thread_id = storage.create_thread("Question")
+    uncited = source_response("Direct source teaching: Jacob teaches this.", [])
+    repaired = source_response("Direct source teaching: Jacob teaches this.", [])
+    answer = ChatService(
+        storage,
+        SimpleNamespace(responses=SequenceResponses(profile_tool_call(arguments=profile_write_arguments()), uncited, repaired)),
+    ).reply(thread_id, "Remember that I only trade ES.")
+
+    assert answer.profile_update == {"kind": "saved"}
+    assert len(storage.current_confirmed_profile_items()) == 1
+    assert storage.display_turns(thread_id)[0]["profile_update"] == {"kind": "saved"}
+
+
+def test_historical_turns_never_restore_deleted_or_superseded_profile_state(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    thread_id = storage.create_thread("Original")
+    profile = ProfileService(storage)
+    deleted = profile.create_item(
+        category="markets/instruments", subject="Primary market", value="ES", kind="fact",
+        provenance="USER_STATED", state="confirmed", origin_kind="chat", origin_thread_id=thread_id,
+        origin_turn_number=1,
+    )
+    storage.record_display_turn(
+        thread_id, user_text="Remember that I only trade ES.", answer_markdown="Saved.", citations=[], evidence=[],
+        diagnostics=None, response_id=None, status="completed", incomplete_reason=None, profile_update={"kind": "saved"},
+    )
+    profile.delete_item(deleted.id)
+    replacement = profile.create_item(
+        category="schedule/horizon", subject="Holding period", value="Intraday", kind="preference",
+        provenance="USER_STATED", state="confirmed", origin_kind="profile-editor",
+    )
+    profile.supersede_item(replacement.id, value="Two days", provenance="USER_DECISION", origin_kind="profile-editor")
+
+    historical = storage.display_turns(thread_id)
+
+    assert historical[0]["profile_update"] == {"kind": "saved"}
+    assert all(item.value != "ES" for item in storage.profile_items())
+    assert all(item.value != "Intraday" for item in storage.current_confirmed_profile_items())
+    assert [item.value for item in storage.current_confirmed_profile_items()] == ["Two days"]
+
+
 def test_citation_repair_after_profile_mutation_keeps_only_raw_search_and_no_dangling_call(tmp_path):
     storage = Storage(tmp_path / "mentor.sqlite3")
     storage.initialize()

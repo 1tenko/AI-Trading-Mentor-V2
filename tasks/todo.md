@@ -62,7 +62,7 @@ not part of this branch.
   - Verify: static/server tests, full pytest, local desktop/mobile browser smoke.
   - Depends on: Checkpoint A.
 
-- [ ] **Task 6 — Compact chat profile-update affordances**
+- [x] **Task 6 — Compact chat profile-update affordances**
   - Acceptance: chat acknowledges saved/proposed updates without turning the
     conversation into an admin interface or reactivating history.
   - Verify: fixtures, full pytest, and two-thread browser smoke.
