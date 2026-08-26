@@ -209,3 +209,291 @@ def test_storage_rolls_back_a_thread_delete_if_any_owned_row_cannot_be_removed(t
     assert storage.has_thread(thread_id)
     assert storage.thread_items(thread_id)
     assert storage.display_turns(thread_id)
+
+
+def test_storage_migrates_constrained_profile_items_without_changing_phase_two_data(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    thread_id = storage.create_thread("Question")
+    raw_item = {"role": "user", "content": [{"type": "input_text", "text": "Question"}]}
+    storage.append_thread_items(thread_id, [raw_item])
+    storage.replace_replay_items(thread_id, [{"type": "reasoning", "encrypted_content": "private"}])
+    storage.record_response_diagnostics(thread_id, "resp_1", {"response_id": "resp_1"})
+    storage.record_display_turn(
+        thread_id,
+        user_text="Question",
+        answer_markdown="Answer",
+        citations=[],
+        evidence=[],
+        diagnostics=None,
+        response_id=None,
+        status="completed",
+        incomplete_reason=None,
+    )
+    storage.initialize()
+    storage.initialize()
+
+    assert storage.thread_items(thread_id) == [raw_item]
+    assert storage.replay_items(thread_id) == [{"type": "reasoning", "encrypted_content": "private"}]
+    assert storage.response_diagnostics(thread_id) == [{"response_id": "resp_1"}]
+    assert storage.display_turns(thread_id)[0]["answer_markdown"] == "Answer"
+    with sqlite3.connect(storage.database_path) as connection:
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                """
+                INSERT INTO trader_profile_items(
+                    category, subject_key, subject, value, kind, provenance, state, origin_kind,
+                    origin_thread_id, origin_turn_number, origin_available
+                ) VALUES ('goals/research', 'goal', 'Goal', 'x', 'unknown', 'USER_STATED',
+                          'confirmed', 'profile-editor', NULL, NULL, 0)
+                """
+                )
+
+
+def test_storage_rejects_profile_values_over_the_storage_bound(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+
+    with pytest.raises(sqlite3.IntegrityError):
+        storage.create_profile_item(
+            category="goals/research",
+            subject="Goal",
+            value="x" * 501,
+            kind="goal",
+            provenance="USER_STATED",
+            state="confirmed",
+            origin_kind="profile-editor",
+        )
+
+
+def test_storage_versions_confirmed_profile_items_and_selects_only_current_records(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    original = storage.create_profile_item(
+        category="schedule/horizon",
+        subject="Holding Period",
+        value="I hold trades for two to five days.",
+        kind="preference",
+        provenance="USER_STATED",
+        state="confirmed",
+        origin_kind="profile-editor",
+    )
+
+    assert original.subject_key == "holding period"
+    assert storage.current_confirmed_profile_items() == [original]
+    with pytest.raises(sqlite3.IntegrityError):
+        storage.create_profile_item(
+            category="schedule/horizon",
+            subject=" holding   period ",
+            value="A second active preference.",
+            kind="preference",
+            provenance="USER_STATED",
+            state="confirmed",
+            origin_kind="profile-editor",
+        )
+
+    replacement = storage.supersede_profile_item(
+        original.id,
+        value="I now day trade only.",
+        provenance="USER_DECISION",
+        origin_kind="confirmation",
+    )
+
+    assert storage.profile_item(original.id).state == "superseded"
+    assert replacement.state == "confirmed"
+    assert replacement.supersedes_item_id == original.id
+    assert storage.current_confirmed_profile_items() == [replacement]
+
+
+def test_storage_archives_conflicts_and_permanently_deletes_profile_items(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    confirmed = storage.create_profile_item(
+        category="markets/instruments",
+        subject="Market",
+        value="I trade ES.",
+        kind="fact",
+        provenance="USER_STATED",
+        state="confirmed",
+        origin_kind="profile-editor",
+    )
+    first = storage.create_profile_item(
+        category="style/methodology",
+        subject="Entry style",
+        value="I prefer breakouts.",
+        kind="preference",
+        provenance="AI_INFERRED",
+        state="tentative",
+        origin_kind="chat",
+    )
+    second = storage.create_profile_item(
+        category="style/methodology",
+        subject="Entry style",
+        value="I prefer mean reversion.",
+        kind="preference",
+        provenance="AI_INFERRED",
+        state="tentative",
+        origin_kind="chat",
+    )
+
+    storage.archive_profile_item(confirmed.id)
+    storage.conflict_profile_items([first.id, second.id])
+    assert storage.current_confirmed_profile_items() == []
+    assert [storage.profile_item(item_id).state for item_id in (first.id, second.id)] == [
+        "conflicting",
+        "conflicting",
+    ]
+
+    assert storage.delete_profile_item(first.id) is True
+    assert storage.profile_item(first.id) is None
+
+
+def test_storage_thread_deletion_keeps_profile_record_and_marks_its_origin_unavailable(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    thread_id = storage.create_thread("Question")
+    item = storage.create_profile_item(
+        category="goals/research",
+        subject="Learning goal",
+        value="I am studying Jacob's material.",
+        kind="goal",
+        provenance="USER_STATED",
+        state="confirmed",
+        origin_kind="chat",
+        origin_thread_id=thread_id,
+        origin_turn_number=1,
+    )
+
+    assert storage.delete_thread(thread_id) is True
+    retained = storage.profile_item(item.id)
+    assert retained.origin_thread_id == thread_id
+    assert retained.origin_turn_number == 1
+    assert retained.origin_available is False
+
+
+def test_storage_migrates_a_phase_two_database_without_losing_existing_data(tmp_path):
+    database_path = tmp_path / "mentor.sqlite3"
+    with sqlite3.connect(database_path) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            CREATE TABLE sources (
+                relative_path TEXT PRIMARY KEY, filename TEXT NOT NULL, year INTEGER NOT NULL,
+                local_path TEXT NOT NULL, modified_at REAL NOT NULL, file_id TEXT NOT NULL,
+                vector_store_file_id TEXT NOT NULL
+            );
+            CREATE TABLE threads (id INTEGER PRIMARY KEY, title TEXT NOT NULL);
+            CREATE TABLE thread_items (
+                thread_id INTEGER NOT NULL REFERENCES threads(id), position INTEGER NOT NULL,
+                item_json TEXT NOT NULL, PRIMARY KEY(thread_id, position)
+            );
+            CREATE TABLE thread_replay_items (
+                thread_id INTEGER NOT NULL REFERENCES threads(id), position INTEGER NOT NULL,
+                item_json TEXT NOT NULL, PRIMARY KEY(thread_id, position)
+            );
+            CREATE TABLE response_diagnostics (
+                response_id TEXT PRIMARY KEY, thread_id INTEGER NOT NULL REFERENCES threads(id),
+                diagnostic_json TEXT NOT NULL
+            );
+            CREATE TABLE display_turns (
+                thread_id INTEGER NOT NULL REFERENCES threads(id), turn_number INTEGER NOT NULL,
+                user_text TEXT NOT NULL, answer_markdown TEXT NOT NULL, citations_json TEXT NOT NULL,
+                evidence_json TEXT NOT NULL, diagnostic_json TEXT, response_id TEXT, status TEXT NOT NULL,
+                incomplete_reason TEXT, raw_start_position INTEGER, raw_end_position INTEGER,
+                PRIMARY KEY(thread_id, turn_number)
+            );
+            INSERT INTO settings VALUES ('vector_store_id', 'vs_phase_two');
+            INSERT INTO sources VALUES ('2026/lesson.txt', 'lesson.txt', 2026, 'C:/lesson.txt', 1.0,
+                                        'file_phase_two', 'vsf_phase_two');
+            INSERT INTO threads VALUES (7, 'Phase 2 question');
+            INSERT INTO thread_items VALUES (7, 0, '{"role": "user", "content": []}');
+            INSERT INTO thread_replay_items VALUES (7, 0, '{"type": "reasoning", "encrypted_content": "private"}');
+            INSERT INTO response_diagnostics VALUES ('resp_phase_two', 7, '{"response_id": "resp_phase_two"}');
+            INSERT INTO display_turns VALUES (7, 1, 'Question', 'Answer', '[]', '[]', NULL,
+                                              'resp_phase_two', 'completed', NULL, 0, 0);
+            """
+        )
+
+    storage = Storage(database_path)
+    storage.initialize()
+
+    assert storage.vector_store_id() == "vs_phase_two"
+    assert storage.source_for_file("file_phase_two").filename == "lesson.txt"
+    assert storage.thread(7).title == "Phase 2 question"
+    assert storage.thread_items(7) == [{"role": "user", "content": []}]
+    assert storage.replay_items(7) == [{"type": "reasoning", "encrypted_content": "private"}]
+    assert storage.response_diagnostics(7) == [{"response_id": "resp_phase_two"}]
+    assert storage.display_turns(7)[0]["answer_markdown"] == "Answer"
+    with sqlite3.connect(database_path) as connection:
+        assert connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'trader_profile_items'"
+        ).fetchone() == (1,)
+
+
+def test_storage_rolls_back_a_failed_profile_supersession(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    original = storage.create_profile_item(
+        category="schedule/horizon",
+        subject="Holding period",
+        value="I hold for days.",
+        kind="preference",
+        provenance="USER_STATED",
+        state="confirmed",
+        origin_kind="profile-editor",
+    )
+    with sqlite3.connect(storage.database_path) as connection:
+        connection.execute(
+            """
+            CREATE TRIGGER prevent_profile_successor
+            BEFORE INSERT ON trader_profile_items
+            WHEN NEW.supersedes_item_id IS NOT NULL
+            BEGIN SELECT RAISE(ABORT, 'test supersession rollback'); END;
+            """
+        )
+
+    with pytest.raises(sqlite3.IntegrityError, match="test supersession rollback"):
+        storage.supersede_profile_item(
+            original.id,
+            value="I now day trade.",
+            provenance="USER_DECISION",
+            origin_kind="confirmation",
+        )
+
+    assert storage.profile_item(original.id).state == "confirmed"
+    assert storage.current_confirmed_profile_items() == [original]
+
+
+def test_storage_rolls_back_thread_deletion_after_profile_origin_update_fails(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    thread_id = storage.create_thread("Question")
+    storage.append_thread_items(
+        thread_id, [{"role": "user", "content": [{"type": "input_text", "text": "Question"}]}]
+    )
+    item = storage.create_profile_item(
+        category="goals/research",
+        subject="Learning goal",
+        value="I am studying Jacob's material.",
+        kind="goal",
+        provenance="USER_STATED",
+        state="confirmed",
+        origin_kind="chat",
+        origin_thread_id=thread_id,
+        origin_turn_number=1,
+    )
+    with sqlite3.connect(storage.database_path) as connection:
+        connection.execute(
+            """
+            CREATE TRIGGER prevent_thread_item_delete_after_origin_update
+            BEFORE DELETE ON thread_items
+            BEGIN SELECT RAISE(ABORT, 'test thread rollback'); END;
+            """
+        )
+
+    with pytest.raises(sqlite3.IntegrityError, match="test thread rollback"):
+        storage.delete_thread(thread_id)
+
+    assert storage.profile_item(item.id).origin_available is True
+    assert storage.has_thread(thread_id)
+    assert storage.thread_items(thread_id)

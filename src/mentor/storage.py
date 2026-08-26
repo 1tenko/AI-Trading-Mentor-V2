@@ -22,6 +22,23 @@ class Thread:
     title: str
 
 
+@dataclass(frozen=True)
+class TraderProfileItem:
+    id: int
+    category: str
+    subject_key: str
+    subject: str
+    value: str
+    kind: str
+    provenance: str
+    state: str
+    origin_kind: str
+    origin_thread_id: int | None
+    origin_turn_number: int | None
+    origin_available: bool
+    supersedes_item_id: int | None
+
+
 class Storage:
     def __init__(self, database_path: Path):
         self.database_path = database_path
@@ -80,6 +97,43 @@ class Storage:
                     raw_end_position INTEGER,
                     PRIMARY KEY(thread_id, turn_number)
                 );
+                CREATE TABLE IF NOT EXISTS trader_profile_items (
+                    id INTEGER PRIMARY KEY,
+                    category TEXT NOT NULL CHECK(category IN (
+                        'goals/research', 'markets/instruments', 'schedule/horizon',
+                        'style/methodology', 'execution/risk/constraints', 'experience/learning',
+                        'preferences/discretion', 'strengths/difficulties/principles'
+                    )),
+                    subject_key TEXT NOT NULL CHECK(
+                        length(subject_key) BETWEEN 1 AND 120
+                        AND subject_key = lower(trim(subject_key))
+                        AND instr(subject_key, '  ') = 0
+                    ),
+                    subject TEXT NOT NULL CHECK(length(subject) BETWEEN 1 AND 120),
+                    value TEXT NOT NULL CHECK(length(value) BETWEEN 1 AND 500),
+                    kind TEXT NOT NULL CHECK(kind IN (
+                        'fact', 'preference', 'constraint', 'goal', 'principle', 'learning-state'
+                    )),
+                    provenance TEXT NOT NULL CHECK(provenance IN (
+                        'USER_STATED', 'USER_CONFIRMED', 'AI_INFERRED', 'USER_DECISION'
+                    )),
+                    state TEXT NOT NULL CHECK(state IN (
+                        'confirmed', 'tentative', 'superseded', 'conflicting', 'archived'
+                    )),
+                    origin_kind TEXT NOT NULL CHECK(origin_kind IN ('chat', 'profile-editor', 'confirmation')),
+                    origin_thread_id INTEGER,
+                    origin_turn_number INTEGER,
+                    origin_available INTEGER NOT NULL CHECK(origin_available IN (0, 1)),
+                    supersedes_item_id INTEGER REFERENCES trader_profile_items(id) ON DELETE SET NULL,
+                    CHECK(
+                        (origin_thread_id IS NULL AND origin_turn_number IS NULL AND origin_available = 0)
+                        OR (origin_thread_id IS NOT NULL AND origin_turn_number > 0)
+                    )
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS unique_current_profile_subject
+                    ON trader_profile_items(category, subject_key) WHERE state = 'confirmed';
+                CREATE INDEX IF NOT EXISTS profile_origin_thread
+                    ON trader_profile_items(origin_thread_id);
                 """
             )
             columns = {row[1] for row in connection.execute("PRAGMA table_info(sources)")}
@@ -358,6 +412,116 @@ class Storage:
             for row in rows
         ]
 
+    def create_profile_item(
+        self,
+        *,
+        category: str,
+        subject: str,
+        value: str,
+        kind: str,
+        provenance: str,
+        state: str,
+        origin_kind: str,
+        origin_thread_id: int | None = None,
+        origin_turn_number: int | None = None,
+        origin_available: bool | None = None,
+        supersedes_item_id: int | None = None,
+    ) -> TraderProfileItem:
+        with self._connect() as connection:
+            return self._insert_profile_item(
+                connection,
+                category=category,
+                subject=subject,
+                value=value,
+                kind=kind,
+                provenance=provenance,
+                state=state,
+                origin_kind=origin_kind,
+                origin_thread_id=origin_thread_id,
+                origin_turn_number=origin_turn_number,
+                origin_available=origin_available,
+                supersedes_item_id=supersedes_item_id,
+            )
+
+    def profile_item(self, item_id: int) -> TraderProfileItem | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT id, category, subject_key, subject, value, kind, provenance, state, "
+                "origin_kind, origin_thread_id, origin_turn_number, origin_available, "
+                "supersedes_item_id FROM trader_profile_items WHERE id = ?",
+                (item_id,),
+            ).fetchone()
+        return None if row is None else _profile_item_from_row(row)
+
+    def current_confirmed_profile_items(self) -> list[TraderProfileItem]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT id, category, subject_key, subject, value, kind, provenance, state, "
+                "origin_kind, origin_thread_id, origin_turn_number, origin_available, "
+                "supersedes_item_id FROM trader_profile_items WHERE state = 'confirmed' "
+                "ORDER BY category, subject_key, id"
+            ).fetchall()
+        return [_profile_item_from_row(row) for row in rows]
+
+    def supersede_profile_item(
+        self,
+        item_id: int,
+        *,
+        value: str,
+        provenance: str,
+        origin_kind: str,
+        subject: str | None = None,
+        kind: str | None = None,
+        origin_thread_id: int | None = None,
+        origin_turn_number: int | None = None,
+        origin_available: bool | None = None,
+    ) -> TraderProfileItem:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT id, category, subject_key, subject, value, kind, provenance, state, "
+                "origin_kind, origin_thread_id, origin_turn_number, origin_available, "
+                "supersedes_item_id FROM trader_profile_items WHERE id = ?",
+                (item_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(item_id)
+            predecessor = _profile_item_from_row(row)
+            connection.execute(
+                "UPDATE trader_profile_items SET state = 'superseded' WHERE id = ?", (item_id,)
+            )
+            return self._insert_profile_item(
+                connection,
+                category=predecessor.category,
+                subject=predecessor.subject if subject is None else subject,
+                value=value,
+                kind=predecessor.kind if kind is None else kind,
+                provenance=provenance,
+                state="confirmed",
+                origin_kind=origin_kind,
+                origin_thread_id=origin_thread_id,
+                origin_turn_number=origin_turn_number,
+                origin_available=origin_available,
+                supersedes_item_id=item_id,
+            )
+
+    def archive_profile_item(self, item_id: int) -> bool:
+        return self._set_profile_state(item_id, "archived")
+
+    def conflict_profile_items(self, item_ids: list[int]) -> int:
+        if not item_ids:
+            return 0
+        with self._connect() as connection:
+            cursor = connection.executemany(
+                "UPDATE trader_profile_items SET state = 'conflicting' WHERE id = ?",
+                [(item_id,) for item_id in item_ids],
+            )
+        return cursor.rowcount
+
+    def delete_profile_item(self, item_id: int) -> bool:
+        with self._connect() as connection:
+            cursor = connection.execute("DELETE FROM trader_profile_items WHERE id = ?", (item_id,))
+        return cursor.rowcount == 1
+
     def delete_thread(self, thread_id: int) -> bool:
         with self._connect() as connection:
             exists = connection.execute(
@@ -365,12 +529,71 @@ class Storage:
             ).fetchone()
             if exists is None:
                 return False
+            connection.execute(
+                "UPDATE trader_profile_items SET origin_available = 0 WHERE origin_thread_id = ?",
+                (thread_id,),
+            )
             connection.execute("DELETE FROM display_turns WHERE thread_id = ?", (thread_id,))
             connection.execute("DELETE FROM response_diagnostics WHERE thread_id = ?", (thread_id,))
             connection.execute("DELETE FROM thread_replay_items WHERE thread_id = ?", (thread_id,))
             connection.execute("DELETE FROM thread_items WHERE thread_id = ?", (thread_id,))
             connection.execute("DELETE FROM threads WHERE id = ?", (thread_id,))
         return True
+
+    def _set_profile_state(self, item_id: int, state: str) -> bool:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "UPDATE trader_profile_items SET state = ? WHERE id = ?", (state, item_id)
+            )
+        return cursor.rowcount == 1
+
+    def _insert_profile_item(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        category: str,
+        subject: str,
+        value: str,
+        kind: str,
+        provenance: str,
+        state: str,
+        origin_kind: str,
+        origin_thread_id: int | None,
+        origin_turn_number: int | None,
+        origin_available: bool | None,
+        supersedes_item_id: int | None,
+    ) -> TraderProfileItem:
+        subject = " ".join(subject.split())
+        value = value.strip()
+        cursor = connection.execute(
+            """
+            INSERT INTO trader_profile_items(
+                category, subject_key, subject, value, kind, provenance, state, origin_kind,
+                origin_thread_id, origin_turn_number, origin_available, supersedes_item_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                category,
+                _profile_subject_key(subject),
+                subject,
+                value,
+                kind,
+                provenance,
+                state,
+                origin_kind,
+                origin_thread_id,
+                origin_turn_number,
+                int(origin_thread_id is not None if origin_available is None else origin_available),
+                supersedes_item_id,
+            ),
+        )
+        row = connection.execute(
+            "SELECT id, category, subject_key, subject, value, kind, provenance, state, "
+            "origin_kind, origin_thread_id, origin_turn_number, origin_available, "
+            "supersedes_item_id FROM trader_profile_items WHERE id = ?",
+            (cursor.lastrowid,),
+        ).fetchone()
+        return _profile_item_from_row(row)
 
     def _backfill_display_turns(self, connection: sqlite3.Connection) -> None:
         thread_ids = connection.execute("SELECT id FROM threads").fetchall()
@@ -466,6 +689,14 @@ def _user_text(item: dict) -> str | None:
 def _compact_title(text: str) -> str:
     compact = " ".join(text.split())
     return f"{compact[:55]}…" if len(compact) > 56 else compact
+
+
+def _profile_subject_key(subject: str) -> str:
+    return " ".join(subject.split()).casefold()
+
+
+def _profile_item_from_row(row: tuple) -> TraderProfileItem:
+    return TraderProfileItem(*row[:11], bool(row[11]), row[12])
 
 
 def _display_content(items: list[dict]) -> tuple[str, list[dict], list[dict]]:

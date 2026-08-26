@@ -11,11 +11,11 @@ not part of this branch.
 
 ## profile-storage
 
-- [ ] **Task 1 — Local profile schema and transactional lifecycle**
+- [x] **Task 1 — Local profile schema and transactional lifecycle**
   - Acceptance: constrained versioned records and origin fields migrate safely;
     global profile state survives thread deletion; destructive actions are
     atomic and replacement identity is unambiguous.
-  - Verify: focused storage tests and full pytest.
+  - Verify: 14 focused storage tests and 52 full pytest tests passed.
   - Depends on: none.
 
 ## profile-context
