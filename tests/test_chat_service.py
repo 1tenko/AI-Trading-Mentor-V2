@@ -160,6 +160,33 @@ def test_personalization_changes_only_bounded_profile_input_not_raw_source_confi
     assert profile_a["context_management"] == profile_b["context_management"]
 
 
+def test_explicit_strategy_design_uses_broader_questionnaire_context_without_replaying_it(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    storage.set_vector_store("vs_jacob")
+    ProfileService(storage).save_questionnaire_answers({
+        "q1": "Build consistent income.",
+        "q2": "ES and NQ.",
+        "q3": "London open.",
+        "q4": "idk",
+        "q7": "Some judgement.",
+        "q13": "One percent risk maximum.",
+        "q15": "No overnight positions.",
+        "q19": "A simple repeatable system.",
+    })
+    responses = FakeResponses(SimpleNamespace(status="completed", output=[]))
+    service = ChatService(storage, SimpleNamespace(responses=responses))
+
+    service.reply(storage.create_thread("Strategy"), "I don't know what I should backtest — help me develop a strategy.")
+
+    request = responses.calls[0]
+    assert "Trader Strategy Profile — user context, not source evidence:" in request["instructions"]
+    assert "trading objective: Build consistent income." in request["instructions"]
+    assert "preferred trading style: User is currently unsure / has not decided." in request["instructions"]
+    assert "risk and funding constraints: One percent risk maximum." in request["instructions"]
+    assert all("Trader Strategy Profile" not in json.dumps(item) for item in request["input"])
+
+
 def test_current_profile_survives_cross_thread_then_old_chat_cannot_restore_deleted_or_superseded_values(tmp_path):
     storage = Storage(tmp_path / "mentor.sqlite3")
     storage.initialize()

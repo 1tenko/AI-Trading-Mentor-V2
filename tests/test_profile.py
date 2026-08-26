@@ -584,6 +584,18 @@ def test_questionnaire_has_all_fixed_human_fields_and_never_exposes_schema_choic
     assert QUESTIONNAIRE_FIELDS[-1].key == "additional_information"
     assert QUESTIONNAIRE_FIELDS[0].subject == "trading objective"
     assert QUESTIONNAIRE_FIELDS[1].subject == "markets willing to trade"
+    assert "consistent profitability" in QUESTIONNAIRE_FIELDS[0].helper
+    assert "high-quality trades" in QUESTIONNAIRE_FIELDS[19].helper
+
+
+def test_questionnaire_recognises_explicit_uncertainty_with_natural_suffixes(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    profile = ProfileService(storage)
+
+    profile.save_questionnaire_answers({"q4": "I don't know yet"})
+
+    assert profile.questionnaire_answers()["q4"].unknown is True
 
 
 def test_questionnaire_batch_save_is_atomic_versioned_and_preserves_explicit_unknown(tmp_path):

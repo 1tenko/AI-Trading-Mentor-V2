@@ -328,7 +328,7 @@ def test_server_keeps_profile_acknowledgement_safe_and_historical_only(tmp_path)
         worker.join()
 
 
-def test_server_serves_the_accessible_local_trader_profile_panel(tmp_path):
+def test_chat_navigates_to_the_dedicated_trader_profile_page_without_technical_editor(tmp_path):
     storage = Storage(tmp_path / "mentor.sqlite3")
     storage.initialize()
     server = create_server(storage, FakeChatService(), port=0)
@@ -337,35 +337,24 @@ def test_server_serves_the_accessible_local_trader_profile_panel(tmp_path):
     try:
         status, _, page = request(server, "GET", "/")
         assert status == 200
-        assert b'id="profile-toggle"' in page
-        assert b'aria-controls="profile-panel"' in page
-        assert b'id="profile-panel"' in page
-        assert b'role="dialog"' in page
-        assert b'aria-modal="true"' in page
-        assert b'aria-labelledby="profile-title"' in page
-        assert b'id="profile-backdrop"' in page
-        assert b'id="profile-add-form"' in page
-        assert b"Needs confirmation" in page
-        assert b"Current profile" in page
+        assert b'href="/profile"' in page
+        assert b">Trader Profile<" in page
+        assert b'profile-panel' not in page
+        assert b'profile-add-form' not in page
+        assert b">Category<" not in page
+        assert b">Kind<" not in page
+        assert b">Provenance<" not in page
 
         status, _, script = request(server, "GET", "/app.js")
         assert status == 200
-        assert b'profileRequest("/api/profile")' in script
-        assert b'profileRequest("/api/profile/items"' in script
-        assert b'method: "PATCH"' in script
-        assert b'method: "DELETE"' in script
-        assert b"Permanently delete" in script
-        assert b"profileClose.focus()" in script
-        assert b"event.key === \"Escape\"" in script
-        assert b"event.key !== \"Tab\"" in script
-        assert b"profileOpener" in script
-        assert b"profileFocusable()" in script
+        assert b'window.location.assign("/profile")' in script
+        assert b'profileRequest("/api/profile")' not in script
+        assert b'profile-add-form' not in script
 
         status, _, stylesheet = request(server, "GET", "/app.css")
         assert status == 200
-        assert b".profile-panel" in stylesheet
-        assert b".profile-record" in stylesheet
-        assert b".profile-backdrop" in stylesheet
+        assert b".profile-main" in stylesheet
+        assert b".questionnaire-field" in stylesheet
         assert b"@media (max-width: 760px)" in stylesheet
     finally:
         server.shutdown()
@@ -573,6 +562,42 @@ def test_profile_api_permanent_delete_does_not_cross_the_thread_boundary(tmp_pat
         assert request(server, "DELETE", f"/api/profile/items/{item.id}")[0] == 200
         assert request(server, "GET", "/api/profile")[2] == b'{"current": [], "tentative": [], "history": [], "conflicts": []}'
         assert request(server, "DELETE", f"/api/profile/items/{item.id}")[0] == 404
+    finally:
+        server.shutdown()
+        worker.join()
+
+
+def test_questionnaire_profile_page_and_local_batch_api_hide_internal_schema(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    server = create_server(storage, FakeChatService(), port=0)
+    worker = threading.Thread(target=server.serve_forever)
+    worker.start()
+    try:
+        status, _, page = request(server, "GET", "/profile")
+        assert status == 200
+        assert b"Trader Profile" in page
+        assert b"AI Chat" in page
+        assert b"Category" not in page
+        assert b"questionnaire-form" in page
+        assert b"/profile.js" in page
+
+        status, _, body = request(server, "GET", "/api/profile/questionnaire")
+        payload = json.loads(body)
+        assert status == 200
+        assert len(payload["fields"]) == 21
+        assert {"category", "kind", "provenance", "subject_key"}.isdisjoint(payload["fields"][0])
+
+        status, _, body = request(
+            server,
+            "PUT",
+            "/api/profile/questionnaire",
+            json.dumps({"answers": {"q1": "Build consistency.", "q4": "idk", "q5": ""}}).encode(),
+        )
+        assert status == 200
+        assert json.loads(body)["answers"]["q1"]["value"] == "Build consistency."
+        assert json.loads(body)["answers"]["q4"]["unknown"] is True
+        assert storage.current_confirmed_profile_items()[0].provenance == "USER_STATED"
     finally:
         server.shutdown()
         worker.join()

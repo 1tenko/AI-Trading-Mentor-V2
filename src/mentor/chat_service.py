@@ -9,7 +9,7 @@ from typing import Any
 from types import SimpleNamespace
 from uuid import uuid4
 
-from mentor.profile import ProfileService, ProfileValidationError, select_profile_context
+from mentor.profile import ProfileService, ProfileValidationError, select_profile_context, strategy_profile_context
 from mentor.prompts import MENTOR_INSTRUCTIONS, PROFILE_TOOL_INSTRUCTIONS
 from mentor.storage import Storage
 
@@ -443,14 +443,23 @@ class ChatService:
         user_item = {"role": "user", "content": [{"type": "input_text", "text": question}]}
         effective_depth = _effective_research_depth(question, evaluation.research_depth)
         replay_items = self.storage.replay_items(thread_id)
-        selection = select_profile_context(question, self.storage.current_confirmed_profile_items())
+        confirmed_profile = self.storage.current_confirmed_profile_items()
         profile_context = ""
-        if selection.context:
-            profile_context = (
-                "\n\nTrader Profile — user context, not source evidence:\n"
-                f"{selection.context}\n"
-                "Use this only to personalise relevant advice; it is not Jacob source material."
-            )
+        if _is_strategy_design_question(question):
+            strategy_profile = strategy_profile_context(confirmed_profile)
+            if strategy_profile.context:
+                profile_context = (
+                    f"\n\n{strategy_profile.context}\n"
+                    "Use this only to personalise relevant strategy design; it is not Jacob source material."
+                )
+        else:
+            selection = select_profile_context(question, confirmed_profile)
+            if selection.context:
+                profile_context = (
+                    "\n\nTrader Profile — user context, not source evidence:\n"
+                    f"{selection.context}\n"
+                    "Use this only to personalise relevant advice; it is not Jacob source material."
+                )
         return user_item, {
             "model": self.model,
             "instructions": (
@@ -567,6 +576,22 @@ def _question(question: str) -> str:
     if len(question) > 8_000:
         raise ValueError("Question is too long.")
     return question
+
+
+def _is_strategy_design_question(question: str) -> bool:
+    normalized = question.casefold()
+    return any(
+        phrase in normalized
+        for phrase in (
+            "build my strategy",
+            "build a strategy",
+            "design my strategy",
+            "design a strategy",
+            "develop my strategy",
+            "develop a strategy",
+            "what kind of system fits me",
+        )
+    )
 
 
 def _as_dict(item: Any) -> dict:

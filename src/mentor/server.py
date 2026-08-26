@@ -10,7 +10,7 @@ from typing import Any
 from urllib.parse import unquote, urlparse
 
 from mentor.chat_service import Answer, EvaluationConfig, StreamEvent
-from mentor.profile import ProfileService, ProfileValidationError
+from mentor.profile import QUESTIONNAIRE_FIELDS, ProfileService, ProfileValidationError
 from mentor.storage import Storage
 
 LOGGER = logging.getLogger(__name__)
@@ -19,6 +19,7 @@ FILE_ID = re.compile(r"^[A-Za-z0-9_-]+$")
 STATIC_ASSETS = {
     "/app.css": ("app.css", "text/css; charset=utf-8"),
     "/app.js": ("app.js", "text/javascript; charset=utf-8"),
+    "/profile.js": ("profile.js", "text/javascript; charset=utf-8"),
     "/vendor/marked.esm.js": ("vendor/marked.esm.js", "text/javascript; charset=utf-8"),
     "/vendor/purify.min.js": ("vendor/purify.min.js", "text/javascript; charset=utf-8"),
 }
@@ -54,11 +55,17 @@ class _Handler(BaseHTTPRequestHandler):
                 {"threads": [thread.__dict__ for thread in self.storage.threads()]},
             )
             return
+        if path == "/profile":
+            self._send_bytes(HTTPStatus.OK, _static("profile.html"), "text/html; charset=utf-8")
+            return
         if path == "/api/profile":
             groups = {"current": [], "tentative": [], "history": [], "conflicts": []}
             for item in self.storage.profile_items():
                 groups[_profile_group(item.state)].append(_profile_item_json(item))
             self._send_json(HTTPStatus.OK, groups)
+            return
+        if path == "/api/profile/questionnaire":
+            self._send_json(HTTPStatus.OK, _questionnaire_json(ProfileService(self.storage)))
             return
         match = re.fullmatch(r"/api/threads/(\d+)", path)
         if match:
@@ -155,6 +162,22 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.OK, {"updated": result})
         else:
             self._send_json(HTTPStatus.OK, {"item": _profile_item_json(result)})
+
+    def do_PUT(self) -> None:  # noqa: N802
+        if urlparse(self.path).path != "/api/profile/questionnaire":
+            self._send_json(HTTPStatus.NOT_FOUND, {"error": "Not found."})
+            return
+        try:
+            body = self._json_body()
+            _only_fields(body, {"answers"})
+            answers = body.get("answers")
+            if not isinstance(answers, dict):
+                raise ValueError("Questionnaire answers must be an object.")
+            ProfileService(self.storage).save_questionnaire_answers(answers)
+        except ValueError as error:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
+            return
+        self._send_json(HTTPStatus.OK, _questionnaire_json(ProfileService(self.storage)))
 
     def _source(self, file_id: str) -> None:
         source = self.storage.source_for_file(file_id)
@@ -344,6 +367,25 @@ def _profile_group(state: str) -> str:
     if state == "conflicting":
         return "conflicts"
     return "history"
+
+
+def _questionnaire_json(profile: ProfileService) -> dict[str, object]:
+    answers = profile.questionnaire_answers()
+    return {
+        "fields": [
+            {
+                "key": field.key,
+                "section": field.section,
+                "question": field.question,
+                "helper": field.helper,
+            }
+            for field in QUESTIONNAIRE_FIELDS
+        ],
+        "answers": {
+            key: None if answer is None else {"value": answer.item.value, "unknown": answer.unknown}
+            for key, answer in answers.items()
+        },
+    }
 
 
 def _profile_item_json(item: Any) -> dict[str, object]:

@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Trader Profile</title>
+    <link rel="stylesheet" href="/app.css">
+  </head>
+  <body class="profile-page">
+    <main class="profile-main">
+      <header class="profile-header"><div><h1>Trader Profile</h1><p class="subtitle">Your local trading context</p></div><a class="profile-chat-link" href="/">AI Chat</a></header>
+      <section class="profile-intro"><p>Tell the Mentor what kind of trader you are and what you want from your strategy.</p><p>There are no right answers. If you don't know an answer yet, type “I don't know” or “idk”. You can change anything later.</p><dl class="profile-answer-guide"><dt>Leave blank</dt><dd>No answer is saved.</dd><dt>Type “idk”, “I don't know”, or “not sure”</dt><dd>Your uncertainty is saved, so the Mentor knows this is not decided yet.</dd></dl><p>Your answers are stored locally and used only when relevant to personalise your trading guidance.</p></section>
+      <p id="profile-status" role="status"></p>
+      <form id="questionnaire-form" novalidate></form>
+      <section id="profile-suggestions" class="profile-secondary" hidden></section>
+      <details id="profile-history" class="profile-secondary"><summary>Profile history</summary><div></div></details>
+    </main>
+    <script type="module" src="/profile.js"></script>
+  </body>
+</html>
