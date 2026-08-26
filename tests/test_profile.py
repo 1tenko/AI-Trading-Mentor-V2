@@ -1,0 +1,483 @@
+from dataclasses import replace
+
+import pytest
+
+from mentor.profile import ProfileService, ProfileValidationError, select_profile_context
+from mentor.storage import Storage
+
+
+def test_profile_service_normalizes_explicit_user_records_and_rejects_invalid_lifecycle_pairs(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    profile = ProfileService(storage)
+
+    item = profile.create_item(
+        category="schedule/horizon",
+        subject="  Holding   period ",
+        value="  I hold trades for two to five days.  ",
+        kind="preference",
+        provenance="USER_STATED",
+        state="confirmed",
+        origin_kind="profile-editor",
+    )
+
+    assert (item.subject, item.subject_key, item.value, item.state) == (
+        "Holding period",
+        "holding period",
+        "I hold trades for two to five days.",
+        "confirmed",
+    )
+    with pytest.raises(ProfileValidationError, match="AI_INFERRED.*tentative"):
+        profile.create_item(
+            category="schedule/horizon",
+            subject="Risk",
+            value="Risk is low.",
+            kind="constraint",
+            provenance="AI_INFERRED",
+            state="confirmed",
+            origin_kind="chat",
+        )
+    with pytest.raises(ProfileValidationError, match="category"):
+        profile.create_item(
+            category="unknown",
+            subject="Risk",
+            value="Risk is low.",
+            kind="constraint",
+            provenance="USER_STATED",
+            state="confirmed",
+            origin_kind="profile-editor",
+        )
+
+
+def test_profile_service_only_supersedes_a_confirmed_unambiguous_predecessor(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    profile = ProfileService(storage)
+    predecessor = profile.create_item(
+        category="schedule/horizon",
+        subject="Holding period",
+        value="I hold for days.",
+        kind="preference",
+        provenance="USER_STATED",
+        state="confirmed",
+        origin_kind="profile-editor",
+    )
+    tentative = profile.propose_item(
+        category="style/methodology",
+        subject="Entry style",
+        value="I prefer breakouts.",
+        kind="preference",
+        origin_kind="chat",
+    )
+
+    successor = profile.supersede_item(
+        predecessor.id,
+        value="I now day trade only.",
+        provenance="USER_DECISION",
+        origin_kind="confirmation",
+    )
+
+    assert storage.profile_item(predecessor.id).state == "superseded"
+    assert successor.state == "confirmed"
+    assert successor.supersedes_item_id == predecessor.id
+    with pytest.raises(ProfileValidationError, match="confirmed"):
+        profile.supersede_item(
+            tentative.id,
+            value="I prefer mean reversion.",
+            provenance="USER_DECISION",
+            origin_kind="confirmation",
+        )
+
+
+def test_profile_service_confirms_only_a_tentative_inference_and_preserves_history(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    profile = ProfileService(storage)
+    proposal = profile.propose_item(
+        category="goals/research",
+        subject="Learning goal",
+        value="I am studying Jacob's material.",
+        kind="goal",
+        origin_kind="chat",
+    )
+
+    confirmed = profile.confirm_item(proposal.id, origin_kind="confirmation")
+
+    assert storage.profile_item(proposal.id).state == "superseded"
+    assert confirmed == storage.current_confirmed_profile_items()[0]
+    assert (confirmed.provenance, confirmed.state, confirmed.supersedes_item_id) == (
+        "USER_CONFIRMED",
+        "confirmed",
+        proposal.id,
+    )
+    with pytest.raises(ProfileValidationError, match="tentative"):
+        profile.confirm_item(confirmed.id, origin_kind="confirmation")
+
+
+def test_profile_selection_uses_only_relevant_current_records_and_never_source_questions(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    profile = ProfileService(storage)
+    goal = profile.create_item(
+        category="goals/research",
+        subject="Research goal",
+        value="I am building a backtest.",
+        kind="goal",
+        provenance="USER_STATED",
+        state="confirmed",
+        origin_kind="profile-editor",
+    )
+    style = profile.create_item(
+        category="style/methodology",
+        subject="Entry style",
+        value="I prefer breakouts.",
+        kind="preference",
+        provenance="USER_STATED",
+        state="confirmed",
+        origin_kind="profile-editor",
+    )
+    tentative = profile.propose_item(
+        category="execution/risk/constraints",
+        subject="Risk",
+        value="I risk one percent.",
+        kind="constraint",
+        origin_kind="chat",
+    )
+    archived = profile.create_item(
+        category="preferences/discretion",
+        subject="Answer format",
+        value="I prefer bullets.",
+        kind="preference",
+        provenance="USER_STATED",
+        state="archived",
+        origin_kind="profile-editor",
+    )
+
+    selected = select_profile_context(
+        "How should I structure a backtest for this breakout setup?",
+        [archived, tentative, style, goal],
+    )
+
+    assert selected.item_ids == (goal.id,)
+    assert selected.character_count == len(selected.context)
+    assert "Research goal: I am building a backtest." in selected.context
+    assert select_profile_context("What did Jacob say at timestamp 12:23?", [goal, style]).item_ids == ()
+
+
+def test_profile_selection_is_deterministic_deduplicated_and_bounded(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    profile = ProfileService(storage)
+    items = [
+        profile.create_item(
+            category="goals/research",
+            subject=f"Research goal {index}",
+            value=f"Goal {index}",
+            kind="goal",
+            provenance="USER_STATED",
+            state="confirmed",
+            origin_kind="profile-editor",
+        )
+        for index in range(7)
+    ]
+    duplicate = replace(items[0], id=999)
+
+    selected = select_profile_context("Help me research and backtest this.", list(reversed(items)) + [duplicate])
+
+    assert selected.item_ids == tuple(item.id for item in items[:6])
+    assert len(selected.items) == 6
+    assert selected.character_count <= 1200
+    assert duplicate.id not in selected.item_ids
+
+
+def test_profile_selection_excludes_unrelated_records_in_a_relevant_category(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    profile = ProfileService(storage)
+    matching_market = profile.create_item(
+        category="goals/research",
+        subject="Market research",
+        value="I study ES opening range setups.",
+        kind="goal",
+        provenance="USER_STATED",
+        state="confirmed",
+        origin_kind="profile-editor",
+    )
+    matching_setup = profile.create_item(
+        category="goals/research",
+        subject="Research focus",
+        value="I backtest opening range breakouts.",
+        kind="goal",
+        provenance="USER_STATED",
+        state="confirmed",
+        origin_kind="profile-editor",
+    )
+    unrelated = profile.create_item(
+        category="goals/research",
+        subject="Learning goal",
+        value="I am improving trading psychology.",
+        kind="goal",
+        provenance="USER_STATED",
+        state="confirmed",
+        origin_kind="profile-editor",
+    )
+
+    selected = select_profile_context(
+        "How do I backtest ES opening range breakouts?",
+        [unrelated, matching_setup, matching_market],
+    )
+
+    assert selected.item_ids == (matching_market.id, matching_setup.id)
+    assert unrelated.id not in selected.item_ids
+
+
+def test_profile_selection_keeps_research_intent_context_across_schedule_and_risk(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    profile = ProfileService(storage)
+    research = profile.create_item(
+        category="goals/research",
+        subject="Research focus",
+        value="I backtest opening range breakouts.",
+        kind="goal",
+        provenance="USER_STATED",
+        state="confirmed",
+        origin_kind="profile-editor",
+    )
+    unrelated_research = profile.create_item(
+        category="goals/research",
+        subject="Learning goal",
+        value="I am improving trading psychology.",
+        kind="goal",
+        provenance="USER_STATED",
+        state="confirmed",
+        origin_kind="profile-editor",
+    )
+    available_session = profile.create_item(
+        category="schedule/horizon",
+        subject="Available session",
+        value="I trade the London open on weekdays.",
+        kind="constraint",
+        provenance="USER_STATED",
+        state="confirmed",
+        origin_kind="profile-editor",
+    )
+    risk = profile.create_item(
+        category="execution/risk/constraints",
+        subject="Maximum risk",
+        value="I risk one percent per position.",
+        kind="constraint",
+        provenance="USER_STATED",
+        state="confirmed",
+        origin_kind="profile-editor",
+    )
+
+    selected = select_profile_context(
+        "How do I backtest opening range breakouts?",
+        [unrelated_research, available_session, risk, research],
+    )
+
+    assert selected.item_ids == (risk.id, available_session.id, research.id)
+    assert unrelated_research.id not in selected.item_ids
+
+
+def _confirmed(profile, *, category, subject, value, kind="constraint", provenance="USER_STATED"):
+    return profile.create_item(
+        category=category,
+        subject=subject,
+        value=value,
+        kind=kind,
+        provenance=provenance,
+        state="confirmed",
+        origin_kind="profile-editor",
+    )
+
+
+def test_profile_selector_contract_a_research_selects_available_session_without_literal_overlap(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    session = _confirmed(ProfileService(storage), category="schedule/horizon", subject="Available session", value="London open")
+
+    assert select_profile_context("Design a robust backtest.", [session]).item_ids == (session.id,)
+
+
+def test_profile_selector_contract_b_research_selects_risk_constraint_without_literal_overlap(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    risk = _confirmed(ProfileService(storage), category="execution/risk/constraints", subject="Maximum risk", value="One percent")
+
+    assert select_profile_context("Help me research this setup.", [risk]).item_ids == (risk.id,)
+
+
+def test_profile_selector_contract_c_same_category_needs_item_applicability(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    profile = ProfileService(storage)
+    holding = _confirmed(profile, category="schedule/horizon", subject="Holding period", value="Two days", kind="preference")
+    session = _confirmed(profile, category="schedule/horizon", subject="Available session", value="London open")
+
+    assert select_profile_context("How should I plan a swing trade holding period?", [session, holding]).item_ids == (holding.id,)
+
+
+def test_profile_selector_contract_d_subject_affinity_selects_holding_period(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    profile = ProfileService(storage)
+    holding = _confirmed(profile, category="schedule/horizon", subject="Holding period", value="Two to five days", kind="preference")
+    session = _confirmed(profile, category="schedule/horizon", subject="Available session", value="London open")
+
+    assert select_profile_context("What holding horizon fits this trade plan?", [session, holding]).item_ids == (holding.id,)
+
+
+def test_profile_selector_contract_e_distinctive_value_is_an_explicit_reference(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    profile = ProfileService(storage)
+    es = _confirmed(profile, category="markets/instruments", subject="Primary market", value="ES", kind="preference")
+    nq = _confirmed(profile, category="markets/instruments", subject="Secondary market", value="NQ", kind="preference")
+
+    selected = select_profile_context("Help me make a plan for ES.", [nq, es])
+
+    assert selected.item_ids == (es.id,)
+    assert selected.reasons == ("explicit_reference",)
+    assert selected.tiers == (1,)
+
+
+def test_profile_selector_contract_f_generic_value_tokens_are_not_explicit_references(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    style = _confirmed(
+        ProfileService(storage),
+        category="style/methodology",
+        subject="Entry style",
+        value="Daily trading strategy",
+        kind="preference",
+    )
+
+    assert select_profile_context("Explain a good trading strategy.", [style]).item_ids == ()
+
+
+def test_profile_selector_contract_g_exact_source_lookup_has_no_profile_context(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    item = _confirmed(ProfileService(storage), category="markets/instruments", subject="Primary market", value="ES", kind="preference")
+
+    assert select_profile_context("What does Jacob mean by Asset Synchronization?", [item]).item_ids == ()
+
+
+def test_profile_selector_contract_h_source_application_can_select_personal_constraint(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    item = _confirmed(ProfileService(storage), category="schedule/horizon", subject="Available session", value="London open")
+
+    assert select_profile_context(
+        "What does Jacob mean by Asset Synchronization, and how does it apply to my London session?", [item]
+    ).item_ids == (item.id,)
+
+
+def test_profile_selector_contract_i_unrelated_question_selects_none(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    item = _confirmed(ProfileService(storage), category="execution/risk/constraints", subject="Maximum risk", value="One percent")
+
+    assert select_profile_context("What is the capital of France?", [item]).item_ids == ()
+
+
+def test_profile_selector_contract_j_nonconfirmed_records_never_select(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    profile = ProfileService(storage)
+    tentative = profile.propose_item(
+        category="schedule/horizon", subject="Available session", value="London open", kind="constraint", origin_kind="chat"
+    )
+
+    assert select_profile_context("Design a backtest.", [tentative]).item_ids == ()
+
+
+def test_profile_selector_contract_k_priority_precedes_six_item_cap(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    profile = ProfileService(storage)
+    generic = [
+            _confirmed(profile, category="goals/research", subject=f"Research goal {index}", value=f"Goal {index}", kind="goal")
+        for index in range(6)
+    ]
+    es = _confirmed(profile, category="markets/instruments", subject="Primary market", value="ES", kind="preference")
+
+    selected = select_profile_context("Research a plan for ES.", generic + [es])
+
+    assert len(selected.items) == 6
+    assert selected.item_ids[0] == es.id
+
+
+def test_profile_selector_contract_l_order_and_safe_diagnostics_are_deterministic(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    profile = ProfileService(storage)
+    session = _confirmed(profile, category="schedule/horizon", subject="Available session", value="London open")
+    risk = _confirmed(profile, category="execution/risk/constraints", subject="Maximum risk", value="One percent")
+
+    first = select_profile_context("Design a backtest.", [risk, session])
+    second = select_profile_context("Design a backtest.", [session, risk])
+
+    assert first == second
+    assert first.item_ids == tuple(item.id for item in first.items)
+    assert first.character_count == len(first.context)
+    assert first.reasons == ("structural_constraint", "structural_constraint")
+
+
+def test_profile_selector_prioritizes_current_user_decision_within_goal_tier(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    profile = ProfileService(storage)
+    stated = _confirmed(profile, category="goals/research", subject="Research goal alpha", value="Alpha", kind="goal")
+    decision = _confirmed(
+        profile,
+        category="goals/research",
+        subject="Research goal beta",
+        value="Beta",
+        kind="goal",
+        provenance="USER_DECISION",
+    )
+
+    assert select_profile_context("Help me research.", [stated, decision]).item_ids == (decision.id, stated.id)
+
+
+def test_profile_selector_does_not_treat_nontrading_script_tests_as_research(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    session = _confirmed(
+        ProfileService(storage),
+        category="schedule/horizon",
+        subject="Available session",
+        value="London open",
+    )
+
+    assert select_profile_context("Can you test this Python script?", [session]).item_ids == ()
+
+
+def test_profile_selector_does_not_treat_general_trading_advice_as_an_execution_plan(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    profile = ProfileService(storage)
+    market = _confirmed(
+        profile,
+        category="markets/instruments",
+        subject="Primary market",
+        value="ES",
+        kind="preference",
+    )
+    session = _confirmed(
+        profile,
+        category="schedule/horizon",
+        subject="Available session",
+        value="London open",
+    )
+    risk = _confirmed(
+        profile,
+        category="execution/risk/constraints",
+        subject="Maximum risk",
+        value="One percent",
+    )
+
+    assert select_profile_context("Give me general trading advice.", [market, session, risk]).item_ids == ()

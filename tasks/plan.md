@@ -67,8 +67,13 @@ Task 1 profile schema/lifecycle
   fields, explicit provenance, and unambiguous successor targets.
 - [ ] Only confirmed current records can be selected; conflicts, tentative,
   superseded, archived, and deleted values never appear in active context.
-- [ ] Relevance selection is deterministic, deduplicated, and capped at six
-  records or 1,200 characters.
+- [ ] The selector uses the documented intent -> eligibility -> applicability
+  -> ranking -> dedupe -> cap policy. Categories are gates, not matches; exact
+  source lookup normally selects none; structural constraints can apply without
+  literal overlap; unrelated same-category records do not select.
+- [ ] Relevance selection is deterministic, records safe reason/tier
+  diagnostics, is deduplicated, and is capped at six records or 1,200
+  characters.
 
 **Verification:** focused profile tests; full pytest.
 

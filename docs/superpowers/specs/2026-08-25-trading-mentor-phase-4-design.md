@@ -158,13 +158,85 @@ past preference from invisibly influencing later advice.
 ## Request-Time Context and Source Authority
 
 Before composing a new Responses request, a local deterministic selector takes
-the current question and active confirmed items. It scores the controlled
-category and normalised subject against a small, explicit question-intent map;
-for example, research/backtest questions can select goals, constraints,
-markets, style, and available time, while an exact source/timestamp question
-normally selects none. It deduplicates and caps orientation at **six items or
-1,200 characters**, whichever is reached first. It records only selected item
-IDs/count/character count in safe per-turn diagnostics; it does not replay a
+the current question and active confirmed items through this fixed sequence:
+
+```text
+question -> intent classification -> eligible profile roles/categories
+         -> per-item applicability -> deterministic ranking -> dedupe
+         -> six-item / 1,200-character cap
+```
+
+The selector uses a small explicit intent policy, not an open-ended similarity
+model. A question may activate compatible intents. The initial vocabulary is
+`research/backtest/strategy development`, `execution/trading plan`,
+`learning/methodology`, `source/exact teaching lookup`, `general trading
+advice`, and `unrelated/non-trading`. A source/exact lookup normally selects
+no profile context. It can also activate an application intent only when the
+question contains an explicit personal-application signal (for example, `my`,
+`for me`, `given I`, `given my`, or `apply this to my`) and names a relevant
+personal constraint. An unrelated/non-trading question selects none unless it
+explicitly asks about the profile itself.
+
+Intent policy is an auditable local table. For each intent it defines eligible
+categories, allowed structural category/kind/subject-family pairs, recognised
+subject-family aliases, exclusions, and priority. A category is an eligibility
+gate, never a match by itself. An item may be selected only through one or
+more of these bounded applicability signals:
+
+1. **Structural constraint or goal relevance:** a policy-approved
+   category/kind/subject-family pair applies to the active intent. Examples
+   include available session/time, holding horizon, traded market/instrument,
+   execution or risk constraint, explicit research goal, and discretion
+   constraint. This admits a relevant scheduling or risk constraint for a
+   research request even when its wording does not occur in the question.
+2. **Subject affinity:** the normalised item subject matches a policy-defined
+   subject family or alias activated by the question.
+3. **Explicit reference:** the question names the subject or a distinctive,
+   policy-approved narrow value such as `ES`, `NQ`, `London session`, or
+   `scalping`. Generic words such as `trading`, `risk`, `strategy`, `good`,
+   and `daily` are never value matches.
+
+The policy must not treat an item's whole value as an intent model. A
+same-category item without a structural pair, subject affinity, or distinctive
+explicit reference is excluded. This prevents a broad category such as
+`goals/research` from injecting unrelated current records.
+
+The initial policy is deliberately small. Subject families are normalised
+aliases for narrowly named subjects, not free-text value classes:
+
+| Intent | Eligible categories | Structural pairs admitted without literal overlap |
+| --- | --- | --- |
+| Research/backtest/strategy development | goals/research, markets/instruments, schedule/horizon, execution/risk/constraints, preferences/discretion, style/methodology | `goals/research` + `goal`/`constraint` + `research goal`; `markets/instruments` + `fact`/`preference`/`constraint` + `market/instrument`; `schedule/horizon` + `constraint`/`preference` + `available session`/`available time`/`holding horizon`; `execution/risk/constraints` + `constraint`/`principle` + `execution/risk constraint`; `preferences/discretion` + `constraint`/`preference` + `discretion constraint`. Style/methodology requires subject affinity or explicit reference. |
+| Execution/trading plan | markets/instruments, schedule/horizon, execution/risk/constraints, preferences/discretion, style/methodology, goals/research | The market, schedule, execution/risk, and discretion pairs above; plus `goals/research` + `goal` + `trading goal`. Style/methodology requires subject affinity or explicit reference. |
+| Learning/methodology | experience/learning, strengths/difficulties/principles, style/methodology, goals/research | `goals/research` + `goal` + `learning goal`; `experience/learning` + `learning-state` + `learning state/difficulty`; `strengths/difficulties/principles` + `principle` + `learning state/difficulty`. Style/methodology requires subject affinity or explicit reference. |
+| General trading advice | markets/instruments, schedule/horizon, execution/risk/constraints, preferences/discretion, style/methodology, goals/research | The execution pairs above. Broad advice does not turn every constraint on. |
+| Source/exact teaching lookup | none by default | None. A compatible application intent is required before another row can select context. |
+| Unrelated/non-trading | none | None, except an explicit request to discuss the Trader Profile itself. |
+
+The implementation encodes the controlled subject families required by these
+roles—`market/instrument`, `available session`, `available time`, `holding
+horizon`, `execution/risk constraint`, `discretion constraint`, `research
+goal`, `trading goal`, `learning goal`, `learning state/difficulty`, and
+`style/methodology`—with a short alias list for each. It does not infer a
+family from arbitrary profile prose.
+
+Every structural pair additionally requires `state=confirmed`. The
+`current_goal` rank applies only to a `goal` with provenance
+`USER_STATED`, `USER_CONFIRMED`, or `USER_DECISION`; `USER_DECISION` breaks
+ties within that rank. The policy never promotes a record by provenance alone.
+
+After applicability, selection ranks records by: (1) explicit reference,
+(2) hard feasibility constraint, (3) current explicit user goal or decision,
+(4) direct subject match, and (5) other policy-approved relevant context.
+Stable category, subject-key, and item-ID tie breaks—not recency—make the
+result deterministic. It then deduplicates by category and normalised subject,
+and caps orientation at **six items or 1,200 characters**, whichever is
+reached first.
+
+Safe per-turn diagnostics retain only selected IDs, count, character count,
+and the applicability tier/reason (for example `explicit_reference`,
+`structural_constraint`, `current_goal`, or `subject_match`). They never
+persist profile values or private reasoning. The selector does not replay a
 full profile into historical Responses state.
 
 The selected records enter Sol's instruction context in a marked `Trader

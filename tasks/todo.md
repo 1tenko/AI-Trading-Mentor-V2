@@ -20,9 +20,13 @@ not part of this branch.
 
 ## profile-context
 
-- [ ] **Task 2 — Profile service and bounded deterministic selection**
-  - Acceptance: only confirmed current items select; relevance is deterministic,
-    deduplicated, and within the six-item/1,200-character cap.
+- [x] **Task 2 — Profile service and bounded deterministic selection**
+  - Acceptance: only confirmed current items select through the documented
+    intent, per-item applicability, deterministic ranking, dedupe, and cap
+    policy; categories alone never select. Exact source lookup normally has no
+    context; structural constraints remain eligible where policy defines them.
+    Diagnostics retain safe reason/tier only. Output is within six items/1,200
+    characters.
   - Verify: focused profile tests and full pytest.
   - Depends on: Task 1.
 
