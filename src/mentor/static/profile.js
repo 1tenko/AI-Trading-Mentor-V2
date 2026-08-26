@@ -90,7 +90,7 @@ async function loadSecondary() {
     suggestions.hidden = true;
   }
 
-  const retained = [...data.current, ...data.history, ...data.conflicts];
+  const retained = [...data.current.filter((item) => !item.questionnaire), ...data.history, ...data.conflicts];
   const content = history.querySelector("div");
   content.replaceChildren();
   if (!retained.length) {

@@ -646,3 +646,27 @@ def test_strategy_profile_context_is_bounded_and_represents_unknowns_without_ass
     assert "preferred trading style: User is currently unsure" in context.context
     assert "I don't know" not in context.context
     assert context.character_count <= 6000
+
+
+def test_ordinary_profile_context_renders_explicit_uncertainty_as_unresolved(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    profile = ProfileService(storage)
+    profile.save_questionnaire_answers({"q4": "idk"})
+
+    selected = select_profile_context("What trading style should I research?", storage.current_confirmed_profile_items())
+
+    assert "preferred trading style: User is currently unsure / has not decided." in selected.context
+    assert "preferred trading style: idk" not in selected.context
+
+
+def test_strategy_profile_context_includes_every_short_questionnaire_answer_within_budget(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    profile = ProfileService(storage)
+    profile.save_questionnaire_answers({field.key: field.key for field in QUESTIONNAIRE_FIELDS})
+
+    context = strategy_profile_context(storage.current_confirmed_profile_items())
+
+    assert len(context.items) == len(QUESTIONNAIRE_FIELDS)
+    assert context.character_count <= 6000

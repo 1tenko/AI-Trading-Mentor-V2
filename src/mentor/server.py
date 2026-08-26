@@ -23,6 +23,10 @@ STATIC_ASSETS = {
     "/vendor/marked.esm.js": ("vendor/marked.esm.js", "text/javascript; charset=utf-8"),
     "/vendor/purify.min.js": ("vendor/purify.min.js", "text/javascript; charset=utf-8"),
 }
+QUESTIONNAIRE_SUBJECTS = frozenset(
+    (field.category, " ".join(field.subject.split()).casefold())
+    for field in QUESTIONNAIRE_FIELDS
+)
 
 
 def create_server(storage: Storage, chat_service: Any, port: int = 8765) -> ThreadingHTTPServer:
@@ -402,4 +406,5 @@ def _profile_item_json(item: Any) -> dict[str, object]:
         "origin_turn_number": item.origin_turn_number,
         "origin_available": item.origin_available,
         "supersedes_item_id": item.supersedes_item_id,
+        "questionnaire": (item.category, item.subject_key) in QUESTIONNAIRE_SUBJECTS,
     }

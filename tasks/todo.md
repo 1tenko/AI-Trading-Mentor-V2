@@ -4,7 +4,9 @@ The binding proposed design is
 [2026-08-25-trading-mentor-phase-4-design.md](../docs/superpowers/specs/2026-08-25-trading-mentor-phase-4-design.md).
 The detailed proposed execution plan is [plan.md](plan.md).
 
-**Status:** Design and plan complete; awaiting Theo's implementation approval.
+**Status:** Tasks 1–7 are implemented. The first Task 8 human gate failed on
+the technical profile-building UX; the approved questionnaire revision resets
+that gate after deterministic and browser verification.
 Phase 4 is based on Phase 2 closure `f809193ef2749dbe53c0af14e5d3196420c896f9`.
 Phase 3/3B remains archived on `feature/phase-3-knowledge-assimilation` and is
 not part of this branch.
@@ -88,10 +90,12 @@ not part of this branch.
     source integrity, UX, and cost/context quality, then records pass/fail.
   - Verify: full pytest before Theo's local private evaluation.
   - Depends on: Task 7.
+  - Note: the first human evaluation failed on the technical profile editor;
+    this remains pending until Theo evaluates the revised questionnaire page.
 
 ### Final checkpoint — Await Theo's Phase 4 decision
 
-- [ ] All deterministic and browser checks pass.
-- [ ] The feature branch is committed and pushed.
+- [x] All deterministic and browser checks pass.
+- [x] The feature branch is committed and pushed.
 - [ ] Theo has made the human acceptance decision.
 - [ ] Stop: do not start Phase 5 or merge to main.

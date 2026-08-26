@@ -79,17 +79,17 @@ _TOKEN_PATTERN = re.compile(r"[a-z0-9]+")
 _TOKEN_STOP_WORDS = {"a", "an", "and", "do", "for", "how", "i", "in", "is", "it", "of", "the", "this", "to", "what"}
 _DISTINCTIVE_VALUES = frozenset({"es", "nq", "london", "scalping"})
 _SUBJECT_FAMILIES = {
-    "market/instrument": ("market", "instrument", "primary market", "secondary market", "markets traded"),
-    "available session": ("available session", "trading session", "session"),
+    "market/instrument": ("market", "instrument", "primary market", "secondary market", "markets traded", "markets willing to trade"),
+    "available session": ("available session", "trading session", "session", "trading availability"),
     "available time": ("available time", "trading time"),
-    "holding horizon": ("holding horizon", "holding period", "holding time"),
-    "execution/risk constraint": ("maximum risk", "risk limit", "risk constraint", "execution constraint"),
+    "holding horizon": ("holding horizon", "holding period", "holding time", "preferred holding duration"),
+    "execution/risk constraint": ("maximum risk", "risk limit", "risk constraint", "execution constraint", "preferred trade frequency", "risk and funding constraints", "strategy deal-breakers"),
     "discretion constraint": ("discretion constraint", "discretion preference", "alert preference"),
-    "research goal": ("research goal", "research focus", "backtest focus", "current research objective", "market research"),
-    "trading goal": ("trading goal",),
+    "research goal": ("research goal", "research focus", "backtest focus", "current research objective", "market research", "backtesting commitment", "suspected edge"),
+    "trading goal": ("trading goal", "trading objective", "strategy priorities"),
     "learning goal": ("learning goal",),
-    "learning state/difficulty": ("learning state", "difficulty", "strength", "struggle"),
-    "style/methodology": ("entry style", "exit style", "trading style", "methodology"),
+    "learning state/difficulty": ("learning state", "difficulty", "strength", "struggle", "trading strengths", "recurring trading difficulties", "trusted and uncertain concepts", "current trading uncertainties"),
+    "style/methodology": ("entry style", "exit style", "trading style", "methodology", "preferred trading style", "concepts/models to build from", "ideal setup", "ideal strategy"),
 }
 _INTENT_POLICIES = {
     "research/backtest/strategy development": {
@@ -418,7 +418,8 @@ def select_profile_context(
     lines: list[str] = []
     length = 0
     for item, (tier, reason) in applicable:
-        line = f"- {item.subject}: {item.value}"
+        value = "User is currently unsure / has not decided." if _is_unknown(item.value) else item.value
+        line = f"- {item.subject}: {value}"
         next_length = length + (1 if lines else 0) + len(line)
         if len(selected) == 6 or next_length > 1200:
             break

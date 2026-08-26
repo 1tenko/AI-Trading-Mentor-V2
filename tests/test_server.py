@@ -355,6 +355,8 @@ def test_chat_navigates_to_the_dedicated_trader_profile_page_without_technical_e
         assert status == 200
         assert b".profile-main" in stylesheet
         assert b".questionnaire-field" in stylesheet
+        assert b"padding: 1.5rem 1rem" in stylesheet
+        assert b"calc((100vw - 52rem)" not in stylesheet
         assert b"@media (max-width: 760px)" in stylesheet
     finally:
         server.shutdown()
@@ -598,6 +600,10 @@ def test_questionnaire_profile_page_and_local_batch_api_hide_internal_schema(tmp
         assert json.loads(body)["answers"]["q1"]["value"] == "Build consistency."
         assert json.loads(body)["answers"]["q4"]["unknown"] is True
         assert storage.current_confirmed_profile_items()[0].provenance == "USER_STATED"
+
+        status, _, body = request(server, "GET", "/api/profile")
+        assert status == 200
+        assert json.loads(body)["current"][0]["questionnaire"] is True
     finally:
         server.shutdown()
         worker.join()
