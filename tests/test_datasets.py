@@ -387,6 +387,45 @@ def test_xlsx_rejects_authority_and_whitespace_prefixed_external_relationship_ta
         _importer(storage, tmp_path)(source)
 
 
+def test_next_start_recovers_rename_then_interrupt_staging_orphan_without_touching_completed_dataset(tmp_path, monkeypatch):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    source = tmp_path / "trades.csv"
+    source.write_text("Result_R\n1.5\n", encoding="utf-8")
+    completed = import_local_dataset(source, storage, tmp_path / "datasets", dataset_id_factory=lambda: "dataset-keep")
+    incomplete_directory = tmp_path / "datasets" / "dataset-imported"
+    real_replace = Path.replace
+    real_rmtree = __import__("shutil").rmtree
+
+    def rename_then_interrupt(path, target):
+        result = real_replace(path, target)
+        if Path(target) == incomplete_directory:
+            raise KeyboardInterrupt()
+        return result
+
+    def leave_staging_directory(path, *args, **kwargs):
+        if Path(path) == incomplete_directory:
+            raise OSError("simulate process shutdown during cleanup")
+        return real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "replace", rename_then_interrupt)
+    monkeypatch.setattr("mentor.datasets.shutil.rmtree", leave_staging_directory)
+
+    with pytest.raises(KeyboardInterrupt):
+        _importer(storage, tmp_path)(source)
+
+    assert (incomplete_directory / ".pending-import").exists()
+    assert storage.pending_dataset_import_ids() == ["dataset-imported"]
+    monkeypatch.setattr(Path, "replace", real_replace)
+    monkeypatch.setattr("mentor.datasets.shutil.rmtree", real_rmtree)
+    import_local_dataset(source, storage, tmp_path / "datasets", dataset_id_factory=lambda: "dataset-next")
+
+    assert not incomplete_directory.exists()
+    assert storage.pending_dataset_import_ids() == []
+    assert completed.original_path.read_bytes() == source.read_bytes()
+    assert storage.dataset(completed.dataset.id) == completed.dataset
+
+
 def _result_envelope(dataset, mapping_version_id: int, operation: str = "summarize_results"):
     return {
         "provenance": "USER_EMPIRICAL_EVIDENCE",

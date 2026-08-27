@@ -136,7 +136,6 @@ def import_local_dataset(
     temporary_directory = Path(tempfile.mkdtemp(prefix=".import-", dir=datasets_root))
     final_directory: Path | None = None
     dataset_id: str | None = None
-    promoted_this_import = False
     reserved_this_import = False
     try:
         temporary_original = temporary_directory / f"original{extension}"
@@ -160,7 +159,6 @@ def import_local_dataset(
         (temporary_directory / ".pending-import").touch(exist_ok=False)
         final_directory = candidate_directory
         temporary_directory.replace(final_directory)
-        promoted_this_import = True
         original_path = final_directory / temporary_original.name
         dataset = storage.create_dataset(
             dataset_id=dataset_id,
@@ -192,7 +190,7 @@ def import_local_dataset(
     except BaseException:
         if reserved_this_import and dataset_id is not None and storage.dataset_import_state(dataset_id) == "staging":
             try:
-                if promoted_this_import and final_directory is not None and final_directory.exists():
+                if final_directory is not None and (final_directory / ".pending-import").exists():
                     shutil.rmtree(final_directory)
                 storage.discard_failed_dataset_import(dataset_id)
                 storage.abandon_dataset_import(dataset_id)
