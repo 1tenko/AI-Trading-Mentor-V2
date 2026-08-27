@@ -319,6 +319,10 @@ class Storage:
                     AND NEW.confirmed_at IS NOT NULL
                 )
                 BEGIN SELECT RAISE(ABORT, 'mapping versions are immutable'); END;
+                CREATE TRIGGER IF NOT EXISTS mapping_versions_must_start_as_draft
+                BEFORE INSERT ON dataset_mapping_versions
+                WHEN NEW.status != 'draft'
+                BEGIN SELECT RAISE(ABORT, 'mapping versions must begin as draft'); END;
                 CREATE TRIGGER IF NOT EXISTS confirmed_mapping_entries_are_immutable
                 BEFORE INSERT ON dataset_mapping_entries
                 WHEN (SELECT status FROM dataset_mapping_versions WHERE id = NEW.mapping_version_id) = 'confirmed'
@@ -393,6 +397,18 @@ class Storage:
                 CREATE TRIGGER IF NOT EXISTS analysis_evidence_is_immutable
                 BEFORE UPDATE ON analysis_evidence
                 BEGIN SELECT RAISE(ABORT, 'analysis evidence is immutable'); END;
+                CREATE TRIGGER IF NOT EXISTS analysis_evidence_arguments_are_metadata_only
+                BEFORE INSERT ON analysis_evidence
+                WHEN json_valid(NEW.arguments_json) = 0
+                  OR length(NEW.arguments_json) > 160
+                  OR json_type(NEW.arguments_json, '$') != 'object'
+                  OR (SELECT COUNT(*) FROM json_each(NEW.arguments_json)) != 1
+                  OR json_extract(NEW.arguments_json, '$.dataset_id') != NEW.dataset_id
+                  OR EXISTS (
+                      SELECT 1 FROM json_each(NEW.arguments_json)
+                      WHERE key != 'dataset_id' OR type != 'text'
+                  )
+                BEGIN SELECT RAISE(ABORT, 'analysis evidence arguments are invalid'); END;
                 CREATE TRIGGER IF NOT EXISTS mapping_entries_require_dataset_column
                 BEFORE INSERT ON dataset_mapping_entries
                 WHEN NOT EXISTS (
@@ -500,6 +516,7 @@ class Storage:
                 row[1] for row in connection.execute("PRAGMA table_info(analysis_tool_outputs)")
             }
             if "arguments_json" not in tool_output_columns:
+                connection.execute("DROP TRIGGER IF EXISTS analysis_tool_outputs_are_immutable")
                 connection.execute("ALTER TABLE analysis_tool_outputs ADD COLUMN arguments_json TEXT")
                 connection.execute(
                     """
@@ -534,14 +551,68 @@ class Storage:
                           AND parent.dataset_id = OLD.dataset_id
                           AND parent.status = 'draft'
                     )
+                    AND NOT EXISTS (
+                        SELECT 1 FROM dataset_mapping_entries AS child_entry
+                        WHERE child_entry.mapping_version_id = NEW.id
+                          AND NOT EXISTS (
+                              SELECT 1 FROM dataset_mapping_entries AS parent_entry
+                              WHERE parent_entry.mapping_version_id = OLD.parent_mapping_version_id
+                                AND parent_entry.column_ordinal = child_entry.column_ordinal
+                                AND parent_entry.semantic_role IS child_entry.semantic_role
+                                AND parent_entry.unit IS child_entry.unit
+                                AND parent_entry.analysis_label IS child_entry.analysis_label
+                                AND parent_entry.source IS child_entry.source
+                          )
+                    )
+                    AND NOT EXISTS (
+                        SELECT 1 FROM dataset_mapping_entries AS parent_entry
+                        WHERE parent_entry.mapping_version_id = OLD.parent_mapping_version_id
+                          AND NOT EXISTS (
+                              SELECT 1 FROM dataset_mapping_entries AS child_entry
+                              WHERE child_entry.mapping_version_id = NEW.id
+                                AND child_entry.column_ordinal = parent_entry.column_ordinal
+                                AND child_entry.semantic_role IS parent_entry.semantic_role
+                                AND child_entry.unit IS parent_entry.unit
+                                AND child_entry.analysis_label IS parent_entry.analysis_label
+                                AND child_entry.source IS parent_entry.source
+                          )
+                    )
                 )
                 BEGIN SELECT RAISE(ABORT, 'mapping versions are immutable'); END;
+                DROP TRIGGER IF EXISTS mapping_versions_must_start_as_draft;
+                CREATE TRIGGER mapping_versions_must_start_as_draft
+                BEFORE INSERT ON dataset_mapping_versions
+                WHEN NEW.status != 'draft'
+                BEGIN SELECT RAISE(ABORT, 'mapping versions must begin as draft'); END;
+                DROP TRIGGER IF EXISTS confirmed_mapping_entries_are_immutable;
+                CREATE TRIGGER confirmed_mapping_entries_are_immutable
+                BEFORE INSERT ON dataset_mapping_entries
+                WHEN (SELECT status FROM dataset_mapping_versions WHERE id = NEW.mapping_version_id) = 'confirmed'
+                BEGIN SELECT RAISE(ABORT, 'confirmed mapping entries are immutable'); END;
                 DROP TRIGGER IF EXISTS confirmed_mapping_entries_cannot_change;
                 CREATE TRIGGER confirmed_mapping_entries_cannot_change
                 BEFORE UPDATE ON dataset_mapping_entries
                 WHEN (SELECT status FROM dataset_mapping_versions WHERE id = OLD.mapping_version_id) = 'confirmed'
                   OR (SELECT status FROM dataset_mapping_versions WHERE id = NEW.mapping_version_id) = 'confirmed'
                 BEGIN SELECT RAISE(ABORT, 'confirmed mapping entries are immutable'); END;
+                DROP TRIGGER IF EXISTS confirmed_mapping_entries_cannot_delete;
+                CREATE TRIGGER confirmed_mapping_entries_cannot_delete
+                BEFORE DELETE ON dataset_mapping_entries
+                WHEN (SELECT status FROM dataset_mapping_versions WHERE id = OLD.mapping_version_id) = 'confirmed'
+                BEGIN SELECT RAISE(ABORT, 'confirmed mapping entries are immutable'); END;
+                DROP TRIGGER IF EXISTS analysis_evidence_arguments_are_metadata_only;
+                CREATE TRIGGER analysis_evidence_arguments_are_metadata_only
+                BEFORE INSERT ON analysis_evidence
+                WHEN json_valid(NEW.arguments_json) = 0
+                  OR length(NEW.arguments_json) > 160
+                  OR json_type(NEW.arguments_json, '$') != 'object'
+                  OR (SELECT COUNT(*) FROM json_each(NEW.arguments_json)) != 1
+                  OR json_extract(NEW.arguments_json, '$.dataset_id') != NEW.dataset_id
+                  OR EXISTS (
+                      SELECT 1 FROM json_each(NEW.arguments_json)
+                      WHERE key != 'dataset_id' OR type != 'text'
+                  )
+                BEGIN SELECT RAISE(ABORT, 'analysis evidence arguments are invalid'); END;
                 DROP TRIGGER IF EXISTS analysis_tool_outputs_require_result_envelope;
                 CREATE TRIGGER analysis_tool_outputs_require_result_envelope
                 BEFORE INSERT ON analysis_tool_outputs
@@ -656,6 +727,10 @@ class Storage:
                       ) OR type NOT IN ('integer', 'real', 'null')
                   )
                 BEGIN SELECT RAISE(ABORT, 'analysis result envelope metrics are invalid'); END;
+                DROP TRIGGER IF EXISTS analysis_tool_outputs_are_immutable;
+                CREATE TRIGGER analysis_tool_outputs_are_immutable
+                BEFORE UPDATE ON analysis_tool_outputs
+                BEGIN SELECT RAISE(ABORT, 'analysis tool output is immutable'); END;
                 """
             )
             connection.execute(
@@ -1408,6 +1483,7 @@ class Storage:
                 operation=operation,
                 schema_version=schema_version,
             )
+            arguments_json = _analysis_evidence_arguments_json(arguments, dataset_id=dataset_id)
             cursor = connection.execute(
                 """
                 INSERT INTO analysis_evidence(
@@ -1425,7 +1501,7 @@ class Storage:
                     mapping_version_id,
                     operation,
                     schema_version,
-                    json.dumps(arguments, separators=(",", ":")),
+                    arguments_json,
                     result_json,
                 ),
             )
@@ -1789,6 +1865,16 @@ def _analysis_tool_arguments_json(
     serialized = json.dumps(expected, separators=(",", ":"))
     if len(serialized) > 512:
         raise ValueError("analysis tool arguments are invalid")
+    return serialized
+
+
+def _analysis_evidence_arguments_json(value: Mapping[str, Any], *, dataset_id: str) -> str:
+    expected = {"dataset_id": dataset_id}
+    if not isinstance(value, Mapping) or dict(value) != expected:
+        raise ValueError("analysis evidence arguments are invalid")
+    serialized = json.dumps(expected, separators=(",", ":"))
+    if len(serialized) > 160:
+        raise ValueError("analysis evidence arguments are invalid")
     return serialized
 
 
