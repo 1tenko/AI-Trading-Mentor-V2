@@ -227,9 +227,14 @@ class Storage:
                     origin_turn_number INTEGER NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS datasets (
-                    id TEXT PRIMARY KEY,
+                    id TEXT PRIMARY KEY NOT NULL CHECK(
+                        typeof(id) = 'text' AND length(id) BETWEEN 1 AND 80 AND id NOT GLOB '*[^A-Za-z0-9_-]*'
+                    ),
                     original_name TEXT NOT NULL,
-                    content_sha256 TEXT NOT NULL CHECK(length(content_sha256) = 64),
+                    content_sha256 TEXT NOT NULL CHECK(
+                        typeof(content_sha256) = 'text' AND length(content_sha256) = 64
+                        AND content_sha256 NOT GLOB '*[^0-9a-f]*'
+                    ),
                     original_extension TEXT NOT NULL,
                     byte_size INTEGER NOT NULL CHECK(byte_size >= 0),
                     source_row_count INTEGER NOT NULL CHECK(source_row_count >= 0),
@@ -302,7 +307,10 @@ class Storage:
                 );
                 CREATE TABLE IF NOT EXISTS analysis_tool_outputs (
                     thread_id INTEGER NOT NULL REFERENCES threads(id),
-                    tool_call_id TEXT NOT NULL,
+                    tool_call_id TEXT NOT NULL CHECK(
+                        typeof(tool_call_id) = 'text' AND length(tool_call_id) BETWEEN 1 AND 128
+                        AND tool_call_id NOT GLOB '*[^A-Za-z0-9_-]*'
+                    ),
                     evidence_id INTEGER NOT NULL REFERENCES analysis_evidence(id),
                     arguments_json TEXT NOT NULL,
                     output_json TEXT NOT NULL,
@@ -545,8 +553,10 @@ class Storage:
                 DROP TRIGGER IF EXISTS dataset_identifiers_are_safe;
                 CREATE TRIGGER dataset_identifiers_are_safe
                 BEFORE INSERT ON datasets
-                WHEN length(NEW.id) NOT BETWEEN 1 AND 80
+                WHEN typeof(NEW.id) != 'text'
+                  OR length(NEW.id) NOT BETWEEN 1 AND 80
                   OR NEW.id GLOB '*[^A-Za-z0-9_-]*'
+                  OR typeof(NEW.content_sha256) != 'text'
                   OR length(NEW.content_sha256) != 64
                   OR NEW.content_sha256 GLOB '*[^0-9a-f]*'
                 BEGIN SELECT RAISE(ABORT, 'dataset identifier or content hash is invalid'); END;
@@ -735,7 +745,8 @@ class Storage:
                 DROP TRIGGER IF EXISTS analysis_tool_call_identifiers_are_safe;
                 CREATE TRIGGER analysis_tool_call_identifiers_are_safe
                 BEFORE INSERT ON analysis_tool_outputs
-                WHEN length(NEW.tool_call_id) NOT BETWEEN 1 AND 128
+                WHEN typeof(NEW.tool_call_id) != 'text'
+                  OR length(NEW.tool_call_id) NOT BETWEEN 1 AND 128
                   OR NEW.tool_call_id GLOB '*[^A-Za-z0-9_-]*'
                 BEGIN SELECT RAISE(ABORT, 'analysis tool call identifier is invalid'); END;
                 DROP TRIGGER IF EXISTS analysis_evidence_metrics_are_bounded;

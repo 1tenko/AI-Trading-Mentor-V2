@@ -892,3 +892,87 @@ def test_dataset_hash_and_tool_call_ids_are_safe_opaque_metadata(tmp_path):
                     json.dumps(_result_envelope(dataset, confirmed.id)),
                 ),
             )
+
+
+def test_dataset_and_tool_identifiers_reject_null_and_blob_sql_bypasses(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    dataset = _dataset(storage)
+    confirmed = storage.confirm_mapping_version(
+        storage.create_mapping_draft(
+            dataset.id, [{"column_ordinal": 0, "semantic_role": "trade_return", "unit": "R", "source": "manual"}]
+        ).id
+    )
+    thread_id = storage.create_thread("Type guards")
+    evidence = storage.record_analysis_evidence(
+        thread_id=thread_id,
+        origin_turn_number=1,
+        dataset_id=dataset.id,
+        mapping_version_id=confirmed.id,
+        operation="summarize_results",
+        schema_version="1",
+        arguments={"dataset_id": dataset.id},
+        result=_result_envelope(dataset, confirmed.id),
+    )
+    with pytest.raises(ValueError, match="dataset identifier"):
+        storage.create_dataset(
+            dataset_id=None,  # type: ignore[arg-type]
+            original_name="trades.csv",
+            content_sha256="a" * 64,
+            original_extension=".csv",
+            byte_size=1,
+            source_row_count=1,
+            status="ready",
+            import_spec={"header_row": 0},
+            columns=[],
+        )
+    with pytest.raises(ValueError, match="content hash"):
+        storage.create_dataset(
+            dataset_id="dataset-bytes",
+            original_name="trades.csv",
+            content_sha256=b"a" * 64,  # type: ignore[arg-type]
+            original_extension=".csv",
+            byte_size=1,
+            source_row_count=1,
+            status="ready",
+            import_spec={"header_row": 0},
+            columns=[],
+        )
+    with pytest.raises(ValueError, match="tool call identifier"):
+        storage.record_analysis_tool_output(
+            thread_id,
+            b"call_safe",  # type: ignore[arg-type]
+            evidence.id,
+            _result_envelope(dataset, confirmed.id),
+        )
+
+    with sqlite3.connect(storage.database_path) as connection:
+        for dataset_id, content_sha256 in (
+            (None, "b" * 64),
+            (b"dataset-blob", "b" * 64),
+            ("dataset-null-hash", None),
+            ("dataset-blob-hash", b"b" * 64),
+        ):
+            with pytest.raises(sqlite3.IntegrityError):
+                connection.execute(
+                    """
+                    INSERT INTO datasets(id, original_name, content_sha256, original_extension, byte_size, source_row_count, status)
+                    VALUES (?, 'trades.csv', ?, '.csv', 1, 1, 'ready')
+                    """,
+                    (dataset_id, content_sha256),
+                )
+        for tool_call_id in (None, b"call_blob"):
+            with pytest.raises(sqlite3.IntegrityError):
+                connection.execute(
+                    """
+                    INSERT INTO analysis_tool_outputs(thread_id, tool_call_id, evidence_id, arguments_json, output_json)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        thread_id,
+                        tool_call_id,
+                        evidence.id,
+                        json.dumps({"dataset_id": dataset.id, "mapping_version_id": confirmed.id, "operation": "summarize_results"}),
+                        json.dumps(_result_envelope(dataset, confirmed.id)),
+                    ),
+                )
