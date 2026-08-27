@@ -254,6 +254,13 @@ class Storage:
                     time_parse_policy TEXT,
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
+                CREATE TABLE IF NOT EXISTS pending_dataset_imports (
+                    dataset_id TEXT PRIMARY KEY NOT NULL CHECK(
+                        typeof(dataset_id) = 'text' AND length(dataset_id) BETWEEN 1 AND 80
+                        AND dataset_id NOT GLOB '*[^A-Za-z0-9_-]*'
+                    ),
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
                 CREATE TABLE IF NOT EXISTS dataset_columns (
                     dataset_id TEXT NOT NULL REFERENCES datasets(id),
                     ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
@@ -1465,6 +1472,57 @@ class Storage:
                 (dataset_id,),
             ).fetchone()
         return None if row is None else Dataset(*row)
+
+    def begin_dataset_import(self, dataset_id: str) -> None:
+        """Reserve an opaque ID so interrupted filesystem work can be recovered."""
+        if not isinstance(dataset_id, str) or _DATASET_ID_PATTERN.fullmatch(dataset_id) is None:
+            raise ValueError("dataset identifier is invalid")
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            if connection.execute("SELECT 1 FROM datasets WHERE id = ?", (dataset_id,)).fetchone() is not None:
+                raise ValueError("dataset identifier already exists")
+            try:
+                connection.execute("INSERT INTO pending_dataset_imports(dataset_id) VALUES (?)", (dataset_id,))
+            except sqlite3.IntegrityError as error:
+                raise ValueError("dataset identifier already exists") from error
+
+    def pending_dataset_import_ids(self) -> list[str]:
+        with self._connect() as connection:
+            rows = connection.execute("SELECT dataset_id FROM pending_dataset_imports ORDER BY dataset_id").fetchall()
+        return [str(row[0]) for row in rows]
+
+    def discard_failed_dataset_import(self, dataset_id: str) -> None:
+        """Remove only this reserved, unreferenced interrupted import."""
+        if not isinstance(dataset_id, str) or _DATASET_ID_PATTERN.fullmatch(dataset_id) is None:
+            raise ValueError("dataset identifier is invalid")
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            pending = connection.execute(
+                "SELECT 1 FROM pending_dataset_imports WHERE dataset_id = ?", (dataset_id,)
+            ).fetchone()
+            if pending is None:
+                return
+            exists = connection.execute("SELECT 1 FROM datasets WHERE id = ?", (dataset_id,)).fetchone()
+            if exists is not None:
+                referenced = connection.execute(
+                    """
+                    SELECT 1 FROM dataset_mapping_versions WHERE dataset_id = ?
+                    UNION ALL SELECT 1 FROM thread_dataset_scopes WHERE dataset_id = ?
+                    UNION ALL SELECT 1 FROM analysis_evidence WHERE dataset_id = ?
+                    LIMIT 1
+                    """,
+                    (dataset_id, dataset_id, dataset_id),
+                ).fetchone()
+                if referenced is not None:
+                    raise ValueError("dataset is no longer an interrupted import")
+                connection.execute("DELETE FROM dataset_columns WHERE dataset_id = ?", (dataset_id,))
+                connection.execute("DELETE FROM dataset_import_specs WHERE dataset_id = ?", (dataset_id,))
+                connection.execute("DELETE FROM datasets WHERE id = ?", (dataset_id,))
+            connection.execute("DELETE FROM pending_dataset_imports WHERE dataset_id = ?", (dataset_id,))
+
+    def complete_dataset_import(self, dataset_id: str) -> None:
+        with self._connect() as connection:
+            connection.execute("DELETE FROM pending_dataset_imports WHERE dataset_id = ?", (dataset_id,))
 
     def create_mapping_draft(
         self, dataset_id: str, entries: list[MappingEntry | Mapping[str, Any]]

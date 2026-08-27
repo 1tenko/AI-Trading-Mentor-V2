@@ -9,8 +9,9 @@ import tempfile
 import uuid
 import zipfile
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Callable, Iterable
+from xml.etree import ElementTree
 
 from openpyxl import load_workbook
 
@@ -27,7 +28,7 @@ MAX_XLSX_ARCHIVE_COMPRESSED_BYTES = MAX_DATASET_BYTES
 MAX_XLSX_ARCHIVE_UNCOMPRESSED_BYTES = 250 * 1024 * 1024
 MAX_XLSX_COMPRESSION_RATIO = 100
 _DATASET_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,79}")
-_EXTERNAL_RELATIONSHIP_PATTERN = re.compile(br"TargetMode\s*=\s*['\"]External['\"]", re.IGNORECASE)
+_CELL_REFERENCE_PATTERN = re.compile(r"([A-Z]+)([1-9][0-9]*)$")
 
 
 @dataclass(frozen=True)
@@ -115,7 +116,7 @@ class DatasetImportResult:
 def import_local_dataset(
     source_path: Path,
     storage: "Storage",
-    datasets_root: Path,
+    datasets_root: Path | None = None,
     *,
     selected_sheet: str | None = None,
     dataset_id_factory: Callable[[], str] | None = None,
@@ -130,10 +131,14 @@ def import_local_dataset(
     if source_path.stat().st_size > MAX_DATASET_BYTES:
         raise DatasetImportError("dataset exceeds the 50 MiB size limit")
 
-    datasets_root = Path(datasets_root)
-    datasets_root.mkdir(parents=True, exist_ok=True)
+    datasets_root = _internal_datasets_root(storage, datasets_root)
+    _recover_pending_dataset_imports(datasets_root, storage)
     temporary_directory = Path(tempfile.mkdtemp(prefix=".import-", dir=datasets_root))
     final_directory: Path | None = None
+    dataset_id: str | None = None
+    promoted_this_import = False
+    reserved_this_import = False
+    completed_import = False
     try:
         temporary_original = temporary_directory / f"original{extension}"
         content_sha256, byte_size = _copy_with_hash(source_path, temporary_original)
@@ -145,10 +150,18 @@ def import_local_dataset(
         dataset_id = (dataset_id_factory or _new_dataset_id)()
         if not isinstance(dataset_id, str) or _DATASET_ID_PATTERN.fullmatch(dataset_id) is None:
             raise DatasetImportError("dataset identifier is invalid")
-        final_directory = datasets_root / dataset_id
-        if final_directory.exists():
+        candidate_directory = datasets_root / dataset_id
+        if candidate_directory.exists():
             raise DatasetImportError("dataset identifier already exists")
+        try:
+            storage.begin_dataset_import(dataset_id)
+        except ValueError as error:
+            raise DatasetImportError("dataset identifier already exists") from error
+        reserved_this_import = True
+        (temporary_directory / ".pending-import").touch(exist_ok=False)
+        final_directory = candidate_directory
         temporary_directory.replace(final_directory)
+        promoted_this_import = True
         original_path = final_directory / temporary_original.name
         dataset = storage.create_dataset(
             dataset_id=dataset_id,
@@ -173,13 +186,54 @@ def import_local_dataset(
                 for index, (header, null_count) in enumerate(zip(parsed.headers, parsed.null_counts, strict=True))
             ],
         )
+        (final_directory / ".pending-import").unlink()
+        storage.complete_dataset_import(dataset_id)
+        completed_import = True
         return DatasetImportResult(dataset, original_path, parsed.duplicate_row_count)
-    except Exception:
-        if final_directory is not None and final_directory.exists():
-            shutil.rmtree(final_directory)
+    except BaseException:
+        if reserved_this_import and not completed_import and dataset_id is not None:
+            try:
+                storage.discard_failed_dataset_import(dataset_id)
+            except Exception:
+                pass
+        if not completed_import and promoted_this_import and final_directory is not None and final_directory.exists():
+            shutil.rmtree(final_directory, ignore_errors=True)
         raise
     finally:
         if temporary_directory.exists():
+            shutil.rmtree(temporary_directory)
+
+
+def _internal_datasets_root(storage: "Storage", requested_root: Path | None) -> Path:
+    data_root = storage.database_path.parent.resolve(strict=False)
+    expected_root = data_root / "datasets"
+    if str(data_root).startswith("\\\\") or str(expected_root).startswith("\\\\"):
+        raise DatasetImportError("dataset root must be local")
+    try:
+        resolved_root = expected_root.resolve(strict=False)
+        resolved_root.relative_to(data_root)
+    except (OSError, ValueError) as error:
+        raise DatasetImportError("dataset root escapes local data storage") from error
+    if requested_root is not None:
+        try:
+            requested_root = Path(requested_root)
+            if str(requested_root).startswith("\\\\") or requested_root.resolve(strict=False) != resolved_root:
+                raise DatasetImportError("dataset root is internal and cannot be caller controlled")
+        except OSError as error:
+            raise DatasetImportError("dataset root is invalid") from error
+    resolved_root.mkdir(parents=True, exist_ok=True)
+    return resolved_root
+
+
+def _recover_pending_dataset_imports(datasets_root: Path, storage: "Storage") -> None:
+    pending_ids = set(storage.pending_dataset_import_ids())
+    for dataset_id in pending_ids:
+        storage.discard_failed_dataset_import(dataset_id)
+        pending_directory = datasets_root / dataset_id
+        if pending_directory.exists():
+            shutil.rmtree(pending_directory)
+    for temporary_directory in datasets_root.glob(".import-*"):
+        if temporary_directory.is_dir():
             shutil.rmtree(temporary_directory)
 
 
@@ -253,23 +307,17 @@ def _csv_encoding(raw: bytes) -> str:
 
 
 def _parse_xlsx(path: Path, selected_sheet: str | None) -> _ParsedDataset:
-    _preflight_xlsx(path)
+    selected_sheet = _preflight_xlsx(path, selected_sheet)
     try:
         workbook = load_workbook(path, read_only=True, data_only=False, keep_links=False)
     except Exception as error:
         raise DatasetImportError("XLSX parse failed") from error
     try:
-        for worksheet in workbook.worksheets:
-            for row in worksheet.iter_rows():
-                if any(cell.data_type == "f" for cell in row):
-                    raise DatasetImportError("XLSX formula cells are not supported")
         worksheet_names = [worksheet.title for worksheet in workbook.worksheets]
-        selected_sheet = selected_sheet or (worksheet_names[0] if worksheet_names else None)
         if selected_sheet not in worksheet_names:
             raise DatasetImportError("selected XLSX worksheet does not exist")
         worksheet = workbook[selected_sheet]
-        if worksheet.max_column > MAX_DATASET_COLUMNS or worksheet.max_row > MAX_DATASET_ROWS + 1:
-            raise DatasetImportError("XLSX exceeds row or column limits")
+        worksheet.reset_dimensions()
         values = worksheet.iter_rows(values_only=True)
         try:
             headers = _headers(next(values))
@@ -288,7 +336,7 @@ def _parse_xlsx(path: Path, selected_sheet: str | None) -> _ParsedDataset:
         workbook.close()
 
 
-def _preflight_xlsx(path: Path) -> None:
+def _preflight_xlsx(path: Path, selected_sheet: str | None) -> str:
     with path.open("rb") as file:
         if file.read(4) != b"PK\x03\x04":
             raise DatasetImportError("XLSX signature is invalid")
@@ -308,29 +356,162 @@ def _preflight_xlsx(path: Path) -> None:
             ):
                 raise DatasetImportError("XLSX archive exceeds safety limits")
             for member in members:
-                parts = Path(member.filename).parts
                 if (
                     member.flag_bits & 0x1
-                    or member.filename.startswith(("/", "\\"))
-                    or ".." in parts
-                    or "\\" in member.filename
+                    or not _canonical_zip_member_name(member)
                     or (member.compress_size and member.file_size > member.compress_size * MAX_XLSX_COMPRESSION_RATIO)
-                    or (not member.compress_size and member.file_size > 0)
                 ):
                     raise DatasetImportError("XLSX archive is unsafe")
             if not {"[Content_Types].xml", "_rels/.rels", "xl/workbook.xml"}.issubset(names):
                 raise DatasetImportError("XLSX OOXML signature is invalid")
-            content_types = archive.read("[Content_Types].xml")
-            relationship_files = [name for name in names if name.endswith(".rels")]
-            if (
-                any("vbaproject" in name.lower() for name in names)
-                or b"macroEnabled" in content_types
-                or any(name.startswith("xl/externalLinks/") for name in names)
-                or any(_EXTERNAL_RELATIONSHIP_PATTERN.search(archive.read(name)) for name in relationship_files)
+            _reject_macro_content_types(archive.read("[Content_Types].xml"))
+            relationships = {
+                name: _parse_relationships(archive.read(name))
+                for name in names
+                if name.endswith(".rels")
+            }
+            if any("vbaproject" in name.casefold() for name in names) or any(
+                name.startswith("xl/externalLinks/") for name in names
             ):
                 raise DatasetImportError("XLSX macros or external links are not supported")
+            sheets = _workbook_sheets(
+                archive.read("xl/workbook.xml"), relationships.get("xl/_rels/workbook.xml.rels", {})
+            )
+            selected_sheet = selected_sheet or next(iter(sheets), None)
+            if selected_sheet not in sheets:
+                raise DatasetImportError("selected XLSX worksheet does not exist")
+            for name, worksheet_path in sheets.items():
+                _scan_worksheet_xml(archive.read(worksheet_path), enforce_limits=name == selected_sheet)
+            return selected_sheet
     except zipfile.BadZipFile as error:
         raise DatasetImportError("XLSX archive is invalid") from error
+
+
+def _canonical_zip_member_name(member: zipfile.ZipInfo) -> bool:
+    name = member.filename
+    canonical = name[:-1] if member.is_dir() else name
+    return bool(
+        canonical
+        and "\\" not in canonical
+        and not canonical.startswith("/")
+        and re.match(r"^[A-Za-z]:", canonical) is None
+        and all(part not in {"", ".", ".."} for part in canonical.split("/"))
+    )
+
+
+def _xml_document(contents: bytes, label: str) -> ElementTree.Element:
+    try:
+        return ElementTree.fromstring(contents)
+    except ElementTree.ParseError as error:
+        raise DatasetImportError(f"XLSX {label} XML is invalid") from error
+
+
+def _local_name(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1]
+
+
+def _reject_macro_content_types(contents: bytes) -> None:
+    document = _xml_document(contents, "content types")
+    for element in document.iter():
+        content_type = element.attrib.get("ContentType", "").casefold()
+        if "macroenabled" in content_type or "vba" in content_type:
+            raise DatasetImportError("XLSX macros are not supported")
+
+
+def _parse_relationships(contents: bytes) -> dict[str, str]:
+    document = _xml_document(contents, "relationship")
+    relationships: dict[str, str] = {}
+    for element in document:
+        if _local_name(element.tag) != "Relationship":
+            continue
+        relationship_id = element.attrib.get("Id")
+        relationship_type = element.attrib.get("Type", "").casefold()
+        target = element.attrib.get("Target", "")
+        target_mode = element.attrib.get("TargetMode", "").casefold()
+        if (
+            target_mode == "external"
+            or "externallink" in relationship_type
+            or re.match(r"^[A-Za-z][A-Za-z0-9+.-]*:", target) is not None
+        ):
+            raise DatasetImportError("XLSX external links are not supported")
+        if "vbaproject" in relationship_type or target.casefold().endswith("vbaproject.bin"):
+            raise DatasetImportError("XLSX macros are not supported")
+        if not relationship_id or not target:
+            raise DatasetImportError("XLSX relationship is invalid")
+        relationships[relationship_id] = target
+    return relationships
+
+
+def _workbook_sheets(workbook_contents: bytes, relationships: dict[str, str]) -> dict[str, str]:
+    document = _xml_document(workbook_contents, "workbook")
+    sheets: dict[str, str] = {}
+    for element in document.iter():
+        if _local_name(element.tag) != "sheet":
+            continue
+        name = element.attrib.get("name")
+        relationship_id = next((value for key, value in element.attrib.items() if _local_name(key) == "id"), None)
+        target = relationships.get(relationship_id or "")
+        if not name or not target or name in sheets:
+            raise DatasetImportError("XLSX workbook sheet relationship is invalid")
+        sheets[name] = _resolve_package_target("xl/workbook.xml", target)
+    if not sheets:
+        raise DatasetImportError("XLSX has no worksheets")
+    return sheets
+
+
+def _resolve_package_target(owner: str, target: str) -> str:
+    if "\\" in target or re.match(r"^[A-Za-z]:", target):
+        raise DatasetImportError("XLSX relationship target is invalid")
+    if target.startswith("/"):
+        if not target.startswith("/xl/"):
+            raise DatasetImportError("XLSX relationship target is invalid")
+        parts: list[str] = []
+        target = target[1:]
+    else:
+        parts = list(PurePosixPath(owner).parent.parts)
+    for part in target.split("/"):
+        if part in {"", "."}:
+            raise DatasetImportError("XLSX relationship target is invalid")
+        if part == "..":
+            if not parts:
+                raise DatasetImportError("XLSX relationship target is invalid")
+            parts.pop()
+        else:
+            parts.append(part)
+    return "/".join(parts)
+
+
+def _scan_worksheet_xml(contents: bytes, *, enforce_limits: bool) -> None:
+    cell_count = 0
+    try:
+        for event, element in ElementTree.iterparse(io.BytesIO(contents), events=("end",)):
+            name = _local_name(element.tag)
+            if name == "f":
+                raise DatasetImportError("XLSX formula cells are not supported")
+            if name == "c" and enforce_limits:
+                reference = element.attrib.get("r", "")
+                match = _CELL_REFERENCE_PATTERN.fullmatch(reference)
+                if match is None:
+                    raise DatasetImportError("XLSX cell reference is invalid")
+                column = _column_number(match.group(1))
+                row = int(match.group(2))
+                cell_count += 1
+                if (
+                    column > MAX_DATASET_COLUMNS
+                    or row > MAX_DATASET_ROWS + 1
+                    or cell_count > MAX_DATASET_CELLS + MAX_DATASET_COLUMNS
+                ):
+                    raise DatasetImportError("XLSX exceeds row, column, or cell limits")
+            element.clear()
+    except ElementTree.ParseError as error:
+        raise DatasetImportError("XLSX worksheet XML is invalid") from error
+
+
+def _column_number(label: str) -> int:
+    value = 0
+    for character in label:
+        value = value * 26 + ord(character) - ord("A") + 1
+    return value
 
 
 def _headers(row: Iterable[object]) -> list[str]:

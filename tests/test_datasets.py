@@ -52,6 +52,15 @@ def _workbook(path: Path, *, sheet_name: str = "Trades", formula: bool = False) 
     workbook.save(path)
 
 
+def _rewrite_zip_member(path: Path, member_name: str, transform) -> None:
+    rewritten = path.with_suffix(".rewritten.xlsx")
+    with zipfile.ZipFile(path) as source, zipfile.ZipFile(rewritten, "w") as destination:
+        for member in source.infolist():
+            contents = source.read(member.filename)
+            destination.writestr(member, transform(contents) if member.filename == member_name else contents)
+    rewritten.replace(path)
+
+
 def test_local_csv_import_copies_bytes_records_dialect_and_reports_duplicate_rows(tmp_path):
     storage = Storage(tmp_path / "mentor.sqlite3")
     storage.initialize()
@@ -134,6 +143,13 @@ def test_xlsx_formula_macro_external_link_and_archive_limit_are_rejected_before_
             "xl/worksheets/_rels/sheet1.xml.rels",
             "<Relationships><Relationship TargetMode='External'/></Relationships>",
         )
+    external_target = tmp_path / "external-target.xlsx"
+    _workbook(external_target)
+    with zipfile.ZipFile(external_target, "a") as archive:
+        archive.writestr(
+            "xl/worksheets/_rels/sheet1.xml.rels",
+            "<Relationships><Relationship Id='rId1' Target='https://example.invalid/data'/></Relationships>",
+        )
     macro = tmp_path / "macro.xlsx"
     _workbook(macro)
     with zipfile.ZipFile(macro, "a") as archive:
@@ -145,6 +161,8 @@ def test_xlsx_formula_macro_external_link_and_archive_limit_are_rejected_before_
         _importer(storage, tmp_path)(formula)
     with pytest.raises(DatasetImportError, match="external"):
         _importer(storage, tmp_path)(external_link)
+    with pytest.raises(DatasetImportError, match="external"):
+        _importer(storage, tmp_path)(external_target)
     with pytest.raises(DatasetImportError, match="macro"):
         _importer(storage, tmp_path)(macro)
     monkeypatch.setattr("mentor.datasets.MAX_XLSX_ARCHIVE_UNCOMPRESSED_BYTES", 1)
@@ -187,6 +205,111 @@ def test_import_rolls_back_original_when_metadata_recording_fails(tmp_path, monk
         _importer(storage, tmp_path)(source)
 
     assert not (tmp_path / "datasets").exists() or not list((tmp_path / "datasets").iterdir())
+
+
+def test_retry_with_existing_dataset_id_preserves_the_existing_immutable_original(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    source = tmp_path / "trades.csv"
+    source.write_text("Result_R\n1.5\n", encoding="utf-8")
+    first = _importer(storage, tmp_path)(source)
+
+    with pytest.raises(DatasetImportError, match="identifier"):
+        _importer(storage, tmp_path)(source)
+
+    assert first.original_path.read_bytes() == source.read_bytes()
+    assert storage.dataset(first.dataset.id) == first.dataset
+
+
+def test_xlsx_formula_and_column_limits_cannot_be_hidden_by_forged_dimension(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    formula = tmp_path / "dimension-formula.xlsx"
+    _workbook(formula, formula=True)
+    _rewrite_zip_member(
+        formula,
+        "xl/worksheets/sheet1.xml",
+        lambda xml: xml.replace(b'<dimension ref="A1:B2"/>', b'<dimension ref="A1:A1"/>'),
+    )
+    columns = tmp_path / "dimension-columns.xlsx"
+    workbook = Workbook()
+    worksheet = workbook.active
+    worksheet.append([f"column_{index}" for index in range(101)])
+    worksheet.append(list(range(101)))
+    workbook.save(columns)
+    _rewrite_zip_member(
+        columns,
+        "xl/worksheets/sheet1.xml",
+        lambda xml: xml.replace(b'<dimension ref="A1:CY2"/>', b'<dimension ref="A1:A1"/>'),
+    )
+
+    with pytest.raises(DatasetImportError, match="formula"):
+        _importer(storage, tmp_path)(formula)
+    with pytest.raises(DatasetImportError, match="column"):
+        _importer(storage, tmp_path)(columns)
+
+
+def test_xlsx_macro_relationship_and_drive_qualified_member_are_rejected_by_preflight(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    macro_relationship = tmp_path / "macro-relationship.xlsx"
+    _workbook(macro_relationship)
+    _rewrite_zip_member(
+        macro_relationship,
+        "xl/_rels/workbook.xml.rels",
+        lambda xml: xml.replace(
+            b"</Relationships>",
+            b"<Relationship Type='http://schemas.microsoft.com/office/2006/relationships/vbaProject' "
+            b"Target='vbaProject.bin'/></Relationships>",
+        ),
+    )
+    drive_member = tmp_path / "drive-member.xlsx"
+    _workbook(drive_member)
+    with zipfile.ZipFile(drive_member, "a") as archive:
+        archive.writestr("C:/outside.xml", "<outside/>")
+
+    with pytest.raises(DatasetImportError, match="macro"):
+        _importer(storage, tmp_path)(macro_relationship)
+    with pytest.raises(DatasetImportError, match="archive"):
+        _importer(storage, tmp_path)(drive_member)
+
+
+def test_keyboard_interrupt_cleans_promoted_bytes_and_metadata_before_reraising(tmp_path, monkeypatch):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    source = tmp_path / "trades.csv"
+    source.write_text("Result_R\n1.5\n", encoding="utf-8")
+    create_dataset = storage.create_dataset
+
+    def interrupt_after_recording(**kwargs):
+        create_dataset(**kwargs)
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr(storage, "create_dataset", interrupt_after_recording)
+
+    with pytest.raises(KeyboardInterrupt):
+        _importer(storage, tmp_path)(source)
+
+    assert storage.dataset("dataset-imported") is None
+    assert not (tmp_path / "datasets").exists() or not list((tmp_path / "datasets").iterdir())
+
+
+def test_import_rejects_caller_controlled_or_unc_dataset_roots(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    source = tmp_path / "trades.csv"
+    source.write_text("Result_R\n1.5\n", encoding="utf-8")
+
+    with pytest.raises(DatasetImportError, match="root"):
+        import_local_dataset(
+            source, storage, tmp_path / "outside", dataset_id_factory=lambda: "dataset-imported"
+        )
+    with pytest.raises(DatasetImportError, match="root"):
+        import_local_dataset(
+            source, storage, Path(r"\\server\share\datasets"), dataset_id_factory=lambda: "dataset-imported"
+        )
+
+    assert not (tmp_path / "outside").exists()
 
 
 def _result_envelope(dataset, mapping_version_id: int, operation: str = "summarize_results"):
