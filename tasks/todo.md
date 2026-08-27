@@ -36,16 +36,16 @@ and thread-owned empirical-evidence models.
 selected-sheet CSV/XLSX parse/import-spec recording, and rollback behavior.
 
 **Acceptance criteria:**
-- [ ] Valid CSV/XLSX imports create exactly one immutable local dataset.
-- [ ] Invalid, oversize, macro/formula/external-link, archive-bomb, or unsupported
+- [x] Valid CSV/XLSX imports create exactly one immutable local dataset.
+- [x] Invalid, oversize, macro/formula/external-link, archive-bomb, or unsupported
   files leave no usable partial dataset and clean temporary files.
-- [ ] Original bytes remain local; formula execution, cached-formula trust, and
+- [x] Original bytes remain local; formula execution, cached-formula trust, and
   external transfer never occur.
 
 **Verification:**
-- [ ] Known CSV/XLSX, CSV dialect/decode/parse, XLSX signature/archive,
+- [x] Known CSV/XLSX, CSV dialect/decode/parse, XLSX signature/archive,
   formula/macro, and rollback fixtures pass.
-- [ ] Hash/new-upload/duplicate-row behavior is deterministic.
+- [x] Hash/new-upload/duplicate-row behavior is deterministic.
 
 **Dependencies:** Task 1
 **Files likely touched:** `src/mentor/datasets.py`, `src/mentor/storage.py`,

@@ -1,9 +1,14 @@
 import json
 import inspect
 import sqlite3
+import zipfile
+from hashlib import sha256
+from pathlib import Path
 
 import pytest
+from openpyxl import Workbook
 
+from mentor.datasets import DatasetImportError, import_local_dataset
 from mentor.storage import Storage
 
 
@@ -30,6 +35,158 @@ def _dataset(storage: Storage):
             {"ordinal": 1, "original_header": "Session", "inferred_type": "string", "null_count": 0, "invalid_count": 0},
         ],
     )
+
+
+def _importer(storage: Storage, tmp_path: Path):
+    return lambda source, **kwargs: import_local_dataset(
+        source, storage, tmp_path / "datasets", dataset_id_factory=lambda: "dataset-imported", **kwargs
+    )
+
+
+def _workbook(path: Path, *, sheet_name: str = "Trades", formula: bool = False) -> None:
+    workbook = Workbook()
+    worksheet = workbook.active
+    worksheet.title = sheet_name
+    worksheet.append(["Result_R", "Session"])
+    worksheet.append(["=1+1" if formula else 1.5, "London"])
+    workbook.save(path)
+
+
+def test_local_csv_import_copies_bytes_records_dialect_and_reports_duplicate_rows(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    source = tmp_path / "trades.csv"
+    source.write_bytes(b'Result_R;Session\r\n1.5;London\r\n1.5;London\r\n')
+
+    result = _importer(storage, tmp_path)(source)
+
+    assert result.dataset.source_row_count == 2
+    assert result.duplicate_row_count == 1
+    assert result.dataset.content_sha256 == sha256(source.read_bytes()).hexdigest()
+    assert result.original_path.read_bytes() == source.read_bytes()
+    assert result.original_path.parent.name == result.dataset.id
+    with sqlite3.connect(storage.database_path) as connection:
+        assert connection.execute(
+            "SELECT csv_encoding, csv_delimiter, csv_quoting, selected_sheet FROM dataset_import_specs"
+        ).fetchone() == ("utf-8", ";", '"', None)
+        assert connection.execute("SELECT original_header FROM dataset_columns ORDER BY ordinal").fetchall() == [
+            ("Result_R",),
+            ("Session",),
+        ]
+
+
+def test_local_xlsx_import_uses_only_the_selected_sheet_and_preserves_original(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    source = tmp_path / "trades.xlsx"
+    _workbook(source)
+    from openpyxl import load_workbook
+
+    selected = load_workbook(source)
+    selected.create_sheet("Ignored")
+    selected["Ignored"].append(["Other"])
+    selected["Ignored"].append(["not imported"])
+    selected.save(source)
+
+    result = _importer(storage, tmp_path)(source, selected_sheet="Trades")
+
+    assert result.dataset.source_row_count == 1
+    assert result.duplicate_row_count == 0
+    assert result.original_path.read_bytes() == source.read_bytes()
+    with sqlite3.connect(storage.database_path) as connection:
+        assert connection.execute("SELECT selected_sheet FROM dataset_import_specs").fetchone() == ("Trades",)
+        assert connection.execute("SELECT original_header FROM dataset_columns ORDER BY ordinal").fetchall() == [
+            ("Result_R",),
+            ("Session",),
+        ]
+
+
+@pytest.mark.parametrize(
+    ("filename", "contents", "message"),
+    [
+        ("bad.csv", b"Result_R\n\xff\n", "decode"),
+        ("bad.csv", b'Result_R\n"unterminated\n', "CSV"),
+        ("bad.txt", b"Result_R\n1\n", "CSV or XLSX"),
+    ],
+)
+def test_rejected_csv_or_extension_leaves_no_dataset_or_temporary_files(tmp_path, filename, contents, message):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    source = tmp_path / filename
+    source.write_bytes(contents)
+
+    with pytest.raises(DatasetImportError, match=message):
+        _importer(storage, tmp_path)(source)
+
+    assert storage.dataset("dataset-imported") is None
+    assert not (tmp_path / "datasets").exists() or not list((tmp_path / "datasets").iterdir())
+
+
+def test_xlsx_formula_macro_external_link_and_archive_limit_are_rejected_before_import(tmp_path, monkeypatch):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    formula = tmp_path / "formula.xlsx"
+    _workbook(formula, formula=True)
+    external_link = tmp_path / "external-link.xlsx"
+    _workbook(external_link)
+    with zipfile.ZipFile(external_link, "a") as archive:
+        archive.writestr(
+            "xl/worksheets/_rels/sheet1.xml.rels",
+            "<Relationships><Relationship TargetMode='External'/></Relationships>",
+        )
+    macro = tmp_path / "macro.xlsx"
+    _workbook(macro)
+    with zipfile.ZipFile(macro, "a") as archive:
+        archive.writestr("xl/vbaProject.bin", b"not a macro we will execute")
+    oversized = tmp_path / "oversized.xlsx"
+    _workbook(oversized)
+
+    with pytest.raises(DatasetImportError, match="formula"):
+        _importer(storage, tmp_path)(formula)
+    with pytest.raises(DatasetImportError, match="external"):
+        _importer(storage, tmp_path)(external_link)
+    with pytest.raises(DatasetImportError, match="macro"):
+        _importer(storage, tmp_path)(macro)
+    monkeypatch.setattr("mentor.datasets.MAX_XLSX_ARCHIVE_UNCOMPRESSED_BYTES", 1)
+    with pytest.raises(DatasetImportError, match="archive"):
+        _importer(storage, tmp_path)(oversized)
+
+    assert storage.dataset("dataset-imported") is None
+    assert not (tmp_path / "datasets").exists() or not list((tmp_path / "datasets").iterdir())
+
+
+def test_non_xlsx_signature_and_unsafe_generated_identifier_cannot_create_dataset_paths(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    non_xlsx = tmp_path / "not-a-workbook.xlsx"
+    non_xlsx.write_bytes(b"not a zip archive")
+    source = tmp_path / "trades.csv"
+    source.write_text("Result_R\n1.5\n", encoding="utf-8")
+
+    with pytest.raises(DatasetImportError, match="signature"):
+        _importer(storage, tmp_path)(non_xlsx)
+    with pytest.raises(DatasetImportError, match="identifier"):
+        import_local_dataset(source, storage, tmp_path / "datasets", dataset_id_factory=lambda: "../escape")
+
+    assert not (tmp_path / "escape").exists()
+    assert storage.dataset("dataset-imported") is None
+
+
+def test_import_rolls_back_original_when_metadata_recording_fails(tmp_path, monkeypatch):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    source = tmp_path / "trades.csv"
+    source.write_text("Result_R\n1.5\n", encoding="utf-8")
+
+    def fail_metadata(**_kwargs):
+        raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr(storage, "create_dataset", fail_metadata)
+
+    with pytest.raises(RuntimeError, match="database unavailable"):
+        _importer(storage, tmp_path)(source)
+
+    assert not (tmp_path / "datasets").exists() or not list((tmp_path / "datasets").iterdir())
 
 
 def _result_envelope(dataset, mapping_version_id: int, operation: str = "summarize_results"):
