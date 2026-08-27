@@ -1,4 +1,5 @@
 import json
+import inspect
 import sqlite3
 
 import pytest
@@ -222,8 +223,16 @@ def test_evidence_provenance_and_result_envelopes_are_immutable_metadata_only(tm
             connection.execute("UPDATE analysis_evidence SET dataset_sha256 = ? WHERE id = ?", ("b" * 64, evidence.id))
         with pytest.raises(sqlite3.IntegrityError, match="analysis result envelope"):
             connection.execute(
-                "INSERT INTO analysis_tool_outputs(thread_id, tool_call_id, evidence_id, output_json) VALUES (?, 'raw-bypass', ?, ?)",
-                (thread_id, evidence.id, json.dumps({"rows": [{"Result_R": 1}]})),
+                """
+                INSERT INTO analysis_tool_outputs(thread_id, tool_call_id, evidence_id, arguments_json, output_json)
+                VALUES (?, 'raw-bypass', ?, ?, ?)
+                """,
+                (
+                    thread_id,
+                    evidence.id,
+                    json.dumps({"dataset_id": dataset.id, "mapping_version_id": confirmed.id, "operation": "summarize_results"}),
+                    json.dumps({"rows": [{"Result_R": 1}]}),
+                ),
             )
         with pytest.raises(sqlite3.IntegrityError, match="immutable"):
             connection.execute(
@@ -257,6 +266,10 @@ def test_mapping_versions_keep_confirmed_parent_lineage_and_recover_existing_row
                 status TEXT NOT NULL, created_at TEXT NOT NULL, confirmed_at TEXT,
                 UNIQUE(dataset_id, version)
             );
+            CREATE TABLE analysis_tool_outputs (
+                thread_id INTEGER NOT NULL, tool_call_id TEXT NOT NULL, evidence_id INTEGER NOT NULL,
+                output_json TEXT NOT NULL, PRIMARY KEY(thread_id, tool_call_id)
+            );
             INSERT INTO datasets VALUES ('legacy', 'legacy.csv', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
                 '.csv', 1, 1, 'ready', '2026-08-27T00:00:00Z');
             INSERT INTO dataset_import_specs VALUES (1, 'legacy', NULL, 0, 'utf-8', ',', '"', 'pandas-3.0.5',
@@ -272,6 +285,7 @@ def test_mapping_versions_keep_confirmed_parent_lineage_and_recover_existing_row
         assert "parent_mapping_version_id" in {
             row[1] for row in connection.execute("PRAGMA table_info(dataset_mapping_versions)")
         }
+        assert "arguments_json" in {row[1] for row in connection.execute("PRAGMA table_info(analysis_tool_outputs)")}
         assert connection.execute(
             "SELECT parent_mapping_version_id FROM dataset_mapping_versions WHERE id = 1"
         ).fetchone() == (None,)
@@ -319,4 +333,188 @@ def test_mapping_drafts_reject_columns_that_are_not_metadata_for_the_dataset(tmp
             connection.execute(
                 "UPDATE dataset_mapping_entries SET column_ordinal = 99 WHERE mapping_version_id = ? AND column_ordinal = 0",
                 (valid_draft.id,),
+            )
+
+
+def test_analysis_tool_arguments_are_bounded_metadata_and_not_raw_payloads(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    dataset = _dataset(storage)
+    confirmed = storage.confirm_mapping_version(
+        storage.create_mapping_draft(
+            dataset.id, [{"column_ordinal": 0, "semantic_role": "trade_return", "unit": "R", "source": "manual"}]
+        ).id
+    )
+    thread_id = storage.create_thread("Tool arguments")
+    evidence = storage.record_analysis_evidence(
+        thread_id=thread_id,
+        origin_turn_number=1,
+        dataset_id=dataset.id,
+        mapping_version_id=confirmed.id,
+        operation="summarize_results",
+        schema_version="1",
+        arguments={"dataset_id": dataset.id},
+        result=_result_envelope(dataset, confirmed.id),
+    )
+
+    assert "arguments" in inspect.signature(storage.record_analysis_tool_output).parameters
+    with pytest.raises(ValueError, match="analysis tool arguments"):
+        storage.record_analysis_tool_output(
+            thread_id,
+            "raw-arguments",
+            evidence.id,
+            _result_envelope(dataset, confirmed.id),
+            arguments={"body": "private upload", "rows": [{"Result_R": 1}]},
+        )
+    with sqlite3.connect(storage.database_path) as connection:
+        assert "arguments_json" in {row[1] for row in connection.execute("PRAGMA table_info(analysis_tool_outputs)")}
+        with pytest.raises(sqlite3.IntegrityError, match="arguments"):
+            connection.execute(
+                "INSERT INTO analysis_tool_outputs(thread_id, tool_call_id, evidence_id, arguments_json, output_json) "
+                "VALUES (?, 'raw-arguments-bypass', ?, ?, ?)",
+                (
+                    thread_id,
+                    evidence.id,
+                    json.dumps({"body": "private upload", "rows": []}),
+                    json.dumps(_result_envelope(dataset, confirmed.id)),
+                ),
+            )
+
+
+def test_confirmed_mapping_snapshots_cannot_be_promoted_or_changed_with_direct_sql(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    dataset = _dataset(storage)
+    draft = storage.create_mapping_draft(
+        dataset.id, [{"column_ordinal": 0, "semantic_role": "trade_return", "unit": "R", "source": "manual"}]
+    )
+    confirmed = storage.confirm_mapping_version(draft.id)
+    other_draft = storage.create_mapping_draft(
+        dataset.id, [{"column_ordinal": 1, "semantic_role": "session", "source": "manual"}]
+    )
+
+    with sqlite3.connect(storage.database_path) as connection:
+        with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+            connection.execute(
+                "UPDATE dataset_mapping_versions SET status = 'confirmed', confirmed_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (other_draft.id,),
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+            connection.execute("UPDATE dataset_mapping_versions SET status = 'draft' WHERE id = ?", (confirmed.id,))
+        with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+            connection.execute(
+                "UPDATE dataset_mapping_versions SET parent_mapping_version_id = ? WHERE id = ?",
+                (draft.id, other_draft.id),
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+            connection.execute("UPDATE dataset_mapping_versions SET version = 99 WHERE id = ?", (confirmed.id,))
+        with pytest.raises(sqlite3.IntegrityError, match="confirmed"):
+            connection.execute(
+                "UPDATE dataset_mapping_entries SET mapping_version_id = ? WHERE mapping_version_id = ?",
+                (confirmed.id, other_draft.id),
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="confirmed"):
+            connection.execute(
+                "UPDATE dataset_mapping_entries SET semantic_role = 'session' WHERE mapping_version_id = ?",
+                (confirmed.id,),
+            )
+
+
+def test_dataset_columns_cannot_be_deleted_while_a_mapping_references_them(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    dataset = _dataset(storage)
+    storage.create_mapping_draft(
+        dataset.id, [{"column_ordinal": 0, "semantic_role": "trade_return", "unit": "R", "source": "manual"}]
+    )
+
+    with sqlite3.connect(storage.database_path) as connection:
+        with pytest.raises(sqlite3.IntegrityError, match="referenced"):
+            connection.execute("DELETE FROM dataset_columns WHERE dataset_id = ? AND ordinal = 0", (dataset.id,))
+
+
+def test_result_envelopes_reject_raw_values_hidden_in_limitations_or_metrics(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    dataset = _dataset(storage)
+    confirmed = storage.confirm_mapping_version(
+        storage.create_mapping_draft(
+            dataset.id, [{"column_ordinal": 0, "semantic_role": "trade_return", "unit": "R", "source": "manual"}]
+        ).id
+    )
+    thread_id = storage.create_thread("Envelope leakage")
+    envelope = _result_envelope(dataset, confirmed.id)
+    leaky_limitations = {**envelope, "limitations": ["trade row: Result_R=2.5"]}
+    leaky_metrics = {**envelope, "metrics": {"mean_return": "Result_R=2.5"}}
+    arbitrary_metric = {**envelope, "metrics": {"raw_result_r_2_5": 2.5}}
+
+    with pytest.raises(ValueError, match="analysis result envelope"):
+        storage.record_analysis_evidence(
+            thread_id=thread_id,
+            origin_turn_number=1,
+            dataset_id=dataset.id,
+            mapping_version_id=confirmed.id,
+            operation="summarize_results",
+            schema_version="1",
+            arguments={"dataset_id": dataset.id},
+            result=leaky_limitations,
+        )
+    with pytest.raises(ValueError, match="analysis result envelope"):
+        storage.record_analysis_evidence(
+            thread_id=thread_id,
+            origin_turn_number=1,
+            dataset_id=dataset.id,
+            mapping_version_id=confirmed.id,
+            operation="summarize_results",
+            schema_version="1",
+            arguments={"dataset_id": dataset.id},
+            result=leaky_metrics,
+        )
+    with pytest.raises(ValueError, match="analysis result envelope"):
+        storage.record_analysis_evidence(
+            thread_id=thread_id,
+            origin_turn_number=1,
+            dataset_id=dataset.id,
+            mapping_version_id=confirmed.id,
+            operation="summarize_results",
+            schema_version="1",
+            arguments={"dataset_id": dataset.id},
+            result=arbitrary_metric,
+        )
+    evidence = storage.record_analysis_evidence(
+        thread_id=thread_id,
+        origin_turn_number=1,
+        dataset_id=dataset.id,
+        mapping_version_id=confirmed.id,
+        operation="summarize_results",
+        schema_version="1",
+        arguments={"dataset_id": dataset.id},
+        result=envelope,
+    )
+    with sqlite3.connect(storage.database_path) as connection:
+        with pytest.raises(sqlite3.IntegrityError, match="envelope"):
+            connection.execute(
+                """
+                INSERT INTO analysis_tool_outputs(thread_id, tool_call_id, evidence_id, arguments_json, output_json)
+                VALUES (?, 'leaky', ?, ?, ?)
+                """,
+                (
+                    thread_id,
+                    evidence.id,
+                    json.dumps({"dataset_id": dataset.id, "mapping_version_id": confirmed.id, "operation": "summarize_results"}),
+                    json.dumps(leaky_limitations),
+                ),
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="envelope"):
+            connection.execute(
+                """
+                INSERT INTO analysis_tool_outputs(thread_id, tool_call_id, evidence_id, arguments_json, output_json)
+                VALUES (?, 'leaky-metric', ?, ?, ?)
+                """,
+                (
+                    thread_id,
+                    evidence.id,
+                    json.dumps({"dataset_id": dataset.id, "mapping_version_id": confirmed.id, "operation": "summarize_results"}),
+                    json.dumps(leaky_metrics),
+                ),
             )

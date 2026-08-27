@@ -2,7 +2,6 @@
 
 import json
 import math
-import re
 import sqlite3
 from dataclasses import asdict
 from dataclasses import dataclass
@@ -17,6 +16,68 @@ from mentor.datasets import (
     DatasetMappingVersion,
     MappingEntry,
     ThreadDatasetScope,
+)
+
+
+_ANALYSIS_LIMITATION_CODES = frozenset(
+    {
+        "ambiguous_date",
+        "derived_outcome",
+        "incompatible_timezone",
+        "insufficient_valid_rows",
+        "invalid_values_excluded",
+        "missing_required_role",
+        "no_matching_rows",
+        "omitted_groups",
+        "small_sample",
+        "unavailable_metric",
+        "unsupported_operation",
+    }
+)
+
+_ANALYSIS_METRIC_NAMES = frozenset(
+    {
+        "best_return",
+        "breakevens",
+        "cumulative_return",
+        "excluded_rows",
+        "first_quartile",
+        "interquartile_range",
+        "iqr_outlier_count",
+        "loss_rate",
+        "losses",
+        "max_consecutive_losses",
+        "max_consecutive_wins",
+        "max_drawdown",
+        "maximum",
+        "mean_losing_return",
+        "mean_mae",
+        "mean_mfe",
+        "mean_return",
+        "mean_winning_return",
+        "median_mae",
+        "median_mfe",
+        "median_return",
+        "minimum",
+        "percentile_05",
+        "percentile_10",
+        "percentile_25",
+        "percentile_50",
+        "percentile_75",
+        "percentile_90",
+        "percentile_95",
+        "realized_reward_risk",
+        "recovery_observations",
+        "sample_standard_deviation",
+        "third_quartile",
+        "total_return",
+        "valid_rows",
+        "wilson_95_lower",
+        "wilson_95_upper",
+        "win_rate",
+        "wins",
+        "worst_return",
+    }
 )
 
 
@@ -236,6 +297,7 @@ class Storage:
                     thread_id INTEGER NOT NULL REFERENCES threads(id),
                     tool_call_id TEXT NOT NULL,
                     evidence_id INTEGER NOT NULL REFERENCES analysis_evidence(id),
+                    arguments_json TEXT NOT NULL,
                     output_json TEXT NOT NULL,
                     PRIMARY KEY(thread_id, tool_call_id)
                 );
@@ -264,6 +326,7 @@ class Storage:
                 CREATE TRIGGER IF NOT EXISTS confirmed_mapping_entries_cannot_change
                 BEFORE UPDATE ON dataset_mapping_entries
                 WHEN (SELECT status FROM dataset_mapping_versions WHERE id = OLD.mapping_version_id) = 'confirmed'
+                  OR (SELECT status FROM dataset_mapping_versions WHERE id = NEW.mapping_version_id) = 'confirmed'
                 BEGIN SELECT RAISE(ABORT, 'confirmed mapping entries are immutable'); END;
                 CREATE TRIGGER IF NOT EXISTS confirmed_mapping_entries_cannot_delete
                 BEFORE DELETE ON dataset_mapping_entries
@@ -317,7 +380,12 @@ class Storage:
                     WHEN (SELECT COUNT(*) FROM json_each(NEW.result_json, '$.limitations')) > 20
                       OR EXISTS (
                           SELECT 1 FROM json_each(NEW.result_json, '$.limitations')
-                          WHERE type != 'text' OR length(value) > 240 OR instr(value, char(10)) > 0
+                          WHERE type != 'text' OR value NOT IN (
+                              'ambiguous_date', 'derived_outcome', 'incompatible_timezone',
+                              'insufficient_valid_rows', 'invalid_values_excluded', 'missing_required_role',
+                              'no_matching_rows', 'omitted_groups', 'small_sample', 'unavailable_metric',
+                              'unsupported_operation'
+                          )
                       ) THEN 1
                     ELSE 0
                 END
@@ -343,6 +411,16 @@ class Storage:
                       AND dataset_columns.ordinal = NEW.column_ordinal
                 )
                 BEGIN SELECT RAISE(ABORT, 'mapping entry must reference an existing dataset column'); END;
+                CREATE TRIGGER IF NOT EXISTS dataset_columns_cannot_delete_referenced
+                BEFORE DELETE ON dataset_columns
+                WHEN EXISTS (
+                    SELECT 1 FROM dataset_mapping_entries
+                    JOIN dataset_mapping_versions
+                      ON dataset_mapping_versions.id = dataset_mapping_entries.mapping_version_id
+                    WHERE dataset_mapping_versions.dataset_id = OLD.dataset_id
+                      AND dataset_mapping_entries.column_ordinal = OLD.ordinal
+                )
+                BEGIN SELECT RAISE(ABORT, 'dataset column is referenced by a mapping'); END;
                 CREATE TRIGGER IF NOT EXISTS analysis_tool_outputs_require_result_envelope
                 BEFORE INSERT ON analysis_tool_outputs
                 WHEN CASE
@@ -384,7 +462,12 @@ class Storage:
                     WHEN (SELECT COUNT(*) FROM json_each(NEW.output_json, '$.limitations')) > 20
                       OR EXISTS (
                           SELECT 1 FROM json_each(NEW.output_json, '$.limitations')
-                          WHERE type != 'text' OR length(value) > 240 OR instr(value, char(10)) > 0
+                          WHERE type != 'text' OR value NOT IN (
+                              'ambiguous_date', 'derived_outcome', 'incompatible_timezone',
+                              'insufficient_valid_rows', 'invalid_values_excluded', 'missing_required_role',
+                              'no_matching_rows', 'omitted_groups', 'small_sample', 'unavailable_metric',
+                              'unsupported_operation'
+                          )
                       ) THEN 1
                     ELSE 0
                 END
@@ -413,6 +496,26 @@ class Storage:
                     "ALTER TABLE dataset_mapping_versions "
                     "ADD COLUMN parent_mapping_version_id INTEGER REFERENCES dataset_mapping_versions(id)"
                 )
+            tool_output_columns = {
+                row[1] for row in connection.execute("PRAGMA table_info(analysis_tool_outputs)")
+            }
+            if "arguments_json" not in tool_output_columns:
+                connection.execute("ALTER TABLE analysis_tool_outputs ADD COLUMN arguments_json TEXT")
+                connection.execute(
+                    """
+                    UPDATE analysis_tool_outputs
+                    SET arguments_json = (
+                        SELECT json_object(
+                            'dataset_id', dataset_id,
+                            'mapping_version_id', mapping_version_id,
+                            'operation', operation
+                        )
+                        FROM analysis_evidence
+                        WHERE analysis_evidence.id = analysis_tool_outputs.evidence_id
+                    )
+                    WHERE arguments_json IS NULL
+                    """
+                )
             connection.executescript(
                 """
                 DROP TRIGGER IF EXISTS mapping_versions_are_immutable_except_confirmation;
@@ -422,10 +525,137 @@ class Storage:
                     OLD.status = 'draft' AND NEW.status = 'confirmed'
                     AND OLD.dataset_id = NEW.dataset_id AND OLD.version = NEW.version
                     AND OLD.parent_mapping_version_id IS NEW.parent_mapping_version_id
+                    AND OLD.parent_mapping_version_id IS NOT NULL
                     AND OLD.created_at = NEW.created_at AND OLD.confirmed_at IS NULL
                     AND NEW.confirmed_at IS NOT NULL
+                    AND EXISTS (
+                        SELECT 1 FROM dataset_mapping_versions AS parent
+                        WHERE parent.id = OLD.parent_mapping_version_id
+                          AND parent.dataset_id = OLD.dataset_id
+                          AND parent.status = 'draft'
+                    )
                 )
                 BEGIN SELECT RAISE(ABORT, 'mapping versions are immutable'); END;
+                DROP TRIGGER IF EXISTS confirmed_mapping_entries_cannot_change;
+                CREATE TRIGGER confirmed_mapping_entries_cannot_change
+                BEFORE UPDATE ON dataset_mapping_entries
+                WHEN (SELECT status FROM dataset_mapping_versions WHERE id = OLD.mapping_version_id) = 'confirmed'
+                  OR (SELECT status FROM dataset_mapping_versions WHERE id = NEW.mapping_version_id) = 'confirmed'
+                BEGIN SELECT RAISE(ABORT, 'confirmed mapping entries are immutable'); END;
+                DROP TRIGGER IF EXISTS analysis_tool_outputs_require_result_envelope;
+                CREATE TRIGGER analysis_tool_outputs_require_result_envelope
+                BEFORE INSERT ON analysis_tool_outputs
+                WHEN CASE
+                    WHEN json_valid(NEW.output_json) = 0 THEN 1
+                    WHEN NOT EXISTS (
+                        SELECT 1 FROM analysis_evidence
+                        WHERE id = NEW.evidence_id AND thread_id = NEW.thread_id
+                          AND json_extract(NEW.output_json, '$.provenance') = 'USER_EMPIRICAL_EVIDENCE'
+                          AND json_extract(NEW.output_json, '$.dataset_id') = dataset_id
+                          AND json_extract(NEW.output_json, '$.dataset_sha256') = dataset_sha256
+                          AND json_extract(NEW.output_json, '$.mapping_version_id') = mapping_version_id
+                          AND json_extract(NEW.output_json, '$.operation') = operation
+                          AND json_extract(NEW.output_json, '$.schema_version') = schema_version
+                    ) THEN 1
+                    WHEN length(NEW.output_json) > 8000
+                      OR json_type(NEW.output_json, '$') != 'object'
+                      OR json_type(NEW.output_json, '$.counts') != 'object'
+                      OR json_type(NEW.output_json, '$.metrics') != 'object'
+                      OR json_type(NEW.output_json, '$.limitations') != 'array' THEN 1
+                    WHEN (SELECT COUNT(*) FROM json_each(NEW.output_json)) != 9
+                      OR EXISTS (
+                          SELECT 1 FROM json_each(NEW.output_json)
+                          WHERE key NOT IN (
+                              'provenance', 'dataset_id', 'dataset_sha256', 'mapping_version_id',
+                              'operation', 'schema_version', 'counts', 'metrics', 'limitations'
+                          )
+                      ) THEN 1
+                    WHEN (SELECT COUNT(*) FROM json_each(NEW.output_json, '$.counts')) != 4
+                      OR EXISTS (
+                          SELECT 1 FROM json_each(NEW.output_json, '$.counts')
+                          WHERE key NOT IN ('source_rows', 'filtered_rows', 'valid_rows', 'excluded_rows')
+                             OR type != 'integer' OR value < 0
+                      ) THEN 1
+                    WHEN (SELECT COUNT(*) FROM json_each(NEW.output_json, '$.metrics')) > 50
+                      OR EXISTS (
+                          SELECT 1 FROM json_each(NEW.output_json, '$.metrics')
+                          WHERE type NOT IN ('integer', 'real', 'null') OR length(key) > 64
+                      ) THEN 1
+                    WHEN (SELECT COUNT(*) FROM json_each(NEW.output_json, '$.limitations')) > 20
+                      OR EXISTS (
+                          SELECT 1 FROM json_each(NEW.output_json, '$.limitations')
+                          WHERE type != 'text' OR value NOT IN (
+                              'ambiguous_date', 'derived_outcome', 'incompatible_timezone',
+                              'insufficient_valid_rows', 'invalid_values_excluded', 'missing_required_role',
+                              'no_matching_rows', 'omitted_groups', 'small_sample', 'unavailable_metric',
+                              'unsupported_operation'
+                          )
+                      ) THEN 1
+                    ELSE 0
+                END
+                BEGIN SELECT RAISE(ABORT, 'analysis result envelope is invalid'); END;
+                DROP TRIGGER IF EXISTS analysis_tool_arguments_are_metadata_only;
+                CREATE TRIGGER analysis_tool_arguments_are_metadata_only
+                BEFORE INSERT ON analysis_tool_outputs
+                WHEN CASE
+                    WHEN json_valid(NEW.arguments_json) = 0 THEN 1
+                    WHEN length(NEW.arguments_json) > 512
+                      OR json_type(NEW.arguments_json, '$') != 'object' THEN 1
+                    WHEN (SELECT COUNT(*) FROM json_each(NEW.arguments_json)) != 3
+                      OR EXISTS (
+                          SELECT 1 FROM json_each(NEW.arguments_json)
+                          WHERE key NOT IN ('dataset_id', 'mapping_version_id', 'operation')
+                      ) THEN 1
+                    WHEN NOT EXISTS (
+                        SELECT 1 FROM analysis_evidence
+                        WHERE id = NEW.evidence_id AND thread_id = NEW.thread_id
+                          AND json_extract(NEW.arguments_json, '$.dataset_id') = dataset_id
+                          AND json_extract(NEW.arguments_json, '$.mapping_version_id') = mapping_version_id
+                          AND json_extract(NEW.arguments_json, '$.operation') = operation
+                    ) THEN 1
+                    ELSE 0
+                END
+                BEGIN SELECT RAISE(ABORT, 'analysis tool arguments are invalid'); END;
+                DROP TRIGGER IF EXISTS analysis_evidence_metrics_are_bounded;
+                CREATE TRIGGER analysis_evidence_metrics_are_bounded
+                BEFORE INSERT ON analysis_evidence
+                WHEN json_valid(NEW.result_json) = 0
+                  OR EXISTS (
+                      SELECT 1 FROM json_each(NEW.result_json, '$.metrics')
+                      WHERE key NOT IN (
+                          'best_return', 'breakevens', 'cumulative_return', 'excluded_rows',
+                          'first_quartile', 'interquartile_range', 'iqr_outlier_count', 'loss_rate',
+                          'losses', 'max_consecutive_losses', 'max_consecutive_wins', 'max_drawdown',
+                          'maximum', 'mean_losing_return', 'mean_mae', 'mean_mfe', 'mean_return',
+                          'mean_winning_return', 'median_mae', 'median_mfe', 'median_return', 'minimum',
+                          'percentile_05', 'percentile_10', 'percentile_25', 'percentile_50',
+                          'percentile_75', 'percentile_90', 'percentile_95', 'realized_reward_risk',
+                          'recovery_observations', 'sample_standard_deviation', 'third_quartile',
+                          'total_return', 'valid_rows', 'wilson_95_lower', 'wilson_95_upper',
+                          'win_rate', 'wins', 'worst_return'
+                      ) OR type NOT IN ('integer', 'real', 'null')
+                  )
+                BEGIN SELECT RAISE(ABORT, 'analysis result envelope metrics are invalid'); END;
+                DROP TRIGGER IF EXISTS analysis_tool_output_metrics_are_bounded;
+                CREATE TRIGGER analysis_tool_output_metrics_are_bounded
+                BEFORE INSERT ON analysis_tool_outputs
+                WHEN json_valid(NEW.output_json) = 0
+                  OR EXISTS (
+                      SELECT 1 FROM json_each(NEW.output_json, '$.metrics')
+                      WHERE key NOT IN (
+                          'best_return', 'breakevens', 'cumulative_return', 'excluded_rows',
+                          'first_quartile', 'interquartile_range', 'iqr_outlier_count', 'loss_rate',
+                          'losses', 'max_consecutive_losses', 'max_consecutive_wins', 'max_drawdown',
+                          'maximum', 'mean_losing_return', 'mean_mae', 'mean_mfe', 'mean_return',
+                          'mean_winning_return', 'median_mae', 'median_mfe', 'median_return', 'minimum',
+                          'percentile_05', 'percentile_10', 'percentile_25', 'percentile_50',
+                          'percentile_75', 'percentile_90', 'percentile_95', 'realized_reward_risk',
+                          'recovery_observations', 'sample_standard_deviation', 'third_quartile',
+                          'total_return', 'valid_rows', 'wilson_95_lower', 'wilson_95_upper',
+                          'win_rate', 'wins', 'worst_return'
+                      ) OR type NOT IN ('integer', 'real', 'null')
+                  )
+                BEGIN SELECT RAISE(ABORT, 'analysis result envelope metrics are invalid'); END;
                 """
             )
             connection.execute(
@@ -1224,7 +1454,13 @@ class Storage:
         return [AnalysisEvidence(*row) for row in rows]
 
     def record_analysis_tool_output(
-        self, thread_id: int, tool_call_id: str, evidence_id: int, output: Mapping[str, Any]
+        self,
+        thread_id: int,
+        tool_call_id: str,
+        evidence_id: int,
+        output: Mapping[str, Any],
+        *,
+        arguments: Mapping[str, Any] | None = None,
     ) -> None:
         with self._connect() as connection:
             evidence = connection.execute(
@@ -1244,19 +1480,36 @@ class Storage:
                 operation=str(evidence[3]),
                 schema_version=str(evidence[4]),
             )
+            arguments_json = _analysis_tool_arguments_json(
+                arguments,
+                dataset_id=str(evidence[0]),
+                mapping_version_id=int(evidence[2]),
+                operation=str(evidence[3]),
+            )
             connection.execute(
-                "INSERT INTO analysis_tool_outputs(thread_id, tool_call_id, evidence_id, output_json) VALUES (?, ?, ?, ?)",
-                (thread_id, tool_call_id, evidence_id, output_json),
+                """
+                INSERT INTO analysis_tool_outputs(thread_id, tool_call_id, evidence_id, arguments_json, output_json)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (thread_id, tool_call_id, evidence_id, arguments_json, output_json),
             )
 
     def analysis_tool_outputs(self, thread_id: int) -> list[dict[str, Any]]:
         with self._connect() as connection:
             rows = connection.execute(
-                "SELECT tool_call_id, evidence_id, output_json FROM analysis_tool_outputs WHERE thread_id = ? ORDER BY tool_call_id",
+                """
+                SELECT tool_call_id, evidence_id, arguments_json, output_json
+                FROM analysis_tool_outputs WHERE thread_id = ? ORDER BY tool_call_id
+                """,
                 (thread_id,),
             ).fetchall()
         return [
-            {"tool_call_id": row[0], "evidence_id": row[1], "output": json.loads(row[2])}
+            {
+                "tool_call_id": row[0],
+                "evidence_id": row[1],
+                "arguments": json.loads(row[2]),
+                "output": json.loads(row[3]),
+            }
             for row in rows
         ]
 
@@ -1497,7 +1750,7 @@ def _analysis_result_envelope_json(
         or len(metrics) > 50
         or any(
             not isinstance(name, str)
-            or re.fullmatch(r"[a-z][a-z0-9_]{0,63}", name) is None
+            or name not in _ANALYSIS_METRIC_NAMES
             or type(metric) not in (int, float, type(None))
             or (isinstance(metric, float) and not math.isfinite(metric))
             for name, metric in metrics.items()
@@ -1508,12 +1761,34 @@ def _analysis_result_envelope_json(
     if (
         not isinstance(limitations, list)
         or len(limitations) > 20
-        or any(not isinstance(item, str) or len(item) > 240 or "\n" in item for item in limitations)
+        or any(item not in _ANALYSIS_LIMITATION_CODES for item in limitations)
     ):
         raise ValueError("analysis result envelope is invalid")
     serialized = json.dumps(value, separators=(",", ":"), allow_nan=False)
     if len(serialized) > 8000:
         raise ValueError("analysis result envelope is invalid")
+    return serialized
+
+
+def _analysis_tool_arguments_json(
+    value: Mapping[str, Any] | None,
+    *,
+    dataset_id: str,
+    mapping_version_id: int,
+    operation: str,
+) -> str:
+    expected = {
+        "dataset_id": dataset_id,
+        "mapping_version_id": mapping_version_id,
+        "operation": operation,
+    }
+    if value is None:
+        value = expected
+    if not isinstance(value, Mapping) or dict(value) != expected:
+        raise ValueError("analysis tool arguments are invalid")
+    serialized = json.dumps(expected, separators=(",", ":"))
+    if len(serialized) > 512:
+        raise ValueError("analysis tool arguments are invalid")
     return serialized
 
 
