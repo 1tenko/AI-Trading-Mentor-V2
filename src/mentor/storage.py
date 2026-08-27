@@ -259,6 +259,7 @@ class Storage:
                         typeof(dataset_id) = 'text' AND length(dataset_id) BETWEEN 1 AND 80
                         AND dataset_id NOT GLOB '*[^A-Za-z0-9_-]*'
                     ),
+                    state TEXT NOT NULL DEFAULT 'staging' CHECK(state IN ('staging', 'committed')),
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
                 CREATE TABLE IF NOT EXISTS dataset_columns (
@@ -533,6 +534,13 @@ class Storage:
                 connection.execute(
                     "ALTER TABLE dataset_mapping_versions "
                     "ADD COLUMN parent_mapping_version_id INTEGER REFERENCES dataset_mapping_versions(id)"
+                )
+            pending_import_columns = {
+                row[1] for row in connection.execute("PRAGMA table_info(pending_dataset_imports)")
+            }
+            if "state" not in pending_import_columns:
+                connection.execute(
+                    "ALTER TABLE pending_dataset_imports ADD COLUMN state TEXT NOT NULL DEFAULT 'staging'"
                 )
             tool_output_columns = {
                 row[1] for row in connection.execute("PRAGMA table_info(analysis_tool_outputs)")
@@ -1491,16 +1499,32 @@ class Storage:
             rows = connection.execute("SELECT dataset_id FROM pending_dataset_imports ORDER BY dataset_id").fetchall()
         return [str(row[0]) for row in rows]
 
+    def dataset_import_state(self, dataset_id: str) -> str | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT state FROM pending_dataset_imports WHERE dataset_id = ?", (dataset_id,)
+            ).fetchone()
+        return None if row is None else str(row[0])
+
+    def mark_dataset_import_committed(self, dataset_id: str) -> None:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "UPDATE pending_dataset_imports SET state = 'committed' WHERE dataset_id = ? AND state = 'staging'",
+                (dataset_id,),
+            )
+        if cursor.rowcount != 1:
+            raise ValueError("dataset import is not staging")
+
     def discard_failed_dataset_import(self, dataset_id: str) -> None:
-        """Remove only this reserved, unreferenced interrupted import."""
+        """Remove staging metadata only; its ledger remains until file cleanup finishes."""
         if not isinstance(dataset_id, str) or _DATASET_ID_PATTERN.fullmatch(dataset_id) is None:
             raise ValueError("dataset identifier is invalid")
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             pending = connection.execute(
-                "SELECT 1 FROM pending_dataset_imports WHERE dataset_id = ?", (dataset_id,)
+                "SELECT state FROM pending_dataset_imports WHERE dataset_id = ?", (dataset_id,)
             ).fetchone()
-            if pending is None:
+            if pending is None or pending[0] != "staging":
                 return
             exists = connection.execute("SELECT 1 FROM datasets WHERE id = ?", (dataset_id,)).fetchone()
             if exists is not None:
@@ -1518,11 +1542,18 @@ class Storage:
                 connection.execute("DELETE FROM dataset_columns WHERE dataset_id = ?", (dataset_id,))
                 connection.execute("DELETE FROM dataset_import_specs WHERE dataset_id = ?", (dataset_id,))
                 connection.execute("DELETE FROM datasets WHERE id = ?", (dataset_id,))
-            connection.execute("DELETE FROM pending_dataset_imports WHERE dataset_id = ?", (dataset_id,))
+
+    def abandon_dataset_import(self, dataset_id: str) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                "DELETE FROM pending_dataset_imports WHERE dataset_id = ? AND state = 'staging'", (dataset_id,)
+            )
 
     def complete_dataset_import(self, dataset_id: str) -> None:
         with self._connect() as connection:
-            connection.execute("DELETE FROM pending_dataset_imports WHERE dataset_id = ?", (dataset_id,))
+            connection.execute(
+                "DELETE FROM pending_dataset_imports WHERE dataset_id = ? AND state = 'committed'", (dataset_id,)
+            )
 
     def create_mapping_draft(
         self, dataset_id: str, entries: list[MappingEntry | Mapping[str, Any]]

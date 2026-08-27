@@ -138,7 +138,6 @@ def import_local_dataset(
     dataset_id: str | None = None
     promoted_this_import = False
     reserved_this_import = False
-    completed_import = False
     try:
         temporary_original = temporary_directory / f"original{extension}"
         content_sha256, byte_size = _copy_with_hash(source_path, temporary_original)
@@ -186,18 +185,19 @@ def import_local_dataset(
                 for index, (header, null_count) in enumerate(zip(parsed.headers, parsed.null_counts, strict=True))
             ],
         )
+        storage.mark_dataset_import_committed(dataset_id)
         (final_directory / ".pending-import").unlink()
         storage.complete_dataset_import(dataset_id)
-        completed_import = True
         return DatasetImportResult(dataset, original_path, parsed.duplicate_row_count)
     except BaseException:
-        if reserved_this_import and not completed_import and dataset_id is not None:
+        if reserved_this_import and dataset_id is not None and storage.dataset_import_state(dataset_id) == "staging":
             try:
+                if promoted_this_import and final_directory is not None and final_directory.exists():
+                    shutil.rmtree(final_directory)
                 storage.discard_failed_dataset_import(dataset_id)
+                storage.abandon_dataset_import(dataset_id)
             except Exception:
                 pass
-        if not completed_import and promoted_this_import and final_directory is not None and final_directory.exists():
-            shutil.rmtree(final_directory, ignore_errors=True)
         raise
     finally:
         if temporary_directory.exists():
@@ -226,12 +226,18 @@ def _internal_datasets_root(storage: "Storage", requested_root: Path | None) -> 
 
 
 def _recover_pending_dataset_imports(datasets_root: Path, storage: "Storage") -> None:
-    pending_ids = set(storage.pending_dataset_import_ids())
-    for dataset_id in pending_ids:
-        storage.discard_failed_dataset_import(dataset_id)
+    for dataset_id in storage.pending_dataset_import_ids():
         pending_directory = datasets_root / dataset_id
-        if pending_directory.exists():
-            shutil.rmtree(pending_directory)
+        if storage.dataset_import_state(dataset_id) == "staging":
+            if pending_directory.exists():
+                shutil.rmtree(pending_directory)
+            storage.discard_failed_dataset_import(dataset_id)
+            storage.abandon_dataset_import(dataset_id)
+        else:
+            marker = pending_directory / ".pending-import"
+            if marker.exists():
+                marker.unlink()
+            storage.complete_dataset_import(dataset_id)
     for temporary_directory in datasets_root.glob(".import-*"):
         if temporary_directory.is_dir():
             shutil.rmtree(temporary_directory)
@@ -428,10 +434,14 @@ def _parse_relationships(contents: bytes) -> dict[str, str]:
         relationship_type = element.attrib.get("Type", "").casefold()
         target = element.attrib.get("Target", "")
         target_mode = element.attrib.get("TargetMode", "").casefold()
+        normalized_target = target.strip()
         if (
             target_mode == "external"
             or "externallink" in relationship_type
-            or re.match(r"^[A-Za-z][A-Za-z0-9+.-]*:", target) is not None
+            or normalized_target != target
+            or normalized_target.startswith("//")
+            or "\\" in normalized_target
+            or re.match(r"^[A-Za-z][A-Za-z0-9+.-]*:", normalized_target) is not None
         ):
             raise DatasetImportError("XLSX external links are not supported")
         if "vbaproject" in relationship_type or target.casefold().endswith("vbaproject.bin"):

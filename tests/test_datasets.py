@@ -312,6 +312,81 @@ def test_import_rejects_caller_controlled_or_unc_dataset_roots(tmp_path):
     assert not (tmp_path / "outside").exists()
 
 
+def test_interrupt_after_durable_completion_preserves_the_committed_dataset_on_next_start(tmp_path, monkeypatch):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    source = tmp_path / "trades.csv"
+    source.write_text("Result_R\n1.5\n", encoding="utf-8")
+    complete_import = storage.complete_dataset_import
+
+    def interrupt_after_completion(dataset_id):
+        complete_import(dataset_id)
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr(storage, "complete_dataset_import", interrupt_after_completion)
+
+    with pytest.raises(KeyboardInterrupt):
+        _importer(storage, tmp_path)(source)
+
+    original = tmp_path / "datasets" / "dataset-imported" / "original.csv"
+    assert original.read_bytes() == source.read_bytes()
+    assert storage.dataset("dataset-imported") is not None
+    monkeypatch.setattr(storage, "complete_dataset_import", complete_import)
+    import_local_dataset(source, storage, tmp_path / "datasets", dataset_id_factory=lambda: "dataset-next")
+    assert original.read_bytes() == source.read_bytes()
+    assert storage.dataset("dataset-imported") is not None
+
+
+def test_next_start_recovers_staging_directory_when_interrupted_during_filesystem_cleanup(tmp_path, monkeypatch):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    source = tmp_path / "trades.csv"
+    source.write_text("Result_R\n1.5\n", encoding="utf-8")
+    create_dataset = storage.create_dataset
+
+    def interrupt_after_recording(**kwargs):
+        create_dataset(**kwargs)
+        raise KeyboardInterrupt()
+
+    interrupted_directory = tmp_path / "datasets" / "dataset-imported"
+    real_rmtree = __import__("shutil").rmtree
+
+    def interrupt_cleanup(path, *args, **kwargs):
+        if Path(path) == interrupted_directory:
+            raise KeyboardInterrupt()
+        return real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(storage, "create_dataset", interrupt_after_recording)
+    monkeypatch.setattr("mentor.datasets.shutil.rmtree", interrupt_cleanup)
+
+    with pytest.raises(KeyboardInterrupt):
+        _importer(storage, tmp_path)(source)
+
+    assert interrupted_directory.exists()
+    assert storage.pending_dataset_import_ids() == ["dataset-imported"]
+    monkeypatch.setattr("mentor.datasets.shutil.rmtree", real_rmtree)
+    monkeypatch.setattr(storage, "create_dataset", create_dataset)
+    import_local_dataset(source, storage, tmp_path / "datasets", dataset_id_factory=lambda: "dataset-next")
+    assert not interrupted_directory.exists()
+    assert storage.pending_dataset_import_ids() == []
+
+
+@pytest.mark.parametrize("target", ["//server/share", r"\\server\share", " https://example.invalid", "\thttps://example.invalid"])
+def test_xlsx_rejects_authority_and_whitespace_prefixed_external_relationship_targets(tmp_path, target):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    source = tmp_path / "external-target.xlsx"
+    _workbook(source)
+    with zipfile.ZipFile(source, "a") as archive:
+        archive.writestr(
+            "xl/worksheets/_rels/sheet1.xml.rels",
+            f"<Relationships><Relationship Id='rId1' Target='{target}'/></Relationships>",
+        )
+
+    with pytest.raises(DatasetImportError, match="external|relationship"):
+        _importer(storage, tmp_path)(source)
+
+
 def _result_envelope(dataset, mapping_version_id: int, operation: str = "summarize_results"):
     return {
         "provenance": "USER_EMPIRICAL_EVIDENCE",
