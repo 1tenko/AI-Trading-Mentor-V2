@@ -30,6 +30,9 @@ class StrategyProfileSelection:
     items: tuple[TraderProfileItem, ...]
     context: str
     character_count: int
+    answered_count: int = 0
+    explicitly_unknown_count: int = 0
+    unanswered_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -452,28 +455,60 @@ def select_profile_context(
 
 
 def strategy_profile_context(confirmed_items: Iterable[TraderProfileItem]) -> StrategyProfileSelection:
-    """Render current questionnaire answers for an explicit strategy-design request."""
+    """Render the complete questionnaire state for an explicit strategy-design request."""
+    return full_questionnaire_profile_context(confirmed_items, heading="Trader Strategy Profile")
+
+
+def full_questionnaire_profile_context(
+    confirmed_items: Iterable[TraderProfileItem], *, heading: str = "Trader Profile"
+) -> StrategyProfileSelection:
+    """Render every questionnaire field while retaining state when details exceed the budget."""
     fields = {
         (field.category, _subject_key(field.subject)): field
         for field in QUESTIONNAIRE_FIELDS
     }
-    pairs = [
-        (fields[(item.category, item.subject_key)], item)
+    current = {
+        (item.category, item.subject_key): item
         for item in confirmed_items
         if item.state == "confirmed" and (item.category, item.subject_key) in fields
-    ]
-    pairs.sort(key=lambda pair: (pair[0].priority, pair[0].key, pair[1].id))
-    lines = ["Trader Strategy Profile — user context, not source evidence:"]
+    }
+    entries = []
     selected: list[TraderProfileItem] = []
-    for field, item in pairs:
-        value = "User is currently unsure / has not decided." if _is_unknown(item.value) else item.value
-        line = f"- {field.subject}: {value}"
-        if len("\n".join([*lines, line])) > 6000:
+    answered_count = explicitly_unknown_count = unanswered_count = 0
+    for field in QUESTIONNAIRE_FIELDS:
+        item = current.get((field.category, _subject_key(field.subject)))
+        if item is None:
+            unanswered_count += 1
+            entries.append((f"[UNANSWERED] {field.subject}", None))
+        elif _is_unknown(item.value):
+            explicitly_unknown_count += 1
+            selected.append(item)
+            entries.append((f"[EXPLICITLY UNKNOWN] {field.subject}", None))
+        else:
+            answered_count += 1
+            selected.append(item)
+            entries.append((f"[ANSWERED — detail omitted for context budget] {field.subject}", item))
+    header = f"{heading} — user context, not source evidence:"
+    reserved_state_length = sum(len(state_line) + 1 for state_line, _ in entries)
+    remaining_detail_budget = 6000 - len(header) - reserved_state_length
+    detailed_indexes = set()
+    for index, (state_line, item) in sorted(
+        enumerate(entries),
+        key=lambda pair: _full_profile_detail_priority(QUESTIONNAIRE_FIELDS[pair[0]], pair[0]),
+    ):
+        if item is None:
             continue
-        lines.append(line)
-        selected.append(item)
-    context = "\n".join(lines) if selected else ""
-    return StrategyProfileSelection(tuple(selected), context, len(context))
+        detail_cost = len(f"[ANSWERED] {item.subject}: {item.value}") - len(state_line)
+        if detail_cost <= remaining_detail_budget:
+            detailed_indexes.add(index)
+            remaining_detail_budget -= detail_cost
+    lines = [header]
+    for index, (state_line, item) in enumerate(entries):
+        lines.append(state_line if item is None or index not in detailed_indexes else f"[ANSWERED] {item.subject}: {item.value}")
+    context = "\n".join(lines)
+    return StrategyProfileSelection(
+        tuple(selected), context, len(context), answered_count, explicitly_unknown_count, unanswered_count
+    )
 
 
 def questionnaire_field_state(
@@ -530,6 +565,11 @@ def questionnaire_field_state(
 
 def _is_unknown(value: str) -> bool:
     return bool(_UNKNOWN_ANSWER.fullmatch(" ".join(value.casefold().split())))
+
+
+def _full_profile_detail_priority(field: QuestionnaireField, index: int) -> tuple[int, int, int]:
+    strategic = field.category == "goals/research" or field.kind == "constraint"
+    return (0 if strategic else 1, field.priority, index)
 
 
 def _validate_item(

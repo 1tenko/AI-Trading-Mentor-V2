@@ -6,6 +6,7 @@ from mentor.profile import (
     QUESTIONNAIRE_FIELDS,
     ProfileService,
     ProfileValidationError,
+    full_questionnaire_profile_context,
     questionnaire_field_state,
     select_profile_context,
     strategy_profile_context,
@@ -644,7 +645,7 @@ def test_strategy_profile_context_is_bounded_and_represents_unknowns_without_ass
     context = strategy_profile_context(storage.current_confirmed_profile_items())
 
     assert "Trader Strategy Profile" in context.context
-    assert "preferred trading style: User is currently unsure" in context.context
+    assert "[EXPLICITLY UNKNOWN] preferred trading style" in context.context
     assert "I don't know" not in context.context
     assert context.character_count <= 6000
 
@@ -714,3 +715,48 @@ def test_strategy_profile_context_includes_every_short_questionnaire_answer_with
 
     assert len(context.items) == len(QUESTIONNAIRE_FIELDS)
     assert context.character_count <= 6000
+
+
+def test_full_questionnaire_context_preserves_answered_unknown_and_unanswered_states_within_budget(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    profile = ProfileService(storage)
+    profile.save_questionnaire_answers({
+        "q1": "Ideally I want at least 70% win rate and at least 2R.",
+        "q6": "I want at least one opportunity per day.",
+        "q13": "idk",
+        "q14": "High win rate, minimum 2R.",
+        "q16": "idk",
+        "q20": "idk",
+    })
+
+    context = full_questionnaire_profile_context(storage.current_confirmed_profile_items())
+
+    assert context.answered_count == 3
+    assert context.explicitly_unknown_count == 3
+    assert context.unanswered_count == 15
+    assert "[ANSWERED] trading objective: Ideally I want at least 70% win rate and at least 2R." in context.context
+    assert "[ANSWERED] strategy priorities: High win rate, minimum 2R." in context.context
+    assert "[EXPLICITLY UNKNOWN] risk and funding constraints" in context.context
+    assert "[EXPLICITLY UNKNOWN] backtesting commitment" in context.context
+    assert "[EXPLICITLY UNKNOWN] optimisation principles" in context.context
+    assert "[UNANSWERED] trusted and uncertain concepts" in context.context
+    assert context.character_count <= 6000
+
+
+def test_full_questionnaire_context_keeps_every_field_state_when_answer_detail_exceeds_budget(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    profile = ProfileService(storage)
+    profile.save_questionnaire_answers({field.key: "x" * 500 for field in QUESTIONNAIRE_FIELDS})
+
+    context = full_questionnaire_profile_context(storage.current_confirmed_profile_items())
+
+    assert context.character_count <= 6000
+    assert context.unanswered_count == 0
+    assert context.context.count("[ANSWERED]") + context.context.count("[ANSWERED — detail omitted for context budget]") == 21
+    assert "[ANSWERED — detail omitted for context budget]" in context.context
+    assert "[ANSWERED] risk and funding constraints: " in context.context
+    assert "[ANSWERED] strategy priorities: " in context.context
+    assert "[ANSWERED] strategy deal-breakers: " in context.context
+    assert "[ANSWERED] backtesting commitment: " in context.context

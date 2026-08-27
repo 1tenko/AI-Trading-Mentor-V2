@@ -12,6 +12,7 @@ from uuid import uuid4
 from mentor.profile import (
     ProfileService,
     ProfileValidationError,
+    full_questionnaire_profile_context,
     questionnaire_field_state,
     select_profile_context,
     strategy_profile_context,
@@ -64,6 +65,10 @@ SUPPORTED_REASONING_EFFORTS = frozenset({"high", "xhigh", "max"})
 SUPPORTED_REASONING_MODES = frozenset({"standard", "pro"})
 SUPPORTED_RESEARCH_DEPTHS = frozenset({"auto", "normal", "deep", "exhaustive"})
 PROFILE_TOOL_NAME = "update_trader_profile"
+PROFILE_CONTEXT_NONE = "none"
+PROFILE_CONTEXT_RELEVANT = "relevant"
+PROFILE_CONTEXT_FULL_PROFILE = "full_profile"
+PROFILE_CONTEXT_STRATEGY = "strategy"
 PROFILE_TOOL = {
     "type": "function",
     "name": PROFILE_TOOL_NAME,
@@ -451,15 +456,18 @@ class ChatService:
         replay_items = self.storage.replay_items(thread_id)
         confirmed_profile = self.storage.current_confirmed_profile_items()
         profile_context = ""
-        field_state = questionnaire_field_state(question, confirmed_profile)
-        if _is_strategy_design_question(question):
+        context_mode = _profile_context_mode(question)
+        field_state = None
+        if context_mode == PROFILE_CONTEXT_FULL_PROFILE:
+            full_profile = full_questionnaire_profile_context(confirmed_profile)
+            profile_context = f"\n\n{full_profile.context}\nUse this only to answer about Theo's profile; it is not Jacob source material."
+        elif context_mode == PROFILE_CONTEXT_STRATEGY:
             strategy_profile = strategy_profile_context(confirmed_profile)
-            if strategy_profile.context:
-                profile_context = (
-                    f"\n\n{strategy_profile.context}\n"
-                    "Use this only to personalise relevant strategy design; it is not Jacob source material."
-                )
-        else:
+            profile_context = (
+                f"\n\n{strategy_profile.context}\n"
+                "Use this only to personalise relevant strategy design; it is not Jacob source material."
+            )
+        elif context_mode == PROFILE_CONTEXT_RELEVANT:
             selection = select_profile_context(question, confirmed_profile)
             if selection.context:
                 profile_context = (
@@ -467,9 +475,12 @@ class ChatService:
                     f"{selection.context}\n"
                     "Use this only to personalise relevant advice; it is not Jacob source material."
                 )
+            field_state = questionnaire_field_state(question, confirmed_profile)
         if field_state is not None:
             profile_context += f"\n\n{field_state.context}"
-        source_tools = [] if field_state is not None and not _explicit_profile_source_request(question) else [
+        source_tools = [] if context_mode == PROFILE_CONTEXT_FULL_PROFILE or (
+            field_state is not None and not _explicit_profile_source_request(question)
+        ) else [
             {
                 "type": "file_search",
                 "vector_store_ids": [vector_store_id],
@@ -588,19 +599,48 @@ def _question(question: str) -> str:
 
 
 def _is_strategy_design_question(question: str) -> bool:
+    normalized = " ".join(question.casefold().replace("-", " ").split())
+    action = re.search(r"\b(?:build|building|design|designing|develop|developing|development|create|creating|construct|constructing|work out|figure out)\b", normalized)
+    artifact = re.search(r"\b(?:trading )?(?:strategy|system|model|playbook)\b", normalized)
+    personal = re.search(r"\b(?:for me|around me|fits me|fit me|my |my profile|trader profile|from scratch|i should)\b", normalized)
+    return bool(action and artifact and personal) or bool(
+        re.search(r"\bwhat kind of (?:trading )?(?:strategy|system|model|playbook)\b.*\bfit(?:s)? me\b", normalized)
+    )
+
+
+def _profile_context_mode(question: str) -> str:
+    if _is_strategy_design_question(question):
+        return PROFILE_CONTEXT_STRATEGY
+    if _is_full_profile_question(question):
+        return PROFILE_CONTEXT_FULL_PROFILE
     normalized = question.casefold()
-    return any(
+    if _explicit_profile_source_request(question) and not any(signal in normalized for signal in ("my ", "for me", "my profile", "trader profile")):
+        return PROFILE_CONTEXT_NONE
+    return PROFILE_CONTEXT_RELEVANT
+
+
+def _is_full_profile_question(question: str) -> bool:
+    normalized = " ".join(question.casefold().split())
+    profile_reference = any(phrase in normalized for phrase in ("trader profile", "my profile", "profile say"))
+    explicit_full_profile = "full trader profile" in normalized or "full profile" in normalized
+    inspection = any(
         phrase in normalized
         for phrase in (
-            "build my strategy",
-            "build a strategy",
-            "design my strategy",
-            "design a strategy",
-            "develop my strategy",
-            "develop a strategy",
-            "what kind of system fits me",
+            "what do you know about me",
+            "summarize my profile",
+            "summarise my profile",
+            "what have i answered",
+            "left unanswered",
+            "left blank",
+            "profile questions are unresolved",
+            "what did i put for my trading preferences",
+            "what does my trader profile say",
+            "what's in my trader profile",
+            "what is in my trader profile",
         )
     )
+    summary = profile_reference and ("summarize" in normalized or "summarise" in normalized)
+    return explicit_full_profile or inspection or summary
 
 
 def _explicit_profile_source_request(question: str) -> bool:

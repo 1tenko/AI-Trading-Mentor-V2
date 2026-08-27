@@ -10,6 +10,7 @@ from mentor.chat_service import (
     FILE_SEARCH_RESULT_BUDGETS,
     _input_item,
     _effective_research_depth,
+    _profile_context_mode,
 )
 from mentor.prompts import MENTOR_INSTRUCTIONS, PROFILE_TOOL_INSTRUCTIONS
 from mentor.profile import ProfileService
@@ -181,10 +182,87 @@ def test_explicit_strategy_design_uses_broader_questionnaire_context_without_rep
 
     request = responses.calls[0]
     assert "Trader Strategy Profile — user context, not source evidence:" in request["instructions"]
-    assert "trading objective: Build consistent income." in request["instructions"]
-    assert "preferred trading style: User is currently unsure / has not decided." in request["instructions"]
-    assert "risk and funding constraints: One percent risk maximum." in request["instructions"]
+    assert "[ANSWERED] trading objective: Build consistent income." in request["instructions"]
+    assert "[EXPLICITLY UNKNOWN] preferred trading style" in request["instructions"]
+    assert "[ANSWERED] risk and funding constraints: One percent risk maximum." in request["instructions"]
     assert all("Trader Strategy Profile" not in json.dumps(item) for item in request["input"])
+
+
+def test_exact_human_profile_overview_prompt_uses_full_profile_state_without_file_search(tmp_path):
+    question = (
+        "Based only on my Trader Profile, what do you actually know about me, what is explicitly unresolved, "
+        "what have I left unanswered, and what are you merely inferring? Do not research Jacob for this."
+    )
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    storage.set_vector_store("vs_jacob")
+    ProfileService(storage).save_questionnaire_answers({"q1": "At least 2R.", "q8": "idk"})
+    responses = FakeResponses(SimpleNamespace(status="completed", output=[]))
+
+    ChatService(storage, SimpleNamespace(responses=responses)).reply(storage.create_thread("Profile"), question)
+
+    request = responses.calls[0]
+    assert _profile_context_mode(question) == "full_profile"
+    assert "Trader Profile — user context, not source evidence:" in request["instructions"]
+    assert "[ANSWERED] trading objective: At least 2R." in request["instructions"]
+    assert "[EXPLICITLY UNKNOWN] trading strengths" in request["instructions"]
+    assert "[UNANSWERED] trusted and uncertain concepts" in request["instructions"]
+    assert all(tool["type"] != "file_search" for tool in request["tools"])
+
+
+def test_exact_human_strategy_prompt_uses_full_strategy_snapshot_and_preserves_answered_minimums(tmp_path):
+    question = (
+        "I want to start developing a trading strategy from scratch around me. Use my full Trader Profile. "
+        "Do not assume answers to anything I've marked unknown. Tell me what kind of strategy we're currently "
+        "aiming toward, what constraints are actually known, what important things are still unresolved, and—most "
+        "importantly—what you think our first research/backtesting step should be."
+    )
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    storage.set_vector_store("vs_jacob")
+    ProfileService(storage).save_questionnaire_answers({
+        "q1": "Ideally I want at least 70% win rate and at least 2R.",
+        "q6": "I want at least one opportunity per day.",
+        "q13": "idk",
+        "q14": "High win rate, minimum 2R.",
+        "q16": "idk",
+        "q20": "idk",
+    })
+    responses = FakeResponses(SimpleNamespace(status="completed", output=[]))
+
+    ChatService(storage, SimpleNamespace(responses=responses)).reply(storage.create_thread("Strategy"), question)
+
+    request = responses.calls[0]
+    assert _profile_context_mode(question) == "strategy"
+    assert "Trader Strategy Profile — user context, not source evidence:" in request["instructions"]
+    assert "at least 70% win rate and at least 2R" in request["instructions"]
+    assert "High win rate, minimum 2R." in request["instructions"]
+    assert "[ANSWERED] preferred trade frequency: I want at least one opportunity per day." in request["instructions"]
+    assert "[EXPLICITLY UNKNOWN] risk and funding constraints" in request["instructions"]
+    assert "[EXPLICITLY UNKNOWN] backtesting commitment" in request["instructions"]
+    assert "[EXPLICITLY UNKNOWN] optimisation principles" in request["instructions"]
+    assert "[UNANSWERED] trusted and uncertain concepts" in request["instructions"]
+    assert request["tools"][0]["type"] == "file_search"
+
+
+@pytest.mark.parametrize(
+    ("question", "expected"),
+    [
+        ("What's in my Trader Profile?", "full_profile"),
+        ("What do you know about me as a trader?", "full_profile"),
+        ("Summarize my Trader Profile.", "full_profile"),
+        ("What have I left unanswered?", "full_profile"),
+        ("Which profile questions are unresolved?", "full_profile"),
+        ("What did I put for my trading preferences?", "full_profile"),
+        ("Use my full Trader Profile.", "full_profile"),
+        ("Let's design my trading system.", "strategy"),
+        ("Use my full Trader Profile and help me figure out what system I should build.", "strategy"),
+        ("What is Jacob's strategy?", "none"),
+        ("Explain strategy expectancy.", "relevant"),
+    ],
+)
+def test_profile_context_modes_cover_natural_profile_and_strategy_variants(question, expected):
+    assert _profile_context_mode(question) == expected
 
 
 @pytest.mark.parametrize(
