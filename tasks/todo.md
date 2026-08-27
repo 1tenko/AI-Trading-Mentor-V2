@@ -12,18 +12,18 @@ directory, SQLite metadata migration, immutable import/mapping-version models,
 and thread-owned empirical-evidence models.
 
 **Acceptance criteria:**
-- [ ] Dataset identity includes immutable hash, original name, row count, import
+- [x] Dataset identity includes immutable hash, original name, row count, import
   spec, status, and mapping/result version references.
-- [ ] Mapping has atomic draft/confirmed parent snapshots with unique role-to-column
+- [x] Mapping has atomic draft/confirmed parent snapshots with unique role-to-column
   entries; an analysis can use only a confirmed immutable version.
-- [ ] Thread deletion transaction removes its dataset scope/evidence/tool-output
+- [x] Thread deletion transaction removes its dataset scope/evidence/tool-output
   references without deleting a shared dataset or another thread's evidence.
-- [ ] Runtime artifacts are ignored and raw rows are not stored in Git or SQLite metadata.
-- [ ] Existing storage/conversation migrations remain compatible.
+- [x] Runtime artifacts are ignored and raw rows are not stored in Git or SQLite metadata.
+- [x] Existing storage/conversation migrations remain compatible.
 
 **Verification:**
-- [ ] Focused storage/migration tests and full pytest pass.
-- [ ] Dependency versions are checked against current official docs.
+- [x] Focused storage/migration tests and full pytest pass.
+- [x] Dependency versions are checked against current official docs.
 
 **Dependencies:** None
 **Files likely touched:** `pyproject.toml`, `.gitignore`, `src/mentor/storage.py`,
