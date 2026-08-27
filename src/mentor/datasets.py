@@ -42,6 +42,7 @@ class DatasetMappingVersion:
     dataset_id: str
     version: int
     status: str
+    parent_mapping_version_id: int | None
 
 
 @dataclass(frozen=True)

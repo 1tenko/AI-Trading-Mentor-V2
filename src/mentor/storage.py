@@ -1,6 +1,8 @@
 """Small SQLite store for private Trading Mentor state."""
 
 import json
+import math
+import re
 import sqlite3
 from dataclasses import asdict
 from dataclasses import dataclass
@@ -193,6 +195,7 @@ class Storage:
                     dataset_id TEXT NOT NULL REFERENCES datasets(id),
                     version INTEGER NOT NULL CHECK(version >= 1),
                     status TEXT NOT NULL CHECK(status IN ('draft', 'confirmed')),
+                    parent_mapping_version_id INTEGER REFERENCES dataset_mapping_versions(id),
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     confirmed_at TEXT,
                     UNIQUE(dataset_id, version)
@@ -268,11 +271,127 @@ class Storage:
                 BEGIN SELECT RAISE(ABORT, 'confirmed mapping entries are immutable'); END;
                 CREATE TRIGGER IF NOT EXISTS analysis_evidence_requires_confirmed_mapping
                 BEFORE INSERT ON analysis_evidence
+                WHEN CASE
+                    WHEN json_valid(NEW.result_json) = 0 THEN 1
+                    WHEN NOT EXISTS (
+                        SELECT 1 FROM dataset_mapping_versions
+                        JOIN datasets ON datasets.id = dataset_mapping_versions.dataset_id
+                        JOIN dataset_import_specs ON dataset_import_specs.dataset_id = datasets.id
+                        WHERE dataset_mapping_versions.id = NEW.mapping_version_id
+                          AND dataset_mapping_versions.dataset_id = NEW.dataset_id
+                          AND dataset_mapping_versions.status = 'confirmed'
+                          AND datasets.content_sha256 = NEW.dataset_sha256
+                          AND dataset_import_specs.id = NEW.import_spec_id
+                    ) THEN 1
+                    WHEN length(NEW.result_json) > 8000 THEN 1
+                    WHEN json_type(NEW.result_json, '$') != 'object'
+                      OR json_type(NEW.result_json, '$.provenance') != 'text'
+                      OR json_extract(NEW.result_json, '$.provenance') != 'USER_EMPIRICAL_EVIDENCE'
+                      OR json_extract(NEW.result_json, '$.dataset_id') != NEW.dataset_id
+                      OR json_extract(NEW.result_json, '$.dataset_sha256') != NEW.dataset_sha256
+                      OR json_extract(NEW.result_json, '$.mapping_version_id') != NEW.mapping_version_id
+                      OR json_extract(NEW.result_json, '$.operation') != NEW.operation
+                      OR json_extract(NEW.result_json, '$.schema_version') != NEW.schema_version
+                      OR json_type(NEW.result_json, '$.counts') != 'object'
+                      OR json_type(NEW.result_json, '$.metrics') != 'object'
+                      OR json_type(NEW.result_json, '$.limitations') != 'array' THEN 1
+                    WHEN (SELECT COUNT(*) FROM json_each(NEW.result_json)) != 9
+                      OR EXISTS (
+                          SELECT 1 FROM json_each(NEW.result_json)
+                          WHERE key NOT IN (
+                              'provenance', 'dataset_id', 'dataset_sha256', 'mapping_version_id',
+                              'operation', 'schema_version', 'counts', 'metrics', 'limitations'
+                          )
+                      ) THEN 1
+                    WHEN (SELECT COUNT(*) FROM json_each(NEW.result_json, '$.counts')) != 4
+                      OR EXISTS (
+                          SELECT 1 FROM json_each(NEW.result_json, '$.counts')
+                          WHERE key NOT IN ('source_rows', 'filtered_rows', 'valid_rows', 'excluded_rows')
+                             OR type != 'integer' OR value < 0
+                      ) THEN 1
+                    WHEN (SELECT COUNT(*) FROM json_each(NEW.result_json, '$.metrics')) > 50
+                      OR EXISTS (
+                          SELECT 1 FROM json_each(NEW.result_json, '$.metrics')
+                          WHERE type NOT IN ('integer', 'real', 'null') OR length(key) > 64
+                      ) THEN 1
+                    WHEN (SELECT COUNT(*) FROM json_each(NEW.result_json, '$.limitations')) > 20
+                      OR EXISTS (
+                          SELECT 1 FROM json_each(NEW.result_json, '$.limitations')
+                          WHERE type != 'text' OR length(value) > 240 OR instr(value, char(10)) > 0
+                      ) THEN 1
+                    ELSE 0
+                END
+                BEGIN SELECT RAISE(ABORT, 'analysis evidence provenance or result envelope is invalid'); END;
+                CREATE TRIGGER IF NOT EXISTS analysis_evidence_is_immutable
+                BEFORE UPDATE ON analysis_evidence
+                BEGIN SELECT RAISE(ABORT, 'analysis evidence is immutable'); END;
+                CREATE TRIGGER IF NOT EXISTS mapping_entries_require_dataset_column
+                BEFORE INSERT ON dataset_mapping_entries
                 WHEN NOT EXISTS (
                     SELECT 1 FROM dataset_mapping_versions
-                    WHERE id = NEW.mapping_version_id AND dataset_id = NEW.dataset_id AND status = 'confirmed'
+                    JOIN dataset_columns ON dataset_columns.dataset_id = dataset_mapping_versions.dataset_id
+                    WHERE dataset_mapping_versions.id = NEW.mapping_version_id
+                      AND dataset_columns.ordinal = NEW.column_ordinal
                 )
-                BEGIN SELECT RAISE(ABORT, 'analysis requires a confirmed mapping version'); END;
+                BEGIN SELECT RAISE(ABORT, 'mapping entry must reference an existing dataset column'); END;
+                CREATE TRIGGER IF NOT EXISTS mapping_entry_updates_require_dataset_column
+                BEFORE UPDATE OF mapping_version_id, column_ordinal ON dataset_mapping_entries
+                WHEN NOT EXISTS (
+                    SELECT 1 FROM dataset_mapping_versions
+                    JOIN dataset_columns ON dataset_columns.dataset_id = dataset_mapping_versions.dataset_id
+                    WHERE dataset_mapping_versions.id = NEW.mapping_version_id
+                      AND dataset_columns.ordinal = NEW.column_ordinal
+                )
+                BEGIN SELECT RAISE(ABORT, 'mapping entry must reference an existing dataset column'); END;
+                CREATE TRIGGER IF NOT EXISTS analysis_tool_outputs_require_result_envelope
+                BEFORE INSERT ON analysis_tool_outputs
+                WHEN CASE
+                    WHEN json_valid(NEW.output_json) = 0 THEN 1
+                    WHEN NOT EXISTS (
+                        SELECT 1 FROM analysis_evidence
+                        WHERE id = NEW.evidence_id AND thread_id = NEW.thread_id
+                          AND json_extract(NEW.output_json, '$.provenance') = 'USER_EMPIRICAL_EVIDENCE'
+                          AND json_extract(NEW.output_json, '$.dataset_id') = dataset_id
+                          AND json_extract(NEW.output_json, '$.dataset_sha256') = dataset_sha256
+                          AND json_extract(NEW.output_json, '$.mapping_version_id') = mapping_version_id
+                          AND json_extract(NEW.output_json, '$.operation') = operation
+                          AND json_extract(NEW.output_json, '$.schema_version') = schema_version
+                    ) THEN 1
+                    WHEN length(NEW.output_json) > 8000
+                      OR json_type(NEW.output_json, '$') != 'object'
+                      OR json_type(NEW.output_json, '$.counts') != 'object'
+                      OR json_type(NEW.output_json, '$.metrics') != 'object'
+                      OR json_type(NEW.output_json, '$.limitations') != 'array' THEN 1
+                    WHEN (SELECT COUNT(*) FROM json_each(NEW.output_json)) != 9
+                      OR EXISTS (
+                          SELECT 1 FROM json_each(NEW.output_json)
+                          WHERE key NOT IN (
+                              'provenance', 'dataset_id', 'dataset_sha256', 'mapping_version_id',
+                              'operation', 'schema_version', 'counts', 'metrics', 'limitations'
+                          )
+                      ) THEN 1
+                    WHEN (SELECT COUNT(*) FROM json_each(NEW.output_json, '$.counts')) != 4
+                      OR EXISTS (
+                          SELECT 1 FROM json_each(NEW.output_json, '$.counts')
+                          WHERE key NOT IN ('source_rows', 'filtered_rows', 'valid_rows', 'excluded_rows')
+                             OR type != 'integer' OR value < 0
+                      ) THEN 1
+                    WHEN (SELECT COUNT(*) FROM json_each(NEW.output_json, '$.metrics')) > 50
+                      OR EXISTS (
+                          SELECT 1 FROM json_each(NEW.output_json, '$.metrics')
+                          WHERE type NOT IN ('integer', 'real', 'null') OR length(key) > 64
+                      ) THEN 1
+                    WHEN (SELECT COUNT(*) FROM json_each(NEW.output_json, '$.limitations')) > 20
+                      OR EXISTS (
+                          SELECT 1 FROM json_each(NEW.output_json, '$.limitations')
+                          WHERE type != 'text' OR length(value) > 240 OR instr(value, char(10)) > 0
+                      ) THEN 1
+                    ELSE 0
+                END
+                BEGIN SELECT RAISE(ABORT, 'analysis result envelope is invalid'); END;
+                CREATE TRIGGER IF NOT EXISTS analysis_tool_outputs_are_immutable
+                BEFORE UPDATE ON analysis_tool_outputs
+                BEGIN SELECT RAISE(ABORT, 'analysis tool output is immutable'); END;
                 """
             )
             columns = {row[1] for row in connection.execute("PRAGMA table_info(sources)")}
@@ -286,6 +405,29 @@ class Storage:
             display_turn_columns = {row[1] for row in connection.execute("PRAGMA table_info(display_turns)")}
             if "profile_update_json" not in display_turn_columns:
                 connection.execute("ALTER TABLE display_turns ADD COLUMN profile_update_json TEXT")
+            mapping_version_columns = {
+                row[1] for row in connection.execute("PRAGMA table_info(dataset_mapping_versions)")
+            }
+            if "parent_mapping_version_id" not in mapping_version_columns:
+                connection.execute(
+                    "ALTER TABLE dataset_mapping_versions "
+                    "ADD COLUMN parent_mapping_version_id INTEGER REFERENCES dataset_mapping_versions(id)"
+                )
+            connection.executescript(
+                """
+                DROP TRIGGER IF EXISTS mapping_versions_are_immutable_except_confirmation;
+                CREATE TRIGGER mapping_versions_are_immutable_except_confirmation
+                BEFORE UPDATE ON dataset_mapping_versions
+                WHEN NOT (
+                    OLD.status = 'draft' AND NEW.status = 'confirmed'
+                    AND OLD.dataset_id = NEW.dataset_id AND OLD.version = NEW.version
+                    AND OLD.parent_mapping_version_id IS NEW.parent_mapping_version_id
+                    AND OLD.created_at = NEW.created_at AND OLD.confirmed_at IS NULL
+                    AND NEW.confirmed_at IS NOT NULL
+                )
+                BEGIN SELECT RAISE(ABORT, 'mapping versions are immutable'); END;
+                """
+            )
             connection.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS unique_profile_tool_call "
                 "ON trader_profile_items(tool_call_id) WHERE tool_call_id IS NOT NULL"
@@ -921,11 +1063,12 @@ class Storage:
                 (dataset_id,),
             ).fetchone()
             cursor = connection.execute(
-                "INSERT INTO dataset_mapping_versions(dataset_id, version, status) VALUES (?, ?, 'draft')",
+                "INSERT INTO dataset_mapping_versions(dataset_id, version, status, parent_mapping_version_id) "
+                "VALUES (?, ?, 'draft', NULL)",
                 (dataset_id, int(row[0])),
             )
             self._insert_mapping_entries(connection, int(cursor.lastrowid), entries)
-            return DatasetMappingVersion(int(cursor.lastrowid), dataset_id, int(row[0]), "draft")
+            return DatasetMappingVersion(int(cursor.lastrowid), dataset_id, int(row[0]), "draft", None)
 
     def confirm_mapping_version(self, draft_mapping_version_id: int) -> DatasetMappingVersion:
         """Copy a draft into a separate immutable confirmed snapshot."""
@@ -941,8 +1084,9 @@ class Storage:
                 (draft[0],),
             ).fetchone()
             cursor = connection.execute(
-                "INSERT INTO dataset_mapping_versions(dataset_id, version, status) VALUES (?, ?, 'draft')",
-                (draft[0], int(next_version[0])),
+                "INSERT INTO dataset_mapping_versions(dataset_id, version, status, parent_mapping_version_id) "
+                "VALUES (?, ?, 'draft', ?)",
+                (draft[0], int(next_version[0]), draft_mapping_version_id),
             )
             confirmed_id = int(cursor.lastrowid)
             self._insert_mapping_entries(
@@ -961,7 +1105,18 @@ class Storage:
                 "UPDATE dataset_mapping_versions SET status = 'confirmed', confirmed_at = CURRENT_TIMESTAMP WHERE id = ?",
                 (confirmed_id,),
             )
-            return DatasetMappingVersion(confirmed_id, str(draft[0]), int(next_version[0]), "confirmed")
+            return DatasetMappingVersion(
+                confirmed_id, str(draft[0]), int(next_version[0]), "confirmed", draft_mapping_version_id
+            )
+
+    def mapping_version(self, mapping_version_id: int) -> DatasetMappingVersion | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT id, dataset_id, version, status, parent_mapping_version_id "
+                "FROM dataset_mapping_versions WHERE id = ?",
+                (mapping_version_id,),
+            ).fetchone()
+        return None if row is None else DatasetMappingVersion(*row)
 
     def mapping_entries(self, mapping_version_id: int) -> list[MappingEntry]:
         with self._connect() as connection:
@@ -1015,6 +1170,14 @@ class Storage:
             ).fetchone()
             if dataset is None:
                 raise ValueError("analysis requires a confirmed mapping version for its dataset")
+            result_json = _analysis_result_envelope_json(
+                result,
+                dataset_id=dataset_id,
+                dataset_sha256=str(dataset[0]),
+                mapping_version_id=mapping_version_id,
+                operation=operation,
+                schema_version=schema_version,
+            )
             cursor = connection.execute(
                 """
                 INSERT INTO analysis_evidence(
@@ -1033,7 +1196,7 @@ class Storage:
                     operation,
                     schema_version,
                     json.dumps(arguments, separators=(",", ":")),
-                    json.dumps(result, separators=(",", ":")),
+                    result_json,
                 ),
             )
             return AnalysisEvidence(
@@ -1065,13 +1228,25 @@ class Storage:
     ) -> None:
         with self._connect() as connection:
             evidence = connection.execute(
-                "SELECT 1 FROM analysis_evidence WHERE id = ? AND thread_id = ?", (evidence_id, thread_id)
+                """
+                SELECT dataset_id, dataset_sha256, mapping_version_id, operation, schema_version
+                FROM analysis_evidence WHERE id = ? AND thread_id = ?
+                """,
+                (evidence_id, thread_id),
             ).fetchone()
             if evidence is None:
                 raise ValueError("analysis tool output must belong to its thread evidence")
+            output_json = _analysis_result_envelope_json(
+                output,
+                dataset_id=str(evidence[0]),
+                dataset_sha256=str(evidence[1]),
+                mapping_version_id=int(evidence[2]),
+                operation=str(evidence[3]),
+                schema_version=str(evidence[4]),
+            )
             connection.execute(
                 "INSERT INTO analysis_tool_outputs(thread_id, tool_call_id, evidence_id, output_json) VALUES (?, ?, ?, ?)",
-                (thread_id, tool_call_id, evidence_id, json.dumps(output, separators=(",", ":"))),
+                (thread_id, tool_call_id, evidence_id, output_json),
             )
 
     def analysis_tool_outputs(self, thread_id: int) -> list[dict[str, Any]]:
@@ -1091,6 +1266,20 @@ class Storage:
         mapping_version_id: int,
         entries: list[MappingEntry | Mapping[str, Any]],
     ) -> None:
+        mapping = connection.execute(
+            "SELECT dataset_id FROM dataset_mapping_versions WHERE id = ?", (mapping_version_id,)
+        ).fetchone()
+        if mapping is None:
+            raise ValueError("mapping version does not exist")
+        available_columns = {
+            row[0]
+            for row in connection.execute(
+                "SELECT ordinal FROM dataset_columns WHERE dataset_id = ?", (mapping[0],)
+            )
+        }
+        values_by_entry = [_dataset_values(entry) for entry in entries]
+        if any(values["column_ordinal"] not in available_columns for values in values_by_entry):
+            raise ValueError("mapping entries must reference an existing dataset column")
         connection.executemany(
             """
             INSERT INTO dataset_mapping_entries(
@@ -1106,8 +1295,7 @@ class Storage:
                     values.get("analysis_label"),
                     values.get("source", "manual"),
                 )
-                for entry in entries
-                if (values := _dataset_values(entry))
+                for values in values_by_entry
             ],
         )
 
@@ -1264,6 +1452,69 @@ class Storage:
 
 def _dataset_values(value: DatasetImportSpec | DatasetColumn | MappingEntry | Mapping[str, Any]) -> dict[str, Any]:
     return dict(value) if isinstance(value, Mapping) else asdict(value)
+
+
+def _analysis_result_envelope_json(
+    value: Mapping[str, Any],
+    *,
+    dataset_id: str,
+    dataset_sha256: str,
+    mapping_version_id: int,
+    operation: str,
+    schema_version: str,
+) -> str:
+    if not isinstance(value, Mapping) or set(value) != {
+        "provenance",
+        "dataset_id",
+        "dataset_sha256",
+        "mapping_version_id",
+        "operation",
+        "schema_version",
+        "counts",
+        "metrics",
+        "limitations",
+    }:
+        raise ValueError("analysis result envelope is invalid")
+    if (
+        value["provenance"] != "USER_EMPIRICAL_EVIDENCE"
+        or value["dataset_id"] != dataset_id
+        or value["dataset_sha256"] != dataset_sha256
+        or value["mapping_version_id"] != mapping_version_id
+        or value["operation"] != operation
+        or value["schema_version"] != schema_version
+    ):
+        raise ValueError("analysis result envelope does not match its evidence provenance")
+    counts = value["counts"]
+    if (
+        not isinstance(counts, Mapping)
+        or set(counts) != {"source_rows", "filtered_rows", "valid_rows", "excluded_rows"}
+        or any(type(count) is not int or count < 0 for count in counts.values())
+    ):
+        raise ValueError("analysis result envelope is invalid")
+    metrics = value["metrics"]
+    if (
+        not isinstance(metrics, Mapping)
+        or len(metrics) > 50
+        or any(
+            not isinstance(name, str)
+            or re.fullmatch(r"[a-z][a-z0-9_]{0,63}", name) is None
+            or type(metric) not in (int, float, type(None))
+            or (isinstance(metric, float) and not math.isfinite(metric))
+            for name, metric in metrics.items()
+        )
+    ):
+        raise ValueError("analysis result envelope is invalid")
+    limitations = value["limitations"]
+    if (
+        not isinstance(limitations, list)
+        or len(limitations) > 20
+        or any(not isinstance(item, str) or len(item) > 240 or "\n" in item for item in limitations)
+    ):
+        raise ValueError("analysis result envelope is invalid")
+    serialized = json.dumps(value, separators=(",", ":"), allow_nan=False)
+    if len(serialized) > 8000:
+        raise ValueError("analysis result envelope is invalid")
+    return serialized
 
 
 def _thread_label(title: str, first_item_json: str | None) -> str:
