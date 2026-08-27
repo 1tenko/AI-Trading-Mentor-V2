@@ -446,6 +446,8 @@ def _parse_relationships(contents: bytes) -> dict[str, str]:
             raise DatasetImportError("XLSX macros are not supported")
         if not relationship_id or not target:
             raise DatasetImportError("XLSX relationship is invalid")
+        if relationship_id in relationships:
+            raise DatasetImportError("XLSX relationship identifiers must be unique")
         relationships[relationship_id] = target
     return relationships
 

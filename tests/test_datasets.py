@@ -426,6 +426,33 @@ def test_next_start_recovers_rename_then_interrupt_staging_orphan_without_touchi
     assert storage.dataset(completed.dataset.id) == completed.dataset
 
 
+def test_xlsx_rejects_duplicate_relationship_id_that_hides_a_formula_target(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    source = tmp_path / "duplicate-relationship.xlsx"
+    _workbook(source)
+    with zipfile.ZipFile(source) as archive:
+        formula_sheet = archive.read("xl/worksheets/sheet1.xml").replace(
+            b"<v>1.5</v>", b"<f>1+1</f><v>2</v>"
+        )
+    _rewrite_zip_member(
+        source,
+        "xl/_rels/workbook.xml.rels",
+        lambda xml: xml.replace(
+            b'Target="/xl/worksheets/sheet1.xml"', b'Target="/xl/worksheets/formula.xml"'
+        ).replace(
+            b"</Relationships>",
+            b'<Relationship Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" '
+            b'Id="rId1" Target="/xl/worksheets/sheet1.xml"/></Relationships>',
+        ),
+    )
+    with zipfile.ZipFile(source, "a") as archive:
+        archive.writestr("xl/worksheets/formula.xml", formula_sheet)
+
+    with pytest.raises(DatasetImportError, match="relationship"):
+        _importer(storage, tmp_path)(source)
+
+
 def _result_envelope(dataset, mapping_version_id: int, operation: str = "summarize_results"):
     return {
         "provenance": "USER_EMPIRICAL_EVIDENCE",
