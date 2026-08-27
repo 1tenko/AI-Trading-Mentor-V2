@@ -83,6 +83,9 @@ _ANALYSIS_METRIC_NAMES = frozenset(
 
 _ANALYSIS_OPERATION_PATTERN = re.compile(r"[a-z][a-z0-9_]{0,63}")
 _ANALYSIS_SCHEMA_VERSION_PATTERN = re.compile(r"[0-9]+(?:\.[0-9]+){0,2}")
+_DATASET_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,79}")
+_TOOL_CALL_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}")
+_SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 
 
 @dataclass(frozen=True)
@@ -539,6 +542,14 @@ class Storage:
                 )
             connection.executescript(
                 """
+                DROP TRIGGER IF EXISTS dataset_identifiers_are_safe;
+                CREATE TRIGGER dataset_identifiers_are_safe
+                BEFORE INSERT ON datasets
+                WHEN length(NEW.id) NOT BETWEEN 1 AND 80
+                  OR NEW.id GLOB '*[^A-Za-z0-9_-]*'
+                  OR length(NEW.content_sha256) != 64
+                  OR NEW.content_sha256 GLOB '*[^0-9a-f]*'
+                BEGIN SELECT RAISE(ABORT, 'dataset identifier or content hash is invalid'); END;
                 DROP TRIGGER IF EXISTS mapping_versions_are_immutable_except_confirmation;
                 CREATE TRIGGER mapping_versions_are_immutable_except_confirmation
                 BEFORE UPDATE ON dataset_mapping_versions
@@ -721,6 +732,12 @@ class Storage:
                   OR length(json_extract(NEW.output_json, '$.schema_version'))
                      - length(replace(json_extract(NEW.output_json, '$.schema_version'), '.', '')) > 2
                 BEGIN SELECT RAISE(ABORT, 'analysis identifiers are invalid'); END;
+                DROP TRIGGER IF EXISTS analysis_tool_call_identifiers_are_safe;
+                CREATE TRIGGER analysis_tool_call_identifiers_are_safe
+                BEFORE INSERT ON analysis_tool_outputs
+                WHEN length(NEW.tool_call_id) NOT BETWEEN 1 AND 128
+                  OR NEW.tool_call_id GLOB '*[^A-Za-z0-9_-]*'
+                BEGIN SELECT RAISE(ABORT, 'analysis tool call identifier is invalid'); END;
                 DROP TRIGGER IF EXISTS analysis_evidence_metrics_are_bounded;
                 CREATE TRIGGER analysis_evidence_metrics_are_bounded
                 BEFORE INSERT ON analysis_evidence
@@ -1368,6 +1385,7 @@ class Storage:
         columns: list[DatasetColumn | Mapping[str, Any]],
     ) -> Dataset:
         """Store metadata only; original rows remain in the ignored local file."""
+        _validate_dataset_identity(dataset_id, content_sha256)
         spec = _dataset_values(import_spec)
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -1617,6 +1635,8 @@ class Storage:
         *,
         arguments: Mapping[str, Any] | None = None,
     ) -> None:
+        if not isinstance(tool_call_id, str) or _TOOL_CALL_ID_PATTERN.fullmatch(tool_call_id) is None:
+            raise ValueError("analysis tool call identifier is invalid")
         with self._connect() as connection:
             evidence = connection.execute(
                 """
@@ -1963,6 +1983,13 @@ def _analysis_evidence_arguments_json(value: Mapping[str, Any], *, dataset_id: s
     if len(serialized) > 160:
         raise ValueError("analysis evidence arguments are invalid")
     return serialized
+
+
+def _validate_dataset_identity(dataset_id: str, content_sha256: str) -> None:
+    if not isinstance(dataset_id, str) or _DATASET_ID_PATTERN.fullmatch(dataset_id) is None:
+        raise ValueError("dataset identifier is invalid")
+    if not isinstance(content_sha256, str) or _SHA256_PATTERN.fullmatch(content_sha256) is None:
+        raise ValueError("content hash is invalid")
 
 
 def _thread_label(title: str, first_item_json: str | None) -> str:
