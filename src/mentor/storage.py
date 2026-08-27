@@ -2,8 +2,20 @@
 
 import json
 import sqlite3
+from dataclasses import asdict
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, Mapping
+
+from mentor.datasets import (
+    AnalysisEvidence,
+    Dataset,
+    DatasetColumn,
+    DatasetImportSpec,
+    DatasetMappingVersion,
+    MappingEntry,
+    ThreadDatasetScope,
+)
 
 
 @dataclass(frozen=True)
@@ -144,6 +156,123 @@ class Storage:
                     origin_thread_id INTEGER NOT NULL,
                     origin_turn_number INTEGER NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS datasets (
+                    id TEXT PRIMARY KEY,
+                    original_name TEXT NOT NULL,
+                    content_sha256 TEXT NOT NULL CHECK(length(content_sha256) = 64),
+                    original_extension TEXT NOT NULL,
+                    byte_size INTEGER NOT NULL CHECK(byte_size >= 0),
+                    source_row_count INTEGER NOT NULL CHECK(source_row_count >= 0),
+                    status TEXT NOT NULL,
+                    imported_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE TABLE IF NOT EXISTS dataset_import_specs (
+                    id INTEGER PRIMARY KEY,
+                    dataset_id TEXT NOT NULL UNIQUE REFERENCES datasets(id),
+                    selected_sheet TEXT,
+                    header_row INTEGER NOT NULL CHECK(header_row >= 0),
+                    csv_encoding TEXT,
+                    csv_delimiter TEXT,
+                    csv_quoting TEXT,
+                    parser_version TEXT,
+                    row_order_policy TEXT,
+                    time_parse_policy TEXT,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE TABLE IF NOT EXISTS dataset_columns (
+                    dataset_id TEXT NOT NULL REFERENCES datasets(id),
+                    ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+                    original_header TEXT NOT NULL,
+                    inferred_type TEXT NOT NULL,
+                    null_count INTEGER NOT NULL CHECK(null_count >= 0),
+                    invalid_count INTEGER NOT NULL CHECK(invalid_count >= 0),
+                    PRIMARY KEY(dataset_id, ordinal)
+                );
+                CREATE TABLE IF NOT EXISTS dataset_mapping_versions (
+                    id INTEGER PRIMARY KEY,
+                    dataset_id TEXT NOT NULL REFERENCES datasets(id),
+                    version INTEGER NOT NULL CHECK(version >= 1),
+                    status TEXT NOT NULL CHECK(status IN ('draft', 'confirmed')),
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    confirmed_at TEXT,
+                    UNIQUE(dataset_id, version)
+                );
+                CREATE TABLE IF NOT EXISTS dataset_mapping_entries (
+                    mapping_version_id INTEGER NOT NULL REFERENCES dataset_mapping_versions(id),
+                    column_ordinal INTEGER NOT NULL CHECK(column_ordinal >= 0),
+                    semantic_role TEXT,
+                    unit TEXT,
+                    analysis_label TEXT,
+                    source TEXT NOT NULL,
+                    PRIMARY KEY(mapping_version_id, column_ordinal)
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS unique_mapping_role
+                    ON dataset_mapping_entries(mapping_version_id, semantic_role)
+                    WHERE semantic_role IS NOT NULL;
+                CREATE TABLE IF NOT EXISTS thread_dataset_scopes (
+                    thread_id INTEGER PRIMARY KEY REFERENCES threads(id),
+                    dataset_id TEXT REFERENCES datasets(id),
+                    selected_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE TABLE IF NOT EXISTS analysis_evidence (
+                    id INTEGER PRIMARY KEY,
+                    thread_id INTEGER NOT NULL REFERENCES threads(id),
+                    origin_turn_number INTEGER NOT NULL CHECK(origin_turn_number > 0),
+                    display_turn_number INTEGER,
+                    dataset_id TEXT NOT NULL REFERENCES datasets(id),
+                    dataset_sha256 TEXT NOT NULL CHECK(length(dataset_sha256) = 64),
+                    import_spec_id INTEGER NOT NULL REFERENCES dataset_import_specs(id),
+                    mapping_version_id INTEGER NOT NULL REFERENCES dataset_mapping_versions(id),
+                    operation TEXT NOT NULL,
+                    schema_version TEXT NOT NULL,
+                    arguments_json TEXT NOT NULL,
+                    result_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE TABLE IF NOT EXISTS analysis_tool_outputs (
+                    thread_id INTEGER NOT NULL REFERENCES threads(id),
+                    tool_call_id TEXT NOT NULL,
+                    evidence_id INTEGER NOT NULL REFERENCES analysis_evidence(id),
+                    output_json TEXT NOT NULL,
+                    PRIMARY KEY(thread_id, tool_call_id)
+                );
+                CREATE TRIGGER IF NOT EXISTS datasets_are_immutable
+                BEFORE UPDATE ON datasets
+                BEGIN SELECT RAISE(ABORT, 'dataset metadata is immutable'); END;
+                CREATE TRIGGER IF NOT EXISTS dataset_import_specs_are_immutable
+                BEFORE UPDATE ON dataset_import_specs
+                BEGIN SELECT RAISE(ABORT, 'dataset import specs are immutable'); END;
+                CREATE TRIGGER IF NOT EXISTS dataset_columns_are_immutable
+                BEFORE UPDATE ON dataset_columns
+                BEGIN SELECT RAISE(ABORT, 'dataset columns are immutable'); END;
+                CREATE TRIGGER IF NOT EXISTS mapping_versions_are_immutable_except_confirmation
+                BEFORE UPDATE ON dataset_mapping_versions
+                WHEN NOT (
+                    OLD.status = 'draft' AND NEW.status = 'confirmed'
+                    AND OLD.dataset_id = NEW.dataset_id AND OLD.version = NEW.version
+                    AND OLD.created_at = NEW.created_at AND OLD.confirmed_at IS NULL
+                    AND NEW.confirmed_at IS NOT NULL
+                )
+                BEGIN SELECT RAISE(ABORT, 'mapping versions are immutable'); END;
+                CREATE TRIGGER IF NOT EXISTS confirmed_mapping_entries_are_immutable
+                BEFORE INSERT ON dataset_mapping_entries
+                WHEN (SELECT status FROM dataset_mapping_versions WHERE id = NEW.mapping_version_id) = 'confirmed'
+                BEGIN SELECT RAISE(ABORT, 'confirmed mapping entries are immutable'); END;
+                CREATE TRIGGER IF NOT EXISTS confirmed_mapping_entries_cannot_change
+                BEFORE UPDATE ON dataset_mapping_entries
+                WHEN (SELECT status FROM dataset_mapping_versions WHERE id = OLD.mapping_version_id) = 'confirmed'
+                BEGIN SELECT RAISE(ABORT, 'confirmed mapping entries are immutable'); END;
+                CREATE TRIGGER IF NOT EXISTS confirmed_mapping_entries_cannot_delete
+                BEFORE DELETE ON dataset_mapping_entries
+                WHEN (SELECT status FROM dataset_mapping_versions WHERE id = OLD.mapping_version_id) = 'confirmed'
+                BEGIN SELECT RAISE(ABORT, 'confirmed mapping entries are immutable'); END;
+                CREATE TRIGGER IF NOT EXISTS analysis_evidence_requires_confirmed_mapping
+                BEFORE INSERT ON analysis_evidence
+                WHEN NOT EXISTS (
+                    SELECT 1 FROM dataset_mapping_versions
+                    WHERE id = NEW.mapping_version_id AND dataset_id = NEW.dataset_id AND status = 'confirmed'
+                )
+                BEGIN SELECT RAISE(ABORT, 'analysis requires a confirmed mapping version'); END;
                 """
             )
             columns = {row[1] for row in connection.execute("PRAGMA table_info(sources)")}
@@ -699,6 +828,289 @@ class Storage:
             ).fetchone()
         return row is not None
 
+    def create_dataset(
+        self,
+        *,
+        dataset_id: str,
+        original_name: str,
+        content_sha256: str,
+        original_extension: str,
+        byte_size: int,
+        source_row_count: int,
+        status: str,
+        import_spec: DatasetImportSpec | Mapping[str, Any],
+        columns: list[DatasetColumn | Mapping[str, Any]],
+    ) -> Dataset:
+        """Store metadata only; original rows remain in the ignored local file."""
+        spec = _dataset_values(import_spec)
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                "INSERT INTO datasets(id, original_name, content_sha256, original_extension, byte_size, source_row_count, status) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (dataset_id, original_name, content_sha256, original_extension, byte_size, source_row_count, status),
+            )
+            cursor = connection.execute(
+                """
+                INSERT INTO dataset_import_specs(
+                    dataset_id, selected_sheet, header_row, csv_encoding, csv_delimiter,
+                    csv_quoting, parser_version, row_order_policy, time_parse_policy
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    dataset_id,
+                    spec.get("selected_sheet"),
+                    spec["header_row"],
+                    spec.get("csv_encoding"),
+                    spec.get("csv_delimiter"),
+                    spec.get("csv_quoting"),
+                    spec.get("parser_version"),
+                    spec.get("row_order_policy"),
+                    spec.get("time_parse_policy"),
+                ),
+            )
+            connection.executemany(
+                """
+                INSERT INTO dataset_columns(dataset_id, ordinal, original_header, inferred_type, null_count, invalid_count)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        dataset_id,
+                        values["ordinal"],
+                        values["original_header"],
+                        values["inferred_type"],
+                        values["null_count"],
+                        values["invalid_count"],
+                    )
+                    for column in columns
+                    if (values := _dataset_values(column))
+                ],
+            )
+            return Dataset(
+                dataset_id,
+                original_name,
+                content_sha256,
+                original_extension,
+                byte_size,
+                source_row_count,
+                status,
+                int(cursor.lastrowid),
+            )
+
+    def dataset(self, dataset_id: str) -> Dataset | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT datasets.id, original_name, content_sha256, original_extension,
+                       byte_size, source_row_count, status, dataset_import_specs.id
+                FROM datasets JOIN dataset_import_specs ON dataset_import_specs.dataset_id = datasets.id
+                WHERE datasets.id = ?
+                """,
+                (dataset_id,),
+            ).fetchone()
+        return None if row is None else Dataset(*row)
+
+    def create_mapping_draft(
+        self, dataset_id: str, entries: list[MappingEntry | Mapping[str, Any]]
+    ) -> DatasetMappingVersion:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT COALESCE(MAX(version), 0) + 1 FROM dataset_mapping_versions WHERE dataset_id = ?",
+                (dataset_id,),
+            ).fetchone()
+            cursor = connection.execute(
+                "INSERT INTO dataset_mapping_versions(dataset_id, version, status) VALUES (?, ?, 'draft')",
+                (dataset_id, int(row[0])),
+            )
+            self._insert_mapping_entries(connection, int(cursor.lastrowid), entries)
+            return DatasetMappingVersion(int(cursor.lastrowid), dataset_id, int(row[0]), "draft")
+
+    def confirm_mapping_version(self, draft_mapping_version_id: int) -> DatasetMappingVersion:
+        """Copy a draft into a separate immutable confirmed snapshot."""
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            draft = connection.execute(
+                "SELECT dataset_id, status FROM dataset_mapping_versions WHERE id = ?", (draft_mapping_version_id,)
+            ).fetchone()
+            if draft is None or draft[1] != "draft":
+                raise ValueError("only a draft mapping version can be confirmed")
+            next_version = connection.execute(
+                "SELECT COALESCE(MAX(version), 0) + 1 FROM dataset_mapping_versions WHERE dataset_id = ?",
+                (draft[0],),
+            ).fetchone()
+            cursor = connection.execute(
+                "INSERT INTO dataset_mapping_versions(dataset_id, version, status) VALUES (?, ?, 'draft')",
+                (draft[0], int(next_version[0])),
+            )
+            confirmed_id = int(cursor.lastrowid)
+            self._insert_mapping_entries(
+                connection,
+                confirmed_id,
+                [
+                    MappingEntry(*row)
+                    for row in connection.execute(
+                        "SELECT column_ordinal, semantic_role, unit, analysis_label, source "
+                        "FROM dataset_mapping_entries WHERE mapping_version_id = ? ORDER BY column_ordinal",
+                        (draft_mapping_version_id,),
+                    )
+                ],
+            )
+            connection.execute(
+                "UPDATE dataset_mapping_versions SET status = 'confirmed', confirmed_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (confirmed_id,),
+            )
+            return DatasetMappingVersion(confirmed_id, str(draft[0]), int(next_version[0]), "confirmed")
+
+    def mapping_entries(self, mapping_version_id: int) -> list[MappingEntry]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT column_ordinal, semantic_role, unit, analysis_label, source "
+                "FROM dataset_mapping_entries WHERE mapping_version_id = ? ORDER BY column_ordinal",
+                (mapping_version_id,),
+            ).fetchall()
+        return [MappingEntry(*row) for row in rows]
+
+    def set_thread_dataset_scope(self, thread_id: int, dataset_id: str | None) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT INTO thread_dataset_scopes(thread_id, dataset_id) VALUES (?, ?) "
+                "ON CONFLICT(thread_id) DO UPDATE SET dataset_id = excluded.dataset_id, selected_at = CURRENT_TIMESTAMP",
+                (thread_id, dataset_id),
+            )
+
+    def thread_dataset_scope(self, thread_id: int) -> ThreadDatasetScope | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT thread_id, dataset_id, selected_at FROM thread_dataset_scopes WHERE thread_id = ?",
+                (thread_id,),
+            ).fetchone()
+        return None if row is None else ThreadDatasetScope(*row)
+
+    def record_analysis_evidence(
+        self,
+        *,
+        thread_id: int,
+        origin_turn_number: int,
+        dataset_id: str,
+        mapping_version_id: int,
+        operation: str,
+        schema_version: str,
+        arguments: Mapping[str, Any],
+        result: Mapping[str, Any],
+        display_turn_number: int | None = None,
+    ) -> AnalysisEvidence:
+        with self._connect() as connection:
+            dataset = connection.execute(
+                """
+                SELECT datasets.content_sha256, dataset_import_specs.id
+                FROM datasets
+                JOIN dataset_import_specs ON dataset_import_specs.dataset_id = datasets.id
+                JOIN dataset_mapping_versions ON dataset_mapping_versions.id = ?
+                WHERE datasets.id = ? AND dataset_mapping_versions.dataset_id = datasets.id
+                      AND dataset_mapping_versions.status = 'confirmed'
+                """,
+                (mapping_version_id, dataset_id),
+            ).fetchone()
+            if dataset is None:
+                raise ValueError("analysis requires a confirmed mapping version for its dataset")
+            cursor = connection.execute(
+                """
+                INSERT INTO analysis_evidence(
+                    thread_id, origin_turn_number, display_turn_number, dataset_id, dataset_sha256,
+                    import_spec_id, mapping_version_id, operation, schema_version, arguments_json, result_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    thread_id,
+                    origin_turn_number,
+                    display_turn_number,
+                    dataset_id,
+                    dataset[0],
+                    dataset[1],
+                    mapping_version_id,
+                    operation,
+                    schema_version,
+                    json.dumps(arguments, separators=(",", ":")),
+                    json.dumps(result, separators=(",", ":")),
+                ),
+            )
+            return AnalysisEvidence(
+                int(cursor.lastrowid),
+                thread_id,
+                origin_turn_number,
+                dataset_id,
+                str(dataset[0]),
+                int(dataset[1]),
+                mapping_version_id,
+                operation,
+                schema_version,
+            )
+
+    def analysis_evidence(self, thread_id: int) -> list[AnalysisEvidence]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT id, thread_id, origin_turn_number, dataset_id, dataset_sha256, import_spec_id,
+                       mapping_version_id, operation, schema_version
+                FROM analysis_evidence WHERE thread_id = ? ORDER BY id
+                """,
+                (thread_id,),
+            ).fetchall()
+        return [AnalysisEvidence(*row) for row in rows]
+
+    def record_analysis_tool_output(
+        self, thread_id: int, tool_call_id: str, evidence_id: int, output: Mapping[str, Any]
+    ) -> None:
+        with self._connect() as connection:
+            evidence = connection.execute(
+                "SELECT 1 FROM analysis_evidence WHERE id = ? AND thread_id = ?", (evidence_id, thread_id)
+            ).fetchone()
+            if evidence is None:
+                raise ValueError("analysis tool output must belong to its thread evidence")
+            connection.execute(
+                "INSERT INTO analysis_tool_outputs(thread_id, tool_call_id, evidence_id, output_json) VALUES (?, ?, ?, ?)",
+                (thread_id, tool_call_id, evidence_id, json.dumps(output, separators=(",", ":"))),
+            )
+
+    def analysis_tool_outputs(self, thread_id: int) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT tool_call_id, evidence_id, output_json FROM analysis_tool_outputs WHERE thread_id = ? ORDER BY tool_call_id",
+                (thread_id,),
+            ).fetchall()
+        return [
+            {"tool_call_id": row[0], "evidence_id": row[1], "output": json.loads(row[2])}
+            for row in rows
+        ]
+
+    def _insert_mapping_entries(
+        self,
+        connection: sqlite3.Connection,
+        mapping_version_id: int,
+        entries: list[MappingEntry | Mapping[str, Any]],
+    ) -> None:
+        connection.executemany(
+            """
+            INSERT INTO dataset_mapping_entries(
+                mapping_version_id, column_ordinal, semantic_role, unit, analysis_label, source
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    mapping_version_id,
+                    values["column_ordinal"],
+                    values.get("semantic_role"),
+                    values.get("unit"),
+                    values.get("analysis_label"),
+                    values.get("source", "manual"),
+                )
+                for entry in entries
+                if (values := _dataset_values(entry))
+            ],
+        )
+
     def delete_thread(self, thread_id: int) -> bool:
         with self._connect() as connection:
             exists = connection.execute(
@@ -713,6 +1125,9 @@ class Storage:
             connection.execute(
                 "DELETE FROM profile_tool_operations WHERE origin_thread_id = ?", (thread_id,)
             )
+            connection.execute("DELETE FROM analysis_tool_outputs WHERE thread_id = ?", (thread_id,))
+            connection.execute("DELETE FROM analysis_evidence WHERE thread_id = ?", (thread_id,))
+            connection.execute("DELETE FROM thread_dataset_scopes WHERE thread_id = ?", (thread_id,))
             connection.execute("DELETE FROM display_turns WHERE thread_id = ?", (thread_id,))
             connection.execute("DELETE FROM response_diagnostics WHERE thread_id = ?", (thread_id,))
             connection.execute("DELETE FROM thread_replay_items WHERE thread_id = ?", (thread_id,))
@@ -845,6 +1260,10 @@ class Storage:
         connection = sqlite3.connect(self.database_path)
         connection.execute("PRAGMA foreign_keys = ON")
         return connection
+
+
+def _dataset_values(value: DatasetImportSpec | DatasetColumn | MappingEntry | Mapping[str, Any]) -> dict[str, Any]:
+    return dict(value) if isinstance(value, Mapping) else asdict(value)
 
 
 def _thread_label(title: str, first_item_json: str | None) -> str:

@@ -7,7 +7,7 @@ name = "trading-mentor"
 version = "0.1.0"
 description = "Private Phase 1 intelligence proof for Theo's AI Trading Mentor"
 requires-python = ">=3.12"
-dependencies = ["openai>=2,<3"]
+dependencies = ["openai>=2,<3", "pandas==3.0.5", "openpyxl==3.1.5"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]
