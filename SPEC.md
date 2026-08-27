@@ -113,13 +113,13 @@ before the next phase starts:
    search. The archived record remains on
    `feature/phase-3-knowledge-assimilation`; it is not continuing product
    architecture.
-4. Trader profile and editable memory.
-5. Backtest and data analysis — structured import and deterministic analysis.
-6. Strategy Projects.
-7. Scientific strategy-development workflow.
-8. Mindset and development sources.
+4. Trader profile and editable memory — passed.
+5. Backtest and empirical data analysis foundation — current design/planning
+   phase; structured import and deterministic analysis only.
+6. Strategy Projects plus source/research scope.
+7. Scientific strategy-development supervisor.
+8. Mindset and development sources and coaching.
 9. Evals, hardening, and productization.
 
-The current implementation boundary is defined only by the Phase 1 design:
-[`docs/superpowers/specs/2026-08-19-trading-mentor-phase-1-design.md`](docs/superpowers/specs/2026-08-19-trading-mentor-phase-1-design.md).
-Later phases are product direction, not permission to implement them now.
+Phase 5 design/planning does not authorize Phase 5 implementation. Later phases
+remain product direction, not permission to implement them now.
