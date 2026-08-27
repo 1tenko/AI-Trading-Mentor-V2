@@ -2,6 +2,7 @@
 
 import json
 import math
+import re
 import sqlite3
 from dataclasses import asdict
 from dataclasses import dataclass
@@ -79,6 +80,9 @@ _ANALYSIS_METRIC_NAMES = frozenset(
         "worst_return",
     }
 )
+
+_ANALYSIS_OPERATION_PATTERN = re.compile(r"[a-z][a-z0-9_]{0,63}")
+_ANALYSIS_SCHEMA_VERSION_PATTERN = re.compile(r"[0-9]+(?:\.[0-9]+){0,2}")
 
 
 @dataclass(frozen=True)
@@ -613,6 +617,19 @@ class Storage:
                       WHERE key != 'dataset_id' OR type != 'text'
                   )
                 BEGIN SELECT RAISE(ABORT, 'analysis evidence arguments are invalid'); END;
+                DROP TRIGGER IF EXISTS analysis_evidence_identifiers_are_safe;
+                CREATE TRIGGER analysis_evidence_identifiers_are_safe
+                BEFORE INSERT ON analysis_evidence
+                WHEN length(NEW.operation) NOT BETWEEN 1 AND 64
+                  OR NEW.operation GLOB '*[^a-z0-9_]*'
+                  OR substr(NEW.operation, 1, 1) NOT GLOB '[a-z]'
+                  OR length(NEW.schema_version) NOT BETWEEN 1 AND 32
+                  OR NEW.schema_version GLOB '*[^0-9.]*'
+                  OR substr(NEW.schema_version, 1, 1) NOT GLOB '[0-9]'
+                  OR substr(NEW.schema_version, -1, 1) NOT GLOB '[0-9]'
+                  OR instr(NEW.schema_version, '..') > 0
+                  OR length(NEW.schema_version) - length(replace(NEW.schema_version, '.', '')) > 2
+                BEGIN SELECT RAISE(ABORT, 'analysis identifiers are invalid'); END;
                 DROP TRIGGER IF EXISTS analysis_tool_outputs_require_result_envelope;
                 CREATE TRIGGER analysis_tool_outputs_require_result_envelope
                 BEFORE INSERT ON analysis_tool_outputs
@@ -687,6 +704,23 @@ class Storage:
                     ELSE 0
                 END
                 BEGIN SELECT RAISE(ABORT, 'analysis tool arguments are invalid'); END;
+                DROP TRIGGER IF EXISTS analysis_tool_output_identifiers_are_safe;
+                CREATE TRIGGER analysis_tool_output_identifiers_are_safe
+                BEFORE INSERT ON analysis_tool_outputs
+                WHEN json_valid(NEW.output_json) = 0
+                  OR json_type(NEW.output_json, '$.operation') != 'text'
+                  OR length(json_extract(NEW.output_json, '$.operation')) NOT BETWEEN 1 AND 64
+                  OR json_extract(NEW.output_json, '$.operation') GLOB '*[^a-z0-9_]*'
+                  OR substr(json_extract(NEW.output_json, '$.operation'), 1, 1) NOT GLOB '[a-z]'
+                  OR json_type(NEW.output_json, '$.schema_version') != 'text'
+                  OR length(json_extract(NEW.output_json, '$.schema_version')) NOT BETWEEN 1 AND 32
+                  OR json_extract(NEW.output_json, '$.schema_version') GLOB '*[^0-9.]*'
+                  OR substr(json_extract(NEW.output_json, '$.schema_version'), 1, 1) NOT GLOB '[0-9]'
+                  OR substr(json_extract(NEW.output_json, '$.schema_version'), -1, 1) NOT GLOB '[0-9]'
+                  OR instr(json_extract(NEW.output_json, '$.schema_version'), '..') > 0
+                  OR length(json_extract(NEW.output_json, '$.schema_version'))
+                     - length(replace(json_extract(NEW.output_json, '$.schema_version'), '.', '')) > 2
+                BEGIN SELECT RAISE(ABORT, 'analysis identifiers are invalid'); END;
                 DROP TRIGGER IF EXISTS analysis_evidence_metrics_are_bounded;
                 CREATE TRIGGER analysis_evidence_metrics_are_bounded
                 BEFORE INSERT ON analysis_evidence
@@ -705,6 +739,12 @@ class Storage:
                           'total_return', 'valid_rows', 'wilson_95_lower', 'wilson_95_upper',
                           'win_rate', 'wins', 'worst_return'
                       ) OR type NOT IN ('integer', 'real', 'null')
+                        OR (type IN ('integer', 'real') AND (
+                            value > 1.7976931348623157e308 OR value < -1.7976931348623157e308
+                        ))
+                  )
+                  OR (SELECT COUNT(*) FROM json_each(NEW.result_json, '$.metrics')) != (
+                      SELECT COUNT(DISTINCT key) FROM json_each(NEW.result_json, '$.metrics')
                   )
                 BEGIN SELECT RAISE(ABORT, 'analysis result envelope metrics are invalid'); END;
                 DROP TRIGGER IF EXISTS analysis_tool_output_metrics_are_bounded;
@@ -725,8 +765,47 @@ class Storage:
                           'total_return', 'valid_rows', 'wilson_95_lower', 'wilson_95_upper',
                           'win_rate', 'wins', 'worst_return'
                       ) OR type NOT IN ('integer', 'real', 'null')
+                        OR (type IN ('integer', 'real') AND (
+                            value > 1.7976931348623157e308 OR value < -1.7976931348623157e308
+                        ))
+                  )
+                  OR (SELECT COUNT(*) FROM json_each(NEW.output_json, '$.metrics')) != (
+                      SELECT COUNT(DISTINCT key) FROM json_each(NEW.output_json, '$.metrics')
                   )
                 BEGIN SELECT RAISE(ABORT, 'analysis result envelope metrics are invalid'); END;
+                DROP TRIGGER IF EXISTS confirmed_mapping_parent_entries_cannot_insert;
+                CREATE TRIGGER confirmed_mapping_parent_entries_cannot_insert
+                BEFORE INSERT ON dataset_mapping_entries
+                WHEN EXISTS (
+                    SELECT 1 FROM dataset_mapping_versions
+                    WHERE parent_mapping_version_id = NEW.mapping_version_id AND status = 'confirmed'
+                )
+                BEGIN SELECT RAISE(ABORT, 'confirmed mapping parent entries are immutable'); END;
+                DROP TRIGGER IF EXISTS confirmed_mapping_parent_entries_cannot_change;
+                CREATE TRIGGER confirmed_mapping_parent_entries_cannot_change
+                BEFORE UPDATE ON dataset_mapping_entries
+                WHEN EXISTS (
+                    SELECT 1 FROM dataset_mapping_versions
+                    WHERE parent_mapping_version_id IN (OLD.mapping_version_id, NEW.mapping_version_id)
+                      AND status = 'confirmed'
+                )
+                BEGIN SELECT RAISE(ABORT, 'confirmed mapping parent entries are immutable'); END;
+                DROP TRIGGER IF EXISTS confirmed_mapping_parent_entries_cannot_delete;
+                CREATE TRIGGER confirmed_mapping_parent_entries_cannot_delete
+                BEFORE DELETE ON dataset_mapping_entries
+                WHEN EXISTS (
+                    SELECT 1 FROM dataset_mapping_versions
+                    WHERE parent_mapping_version_id = OLD.mapping_version_id AND status = 'confirmed'
+                )
+                BEGIN SELECT RAISE(ABORT, 'confirmed mapping parent entries are immutable'); END;
+                DROP TRIGGER IF EXISTS confirmed_mapping_parents_cannot_delete;
+                CREATE TRIGGER confirmed_mapping_parents_cannot_delete
+                BEFORE DELETE ON dataset_mapping_versions
+                WHEN EXISTS (
+                    SELECT 1 FROM dataset_mapping_versions
+                    WHERE parent_mapping_version_id = OLD.id AND status = 'confirmed'
+                )
+                BEGIN SELECT RAISE(ABORT, 'confirmed mapping parent is immutable'); END;
                 DROP TRIGGER IF EXISTS analysis_tool_outputs_are_immutable;
                 CREATE TRIGGER analysis_tool_outputs_are_immutable
                 BEFORE UPDATE ON analysis_tool_outputs
@@ -1792,6 +1871,14 @@ def _analysis_result_envelope_json(
     operation: str,
     schema_version: str,
 ) -> str:
+    if (
+        not isinstance(operation, str)
+        or _ANALYSIS_OPERATION_PATTERN.fullmatch(operation) is None
+        or not isinstance(schema_version, str)
+        or _ANALYSIS_SCHEMA_VERSION_PATTERN.fullmatch(schema_version) is None
+        or len(schema_version) > 32
+    ):
+        raise ValueError("analysis identifier is invalid")
     if not isinstance(value, Mapping) or set(value) != {
         "provenance",
         "dataset_id",

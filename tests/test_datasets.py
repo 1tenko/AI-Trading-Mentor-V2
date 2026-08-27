@@ -644,3 +644,164 @@ def test_migration_backfills_preexisting_tool_outputs_before_immutability_trigge
         assert connection.execute(
             "SELECT arguments_json FROM analysis_tool_outputs WHERE tool_call_id = 'legacy-call'"
         ).fetchone() == ('{"dataset_id":"legacy-dataset","mapping_version_id":1,"operation":"summarize_results"}',)
+
+
+def test_analysis_identifiers_and_metrics_are_safe_finite_and_unique(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    dataset = _dataset(storage)
+    confirmed = storage.confirm_mapping_version(
+        storage.create_mapping_draft(
+            dataset.id, [{"column_ordinal": 0, "semantic_role": "trade_return", "unit": "R", "source": "manual"}]
+        ).id
+    )
+    thread_id = storage.create_thread("Identifier guards")
+    envelope = _result_envelope(dataset, confirmed.id)
+
+    with pytest.raises(ValueError, match="identifier"):
+        storage.record_analysis_evidence(
+            thread_id=thread_id,
+            origin_turn_number=1,
+            dataset_id=dataset.id,
+            mapping_version_id=confirmed.id,
+            operation="trades.csv",
+            schema_version="1",
+            arguments={"dataset_id": dataset.id},
+            result=_result_envelope(dataset, confirmed.id, operation="trades.csv"),
+        )
+    with pytest.raises(ValueError, match="identifier"):
+        storage.record_analysis_evidence(
+            thread_id=thread_id,
+            origin_turn_number=1,
+            dataset_id=dataset.id,
+            mapping_version_id=confirmed.id,
+            operation="summarize_results",
+            schema_version="source-file.csv",
+            arguments={"dataset_id": dataset.id},
+            result={**envelope, "schema_version": "source-file.csv"},
+        )
+    with pytest.raises(ValueError, match="analysis result envelope"):
+        storage.record_analysis_evidence(
+            thread_id=thread_id,
+            origin_turn_number=1,
+            dataset_id=dataset.id,
+            mapping_version_id=confirmed.id,
+            operation="summarize_results",
+            schema_version="1",
+            arguments={"dataset_id": dataset.id},
+            result={**envelope, "metrics": {"mean_return": float("inf")}},
+        )
+    evidence = storage.record_analysis_evidence(
+        thread_id=thread_id,
+        origin_turn_number=1,
+        dataset_id=dataset.id,
+        mapping_version_id=confirmed.id,
+        operation="summarize_results",
+        schema_version="1",
+        arguments={"dataset_id": dataset.id},
+        result=envelope,
+    )
+    with sqlite3.connect(storage.database_path) as connection:
+        with pytest.raises(sqlite3.IntegrityError, match="identifier"):
+            connection.execute(
+                """
+                INSERT INTO analysis_tool_outputs(thread_id, tool_call_id, evidence_id, arguments_json, output_json)
+                VALUES (?, 'unsafe-identifier', ?, ?, ?)
+                """,
+                (
+                    thread_id,
+                    evidence.id,
+                    json.dumps({"dataset_id": dataset.id, "mapping_version_id": confirmed.id, "operation": "summarize_results"}),
+                    json.dumps({**envelope, "operation": "raw-file.csv"}),
+                ),
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="identifier"):
+            connection.execute(
+                """
+                INSERT INTO analysis_tool_outputs(thread_id, tool_call_id, evidence_id, arguments_json, output_json)
+                VALUES (?, 'unsafe-version', ?, ?, ?)
+                """,
+                (
+                    thread_id,
+                    evidence.id,
+                    json.dumps({"dataset_id": dataset.id, "mapping_version_id": confirmed.id, "operation": "summarize_results"}),
+                    json.dumps({**envelope, "schema_version": "raw-file.csv"}),
+                ),
+            )
+        duplicate_metrics = json.dumps(envelope).replace(
+            '"metrics": {"valid_rows": 3}', '"metrics": {"valid_rows": 3, "valid_rows": 1}'
+        )
+        with pytest.raises(sqlite3.IntegrityError, match="metrics"):
+            connection.execute(
+                """
+                INSERT INTO analysis_tool_outputs(thread_id, tool_call_id, evidence_id, arguments_json, output_json)
+                VALUES (?, 'duplicate-metric', ?, ?, ?)
+                """,
+                (
+                    thread_id,
+                    evidence.id,
+                    json.dumps({"dataset_id": dataset.id, "mapping_version_id": confirmed.id, "operation": "summarize_results"}),
+                    duplicate_metrics,
+                ),
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="metrics"):
+            connection.execute(
+                """
+                INSERT INTO analysis_evidence(
+                    thread_id, origin_turn_number, dataset_id, dataset_sha256, import_spec_id,
+                    mapping_version_id, operation, schema_version, arguments_json, result_json
+                ) VALUES (?, 2, ?, ?, ?, ?, 'summarize_results', '1', ?, ?)
+                """,
+                (
+                    thread_id,
+                    dataset.id,
+                    dataset.content_sha256,
+                    dataset.import_spec_id,
+                    confirmed.id,
+                    json.dumps({"dataset_id": dataset.id}),
+                    duplicate_metrics,
+                ),
+            )
+        infinite_metrics = json.dumps(envelope).replace(
+            '"metrics": {"valid_rows": 3}', '"metrics": {"mean_return": 1e999}'
+        )
+        with pytest.raises(sqlite3.IntegrityError, match="metrics"):
+            connection.execute(
+                """
+                INSERT INTO analysis_tool_outputs(thread_id, tool_call_id, evidence_id, arguments_json, output_json)
+                VALUES (?, 'infinite-metric', ?, ?, ?)
+                """,
+                (
+                    thread_id,
+                    evidence.id,
+                    json.dumps({"dataset_id": dataset.id, "mapping_version_id": confirmed.id, "operation": "summarize_results"}),
+                    infinite_metrics,
+                ),
+            )
+
+
+def test_parent_drafts_referenced_by_confirmed_snapshots_are_immutable(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    dataset = _dataset(storage)
+    parent = storage.create_mapping_draft(
+        dataset.id, [{"column_ordinal": 0, "semantic_role": "trade_return", "unit": "R", "source": "manual"}]
+    )
+    storage.confirm_mapping_version(parent.id)
+
+    with sqlite3.connect(storage.database_path) as connection:
+        with pytest.raises(sqlite3.IntegrityError, match="parent"):
+            connection.execute(
+                "UPDATE dataset_mapping_entries SET semantic_role = 'session' WHERE mapping_version_id = ?",
+                (parent.id,),
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="parent"):
+            connection.execute(
+                "INSERT INTO dataset_mapping_entries(mapping_version_id, column_ordinal, semantic_role, unit, analysis_label, source) "
+                "VALUES (?, 1, 'session', NULL, NULL, 'manual')",
+                (parent.id,),
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="parent"):
+            connection.execute("DELETE FROM dataset_mapping_entries WHERE mapping_version_id = ?", (parent.id,))
+        with pytest.raises(sqlite3.IntegrityError, match="parent"):
+            connection.execute("DELETE FROM dataset_mapping_versions WHERE id = ?", (parent.id,))
