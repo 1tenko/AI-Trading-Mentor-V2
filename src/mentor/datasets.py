@@ -3,14 +3,18 @@
 import csv
 import hashlib
 import io
+import os
 import re
 import shutil
 import tempfile
+import threading
+import time
 import uuid
 import zipfile
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import TYPE_CHECKING, Callable, Iterable
+from typing import TYPE_CHECKING, Callable, Iterable, Iterator
 from xml.etree import ElementTree
 
 from openpyxl import load_workbook
@@ -29,6 +33,7 @@ MAX_XLSX_ARCHIVE_UNCOMPRESSED_BYTES = 250 * 1024 * 1024
 MAX_XLSX_COMPRESSION_RATIO = 100
 _DATASET_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,79}")
 _CELL_REFERENCE_PATTERN = re.compile(r"([A-Z]+)([1-9][0-9]*)$")
+_IMPORT_LEASE_LOCK = threading.RLock()
 
 
 @dataclass(frozen=True)
@@ -132,6 +137,26 @@ def import_local_dataset(
         raise DatasetImportError("dataset exceeds the 50 MiB size limit")
 
     datasets_root = _internal_datasets_root(storage, datasets_root)
+    with _dataset_import_lease(datasets_root):
+        return _import_local_dataset_locked(
+            source_path,
+            storage,
+            datasets_root,
+            extension=extension,
+            selected_sheet=selected_sheet,
+            dataset_id_factory=dataset_id_factory,
+        )
+
+
+def _import_local_dataset_locked(
+    source_path: Path,
+    storage: "Storage",
+    datasets_root: Path,
+    *,
+    extension: str,
+    selected_sheet: str | None,
+    dataset_id_factory: Callable[[], str] | None,
+) -> DatasetImportResult:
     _recover_pending_dataset_imports(datasets_root, storage)
     temporary_directory = Path(tempfile.mkdtemp(prefix=".import-", dir=datasets_root))
     final_directory: Path | None = None
@@ -200,6 +225,52 @@ def import_local_dataset(
     finally:
         if temporary_directory.exists():
             shutil.rmtree(temporary_directory)
+
+
+@contextmanager
+def _dataset_import_lease(datasets_root: Path) -> Iterator[None]:
+    """Serialize local import recovery and promotion across threads and processes."""
+    with _IMPORT_LEASE_LOCK:
+        lease_path = datasets_root.parent / ".dataset-import.lock"
+        with lease_path.open("a+b") as lease_file:
+            lease_file.seek(0, 2)
+            if lease_file.tell() == 0:
+                lease_file.write(b"\0")
+                lease_file.flush()
+            lease_file.seek(0)
+            _acquire_file_lease(lease_file)
+            try:
+                yield
+            finally:
+                _release_file_lease(lease_file)
+
+
+def _acquire_file_lease(lease_file: io.BufferedRandom) -> None:
+    if os.name == "nt":
+        import msvcrt
+
+        while True:
+            try:
+                msvcrt.locking(lease_file.fileno(), msvcrt.LK_NBLCK, 1)
+                return
+            except OSError:
+                time.sleep(0.05)
+    else:
+        import fcntl
+
+        fcntl.flock(lease_file.fileno(), fcntl.LOCK_EX)
+
+
+def _release_file_lease(lease_file: io.BufferedRandom) -> None:
+    lease_file.seek(0)
+    if os.name == "nt":
+        import msvcrt
+
+        msvcrt.locking(lease_file.fileno(), msvcrt.LK_UNLCK, 1)
+    else:
+        import fcntl
+
+        fcntl.flock(lease_file.fileno(), fcntl.LOCK_UN)
 
 
 def _internal_datasets_root(storage: "Storage", requested_root: Path | None) -> Path:

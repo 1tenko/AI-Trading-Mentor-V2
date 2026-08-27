@@ -1,6 +1,7 @@
 import json
 import inspect
 import sqlite3
+import threading
 import zipfile
 from hashlib import sha256
 from pathlib import Path
@@ -8,6 +9,7 @@ from pathlib import Path
 import pytest
 from openpyxl import Workbook
 
+import mentor.datasets as dataset_module
 from mentor.datasets import DatasetImportError, import_local_dataset
 from mentor.storage import Storage
 
@@ -451,6 +453,57 @@ def test_xlsx_rejects_duplicate_relationship_id_that_hides_a_formula_target(tmp_
 
     with pytest.raises(DatasetImportError, match="relationship"):
         _importer(storage, tmp_path)(source)
+
+
+def test_overlapping_import_cannot_recover_an_active_staging_dataset(tmp_path, monkeypatch):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    source = tmp_path / "trades.csv"
+    source.write_text("Result_R\n1.5\n", encoding="utf-8")
+    entered_create = threading.Event()
+    release_create = threading.Event()
+    create_dataset = storage.create_dataset
+    recover_pending_imports = dataset_module._recover_pending_dataset_imports
+    recovery_seen = threading.Event()
+    failures: list[BaseException] = []
+
+    def block_first_create(**kwargs):
+        if kwargs["dataset_id"] == "dataset-first":
+            entered_create.set()
+            assert release_create.wait(10)
+        return create_dataset(**kwargs)
+
+    def run_import(dataset_id):
+        try:
+            import_local_dataset(source, storage, tmp_path / "datasets", dataset_id_factory=lambda: dataset_id)
+        except BaseException as error:
+            failures.append(error)
+
+    def watch_recovery(root, active_storage):
+        if "dataset-first" in active_storage.pending_dataset_import_ids():
+            recovery_seen.set()
+        return recover_pending_imports(root, active_storage)
+
+    monkeypatch.setattr(storage, "create_dataset", block_first_create)
+    monkeypatch.setattr(dataset_module, "_recover_pending_dataset_imports", watch_recovery)
+    first = threading.Thread(target=run_import, args=("dataset-first",))
+    second = threading.Thread(target=run_import, args=("dataset-second",))
+    first.start()
+    assert entered_create.wait(10)
+    second.start()
+    try:
+        assert not recovery_seen.wait(0.25)
+    finally:
+        release_create.set()
+    first.join(10)
+    second.join(10)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert failures == []
+    for dataset_id in ("dataset-first", "dataset-second"):
+        assert storage.dataset(dataset_id) is not None
+        assert (tmp_path / "datasets" / dataset_id / "original.csv").read_bytes() == source.read_bytes()
 
 
 def _result_envelope(dataset, mapping_version_id: int, operation: str = "summarize_results"):
