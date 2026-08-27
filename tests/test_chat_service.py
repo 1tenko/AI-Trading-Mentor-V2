@@ -11,7 +11,7 @@ from mentor.chat_service import (
     _input_item,
     _effective_research_depth,
 )
-from mentor.prompts import MENTOR_INSTRUCTIONS
+from mentor.prompts import MENTOR_INSTRUCTIONS, PROFILE_TOOL_INSTRUCTIONS
 from mentor.profile import ProfileService
 from mentor.storage import Storage
 
@@ -185,6 +185,163 @@ def test_explicit_strategy_design_uses_broader_questionnaire_context_without_rep
     assert "preferred trading style: User is currently unsure / has not decided." in request["instructions"]
     assert "risk and funding constraints: One percent risk maximum." in request["instructions"]
     assert all("Trader Strategy Profile" not in json.dumps(item) for item in request["input"])
+
+
+@pytest.mark.parametrize(
+    ("question", "answers", "state", "expected"),
+    [
+        (
+            "Based on my Trader Profile, what am I naturally good at?",
+            {"q8": "idk"},
+            "EXPLICITLY UNKNOWN",
+            "must not become a current profile fact",
+        ),
+        (
+            "Which concepts do I currently trust most?",
+            {},
+            "UNANSWERED",
+            "has not answered this field",
+        ),
+        (
+            "What should you optimise around for me?",
+            {"q20": "idk", "q14": "70% win rate and at least 2R."},
+            "EXPLICITLY UNKNOWN",
+            "optimisation principles",
+        ),
+    ],
+)
+def test_direct_profile_state_questions_are_explicit_bounded_and_do_not_offer_file_search(
+    tmp_path, question, answers, state, expected
+):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    storage.set_vector_store("vs_jacob")
+    ProfileService(storage).save_questionnaire_answers(answers)
+    responses = FakeResponses(SimpleNamespace(status="completed", output=[]))
+
+    ChatService(storage, SimpleNamespace(responses=responses)).reply(storage.create_thread("Profile"), question)
+
+    request = responses.calls[0]
+    assert "Trader Profile field state — user context, not source evidence:" in request["instructions"]
+    assert state in request["instructions"]
+    assert expected in request["instructions"]
+    if state == "EXPLICITLY UNKNOWN":
+        assert "Start with: Your Trader Profile says this is currently unresolved" in request["instructions"]
+    else:
+        assert "Start with: You have not answered this in your Trader Profile" in request["instructions"]
+    assert all(tool["type"] != "file_search" for tool in request["tools"])
+    assert all("Trader Profile field state" not in json.dumps(item) for item in request["input"])
+
+
+def test_direct_profile_state_with_explicit_jacob_request_keeps_raw_source_tool_and_state_separate(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    storage.set_vector_store("vs_jacob")
+    ProfileService(storage).save_questionnaire_answers({"q20": "idk"})
+    responses = FakeResponses(SimpleNamespace(status="completed", output=[]))
+
+    ChatService(storage, SimpleNamespace(responses=responses)).reply(
+        storage.create_thread("Profile"), "What should you optimise around for me according to Jacob?"
+    )
+
+    request = responses.calls[0]
+    assert "EXPLICITLY UNKNOWN" in request["instructions"]
+    assert request["tools"][0]["type"] == "file_search"
+
+
+def test_source_only_question_does_not_receive_personal_field_state(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    storage.set_vector_store("vs_jacob")
+    ProfileService(storage).save_questionnaire_answers({"q12": "A London reversal setup."})
+    responses = FakeResponses(SimpleNamespace(status="completed", output=[]))
+
+    ChatService(storage, SimpleNamespace(responses=responses)).reply(
+        storage.create_thread("Source"), "What does Jacob say about the ideal trade setup?"
+    )
+
+    request = responses.calls[0]
+    assert "Trader Profile field state" not in request["instructions"]
+    assert request["tools"][0]["type"] == "file_search"
+
+
+def test_ordinary_methodology_question_keeps_file_search_even_when_it_overlaps_a_questionnaire_topic(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    storage.set_vector_store("vs_jacob")
+    ProfileService(storage).save_questionnaire_answers({"q12": "A London reversal setup."})
+    responses = FakeResponses(SimpleNamespace(status="completed", output=[]))
+
+    ChatService(storage, SimpleNamespace(responses=responses)).reply(
+        storage.create_thread("Methodology"), "How does a reversal setup work?"
+    )
+
+    request = responses.calls[0]
+    assert "Trader Profile field state" not in request["instructions"]
+    assert request["tools"][0]["type"] == "file_search"
+
+
+@pytest.mark.parametrize("question", ["How does a reversal setup work for me?", "What trade setup is good for me?"])
+def test_personal_methodology_question_does_not_disable_source_research_without_a_direct_field_match(tmp_path, question):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    storage.set_vector_store("vs_jacob")
+    ProfileService(storage).save_questionnaire_answers({"q12": "A London reversal setup."})
+    responses = FakeResponses(SimpleNamespace(status="completed", output=[]))
+
+    ChatService(storage, SimpleNamespace(responses=responses)).reply(storage.create_thread("Methodology"), question)
+
+    request = responses.calls[0]
+    assert "Trader Profile field state" not in request["instructions"]
+    assert request["tools"][0]["type"] == "file_search"
+
+
+def test_profile_policy_requires_unknown_blank_and_inference_separation():
+    assert "EXPLICITLY UNKNOWN" in PROFILE_TOOL_INSTRUCTIONS
+    assert "UNANSWERED" in PROFILE_TOOL_INSTRUCTIONS
+    assert "AI hypothesis" in PROFILE_TOOL_INSTRUCTIONS
+    assert "Jacob teaching must not resolve an unknown user" in PROFILE_TOOL_INSTRUCTIONS
+
+
+def test_explicit_inference_request_keeps_unknown_profile_state_and_does_not_write_it(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    storage.set_vector_store("vs_jacob")
+    profile = ProfileService(storage)
+    profile.save_questionnaire_answers({"q8": "idk"})
+    before = storage.current_confirmed_profile_items()
+    responses = FakeResponses(SimpleNamespace(status="completed", output=[]))
+
+    ChatService(storage, SimpleNamespace(responses=responses)).reply(
+        storage.create_thread("Profile"), "What do YOU think I am naturally good at?"
+    )
+
+    request = responses.calls[0]
+    assert "EXPLICITLY UNKNOWN" in request["instructions"]
+    assert "AI hypothesis" in request["instructions"]
+    assert storage.current_confirmed_profile_items() == before
+
+
+def test_known_profile_goals_can_be_presented_as_conflicting_without_resolving_unknown_optimisation(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    storage.set_vector_store("vs_jacob")
+    ProfileService(storage).save_questionnaire_answers({
+        "q14": "70%+ win rate, at least 2R, daily opportunities, and green most days.",
+        "q20": "idk",
+    })
+    responses = FakeResponses(SimpleNamespace(status="completed", output=[]))
+
+    ChatService(storage, SimpleNamespace(responses=responses)).reply(
+        storage.create_thread("Profile"), "What should you optimise around for me?"
+    )
+
+    instructions = responses.calls[0]["instructions"]
+    assert "EXPLICITLY UNKNOWN" in instructions
+    assert "70%+ win rate" in instructions
+    assert "not a resolution of this unknown field" in instructions
+    assert "potentially conflicting targets" in instructions
+    assert all(tool["type"] != "file_search" for tool in responses.calls[0]["tools"])
 
 
 def test_current_profile_survives_cross_thread_then_old_chat_cannot_restore_deleted_or_superseded_values(tmp_path):

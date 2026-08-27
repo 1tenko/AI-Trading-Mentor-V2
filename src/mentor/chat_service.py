@@ -9,7 +9,13 @@ from typing import Any
 from types import SimpleNamespace
 from uuid import uuid4
 
-from mentor.profile import ProfileService, ProfileValidationError, select_profile_context, strategy_profile_context
+from mentor.profile import (
+    ProfileService,
+    ProfileValidationError,
+    questionnaire_field_state,
+    select_profile_context,
+    strategy_profile_context,
+)
 from mentor.prompts import MENTOR_INSTRUCTIONS, PROFILE_TOOL_INSTRUCTIONS
 from mentor.storage import Storage
 
@@ -445,6 +451,7 @@ class ChatService:
         replay_items = self.storage.replay_items(thread_id)
         confirmed_profile = self.storage.current_confirmed_profile_items()
         profile_context = ""
+        field_state = questionnaire_field_state(question, confirmed_profile)
         if _is_strategy_design_question(question):
             strategy_profile = strategy_profile_context(confirmed_profile)
             if strategy_profile.context:
@@ -460,6 +467,15 @@ class ChatService:
                     f"{selection.context}\n"
                     "Use this only to personalise relevant advice; it is not Jacob source material."
                 )
+        if field_state is not None:
+            profile_context += f"\n\n{field_state.context}"
+        source_tools = [] if field_state is not None and not _explicit_profile_source_request(question) else [
+            {
+                "type": "file_search",
+                "vector_store_ids": [vector_store_id],
+                "max_num_results": FILE_SEARCH_RESULT_BUDGETS[effective_depth],
+            }
+        ]
         return user_item, {
             "model": self.model,
             "instructions": (
@@ -470,14 +486,7 @@ class ChatService:
                 *(_input_item(item) for item in replay_items),
                 user_item,
             ],
-            "tools": [
-                {
-                    "type": "file_search",
-                    "vector_store_ids": [vector_store_id],
-                    "max_num_results": FILE_SEARCH_RESULT_BUDGETS[effective_depth],
-                },
-                PROFILE_TOOL,
-            ],
+            "tools": [*source_tools, PROFILE_TOOL],
             "include": ["reasoning.encrypted_content", "file_search_call.results"],
             "reasoning": evaluation.request_value(),
             "context_management": [{"type": "compaction", "compact_threshold": COMPACTION_TOKEN_THRESHOLD}],
@@ -592,6 +601,11 @@ def _is_strategy_design_question(question: str) -> bool:
             "what kind of system fits me",
         )
     )
+
+
+def _explicit_profile_source_request(question: str) -> bool:
+    normalized = question.casefold()
+    return any(term in normalized for term in ("jacob", "source", "transcript", "citation", "according to"))
 
 
 def _as_dict(item: Any) -> dict:

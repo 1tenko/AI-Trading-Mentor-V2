@@ -32,6 +32,15 @@ class StrategyProfileSelection:
     character_count: int
 
 
+@dataclass(frozen=True)
+class QuestionnaireFieldState:
+    field: QuestionnaireField
+    item: TraderProfileItem | None
+    state: str
+    context: str
+    character_count: int
+
+
 QUESTIONNAIRE_FIELDS = (
     QuestionnaireField("q1", "Your goals", "What are you actually trying to achieve with trading?", "What would success look like for you? For example: consistent profitability, passing/keeping prop accounts, trading your own capital, a particular income goal, freedom of time, or something else.", "goals/research", "trading objective", "goal", 1),
     QuestionnaireField("q2", "Your goals", "What markets are you willing or interested in trading?", "For example: ES, NQ, YM, GC, crypto, forex. Mention anything you specifically do or do not want to trade.", "markets/instruments", "markets willing to trade", "preference", 2),
@@ -77,6 +86,8 @@ ORIGIN_KINDS = ("chat", "profile-editor", "confirmation")
 _SOURCE_QUESTION_TERMS = ("timestamp", "transcript", "citation", "source", "exact quote", "jacob")
 _TOKEN_PATTERN = re.compile(r"[a-z0-9]+")
 _TOKEN_STOP_WORDS = {"a", "an", "and", "do", "for", "how", "i", "in", "is", "it", "of", "the", "this", "to", "what"}
+_PERSONAL_PROFILE_REFERENCE = re.compile(r"\b(?:i|me|my)\b|trader profile|\bprofile\b", re.IGNORECASE)
+_GENERIC_FIELD_TERMS = frozenset({"concept", "market", "model", "risk", "setup", "strategy", "system", "trade", "trader", "trading"})
 _DISTINCTIVE_VALUES = frozenset({"es", "nq", "london", "scalping"})
 _SUBJECT_FAMILIES = {
     "market/instrument": ("market", "instrument", "primary market", "secondary market", "markets traded", "markets willing to trade"),
@@ -465,6 +476,58 @@ def strategy_profile_context(confirmed_items: Iterable[TraderProfileItem]) -> St
     return StrategyProfileSelection(tuple(selected), context, len(context))
 
 
+def questionnaire_field_state(
+    question: str, confirmed_items: Iterable[TraderProfileItem]
+) -> QuestionnaireFieldState | None:
+    """Expose one directly asked questionnaire field without expanding normal context."""
+    field = _questionnaire_field_for_question(question)
+    if field is None:
+        return None
+    current = {
+        (item.category, item.subject_key): item
+        for item in confirmed_items
+        if item.state == "confirmed"
+    }
+    item = current.get((field.category, _subject_key(field.subject)))
+    if item is None:
+        state = "unanswered"
+        detail = "Theo has not answered this field, so no current profile fact or preference is established."
+        opening = "Start with: You have not answered this in your Trader Profile, so I do not actually know."
+    elif _is_unknown(item.value):
+        state = "explicitly_unknown"
+        detail = (
+            "Theo explicitly marked this field unresolved; it must not become a current profile fact "
+            "or preference from other clues."
+        )
+        opening = "Start with: Your Trader Profile says this is currently unresolved / you have not decided yet."
+    else:
+        state = "answered"
+        detail = f"Current user answer: {_truncate_profile_value(item.value)}"
+        opening = "Use this current user answer as profile context, not source evidence."
+    lines = [
+        "Trader Profile field state — user context, not source evidence:\n"
+        f"- {field.subject}: {state.upper().replace('_', ' ')}. {detail}",
+        opening,
+    ]
+    if state == "explicitly_unknown" and field.kind == "principle":
+        related = [
+            candidate
+            for candidate in current.values()
+            if candidate.category == "goals/research" and not _is_unknown(candidate.value)
+        ]
+        related.sort(key=lambda candidate: (candidate.subject_key, candidate.id))
+        for candidate in related:
+            line = (
+                f"Known related user goal — not a resolution of this unknown field: "
+                f"{candidate.subject}: {_truncate_profile_value(candidate.value, limit=180)}"
+            )
+            if len("\n".join([*lines, line])) > 600:
+                break
+            lines.append(line)
+    context = "\n".join(lines)
+    return QuestionnaireFieldState(field, item, state, context, len(context))
+
+
 def _is_unknown(value: str) -> bool:
     return bool(_UNKNOWN_ANSWER.fullmatch(" ".join(value.casefold().split())))
 
@@ -628,10 +691,37 @@ def _has_personal_application(question: str) -> bool:
 def _profile_tokens(text: str) -> set[str]:
     return {
         _singularize(token)
-        for token in _TOKEN_PATTERN.findall(text.casefold())
+        for token in _TOKEN_PATTERN.findall(text.casefold().replace("optimize", "optimise"))
         if token not in _TOKEN_STOP_WORDS
     }
 
 
 def _singularize(token: str) -> str:
     return token[:-1] if len(token) > 3 and token.endswith("s") else token
+
+
+def _questionnaire_field_for_question(question: str) -> QuestionnaireField | None:
+    if not _PERSONAL_PROFILE_REFERENCE.search(question):
+        return None
+    normalized = _subject_key(question)
+    question_tokens = _profile_tokens(question)
+    candidates: list[tuple[int, QuestionnaireField]] = []
+    for field in QUESTIONNAIRE_FIELDS:
+        subject_tokens = _profile_tokens(field.subject)
+        field_tokens = _profile_tokens(f"{field.subject} {field.question}")
+        overlap = question_tokens.intersection(field_tokens)
+        subject_match = _subject_key(field.subject) in normalized
+        distinctive_overlap = overlap.difference(_GENERIC_FIELD_TERMS)
+        if subject_match or len(distinctive_overlap) >= 2:
+            score = len(distinctive_overlap) + (3 if subject_match else 0)
+            candidates.append((score, field))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda pair: (-pair[0], pair[1].priority, pair[1].key))
+    if len(candidates) > 1 and candidates[0][0] == candidates[1][0]:
+        return None
+    return candidates[0][1]
+
+
+def _truncate_profile_value(value: str, *, limit: int = 400) -> str:
+    return value if len(value) <= limit else f"{value[:limit - 3]}..."

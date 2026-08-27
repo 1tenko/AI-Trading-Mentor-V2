@@ -6,6 +6,7 @@ from mentor.profile import (
     QUESTIONNAIRE_FIELDS,
     ProfileService,
     ProfileValidationError,
+    questionnaire_field_state,
     select_profile_context,
     strategy_profile_context,
 )
@@ -658,6 +659,49 @@ def test_ordinary_profile_context_renders_explicit_uncertainty_as_unresolved(tmp
 
     assert "preferred trading style: User is currently unsure / has not decided." in selected.context
     assert "preferred trading style: idk" not in selected.context
+
+
+def test_questionnaire_field_state_distinguishes_answered_unknown_and_unanswered_without_profile_writes(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    profile = ProfileService(storage)
+    profile.save_questionnaire_answers({"q8": "idk", "q20": "Keep it simple."})
+    current = storage.current_confirmed_profile_items()
+
+    unknown = questionnaire_field_state("Based on my profile, what am I naturally good at?", current)
+    blank = questionnaire_field_state("Which concepts do I currently trust most?", current)
+    answered = questionnaire_field_state("What should you optimise around for me?", current)
+
+    assert unknown is not None
+    assert unknown.state == "explicitly_unknown"
+    assert "trading strengths" in unknown.context
+    assert "must not become a current profile fact" in unknown.context
+    assert "Your Trader Profile says this is currently unresolved" in unknown.context
+    assert blank is not None
+    assert blank.state == "unanswered"
+    assert "trusted and uncertain concepts" in blank.context
+    assert "has not answered" in blank.context
+    assert "You have not answered this in your Trader Profile" in blank.context
+    assert answered is not None
+    assert answered.state == "answered"
+    assert "Keep it simple." in answered.context
+    assert storage.current_confirmed_profile_items() == current
+
+
+def test_questionnaire_field_state_is_bounded_and_only_emitted_for_a_direct_field_question(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    profile = ProfileService(storage)
+    profile.save_questionnaire_answers({"q8": "idk"})
+
+    state = questionnaire_field_state("What do you think I am naturally good at?", storage.current_confirmed_profile_items())
+
+    assert state is not None
+    assert state.character_count <= 600
+    assert questionnaire_field_state("Explain Jacob's Asset Synchronization.", storage.current_confirmed_profile_items()) is None
+    assert questionnaire_field_state("How does a reversal setup work?", storage.current_confirmed_profile_items()) is None
+    assert questionnaire_field_state("How does a reversal setup work for me?", storage.current_confirmed_profile_items()) is None
+    assert questionnaire_field_state("What trade setup is good for me?", storage.current_confirmed_profile_items()) is None
 
 
 def test_strategy_profile_context_includes_every_short_questionnaire_answer_within_budget(tmp_path):
