@@ -1,6 +1,7 @@
 """Local, validated input boundary for deterministic backtest analysis."""
 
 import hashlib
+import json
 import math
 from dataclasses import dataclass, field
 from datetime import date, datetime, time
@@ -18,6 +19,14 @@ if TYPE_CHECKING:
 _OUTCOMES = {"win": "win", "w": "win", "loss": "loss", "l": "loss", "breakeven": "breakeven", "break even": "breakeven", "be": "breakeven"}
 _FILTER_OPERATORS = frozenset({"eq", "neq", "in", "not_in", "is_blank", "not_blank", "gt", "gte", "lt", "lte", "between"})
 _ORDER_MODES = frozenset({"source", "timestamp"})
+_SUMMARY_METRICS = (
+    "wins", "losses", "breakevens", "win_rate", "loss_rate", "max_consecutive_wins", "max_consecutive_losses",
+    "total_return", "mean_return", "median_return", "mean_winning_return", "mean_losing_return", "best_return",
+    "worst_return", "realized_reward_risk", "cumulative_return", "max_drawdown", "recovery_observations",
+    "minimum", "maximum", "sample_standard_deviation", "first_quartile", "third_quartile", "interquartile_range",
+    "iqr_outlier_count", "percentile_05", "percentile_10", "percentile_25", "percentile_50", "percentile_75",
+    "percentile_90", "percentile_95", "valid_rows", "excluded_rows",
+)
 
 
 @dataclass(frozen=True)
@@ -54,6 +63,7 @@ class AnalysisFrame:
 
     data: pd.DataFrame = field(repr=False, compare=False)
     fields: tuple[AnalysisField, ...]
+    filters: tuple[AnalysisFilter, ...] = field(repr=False)
     required_roles: tuple[str, ...]
     source_rows: int
     filtered_rows: int
@@ -137,6 +147,7 @@ def build_analysis_frame(
     return AnalysisFrame(
         data=data,
         fields=fields,
+        filters=validated_filters,
         required_roles=effective_required,
         source_rows=len(rows),
         filtered_rows=len(filtered),
@@ -147,6 +158,181 @@ def build_analysis_frame(
         order=order,
         no_data_reason=no_data_reason,
     )
+
+
+def summarize_results(
+    frame: AnalysisFrame,
+    *,
+    dataset_id: str,
+    dataset_sha256: str,
+    mapping_version_id: int,
+) -> dict[str, object]:
+    """Calculate the bounded core summary from an already validated frame."""
+    if not isinstance(frame, AnalysisFrame):
+        raise ValueError("summary requires a validated analysis frame")
+    if not isinstance(dataset_id, str) or not dataset_id or not isinstance(dataset_sha256, str) or len(dataset_sha256) != 64:
+        raise ValueError("summary provenance is invalid")
+    if type(mapping_version_id) is not int or mapping_version_id < 1:
+        raise ValueError("summary provenance is invalid")
+
+    has_return = any(field.semantic_role == "trade_return" for field in frame.fields)
+    has_outcome = any(field.semantic_role == "trade_outcome" for field in frame.fields)
+    returns = frame.data["trade_return"].dropna().astype(float).tolist() if has_return else []
+    outcomes = frame.data["trade_outcome"].dropna().tolist() if has_outcome else []
+    metrics = {name: None for name in _SUMMARY_METRICS}
+    metrics["valid_rows"] = frame.valid_rows
+    metrics["excluded_rows"] = frame.excluded_rows
+
+    if has_outcome:
+        metrics.update(_outcome_metrics(outcomes))
+    if has_return and returns:
+        metrics.update(_return_metrics(returns, frame, has_outcome))
+    if frame.return_unit == "R" and has_return and returns:
+        metrics.update(_r_metrics(returns, frame if has_outcome else None))
+
+    limitations = _summary_limitations(frame, metrics)
+    return {
+        "provenance": "USER_EMPIRICAL_EVIDENCE",
+        "dataset_id": dataset_id,
+        "dataset_sha256": dataset_sha256,
+        "mapping_version_id": mapping_version_id,
+        "operation": "summarize_results",
+        "schema_version": "1.0",
+        "filters": [_filter_descriptor(item) for item in frame.filters],
+        "metric_definitions": {
+            "outcome_rate_denominator": "wins + losses + breakevens",
+            "quantile_method": "linear",
+            "return_unit": frame.return_unit,
+            "row_order": frame.order.mode,
+        },
+        "counts": {
+            "source_rows": frame.source_rows,
+            "filtered_rows": frame.filtered_rows,
+            "valid_rows": frame.valid_rows,
+            "excluded_rows": frame.excluded_rows,
+        },
+        "exclusions": [
+            {"role": item.role, "reason": item.reason, "count": item.count} for item in frame.exclusions
+        ],
+        "metrics": metrics,
+        "limitations": limitations,
+    }
+
+
+def _outcome_metrics(outcomes: Sequence[object]) -> dict[str, float | int | None]:
+    wins = sum(outcome == "win" for outcome in outcomes)
+    losses = sum(outcome == "loss" for outcome in outcomes)
+    breakevens = sum(outcome == "breakeven" for outcome in outcomes)
+    denominator = wins + losses + breakevens
+    return {
+        "wins": wins,
+        "losses": losses,
+        "breakevens": breakevens,
+        "win_rate": wins / denominator if denominator else None,
+        "loss_rate": losses / denominator if denominator else None,
+        "max_consecutive_wins": _longest_streak(outcomes, "win"),
+        "max_consecutive_losses": _longest_streak(outcomes, "loss"),
+    }
+
+
+def _return_metrics(values: Sequence[float], frame: AnalysisFrame, has_outcome: bool) -> dict[str, float | int | None]:
+    series = pd.Series(values, dtype="float64")
+    result: dict[str, float | int | None] = {
+        "total_return": float(series.sum()),
+        "mean_return": float(series.mean()),
+        "median_return": float(series.median()),
+        "best_return": float(series.max()),
+        "worst_return": float(series.min()),
+        "minimum": float(series.min()),
+        "maximum": float(series.max()),
+        "sample_standard_deviation": float(series.std(ddof=1)) if len(series) >= 2 else None,
+        "first_quartile": _quantile(series, 0.25),
+        "third_quartile": _quantile(series, 0.75),
+        "percentile_05": _quantile(series, 0.05),
+        "percentile_10": _quantile(series, 0.10),
+        "percentile_25": _quantile(series, 0.25),
+        "percentile_50": _quantile(series, 0.50),
+        "percentile_75": _quantile(series, 0.75),
+        "percentile_90": _quantile(series, 0.90),
+        "percentile_95": _quantile(series, 0.95),
+    }
+    result["interquartile_range"] = result["third_quartile"] - result["first_quartile"]  # type: ignore[operator]
+    result["iqr_outlier_count"] = _iqr_outlier_count(series) if len(series) >= 4 else None
+    if has_outcome:
+        paired = frame.data[["trade_return", "trade_outcome"]].dropna()
+        winners = paired.loc[paired["trade_outcome"] == "win", "trade_return"]
+        losers = paired.loc[paired["trade_outcome"] == "loss", "trade_return"]
+        result["mean_winning_return"] = float(winners.mean()) if not winners.empty else None
+        result["mean_losing_return"] = float(losers.mean()) if not losers.empty else None
+    return result
+
+
+def _r_metrics(values: Sequence[float], frame: AnalysisFrame | None) -> dict[str, float | int | None]:
+    equity = pd.concat([pd.Series([0.0]), pd.Series(values, dtype="float64").cumsum()], ignore_index=True)
+    peaks = equity.cummax()
+    drawdowns = equity - peaks
+    trough_index = int(drawdowns.idxmin())
+    max_drawdown = float(-drawdowns.iloc[trough_index])
+    peak = float(peaks.iloc[trough_index])
+    recovery = (
+        next((index - trough_index for index in range(trough_index + 1, len(equity)) if equity.iloc[index] >= peak), None)
+        if max_drawdown > 0
+        else None
+    )
+    realized_reward_risk = None
+    if frame is not None:
+        paired = frame.data[["trade_return", "trade_outcome"]].dropna()
+        winners = paired.loc[paired["trade_outcome"] == "win", "trade_return"]
+        losers = paired.loc[paired["trade_outcome"] == "loss", "trade_return"]
+        if not winners.empty and not losers.empty:
+            realized_reward_risk = float(winners.mean() / abs(losers.mean()))
+    return {
+        "realized_reward_risk": realized_reward_risk,
+        "cumulative_return": float(equity.iloc[-1]),
+        "max_drawdown": max_drawdown,
+        "recovery_observations": recovery,
+    }
+
+
+def _longest_streak(outcomes: Sequence[object], target: str) -> int:
+    longest = current = 0
+    for outcome in outcomes:
+        current = current + 1 if outcome == target else 0
+        longest = max(longest, current)
+    return longest
+
+
+def _quantile(series: pd.Series, quantile: float) -> float:
+    return float(series.quantile(quantile, interpolation="linear"))
+
+
+def _iqr_outlier_count(series: pd.Series) -> int:
+    first, third = _quantile(series, 0.25), _quantile(series, 0.75)
+    iqr = third - first
+    return int(((series < first - 1.5 * iqr) | (series > third + 1.5 * iqr)).sum())
+
+
+def _summary_limitations(frame: AnalysisFrame, metrics: dict[str, object]) -> list[str]:
+    limitations: list[str] = []
+    if frame.valid_rows < 30:
+        limitations.append("small_sample")
+    if any(item.reason == "invalid" for item in frame.exclusions):
+        limitations.append("invalid_values_excluded")
+    if frame.no_data_reason == "no_matching_rows":
+        limitations.append("no_matching_rows")
+    if any(value is None for value in metrics.values()):
+        limitations.append("unavailable_metric")
+    return limitations
+
+
+def _filter_descriptor(filter_: AnalysisFilter) -> dict[str, str]:
+    value = filter_.value
+    encoded = json.dumps(value, default=lambda item: item.isoformat() if isinstance(item, datetime) else None, sort_keys=True, separators=(",", ":"))
+    return {
+        "field_id": filter_.field_id,
+        "operator": filter_.operator,
+        "value_sha256": hashlib.sha256(encoded.encode("utf-8")).hexdigest(),
+    }
 
 
 def _field(entry: "MappingEntry") -> AnalysisField:

@@ -1,10 +1,12 @@
+import json
+import math
 from datetime import datetime
 from pathlib import Path
 
 import pytest
 
 import mentor.analysis as analysis_module
-from mentor.analysis import AnalysisFilter, build_analysis_frame
+from mentor.analysis import AnalysisFilter, build_analysis_frame, summarize_results
 from mentor.datasets import MappingEntry, create_inspected_mapping_draft, import_local_dataset, inspect_local_dataset
 from mentor.storage import Storage
 
@@ -125,6 +127,136 @@ def test_analysis_frame_uses_source_order_unless_validated_timestamp_order_is_re
     assert time_order.data["source_row_ordinal"].tolist() == [1, 0]
     assert time_order.order.mode == "timestamp"
     assert time_order.order.timestamp_field_id is not None
+
+
+def test_summarize_results_calculates_r_metrics_in_source_order_and_returns_a_reproducible_envelope(tmp_path):
+    storage, dataset, mapping = _confirmed_dataset(
+        tmp_path,
+        "Result,Outcome,Desk Secret\n2,win,do-not-disclose\n-1,loss,do-not-disclose\n-2,loss,do-not-disclose\n3,win,do-not-disclose\n0,BE,do-not-disclose\n",
+        [
+            MappingEntry(0, semantic_role="trade_return", unit="R"),
+            MappingEntry(1, semantic_role="trade_outcome"),
+        ],
+    )
+    frame = build_analysis_frame(
+        storage, dataset.id, mapping.id, required_roles=("trade_return", "trade_outcome")
+    )
+
+    result = summarize_results(
+        frame,
+        dataset_id=dataset.id,
+        dataset_sha256=dataset.content_sha256,
+        mapping_version_id=mapping.id,
+    )
+
+    assert result["provenance"] == "USER_EMPIRICAL_EVIDENCE"
+    assert result["dataset_id"] == dataset.id
+    assert result["dataset_sha256"] == dataset.content_sha256
+    assert result["mapping_version_id"] == mapping.id
+    assert result["operation"] == "summarize_results"
+    assert result["schema_version"] == "1.0"
+    assert result["filters"] == []
+    assert result["counts"] == {"source_rows": 5, "filtered_rows": 5, "valid_rows": 5, "excluded_rows": 0}
+    assert result["exclusions"] == []
+    assert result["metric_definitions"] == {
+        "outcome_rate_denominator": "wins + losses + breakevens",
+        "quantile_method": "linear",
+        "return_unit": "R",
+        "row_order": "source",
+    }
+    assert result["metrics"] == pytest.approx({
+        "wins": 2,
+        "losses": 2,
+        "breakevens": 1,
+        "win_rate": 0.4,
+        "loss_rate": 0.4,
+        "max_consecutive_wins": 1,
+        "max_consecutive_losses": 2,
+        "total_return": 2.0,
+        "mean_return": 0.4,
+        "median_return": 0.0,
+        "mean_winning_return": 2.5,
+        "mean_losing_return": -1.5,
+        "best_return": 3.0,
+        "worst_return": -2.0,
+        "realized_reward_risk": 5 / 3,
+        "cumulative_return": 2.0,
+        "max_drawdown": 3.0,
+        "recovery_observations": 1,
+        "minimum": -2.0,
+        "maximum": 3.0,
+        "sample_standard_deviation": math.sqrt(4.3),
+        "first_quartile": -1.0,
+        "third_quartile": 2.0,
+        "interquartile_range": 3.0,
+        "iqr_outlier_count": 0,
+        "percentile_05": -1.8,
+        "percentile_10": -1.6,
+        "percentile_25": -1.0,
+        "percentile_50": 0.0,
+        "percentile_75": 2.0,
+        "percentile_90": 2.6,
+        "percentile_95": 2.8,
+        "valid_rows": 5,
+        "excluded_rows": 0,
+    })
+    assert result["limitations"] == ["small_sample"]
+    assert "Desk Secret" not in json.dumps(result)
+    assert "do-not-disclose" not in json.dumps(result)
+
+
+def test_summarize_results_preserves_non_r_returns_and_marks_missing_capabilities_unavailable(tmp_path):
+    storage, dataset, mapping = _confirmed_dataset(
+        tmp_path,
+        "Result,Private Header\n1.5,private-value\n-0.5,private-value\n",
+        [MappingEntry(0, semantic_role="trade_return", unit="percentage")],
+    )
+    frame = build_analysis_frame(storage, dataset.id, mapping.id, required_roles=("trade_return",))
+
+    result = summarize_results(
+        frame,
+        dataset_id=dataset.id,
+        dataset_sha256=dataset.content_sha256,
+        mapping_version_id=mapping.id,
+    )
+
+    assert result["metric_definitions"]["return_unit"] == "percentage"
+    assert result["metrics"]["total_return"] == 1.0
+    assert result["metrics"]["mean_return"] == 0.5
+    assert result["metrics"]["wins"] is None
+    assert result["metrics"]["win_rate"] is None
+    assert result["metrics"]["realized_reward_risk"] is None
+    assert result["metrics"]["cumulative_return"] is None
+    assert result["metrics"]["max_drawdown"] is None
+    assert result["metrics"]["recovery_observations"] is None
+    assert result["limitations"] == ["small_sample", "unavailable_metric"]
+    assert "Private Header" not in json.dumps(result)
+    assert "private-value" not in json.dumps(result)
+
+
+def test_summarize_results_uses_the_frame_validated_filter_fingerprint_without_disclosing_its_value(tmp_path):
+    storage, dataset, mapping = _confirmed_dataset(
+        tmp_path,
+        "Result\n1\n2\n",
+        [MappingEntry(0, semantic_role="trade_return", unit="R")],
+    )
+    field_id = storage.mapping_entries(mapping.id)[0].field_id
+    filter_ = AnalysisFilter(field_id or "", "gt", 1)
+    frame = build_analysis_frame(
+        storage, dataset.id, mapping.id, required_roles=("trade_return",), filters=(filter_,)
+    )
+
+    result = summarize_results(
+        frame,
+        dataset_id=dataset.id,
+        dataset_sha256=dataset.content_sha256,
+        mapping_version_id=mapping.id,
+    )
+
+    assert result["counts"]["filtered_rows"] == 1
+    assert result["filters"] == [
+        {"field_id": field_id, "operator": "gt", "value_sha256": "6b86b273ff34fce19d6b804eff5a3f5747ada4eaa22f1d49c01e52ddb7875b4b"}
+    ]
 
 
 def test_analysis_frame_parses_the_verified_bytes_if_the_local_original_is_swapped(tmp_path, monkeypatch):

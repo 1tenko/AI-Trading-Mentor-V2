@@ -83,6 +83,7 @@ _ANALYSIS_METRIC_NAMES = frozenset(
 
 _ANALYSIS_OPERATION_PATTERN = re.compile(r"[a-z][a-z0-9_]{0,63}")
 _ANALYSIS_SCHEMA_VERSION_PATTERN = re.compile(r"[0-9]+(?:\.[0-9]+){0,2}")
+_ANALYSIS_FIELD_ID_PATTERN = re.compile(r"field_[0-9a-f]{12}")
 _DATASET_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,79}")
 _TOOL_CALL_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}")
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
@@ -369,7 +370,8 @@ class Storage:
                 BEFORE DELETE ON dataset_mapping_entries
                 WHEN (SELECT status FROM dataset_mapping_versions WHERE id = OLD.mapping_version_id) = 'confirmed'
                 BEGIN SELECT RAISE(ABORT, 'confirmed mapping entries are immutable'); END;
-                CREATE TRIGGER IF NOT EXISTS analysis_evidence_requires_confirmed_mapping
+                DROP TRIGGER IF EXISTS analysis_evidence_requires_confirmed_mapping;
+                CREATE TRIGGER analysis_evidence_requires_confirmed_mapping
                 BEFORE INSERT ON analysis_evidence
                 WHEN CASE
                     WHEN json_valid(NEW.result_json) = 0 THEN 1
@@ -392,15 +394,19 @@ class Storage:
                       OR json_extract(NEW.result_json, '$.mapping_version_id') != NEW.mapping_version_id
                       OR json_extract(NEW.result_json, '$.operation') != NEW.operation
                       OR json_extract(NEW.result_json, '$.schema_version') != NEW.schema_version
+                      OR json_type(NEW.result_json, '$.filters') != 'array'
+                      OR json_type(NEW.result_json, '$.metric_definitions') != 'object'
                       OR json_type(NEW.result_json, '$.counts') != 'object'
+                      OR json_type(NEW.result_json, '$.exclusions') != 'array'
                       OR json_type(NEW.result_json, '$.metrics') != 'object'
                       OR json_type(NEW.result_json, '$.limitations') != 'array' THEN 1
-                    WHEN (SELECT COUNT(*) FROM json_each(NEW.result_json)) != 9
+                    WHEN (SELECT COUNT(*) FROM json_each(NEW.result_json)) != 12
                       OR EXISTS (
                           SELECT 1 FROM json_each(NEW.result_json)
                           WHERE key NOT IN (
                               'provenance', 'dataset_id', 'dataset_sha256', 'mapping_version_id',
-                              'operation', 'schema_version', 'counts', 'metrics', 'limitations'
+                              'operation', 'schema_version', 'filters', 'metric_definitions', 'counts',
+                              'exclusions', 'metrics', 'limitations'
                           )
                       ) THEN 1
                     WHEN (SELECT COUNT(*) FROM json_each(NEW.result_json, '$.counts')) != 4
@@ -486,15 +492,19 @@ class Storage:
                     ) THEN 1
                     WHEN length(NEW.output_json) > 8000
                       OR json_type(NEW.output_json, '$') != 'object'
+                      OR json_type(NEW.output_json, '$.filters') != 'array'
+                      OR json_type(NEW.output_json, '$.metric_definitions') != 'object'
                       OR json_type(NEW.output_json, '$.counts') != 'object'
+                      OR json_type(NEW.output_json, '$.exclusions') != 'array'
                       OR json_type(NEW.output_json, '$.metrics') != 'object'
                       OR json_type(NEW.output_json, '$.limitations') != 'array' THEN 1
-                    WHEN (SELECT COUNT(*) FROM json_each(NEW.output_json)) != 9
+                    WHEN (SELECT COUNT(*) FROM json_each(NEW.output_json)) != 12
                       OR EXISTS (
                           SELECT 1 FROM json_each(NEW.output_json)
                           WHERE key NOT IN (
                               'provenance', 'dataset_id', 'dataset_sha256', 'mapping_version_id',
-                              'operation', 'schema_version', 'counts', 'metrics', 'limitations'
+                              'operation', 'schema_version', 'filters', 'metric_definitions', 'counts',
+                              'exclusions', 'metrics', 'limitations'
                           )
                       ) THEN 1
                     WHEN (SELECT COUNT(*) FROM json_each(NEW.output_json, '$.counts')) != 4
@@ -730,15 +740,19 @@ class Storage:
                     ) THEN 1
                     WHEN length(NEW.output_json) > 8000
                       OR json_type(NEW.output_json, '$') != 'object'
+                      OR json_type(NEW.output_json, '$.filters') != 'array'
+                      OR json_type(NEW.output_json, '$.metric_definitions') != 'object'
                       OR json_type(NEW.output_json, '$.counts') != 'object'
+                      OR json_type(NEW.output_json, '$.exclusions') != 'array'
                       OR json_type(NEW.output_json, '$.metrics') != 'object'
                       OR json_type(NEW.output_json, '$.limitations') != 'array' THEN 1
-                    WHEN (SELECT COUNT(*) FROM json_each(NEW.output_json)) != 9
+                    WHEN (SELECT COUNT(*) FROM json_each(NEW.output_json)) != 12
                       OR EXISTS (
                           SELECT 1 FROM json_each(NEW.output_json)
                           WHERE key NOT IN (
                               'provenance', 'dataset_id', 'dataset_sha256', 'mapping_version_id',
-                              'operation', 'schema_version', 'counts', 'metrics', 'limitations'
+                              'operation', 'schema_version', 'filters', 'metric_definitions', 'counts',
+                              'exclusions', 'metrics', 'limitations'
                           )
                       ) THEN 1
                     WHEN (SELECT COUNT(*) FROM json_each(NEW.output_json, '$.counts')) != 4
@@ -863,6 +877,96 @@ class Storage:
                       SELECT COUNT(DISTINCT key) FROM json_each(NEW.output_json, '$.metrics')
                   )
                 BEGIN SELECT RAISE(ABORT, 'analysis result envelope metrics are invalid'); END;
+                DROP TRIGGER IF EXISTS analysis_evidence_envelope_details_are_safe;
+                CREATE TRIGGER analysis_evidence_envelope_details_are_safe
+                BEFORE INSERT ON analysis_evidence
+                WHEN json_valid(NEW.result_json) = 0
+                  OR (SELECT COUNT(*) FROM json_each(NEW.result_json, '$.filters')) > 20
+                  OR EXISTS (
+                      SELECT 1 FROM json_each(NEW.result_json, '$.filters')
+                      WHERE json_type(value) != 'object'
+                        OR (SELECT COUNT(*) FROM json_each(value)) != 3
+                        OR json_type(value, '$.field_id') != 'text'
+                        OR NOT EXISTS (
+                            SELECT 1 FROM dataset_mapping_entries
+                            WHERE mapping_version_id = NEW.mapping_version_id
+                              AND field_id = json_extract(value, '$.field_id')
+                        )
+                        OR json_extract(value, '$.operator') NOT IN (
+                            'eq', 'neq', 'in', 'not_in', 'is_blank', 'not_blank', 'gt', 'gte', 'lt', 'lte', 'between'
+                        )
+                        OR json_type(value, '$.value_sha256') != 'text'
+                        OR length(json_extract(value, '$.value_sha256')) != 64
+                        OR json_extract(value, '$.value_sha256') GLOB '*[^0-9a-f]*'
+                  )
+                  OR (SELECT COUNT(*) FROM json_each(NEW.result_json, '$.metric_definitions')) != 4
+                  OR json_extract(NEW.result_json, '$.metric_definitions.outcome_rate_denominator') != 'wins + losses + breakevens'
+                  OR json_extract(NEW.result_json, '$.metric_definitions.quantile_method') != 'linear'
+                  OR json_extract(NEW.result_json, '$.metric_definitions.row_order') NOT IN ('source', 'timestamp')
+                  OR (
+                      json_type(NEW.result_json, '$.metric_definitions.return_unit') != 'null'
+                      AND json_extract(NEW.result_json, '$.metric_definitions.return_unit') NOT IN ('R', 'currency', 'points', 'percentage')
+                  )
+                  OR (SELECT COUNT(*) FROM json_each(NEW.result_json, '$.exclusions')) > 20
+                  OR EXISTS (
+                      SELECT 1 FROM json_each(NEW.result_json, '$.exclusions')
+                      WHERE json_type(value) != 'object'
+                        OR (SELECT COUNT(*) FROM json_each(value)) != 3
+                        OR NOT EXISTS (
+                            SELECT 1 FROM dataset_mapping_entries
+                            WHERE mapping_version_id = NEW.mapping_version_id
+                              AND semantic_role = json_extract(value, '$.role')
+                        )
+                        OR json_extract(value, '$.reason') NOT IN ('blank', 'invalid')
+                        OR json_type(value, '$.count') != 'integer'
+                        OR json_extract(value, '$.count') < 1
+                  )
+                BEGIN SELECT RAISE(ABORT, 'analysis result envelope details are invalid'); END;
+                DROP TRIGGER IF EXISTS analysis_tool_output_envelope_details_are_safe;
+                CREATE TRIGGER analysis_tool_output_envelope_details_are_safe
+                BEFORE INSERT ON analysis_tool_outputs
+                WHEN json_valid(NEW.output_json) = 0
+                  OR (SELECT COUNT(*) FROM json_each(NEW.output_json, '$.filters')) > 20
+                  OR EXISTS (
+                      SELECT 1 FROM json_each(NEW.output_json, '$.filters')
+                      WHERE json_type(value) != 'object'
+                        OR (SELECT COUNT(*) FROM json_each(value)) != 3
+                        OR json_type(value, '$.field_id') != 'text'
+                        OR NOT EXISTS (
+                            SELECT 1 FROM dataset_mapping_entries
+                            WHERE mapping_version_id = (SELECT mapping_version_id FROM analysis_evidence WHERE id = NEW.evidence_id)
+                              AND field_id = json_extract(value, '$.field_id')
+                        )
+                        OR json_extract(value, '$.operator') NOT IN (
+                            'eq', 'neq', 'in', 'not_in', 'is_blank', 'not_blank', 'gt', 'gte', 'lt', 'lte', 'between'
+                        )
+                        OR json_type(value, '$.value_sha256') != 'text'
+                        OR length(json_extract(value, '$.value_sha256')) != 64
+                        OR json_extract(value, '$.value_sha256') GLOB '*[^0-9a-f]*'
+                  )
+                  OR (SELECT COUNT(*) FROM json_each(NEW.output_json, '$.metric_definitions')) != 4
+                  OR json_extract(NEW.output_json, '$.metric_definitions.outcome_rate_denominator') != 'wins + losses + breakevens'
+                  OR json_extract(NEW.output_json, '$.metric_definitions.quantile_method') != 'linear'
+                  OR json_extract(NEW.output_json, '$.metric_definitions.row_order') NOT IN ('source', 'timestamp')
+                  OR (
+                      json_type(NEW.output_json, '$.metric_definitions.return_unit') != 'null'
+                      AND json_extract(NEW.output_json, '$.metric_definitions.return_unit') NOT IN ('R', 'currency', 'points', 'percentage')
+                  )
+                  OR (SELECT COUNT(*) FROM json_each(NEW.output_json, '$.exclusions')) > 20
+                  OR EXISTS (
+                      SELECT 1 FROM json_each(NEW.output_json, '$.exclusions')
+                      WHERE json_type(value) != 'object'
+                        OR (SELECT COUNT(*) FROM json_each(value)) != 3
+                        OR NOT EXISTS (
+                            SELECT 1 FROM dataset_mapping_entries
+                            WHERE mapping_version_id = (SELECT mapping_version_id FROM analysis_evidence WHERE id = NEW.evidence_id)
+                              AND semantic_role = json_extract(value, '$.role')
+                        )
+                        OR json_extract(value, '$.reason') NOT IN ('blank', 'invalid')
+                        OR json_type(value, '$.count') != 'integer'
+                        OR json_extract(value, '$.count') < 1
+                  )
+                BEGIN SELECT RAISE(ABORT, 'analysis result envelope details are invalid'); END;
                 DROP TRIGGER IF EXISTS confirmed_mapping_parent_entries_cannot_insert;
                 CREATE TRIGGER confirmed_mapping_parent_entries_cannot_insert
                 BEFORE INSERT ON dataset_mapping_entries
@@ -2176,7 +2280,10 @@ def _analysis_result_envelope_json(
         "mapping_version_id",
         "operation",
         "schema_version",
+        "filters",
+        "metric_definitions",
         "counts",
+        "exclusions",
         "metrics",
         "limitations",
     }:
@@ -2195,6 +2302,53 @@ def _analysis_result_envelope_json(
         not isinstance(counts, Mapping)
         or set(counts) != {"source_rows", "filtered_rows", "valid_rows", "excluded_rows"}
         or any(type(count) is not int or count < 0 for count in counts.values())
+        or counts["source_rows"] < counts["filtered_rows"]
+        or counts["filtered_rows"] != counts["valid_rows"] + counts["excluded_rows"]
+    ):
+        raise ValueError("analysis result envelope is invalid")
+    filters = value["filters"]
+    if (
+        not isinstance(filters, list)
+        or len(filters) > 20
+        or any(
+            not isinstance(filter_, Mapping)
+            or set(filter_) != {"field_id", "operator", "value_sha256"}
+            or not isinstance(filter_["field_id"], str)
+            or _ANALYSIS_FIELD_ID_PATTERN.fullmatch(filter_["field_id"]) is None
+            or not isinstance(filter_["operator"], str)
+            or filter_["operator"] not in {"eq", "neq", "in", "not_in", "is_blank", "not_blank", "gt", "gte", "lt", "lte", "between"}
+            or not isinstance(filter_["value_sha256"], str)
+            or _SHA256_PATTERN.fullmatch(filter_["value_sha256"]) is None
+            for filter_ in filters
+        )
+    ):
+        raise ValueError("analysis result envelope is invalid")
+    definitions = value["metric_definitions"]
+    if (
+        not isinstance(definitions, Mapping)
+        or dict(definitions) != {
+            "outcome_rate_denominator": "wins + losses + breakevens",
+            "quantile_method": "linear",
+            "return_unit": definitions.get("return_unit"),
+            "row_order": definitions.get("row_order"),
+        }
+        or definitions["return_unit"] not in {None, "R", "currency", "points", "percentage"}
+        or definitions["row_order"] not in {"source", "timestamp"}
+    ):
+        raise ValueError("analysis result envelope is invalid")
+    exclusions = value["exclusions"]
+    if (
+        not isinstance(exclusions, list)
+        or len(exclusions) > 20
+        or any(
+            not isinstance(exclusion, Mapping)
+            or set(exclusion) != {"role", "reason", "count"}
+            or exclusion["role"] not in {"trade_return", "trade_outcome", "trade_timestamp", "mfe", "mae"}
+            or exclusion["reason"] not in {"blank", "invalid"}
+            or type(exclusion["count"]) is not int
+            or exclusion["count"] < 1
+            for exclusion in exclusions
+        )
     ):
         raise ValueError("analysis result envelope is invalid")
     metrics = value["metrics"]

@@ -114,15 +114,15 @@ ordinal, and exclusion accounting.
 metrics with a versioned `USER_EMPIRICAL_EVIDENCE` envelope.
 
 **Acceptance criteria:**
-- [ ] Known fixtures prove N, explicit outcome denominator, native-unit return
+- [x] Known fixtures prove N, explicit outcome denominator, native-unit return
   metrics, row-ordered streaks/drawdown/recovery, quantiles, and unavailable metrics.
-- [ ] Every result identifies dataset hash, mapping version, operation, filters,
+- [x] Every result identifies dataset hash, mapping version, operation, filters,
   metric definitions, exclusions, and limitations.
-- [ ] No metric changes P&L units or invents missing outcome/MFE/MAE data;
+- [x] No metric changes P&L units or invents missing outcome/MFE/MAE data;
   R-specific outputs are unavailable unless the confirmed return unit is R.
 
 **Verification:**
-- [ ] Exact expected-value tests and full pytest pass.
+- [x] Exact expected-value tests and full pytest pass.
 
 **Dependencies:** Task 4
 **Files likely touched:** `src/mentor/analysis.py`, `src/mentor/storage.py`,

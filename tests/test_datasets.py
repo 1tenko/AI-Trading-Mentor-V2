@@ -801,7 +801,15 @@ def _result_envelope(dataset, mapping_version_id: int, operation: str = "summari
         "mapping_version_id": mapping_version_id,
         "operation": operation,
         "schema_version": "1",
+        "filters": [],
+        "metric_definitions": {
+            "outcome_rate_denominator": "wins + losses + breakevens",
+            "quantile_method": "linear",
+            "return_unit": "R",
+            "row_order": "source",
+        },
         "counts": {"source_rows": 3, "filtered_rows": 3, "valid_rows": 3, "excluded_rows": 0},
+        "exclusions": [],
         "metrics": {"valid_rows": 3},
         "limitations": [],
     }
@@ -1208,6 +1216,14 @@ def test_result_envelopes_reject_raw_values_hidden_in_limitations_or_metrics(tmp
     leaky_limitations = {**envelope, "limitations": ["trade row: Result_R=2.5"]}
     leaky_metrics = {**envelope, "metrics": {"mean_return": "Result_R=2.5"}}
     arbitrary_metric = {**envelope, "metrics": {"raw_result_r_2_5": 2.5}}
+    leaky_filter = {
+        **envelope,
+        "filters": [{"field_id": "Result_R", "operator": "eq", "value_sha256": "a" * 64}],
+    }
+    leaky_definition = {
+        **envelope,
+        "metric_definitions": {**envelope["metric_definitions"], "return_unit": "Result_R=2.5"},
+    }
 
     with pytest.raises(ValueError, match="analysis result envelope"):
         storage.record_analysis_evidence(
@@ -1242,6 +1258,18 @@ def test_result_envelopes_reject_raw_values_hidden_in_limitations_or_metrics(tmp
             arguments={"dataset_id": dataset.id},
             result=arbitrary_metric,
         )
+    for leaky_envelope in (leaky_filter, leaky_definition):
+        with pytest.raises(ValueError, match="analysis result envelope"):
+            storage.record_analysis_evidence(
+                thread_id=thread_id,
+                origin_turn_number=1,
+                dataset_id=dataset.id,
+                mapping_version_id=confirmed.id,
+                operation="summarize_results",
+                schema_version="1",
+                arguments={"dataset_id": dataset.id},
+                result=leaky_envelope,
+            )
     evidence = storage.record_analysis_evidence(
         thread_id=thread_id,
         origin_turn_number=1,
@@ -1277,6 +1305,19 @@ def test_result_envelopes_reject_raw_values_hidden_in_limitations_or_metrics(tmp
                     evidence.id,
                     json.dumps({"dataset_id": dataset.id, "mapping_version_id": confirmed.id, "operation": "summarize_results"}),
                     json.dumps(leaky_metrics),
+                ),
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="details|envelope"):
+            connection.execute(
+                """
+                INSERT INTO analysis_tool_outputs(thread_id, tool_call_id, evidence_id, arguments_json, output_json)
+                VALUES (?, 'leaky-filter', ?, ?, ?)
+                """,
+                (
+                    thread_id,
+                    evidence.id,
+                    json.dumps({"dataset_id": dataset.id, "mapping_version_id": confirmed.id, "operation": "summarize_results"}),
+                    json.dumps(leaky_filter),
                 ),
             )
 
