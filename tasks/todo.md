@@ -79,9 +79,9 @@ suggestions, and complete user-confirmed mapping snapshots for Phase 5 roles/uni
 
 ### Checkpoint A: Local import and mapping
 
-- [ ] Tasks 1–3 focused tests and full pytest are green.
-- [ ] Raw uploads are ignored, private and never sent to OpenAI.
-- [ ] A manual local import can preview a file and confirm a mapping.
+- [x] Tasks 1–3 focused tests and full pytest are green.
+- [x] Raw uploads are ignored, private and never sent to OpenAI.
+- [x] A manual local import can preview a file and confirm a mapping.
 
 ## deterministic-analysis
 
