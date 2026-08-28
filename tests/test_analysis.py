@@ -1,7 +1,9 @@
+from datetime import datetime
 from pathlib import Path
 
 import pytest
 
+import mentor.analysis as analysis_module
 from mentor.analysis import AnalysisFilter, build_analysis_frame
 from mentor.datasets import MappingEntry, create_inspected_mapping_draft, import_local_dataset, inspect_local_dataset
 from mentor.storage import Storage
@@ -123,3 +125,51 @@ def test_analysis_frame_uses_source_order_unless_validated_timestamp_order_is_re
     assert time_order.data["source_row_ordinal"].tolist() == [1, 0]
     assert time_order.order.mode == "timestamp"
     assert time_order.order.timestamp_field_id is not None
+
+
+def test_analysis_frame_parses_the_verified_bytes_if_the_local_original_is_swapped(tmp_path, monkeypatch):
+    storage, dataset, mapping = _confirmed_dataset(
+        tmp_path,
+        "Result\n1\n",
+        [MappingEntry(0, semantic_role="trade_return", unit="R")],
+    )
+    original_path = storage.database_path.parent / "datasets" / dataset.id / "original.csv"
+    original_parser = analysis_module._inspection_rows_from_bytes
+
+    def parse_verified_bytes(contents, extension, spec):
+        original_path.write_text("Result\n999\n", encoding="utf-8")
+        return original_parser(contents, extension, spec)
+
+    monkeypatch.setattr(analysis_module, "_inspection_rows_from_bytes", parse_verified_bytes)
+
+    frame = build_analysis_frame(storage, dataset.id, mapping.id, required_roles=("trade_return",))
+
+    assert frame.data["trade_return"].tolist() == [1.0]
+
+
+@pytest.mark.parametrize(
+    "operator,value",
+    [
+        ("eq", datetime(2026, 1, 2)),
+        ("in", [datetime(2026, 1, 2)]),
+        ("between", [datetime(2026, 1, 1), datetime(2026, 1, 3)]),
+    ],
+)
+def test_timestamp_filters_reject_naive_values_for_aware_dataset_times(tmp_path, operator, value):
+    storage, dataset, mapping = _confirmed_dataset(
+        tmp_path,
+        "Result,Trade Date\n1,2026-01-02T12:00:00+00:00\n",
+        [MappingEntry(0, semantic_role="trade_return", unit="R"), MappingEntry(1, semantic_role="trade_timestamp")],
+    )
+    timestamp_id = next(
+        entry.field_id for entry in storage.mapping_entries(mapping.id) if entry.semantic_role == "trade_timestamp"
+    )
+
+    with pytest.raises(ValueError, match="timezone"):
+        build_analysis_frame(
+            storage,
+            dataset.id,
+            mapping.id,
+            required_roles=("trade_return",),
+            filters=(AnalysisFilter(timestamp_id or "", operator, value),),
+        )

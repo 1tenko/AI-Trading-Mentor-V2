@@ -372,10 +372,23 @@ def _entry_ordinal(entry: MappingEntry | object) -> int | None:
 
 
 def _inspection_rows(path: Path, extension: str, spec: DatasetImportSpec) -> tuple[list[str], list[list[object]]]:
+    try:
+        contents = path.read_bytes()
+    except OSError as error:
+        raise DatasetImportError("local dataset original is unavailable") from error
+    return _inspection_rows_from_bytes(contents, extension, spec)
+
+
+def _inspection_rows_from_bytes(
+    contents: bytes, extension: str, spec: DatasetImportSpec
+) -> tuple[list[str], list[list[object]]]:
     if extension == ".csv":
         if not spec.csv_encoding or not spec.csv_delimiter or not spec.csv_quoting:
             raise DatasetImportError("CSV import specification is incomplete")
-        text = path.read_text(encoding=spec.csv_encoding, errors="strict")
+        try:
+            text = contents.decode(spec.csv_encoding, errors="strict")
+        except UnicodeDecodeError as error:
+            raise DatasetImportError("CSV parse failed") from error
         rows = csv.reader(io.StringIO(text, newline=""), delimiter=spec.csv_delimiter, quotechar=spec.csv_quoting, strict=True)
         try:
             headers = _headers(next(rows))
@@ -383,12 +396,14 @@ def _inspection_rows(path: Path, extension: str, spec: DatasetImportSpec) -> tup
             raise DatasetImportError("CSV has no header row") from error
         values = [list(row) for row in rows if row and not all(value == "" for value in row)]
     else:
+        _preflight_xlsx_bytes(contents, spec.selected_sheet)
         try:
-            workbook = load_workbook(path, read_only=True, data_only=False, keep_links=False)
+            workbook = load_workbook(io.BytesIO(contents), read_only=True, data_only=False, keep_links=False)
         except Exception as error:
             raise DatasetImportError("XLSX parse failed") from error
         try:
             worksheet = workbook[spec.selected_sheet or ""]
+            worksheet.reset_dimensions()
             iterator = worksheet.iter_rows(values_only=True)
             headers = _headers(next(iterator))
             values = [list(row) for row in iterator if row and not all(value is None or value == "" for value in row)]
@@ -823,13 +838,18 @@ def _parse_xlsx(path: Path, selected_sheet: str | None) -> _ParsedDataset:
 
 
 def _preflight_xlsx(path: Path, selected_sheet: str | None) -> str:
-    with path.open("rb") as file:
-        if file.read(4) != b"PK\x03\x04":
-            raise DatasetImportError("XLSX signature is invalid")
-    if not zipfile.is_zipfile(path):
+    try:
+        contents = path.read_bytes()
+    except OSError as error:
+        raise DatasetImportError("XLSX signature is invalid") from error
+    return _preflight_xlsx_bytes(contents, selected_sheet)
+
+
+def _preflight_xlsx_bytes(contents: bytes, selected_sheet: str | None) -> str:
+    if contents[:4] != b"PK\x03\x04" or not zipfile.is_zipfile(io.BytesIO(contents)):
         raise DatasetImportError("XLSX signature is invalid")
     try:
-        with zipfile.ZipFile(path) as archive:
+        with zipfile.ZipFile(io.BytesIO(contents)) as archive:
             members = archive.infolist()
             names = [member.filename for member in members]
             compressed_bytes = sum(member.compress_size for member in members)

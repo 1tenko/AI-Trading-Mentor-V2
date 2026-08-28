@@ -1,5 +1,6 @@
 """Local, validated input boundary for deterministic backtest analysis."""
 
+import hashlib
 import math
 from dataclasses import dataclass, field
 from datetime import date, datetime, time
@@ -7,7 +8,7 @@ from typing import TYPE_CHECKING, Literal, Sequence
 
 import pandas as pd
 
-from mentor.datasets import _inspection_rows, inspect_local_dataset
+from mentor.datasets import DatasetImportError, _inspection_rows_from_bytes
 
 if TYPE_CHECKING:
     from mentor.datasets import MappingEntry
@@ -86,7 +87,10 @@ def build_analysis_frame(
     mapping = storage.mapping_version(mapping_version_id)
     if dataset is None or mapping is None or mapping.status != "confirmed" or mapping.dataset_id != dataset_id:
         raise ValueError("analysis requires a confirmed mapping for the dataset")
-    inspection = inspect_local_dataset(storage, dataset_id)
+    spec = storage.dataset_import_spec(dataset_id)
+    columns = storage.dataset_columns(dataset_id)
+    if spec is None or not columns:
+        raise ValueError("dataset metadata is unavailable")
     entries = tuple(entry for entry in storage.mapping_entries(mapping_version_id) if entry.field_id and (entry.semantic_role or entry.analysis_label))
     role_entries = {entry.semantic_role: entry for entry in entries if entry.semantic_role}
     for role in required:
@@ -99,15 +103,19 @@ def build_analysis_frame(
     fields = tuple(_field(entry) for entry in entries)
     by_id = {field.field_id: field for field in fields}
     validated_filters = tuple(_validate_filter(filter_, by_id) for filter_ in filters)
-    headers, source_rows = _inspection_rows(
-        storage.database_path.parent / "datasets" / dataset.id / f"original{dataset.original_extension}",
-        dataset.original_extension,
-        inspection.import_spec,
-    )
-    if len(headers) != len(inspection.columns):
+    original_path = storage.database_path.parent / "datasets" / dataset.id / f"original{dataset.original_extension}"
+    try:
+        contents = original_path.read_bytes()
+    except OSError as error:
+        raise DatasetImportError("local dataset original is unavailable") from error
+    if hashlib.sha256(contents).hexdigest() != dataset.content_sha256:
+        raise DatasetImportError("local dataset original no longer matches its immutable hash")
+    headers, source_rows = _inspection_rows_from_bytes(contents, dataset.original_extension, spec)
+    if headers != [column.original_header for column in columns] or len(source_rows) != dataset.source_row_count:
         raise ValueError("local dataset schema is unavailable")
 
     rows = [_typed_row(index, row, entries) for index, row in enumerate(source_rows)]
+    _validate_datetime_filter_timezones(rows, validated_filters, by_id)
     filtered = [row for row in rows if _matches_filters(row, validated_filters, by_id)]
     valid = [row for row in filtered if all(row["states"][role_entries[role].field_id] == "valid" for role in effective_required)]
     exclusions = _exclusions(filtered, role_entries, effective_required)
@@ -220,6 +228,8 @@ def _validate_filter(filter_: AnalysisFilter, fields: dict[str, AnalysisField]) 
         raise ValueError("filter values are invalid")
     if any(not _filter_value_matches(field.value_type, value) for value in values):
         raise ValueError("filter values are incompatible with the field type")
+    if filter_.operator == "between" and field.value_type == "datetime" and _mixed_timezone(values):
+        raise ValueError("filter timestamp timezones are incompatible")
     if filter_.operator == "between" and values[0] > values[1]:
         raise ValueError("filter range is invalid")
     return filter_
@@ -233,6 +243,28 @@ def _filter_value_matches(value_type: str, value: object) -> bool:
     if value_type == "boolean":
         return isinstance(value, bool)
     return value_type == "categorical" and isinstance(value, str)
+
+
+def _validate_datetime_filter_timezones(
+    rows: Sequence[dict[str, object]], filters: Sequence[AnalysisFilter], fields: dict[str, AnalysisField]
+) -> None:
+    for filter_ in filters:
+        if fields[filter_.field_id].value_type != "datetime" or filter_.operator in {"is_blank", "not_blank"}:
+            continue
+        filter_values = filter_.value if filter_.operator in {"in", "not_in", "between"} else (filter_.value,)
+        values = [row["values"][filter_.field_id] for row in rows if row["states"][filter_.field_id] == "valid"]  # type: ignore[index]
+        if _mixed_timezone(values) or _mixed_timezone(filter_values):
+            raise ValueError("filter timestamp timezones are incompatible")
+        if values and filter_values and _timezone_aware(values[0]) != _timezone_aware(filter_values[0]):
+            raise ValueError("filter timestamp timezone does not match dataset timestamps")
+
+
+def _mixed_timezone(values: Sequence[object]) -> bool:
+    return len({_timezone_aware(value) for value in values if isinstance(value, datetime)}) > 1
+
+
+def _timezone_aware(value: object) -> bool:
+    return isinstance(value, datetime) and value.tzinfo is not None and value.utcoffset() is not None
 
 
 def _matches_filters(row: dict[str, object], filters: Sequence[AnalysisFilter], fields: dict[str, AnalysisField]) -> bool:
