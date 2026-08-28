@@ -7,6 +7,8 @@ import pytest
 
 import mentor.analysis as analysis_module
 from mentor.analysis import (
+    AnalysisLimitError,
+    AnalysisNumericError,
     AnalysisFilter,
     analyze_mfe_mae,
     analyze_over_time,
@@ -730,7 +732,7 @@ def test_timestamp_order_rejects_mixed_timezones_in_excluded_timestamp_valid_row
         )
 
 
-def test_temporal_rolling_buckets_are_capped_with_deterministic_omission_metadata(tmp_path):
+def test_temporal_rolling_buckets_over_the_evidence_limit_fail_closed(tmp_path):
     rows = "\n".join(f"1,2026-{1 + index // 28:02d}-{1 + index % 28:02d}" for index in range(55))
     storage, dataset, mapping = _confirmed_dataset(
         tmp_path,
@@ -745,11 +747,11 @@ def test_temporal_rolling_buckets_are_capped_with_deterministic_omission_metadat
         order_by="timestamp",
     )
 
-    result = analyze_over_time(frame, mode="rolling", window_size=2)
+    with pytest.raises(AnalysisLimitError) as error:
+        analyze_over_time(frame, mode="rolling", window_size=2)
 
-    assert [bucket["period"] for bucket in result["buckets"]] == [f"rolling_{index}" for index in range(1, 51)]
-    assert result["omissions"] == {"total_buckets": 54, "returned_buckets": 50, "omitted_buckets": 4}
-    assert "temporal_buckets_omitted" in result["limitations"]
+    assert error.value.code == "temporal_bucket_limit_exceeded"
+    assert error.value.metadata == {"mode": "rolling", "total_buckets": 54, "max_buckets": 50}
 
 
 def test_mfe_mae_outputs_confirmed_unit_distributions_and_explicit_unavailability(tmp_path):
@@ -820,3 +822,221 @@ def test_win_rate_wilson_interval_and_r_spread_are_descriptive_without_inference
     assert zero["metrics"]["wilson_95_lower"] is None
     assert zero["metrics"]["wilson_95_upper"] is None
     assert "small_sample" in zero["limitations"]
+
+
+def test_filter_invalid_values_are_excluded_not_hidden_and_rebuild_reproduces_counts(tmp_path):
+    storage, dataset, mapping = _confirmed_dataset(
+        tmp_path,
+        "Result,Trade Date,Session\n1,2026-01-02,London\nbad,not-a-date,New York\n,,London\n",
+        [
+            MappingEntry(0, semantic_role="trade_return", unit="R"),
+            MappingEntry(1, semantic_role="trade_timestamp"),
+            MappingEntry(2, analysis_label="Session", model_disclosure=True),
+        ],
+    )
+    entries = storage.mapping_entries(mapping.id)
+    result_id = next(entry.field_id for entry in entries if entry.semantic_role == "trade_return")
+    timestamp_id = next(entry.field_id for entry in entries if entry.semantic_role == "trade_timestamp")
+    session_id = next(entry.field_id for entry in entries if entry.analysis_label == "Session")
+
+    not_blank = build_analysis_frame(
+        storage, dataset.id, mapping.id, required_roles=("trade_return",), filters=(AnalysisFilter(result_id or "", "not_blank"),)
+    )
+    is_blank = build_analysis_frame(
+        storage, dataset.id, mapping.id, required_roles=("trade_return",), filters=(AnalysisFilter(result_id or "", "is_blank"),)
+    )
+    numeric = build_analysis_frame(
+        storage, dataset.id, mapping.id, required_roles=("trade_return",), filters=(AnalysisFilter(result_id or "", "gt", 0),)
+    )
+    temporal = build_analysis_frame(
+        storage,
+        dataset.id,
+        mapping.id,
+        required_roles=("trade_return", "trade_timestamp"),
+        filters=(AnalysisFilter(timestamp_id or "", "gte", datetime(2026, 1, 1)),),
+        order_by="timestamp",
+    )
+
+    assert (not_blank.filtered_rows, not_blank.valid_rows, not_blank.excluded_rows) == (2, 1, 1)
+    assert {(item.role, item.reason, item.count) for item in not_blank.exclusions} == {("trade_return", "invalid", 1)}
+    assert (is_blank.filtered_rows, is_blank.valid_rows, is_blank.excluded_rows) == (2, 0, 2)
+    assert {(item.role, item.reason, item.count) for item in is_blank.exclusions} == {("trade_return", "blank", 1), ("trade_return", "invalid", 1)}
+    assert (numeric.filtered_rows, numeric.valid_rows, numeric.excluded_rows) == (2, 1, 1)
+    assert (temporal.filtered_rows, temporal.valid_rows, temporal.excluded_rows) == (2, 1, 1)
+    assert {item.role for item in temporal.exclusions} == {"trade_return", "trade_timestamp"}
+    assert group_results(not_blank, (session_id or "",))["groups"][1]["counts"] == {
+        "source_rows": 1, "filtered_rows": 1, "valid_rows": 0, "excluded_rows": 1,
+    }
+
+    reopened = Storage(storage.database_path)
+    reopened.initialize()
+    rebuilt = build_analysis_frame(
+        reopened, dataset.id, mapping.id, required_roles=("trade_return",), filters=(AnalysisFilter(result_id or "", "not_blank"),)
+    )
+    assert summarize_results(rebuilt)["counts"] == summarize_results(not_blank)["counts"]
+    assert summarize_results(rebuilt)["exclusions"] == summarize_results(not_blank)["exclusions"]
+
+
+def test_filter_limit_is_shared_and_every_accepted_filter_is_recorded(tmp_path):
+    storage, dataset, mapping = _confirmed_dataset(
+        tmp_path, "Result,Session\n1,London\n", [MappingEntry(0, semantic_role="trade_return", unit="R"), MappingEntry(1, analysis_label="Session")]
+    )
+    session_id = next(entry.field_id for entry in storage.mapping_entries(mapping.id) if entry.analysis_label == "Session")
+    at_limit = tuple(AnalysisFilter(session_id or "", "eq", "London") for _ in range(20))
+
+    frame = build_analysis_frame(storage, dataset.id, mapping.id, required_roles=("trade_return",), filters=at_limit)
+
+    assert len(summarize_results(frame)["filters"]) == 20
+    evidence = storage.record_analysis_evidence(
+        thread_id=storage.create_thread("Filter limit"),
+        origin_turn_number=1,
+        dataset_id=dataset.id,
+        mapping_version_id=mapping.id,
+        operation="summarize_results",
+        schema_version="1.0",
+        arguments={"dataset_id": dataset.id},
+        result=summarize_results(frame),
+    )
+    assert evidence.dataset_id == dataset.id
+    with pytest.raises(ValueError, match="filter limit"):
+        build_analysis_frame(storage, dataset.id, mapping.id, required_roles=("trade_return",), filters=at_limit + (AnalysisFilter(session_id or "", "eq", "London"),))
+
+
+def test_filter_stage_exclusion_for_a_nonrequired_typed_field_is_persistable(tmp_path):
+    storage, dataset, mapping = _confirmed_dataset(
+        tmp_path,
+        "Result,MFE\n1,1\n2,bad\n",
+        [
+            MappingEntry(0, semantic_role="trade_return", unit="R"),
+            MappingEntry(1, analysis_label="MFE"),
+        ],
+    )
+    score_id = next(entry.field_id for entry in storage.mapping_entries(mapping.id) if entry.analysis_label == "MFE")
+    frame = build_analysis_frame(
+        storage, dataset.id, mapping.id, required_roles=("trade_return",), filters=(AnalysisFilter(score_id or "", "gt", 0),)
+    )
+
+    result = summarize_results(frame)
+
+    assert result["counts"] == {"source_rows": 2, "filtered_rows": 2, "valid_rows": 1, "excluded_rows": 1}
+    assert result["exclusions"] == [{"role": f"filter:{score_id}", "reason": "invalid", "count": 1}]
+    storage.record_analysis_evidence(
+        thread_id=storage.create_thread("Filter exclusion"),
+        origin_turn_number=1,
+        dataset_id=dataset.id,
+        mapping_version_id=mapping.id,
+        operation="summarize_results",
+        schema_version="1.0",
+        arguments={"dataset_id": dataset.id},
+        result=result,
+    )
+
+
+@pytest.mark.parametrize("values", [(1e308, 1e308), (1.7e308, -1.7e308)])
+def test_nonfinite_derived_summary_metrics_fail_closed(tmp_path, values):
+    rows = "\n".join(str(value) for value in values)
+    storage, dataset, mapping = _confirmed_dataset(
+        tmp_path, f"Result\n{rows}\n", [MappingEntry(0, semantic_role="trade_return", unit="R")]
+    )
+    frame = build_analysis_frame(storage, dataset.id, mapping.id, required_roles=("trade_return",))
+
+    with pytest.raises(AnalysisNumericError, match="numeric_overflow") as error:
+        summarize_results(frame)
+
+    assert error.value.code == "numeric_overflow"
+
+
+def test_nonfinite_comparison_group_and_temporal_metrics_fail_closed(tmp_path):
+    storage, dataset, mapping = _confirmed_dataset(
+        tmp_path,
+        "Result,Session,Trade Date\n1e308,A,2026-01-01\n-1e308,B,2026-02-01\n1e308,C,2026-03-01\n1e308,C,2026-03-02\n",
+        [
+            MappingEntry(0, semantic_role="trade_return", unit="R"),
+            MappingEntry(1, analysis_label="Session", model_disclosure=True),
+            MappingEntry(2, semantic_role="trade_timestamp"),
+        ],
+    )
+    entries = storage.mapping_entries(mapping.id)
+    session_id = next(entry.field_id for entry in entries if entry.analysis_label == "Session")
+    frame = build_analysis_frame(
+        storage, dataset.id, mapping.id, required_roles=("trade_return", "trade_timestamp"), order_by="timestamp"
+    )
+
+    with pytest.raises(AnalysisNumericError, match="numeric_overflow"):
+        compare_groups(frame, session_id or "", "A", "B")
+    with pytest.raises(AnalysisNumericError, match="numeric_overflow"):
+        group_results(frame, (session_id or "",))
+    with pytest.raises(AnalysisNumericError, match="numeric_overflow"):
+        analyze_over_time(frame, mode="month")
+
+
+def test_nonfinite_cumulative_and_mfe_distribution_metrics_fail_closed(tmp_path):
+    storage, dataset, mapping = _confirmed_dataset(
+        tmp_path,
+        "Result,MFE\n1,1.7e308\n2,-1.7e308\n",
+        [MappingEntry(0, semantic_role="trade_return", unit="R"), MappingEntry(1, semantic_role="mfe", unit="points")],
+    )
+    frame = build_analysis_frame(storage, dataset.id, mapping.id, required_roles=("trade_return",))
+
+    with pytest.raises(AnalysisNumericError, match="numeric_overflow"):
+        analysis_module._r_metrics((1e308, 1e308), None)
+    with pytest.raises(AnalysisNumericError, match="numeric_overflow"):
+        analyze_mfe_mae(frame)
+
+
+def test_ordinary_result_envelopes_remain_json_safe(tmp_path):
+    storage, dataset, mapping = _confirmed_dataset(
+        tmp_path, "Result\n1\n-1\n", [MappingEntry(0, semantic_role="trade_return", unit="R")]
+    )
+
+    result = summarize_results(build_analysis_frame(storage, dataset.id, mapping.id, required_roles=("trade_return",)))
+
+    assert json.dumps(result, allow_nan=False)
+
+
+def _monthly_rows(count: int) -> str:
+    return "\n".join(f"1,{2020 + index // 12:04d}-{index % 12 + 1:02d}-01" for index in range(count))
+
+
+@pytest.mark.parametrize("count", [49, 50])
+def test_temporal_monthly_buckets_at_or_below_limit_remain_complete_and_chronological(tmp_path, count):
+    storage, dataset, mapping = _confirmed_dataset(
+        tmp_path,
+        f"Result,Trade Date\n{_monthly_rows(count)}\n",
+        [MappingEntry(0, semantic_role="trade_return", unit="R"), MappingEntry(1, semantic_role="trade_timestamp")],
+    )
+    frame = build_analysis_frame(storage, dataset.id, mapping.id, required_roles=("trade_return", "trade_timestamp"), order_by="timestamp")
+
+    result = analyze_over_time(frame, mode="month")
+
+    assert len(result["buckets"]) == count
+    assert [bucket["period"] for bucket in result["buckets"]] == sorted(bucket["period"] for bucket in result["buckets"])
+
+
+@pytest.mark.parametrize("count", [51, 60])
+def test_temporal_monthly_limit_fails_closed_but_filtered_range_and_halves_remain_bounded(tmp_path, count):
+    storage, dataset, mapping = _confirmed_dataset(
+        tmp_path,
+        f"Result,Trade Date\n{_monthly_rows(count)}\n",
+        [MappingEntry(0, semantic_role="trade_return", unit="R"), MappingEntry(1, semantic_role="trade_timestamp")],
+    )
+    timestamp_id = next(entry.field_id for entry in storage.mapping_entries(mapping.id) if entry.semantic_role == "trade_timestamp")
+    frame = build_analysis_frame(storage, dataset.id, mapping.id, required_roles=("trade_return", "trade_timestamp"), order_by="timestamp")
+
+    with pytest.raises(AnalysisLimitError) as error:
+        analyze_over_time(frame, mode="month")
+    assert error.value.metadata == {"mode": "month", "total_buckets": count, "max_buckets": 50}
+    assert len(analyze_over_time(frame, mode="halves")["buckets"]) == 2
+
+    if count == 51:
+        return
+
+    narrowed = build_analysis_frame(
+        storage,
+        dataset.id,
+        mapping.id,
+        required_roles=("trade_return", "trade_timestamp"),
+        filters=(AnalysisFilter(timestamp_id or "", "gte", datetime(2020, 11, 1)),),
+        order_by="timestamp",
+    )
+    assert len(analyze_over_time(narrowed, mode="month")["buckets"]) == 50

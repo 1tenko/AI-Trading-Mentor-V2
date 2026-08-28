@@ -5,11 +5,13 @@ import json
 import math
 from dataclasses import dataclass, field
 from datetime import date, datetime, time
+from numbers import Integral, Real
 from typing import TYPE_CHECKING, Literal, Sequence
 
 import pandas as pd
 
 from mentor.datasets import DatasetImportError, _inspection_rows_from_bytes
+from mentor.storage import ANALYSIS_FILTER_LIMIT
 
 if TYPE_CHECKING:
     from mentor.datasets import MappingEntry
@@ -29,6 +31,7 @@ _SUMMARY_METRICS = (
 )
 _GROUP_LIMIT = 50
 _TEMPORAL_BUCKET_LIMIT = 50
+_FILTER_LIMIT = ANALYSIS_FILTER_LIMIT
 _GROUP_METRICS = (
     "wins", "losses", "breakevens", "win_rate", "loss_rate", "wilson_95_lower", "wilson_95_upper",
     "total_return", "mean_return", "median_return", "mean_winning_return", "mean_losing_return",
@@ -43,6 +46,24 @@ class AnalysisFilter:
     field_id: str
     operator: str
     value: object | None = None
+
+
+class AnalysisLimitError(ValueError):
+    """A bounded analysis cannot faithfully represent the requested result."""
+
+    def __init__(self, code: str, metadata: dict[str, object]):
+        self.code = code
+        self.metadata = metadata
+        super().__init__(code)
+
+
+class AnalysisNumericError(ValueError):
+    """A required deterministic metric cannot be represented safely."""
+
+    code = "numeric_overflow"
+
+    def __init__(self):
+        super().__init__(self.code)
 
 
 @dataclass(frozen=True)
@@ -109,6 +130,8 @@ def build_analysis_frame(
         raise ValueError("required_roles must be a non-empty unique sequence")
     if order_by not in _ORDER_MODES:
         raise ValueError("analysis order is unsupported")
+    if len(filters) > _FILTER_LIMIT:
+        raise ValueError(f"filter limit is {_FILTER_LIMIT}")
 
     dataset = storage.dataset(dataset_id)
     mapping = storage.mapping_version(mapping_version_id)
@@ -143,12 +166,22 @@ def build_analysis_frame(
 
     rows = [_typed_row(index, row, entries) for index, row in enumerate(source_rows)]
     _validate_datetime_filter_timezones(rows, validated_filters, by_id)
-    filtered = [row for row in rows if _matches_filters(row, validated_filters, by_id)]
-    valid = [row for row in filtered if all(row["states"][role_entries[role].field_id] == "valid" for role in effective_required)]
+    for row in rows:
+        filter_state, invalid_field_id = _evaluate_filters(row, validated_filters, by_id)
+        row["filter_state"] = filter_state
+        row["filter_invalid_field_id"] = invalid_field_id
+    filtered = [row for row in rows if row["filter_state"] != "no_match"]
+    valid = [
+        row
+        for row in filtered
+        if row["filter_state"] == "match"
+        and all(row["states"][role_entries[role].field_id] == "valid" for role in effective_required)
+    ]
     exclusions = _exclusions(filtered, role_entries, effective_required)
     outcome_rows = [
         row
         for row in filtered
+        if row["filter_state"] == "match"
         if "trade_outcome" in effective_required
         and all(
             row["states"][role_entries[role].field_id] == "valid"
@@ -223,11 +256,11 @@ def summarize_results(
         metrics.update(_r_metrics(returns, frame if has_outcome else None))
 
     limitations = _summary_limitations(frame, metrics)
-    return {
+    return _finalize_evidence({
         **_result_metadata(frame, "summarize_results"),
         "metrics": metrics,
         "limitations": limitations,
-    }
+    })
 
 
 def group_results(frame: AnalysisFrame, group_fields: Sequence[str]) -> dict[str, object]:
@@ -244,7 +277,7 @@ def group_results(frame: AnalysisFrame, group_fields: Sequence[str]) -> dict[str
     limitations = _group_limitations(frame, len(keys), len(returned_keys))
     if ungrouped.filtered_rows:
         limitations.append("ungrouped_group_values_excluded")
-    return {
+    return _finalize_evidence({
         **_result_metadata(frame, "group_results"),
         "grouping": {
             "field_ids": [field.field_id for field in fields],
@@ -261,7 +294,7 @@ def group_results(frame: AnalysisFrame, group_fields: Sequence[str]) -> dict[str
         },
         "groups": groups,
         "limitations": limitations,
-    }
+    })
 
 
 def compare_groups(frame: AnalysisFrame, field_id: str, value_a: object, value_b: object) -> dict[str, object]:
@@ -283,7 +316,7 @@ def compare_groups(frame: AnalysisFrame, field_id: str, value_a: object, value_b
     }
     limitations = sorted({"descriptive_comparison_only", *a_payload["limitations"], *b_payload["limitations"]})  # type: ignore[arg-type]
     metadata = _result_metadata(frame, "compare_groups")
-    return {
+    return _finalize_evidence({
         **metadata,
         "metric_definitions": {
             **metadata["metric_definitions"],  # type: ignore[arg-type]
@@ -296,7 +329,7 @@ def compare_groups(frame: AnalysisFrame, field_id: str, value_a: object, value_b
             "deltas": deltas,
         },
         "limitations": limitations,
-    }
+    })
 
 
 def analyze_over_time(
@@ -341,24 +374,27 @@ def analyze_over_time(
             bucket = filtered_timestamps.iloc[index:index + window_size]
             buckets.append((f"rolling_{index + 1}", _timestamp_range(source_timestamps, bucket), bucket))
 
+    if len(buckets) > _TEMPORAL_BUCKET_LIMIT:
+        raise AnalysisLimitError(
+            "temporal_bucket_limit_exceeded",
+            {"mode": mode, "total_buckets": len(buckets), "max_buckets": _TEMPORAL_BUCKET_LIMIT},
+        )
     metadata = _result_metadata(frame, "analyze_over_time")
-    returned_buckets = buckets[:_TEMPORAL_BUCKET_LIMIT] if mode == "rolling" else buckets
-    omitted_buckets = len(buckets) - len(returned_buckets)
-    return {
+    return _finalize_evidence({
         **metadata,
         "temporal": {
             "mode": mode,
             "timestamp_field_id": frame.order.timestamp_field_id,
             "rolling_window_size": window_size if mode == "rolling" else None,
         },
-        "buckets": [_temporal_bucket(frame, label, source, filtered) for label, source, filtered in returned_buckets],
+        "buckets": [_temporal_bucket(frame, label, source, filtered) for label, source, filtered in buckets],
         "omissions": {
             "total_buckets": len(buckets),
-            "returned_buckets": len(returned_buckets),
-            "omitted_buckets": omitted_buckets,
+            "returned_buckets": len(buckets),
+            "omitted_buckets": 0,
         },
-        "limitations": _temporal_limitations(frame, mode, len(filtered_timestamps), omitted_buckets),
-    }
+        "limitations": _temporal_limitations(frame, mode, len(filtered_timestamps)),
+    })
 
 
 def analyze_mfe_mae(frame: AnalysisFrame) -> dict[str, object]:
@@ -368,12 +404,12 @@ def analyze_mfe_mae(frame: AnalysisFrame) -> dict[str, object]:
     metadata = _result_metadata(frame, "analyze_mfe_mae")
     mfe = _mfe_mae_payload(frame, "mfe")
     mae = _mfe_mae_payload(frame, "mae")
-    return {
+    return _finalize_evidence({
         **metadata,
         "mfe": mfe,
         "mae": mae,
         "limitations": [f"{role}_unavailable" for role, payload in (("mfe", mfe), ("mae", mae)) if not payload["available"]],
-    }
+    })
 
 
 def _result_metadata(frame: AnalysisFrame, operation: str) -> dict[str, object]:
@@ -521,6 +557,11 @@ def _frame_exclusions(data: pd.DataFrame, frame: AnalysisFrame) -> tuple[Exclusi
             count = int((states == reason).sum())
             if count:
                 reasons.append(ExclusionReason(role, reason, count))
+    required_field_ids = {by_role[role].field_id for role in frame.required_roles}
+    if "__filter_invalid_field_id" in data:
+        for field_id, count in data["__filter_invalid_field_id"].value_counts(dropna=True).items():
+            if isinstance(field_id, str) and field_id not in required_field_ids:
+                reasons.append(ExclusionReason(f"filter:{field_id}", "invalid", int(count)))
     return tuple(reasons)
 
 
@@ -585,14 +626,12 @@ def _temporal_bucket(frame: AnalysisFrame, period: str, source_data: pd.DataFram
     }
 
 
-def _temporal_limitations(frame: AnalysisFrame, mode: str, timestamp_rows: int, omitted_buckets: int) -> list[str]:
+def _temporal_limitations(frame: AnalysisFrame, mode: str, timestamp_rows: int) -> list[str]:
     limitations = _summary_limitations(frame, {"valid_rows": timestamp_rows})
     if not timestamp_rows:
         limitations.append("no_valid_timestamp_rows")
     if mode == "rolling" and timestamp_rows == 0:
         limitations.append("no_rolling_windows")
-    if omitted_buckets:
-        limitations.append("temporal_buckets_omitted")
     return sorted(set(limitations))
 
 
@@ -680,6 +719,35 @@ def _exclusion_payload(exclusions: Sequence[ExclusionReason]) -> list[dict[str, 
     return [{"role": item.role, "reason": item.reason, "count": item.count} for item in exclusions]
 
 
+def _finite_sum(values: Sequence[float]) -> float:
+    try:
+        return math.fsum(values)
+    except OverflowError as error:
+        raise AnalysisNumericError() from error
+
+
+def _finalize_evidence(result: dict[str, object]) -> dict[str, object]:
+    """Reject an empirical envelope containing an unrepresentable real metric."""
+    _assert_finite_evidence(result)
+    return result
+
+
+def _assert_finite_evidence(value: object) -> None:
+    if isinstance(value, dict):
+        for item in value.values():
+            _assert_finite_evidence(item)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            _assert_finite_evidence(item)
+    elif isinstance(value, Real) and not isinstance(value, (Integral, bool)):
+        try:
+            finite = math.isfinite(float(value))
+        except OverflowError as error:
+            raise AnalysisNumericError() from error
+        if not finite:
+            raise AnalysisNumericError()
+
+
 def _outcome_metrics(
     outcomes: Sequence[object], ordered_outcomes: Sequence[object] | None = None
 ) -> dict[str, float | int | None]:
@@ -715,15 +783,16 @@ def _wilson_95(successes: int, total: int) -> tuple[float | None, float | None]:
 
 def _return_metrics(values: Sequence[float], frame: AnalysisFrame, has_outcome: bool) -> dict[str, float | int | None]:
     series = pd.Series(values, dtype="float64")
+    total = _finite_sum(values)
     result: dict[str, float | int | None] = {
-        "total_return": float(series.sum()),
-        "mean_return": float(series.mean()),
-        "median_return": float(series.median()),
+        "total_return": total,
+        "mean_return": total / len(values),
+        "median_return": _quantile(series, 0.50),
         "best_return": float(series.max()),
         "worst_return": float(series.min()),
         "minimum": float(series.min()),
         "maximum": float(series.max()),
-        "sample_standard_deviation": float(series.std(ddof=1)) if len(series) >= 2 else None,
+        "sample_standard_deviation": _sample_standard_deviation(values),
         "first_quartile": _quantile(series, 0.25),
         "third_quartile": _quantile(series, 0.75),
         "percentile_05": _quantile(series, 0.05),
@@ -740,8 +809,8 @@ def _return_metrics(values: Sequence[float], frame: AnalysisFrame, has_outcome: 
         paired = frame.data[["trade_return", "trade_outcome"]].dropna()
         winners = paired.loc[paired["trade_outcome"] == "win", "trade_return"]
         losers = paired.loc[paired["trade_outcome"] == "loss", "trade_return"]
-        result["mean_winning_return"] = float(winners.mean()) if not winners.empty else None
-        result["mean_losing_return"] = float(losers.mean()) if not losers.empty else None
+        result["mean_winning_return"] = _finite_sum(winners.tolist()) / len(winners) if not winners.empty else None
+        result["mean_losing_return"] = _finite_sum(losers.tolist()) / len(losers) if not losers.empty else None
     return result
 
 
@@ -759,11 +828,11 @@ def _distribution_metrics(values: pd.Series) -> dict[str, float | None]:
             "percentile_95": None,
         }
     return {
-        "mean": float(values.mean()),
-        "median": float(values.median()),
+        "mean": _finite_sum(values.tolist()) / len(values),
+        "median": _quantile(values, 0.50),
         "minimum": float(values.min()),
         "maximum": float(values.max()),
-        "sample_standard_deviation": float(values.std(ddof=1)) if len(values) >= 2 else None,
+        "sample_standard_deviation": _sample_standard_deviation(values.tolist()),
         "percentile_05": _quantile(values, 0.05),
         "percentile_25": _quantile(values, 0.25),
         "percentile_75": _quantile(values, 0.75),
@@ -772,7 +841,10 @@ def _distribution_metrics(values: pd.Series) -> dict[str, float | None]:
 
 
 def _r_metrics(values: Sequence[float], frame: AnalysisFrame | None) -> dict[str, float | int | None]:
-    equity = pd.concat([pd.Series([0.0]), pd.Series(values, dtype="float64").cumsum()], ignore_index=True)
+    equity_values = [0.0]
+    for value in values:
+        equity_values.append(_finite_sum((equity_values[-1], value)))
+    equity = pd.Series(equity_values, dtype="float64")
     peaks = equity.cummax()
     drawdowns = equity - peaks
     trough_index = int(drawdowns.idxmin())
@@ -788,8 +860,11 @@ def _r_metrics(values: Sequence[float], frame: AnalysisFrame | None) -> dict[str
         paired = frame.data[["trade_return", "trade_outcome"]].dropna()
         winners = paired.loc[paired["trade_outcome"] == "win", "trade_return"]
         losers = paired.loc[paired["trade_outcome"] == "loss", "trade_return"]
-        if not winners.empty and not losers.empty and losers.mean() != 0:
-            realized_reward_risk = float(winners.mean() / abs(losers.mean()))
+        if not winners.empty and not losers.empty:
+            winner_mean = _finite_sum(winners.tolist()) / len(winners)
+            loser_mean = _finite_sum(losers.tolist()) / len(losers)
+            if loser_mean != 0:
+                realized_reward_risk = float(winner_mean / abs(loser_mean))
     return {
         "realized_reward_risk": realized_reward_risk,
         "cumulative_return": float(equity.iloc[-1]),
@@ -806,8 +881,26 @@ def _longest_streak(outcomes: Sequence[object], target: str) -> int:
     return longest
 
 
+def _sample_standard_deviation(values: Sequence[float]) -> float | None:
+    if len(values) < 2:
+        return None
+    mean = _finite_sum(values) / len(values)
+    scale = max(abs(value) for value in values)
+    if scale == 0:
+        return 0.0
+    scaled_squares = [((value - mean) / scale) ** 2 for value in values]
+    return scale * math.sqrt(_finite_sum(scaled_squares) / (len(values) - 1))
+
+
 def _quantile(series: pd.Series, quantile: float) -> float:
-    return float(series.quantile(quantile, interpolation="linear"))
+    values = sorted(float(value) for value in series.tolist())
+    position = (len(values) - 1) * quantile
+    lower = math.floor(position)
+    upper = math.ceil(position)
+    if lower == upper:
+        return values[lower]
+    fraction = position - lower
+    return _finite_sum((values[lower] * (1 - fraction), values[upper] * fraction))
 
 
 def _iqr_outlier_count(series: pd.Series) -> int:
@@ -853,7 +946,7 @@ def _field(entry: "MappingEntry") -> AnalysisField:
 def _frame_data(rows: Sequence[dict[str, object]], fields: Sequence[AnalysisField], *, include_states: bool = False) -> pd.DataFrame:
     columns = ["source_row_ordinal", *(field.column_name for field in fields)]
     if include_states:
-        columns.extend(_state_column(field) for field in fields)
+        columns.extend((*(_state_column(field) for field in fields), "__filter_state", "__filter_invalid_field_id"))
     records = []
     for row in rows:
         values = row["values"]
@@ -862,6 +955,8 @@ def _frame_data(rows: Sequence[dict[str, object]], fields: Sequence[AnalysisFiel
         record = {"source_row_ordinal": row["source_row_ordinal"], **{field.column_name: values[field.field_id] for field in fields}}
         if include_states:
             record.update({_state_column(field): states[field.field_id] for field in fields})
+            record["__filter_state"] = row.get("filter_state", "match")
+            record["__filter_invalid_field_id"] = row.get("filter_invalid_field_id")
         records.append(record)
     data = pd.DataFrame(records, columns=columns)
     if not data.empty:
@@ -987,18 +1082,26 @@ def _timezone_aware(value: object) -> bool:
     return isinstance(value, datetime) and value.tzinfo is not None and value.utcoffset() is not None
 
 
-def _matches_filters(row: dict[str, object], filters: Sequence[AnalysisFilter], fields: dict[str, AnalysisField]) -> bool:
+def _evaluate_filters(
+    row: dict[str, object], filters: Sequence[AnalysisFilter], fields: dict[str, AnalysisField]
+) -> tuple[Literal["match", "no_match", "invalid"], str | None]:
     values = row["values"]
     states = row["states"]
     assert isinstance(values, dict) and isinstance(states, dict)
     for filter_ in filters:
         state = states[filter_.field_id]
         if filter_.operator == "is_blank":
+            if state == "invalid":
+                return "invalid", filter_.field_id
             matched = state == "blank"
         elif filter_.operator == "not_blank":
+            if state == "invalid":
+                return "invalid", filter_.field_id
             matched = state == "valid"
-        elif state != "valid":
+        elif state == "blank":
             matched = False
+        elif state == "invalid":
+            return "invalid", filter_.field_id
         else:
             value = values[filter_.field_id]
             if filter_.operator == "eq": matched = value == filter_.value
@@ -1011,12 +1114,13 @@ def _matches_filters(row: dict[str, object], filters: Sequence[AnalysisFilter], 
             elif filter_.operator == "lte": matched = value <= filter_.value  # type: ignore[operator]
             else: matched = filter_.value[0] <= value <= filter_.value[1]  # type: ignore[index,operator]
         if not matched:
-            return False
-    return True
+            return "no_match", None
+    return "match", None
 
 
 def _exclusions(rows: Sequence[dict[str, object]], roles: dict[str | None, "MappingEntry"], required: Sequence[str]) -> tuple[ExclusionReason, ...]:
     counts: dict[tuple[str, Literal["blank", "invalid"]], int] = {}
+    required_field_ids = {roles[role].field_id for role in required}
     for row in rows:
         states = row["states"]
         assert isinstance(states, dict)
@@ -1025,6 +1129,10 @@ def _exclusions(rows: Sequence[dict[str, object]], roles: dict[str | None, "Mapp
             if state in {"blank", "invalid"}:
                 key = (role, state)
                 counts[key] = counts.get(key, 0) + 1
+        filter_field_id = row.get("filter_invalid_field_id")
+        if isinstance(filter_field_id, str) and filter_field_id not in required_field_ids:
+            key = (f"filter:{filter_field_id}", "invalid")
+            counts[key] = counts.get(key, 0) + 1
     return tuple(ExclusionReason(role, reason, count) for (role, reason), count in sorted(counts.items()))
 
 

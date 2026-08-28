@@ -87,6 +87,8 @@ _ANALYSIS_FIELD_ID_PATTERN = re.compile(r"field_[0-9a-f]{12}")
 _DATASET_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,79}")
 _TOOL_CALL_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}")
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
+ANALYSIS_FILTER_LIMIT = 20
+_ANALYSIS_EXCLUSION_LIMIT = ANALYSIS_FILTER_LIMIT + 5
 
 
 @dataclass(frozen=True)
@@ -601,7 +603,7 @@ class Storage:
                     """
                 )
             connection.executescript(
-                """
+                f"""
                 DROP TRIGGER IF EXISTS dataset_identifiers_are_safe;
                 CREATE TRIGGER dataset_identifiers_are_safe
                 BEFORE INSERT ON datasets
@@ -891,23 +893,23 @@ class Storage:
                       AND dataset_import_specs.id = NEW.import_spec_id
                 ) AND (
                     json_valid(NEW.result_json) = 0
-                  OR (SELECT COUNT(*) FROM json_each(NEW.result_json, '$.filters')) > 20
+                  OR (SELECT COUNT(*) FROM json_each(NEW.result_json, '$.filters')) > {ANALYSIS_FILTER_LIMIT}
                   OR EXISTS (
-                      SELECT 1 FROM json_each(NEW.result_json, '$.filters')
-                      WHERE json_type(value) != 'object'
-                        OR (SELECT COUNT(*) FROM json_each(value)) != 3
-                        OR json_type(value, '$.field_id') != 'text'
+                      SELECT 1 FROM json_each(NEW.result_json, '$.filters') AS filter_
+                      WHERE json_type(filter_.value) != 'object'
+                        OR (SELECT COUNT(*) FROM json_each(filter_.value)) != 3
+                        OR json_type(filter_.value, '$.field_id') != 'text'
                         OR NOT EXISTS (
                             SELECT 1 FROM dataset_mapping_entries
                             WHERE mapping_version_id = NEW.mapping_version_id
-                              AND field_id = json_extract(value, '$.field_id')
+                              AND field_id = json_extract(filter_.value, '$.field_id')
                         )
-                        OR json_extract(value, '$.operator') NOT IN (
+                        OR json_extract(filter_.value, '$.operator') NOT IN (
                             'eq', 'neq', 'in', 'not_in', 'is_blank', 'not_blank', 'gt', 'gte', 'lt', 'lte', 'between'
                         )
-                        OR json_type(value, '$.value_sha256') != 'text'
-                        OR length(json_extract(value, '$.value_sha256')) != 64
-                        OR json_extract(value, '$.value_sha256') GLOB '*[^0-9a-f]*'
+                        OR json_type(filter_.value, '$.value_sha256') != 'text'
+                        OR length(json_extract(filter_.value, '$.value_sha256')) != 64
+                        OR json_extract(filter_.value, '$.value_sha256') GLOB '*[^0-9a-f]*'
                   )
                   OR (SELECT COUNT(*) FROM json_each(NEW.result_json, '$.metric_definitions')) != 5
                   OR json_extract(NEW.result_json, '$.metric_definitions.outcome_rate_denominator') != 'wins + losses + breakevens'
@@ -931,19 +933,25 @@ class Storage:
                             AND type != 'null'
                       )
                   )
-                  OR (SELECT COUNT(*) FROM json_each(NEW.result_json, '$.exclusions')) > 20
+                  OR (SELECT COUNT(*) FROM json_each(NEW.result_json, '$.exclusions')) > {_ANALYSIS_EXCLUSION_LIMIT}
                   OR EXISTS (
-                      SELECT 1 FROM json_each(NEW.result_json, '$.exclusions')
-                      WHERE json_type(value) != 'object'
-                        OR (SELECT COUNT(*) FROM json_each(value)) != 3
-                        OR NOT EXISTS (
-                            SELECT 1 FROM dataset_mapping_entries
-                            WHERE mapping_version_id = NEW.mapping_version_id
-                              AND semantic_role = json_extract(value, '$.role')
+                    SELECT 1 FROM json_each(NEW.result_json, '$.exclusions') AS exclusion_
+                    WHERE json_type(exclusion_.value) != 'object'
+                        OR (SELECT COUNT(*) FROM json_each(exclusion_.value)) != 3
+                        OR (
+                            NOT EXISTS (
+                                SELECT 1 FROM dataset_mapping_entries
+                                WHERE mapping_version_id = NEW.mapping_version_id
+                                  AND semantic_role = json_extract(exclusion_.value, '$.role')
+                            ) AND NOT (
+                                length(json_extract(exclusion_.value, '$.role')) = 25
+                                AND substr(json_extract(exclusion_.value, '$.role'), 1, 13) = 'filter:field_'
+                                AND substr(json_extract(exclusion_.value, '$.role'), 14) NOT GLOB '*[^0-9a-f]*'
+                            )
                         )
-                        OR json_extract(value, '$.reason') NOT IN ('blank', 'invalid')
-                        OR json_type(value, '$.count') != 'integer'
-                        OR json_extract(value, '$.count') < 1
+                        OR json_extract(exclusion_.value, '$.reason') NOT IN ('blank', 'invalid')
+                        OR json_type(exclusion_.value, '$.count') != 'integer'
+                        OR json_extract(exclusion_.value, '$.count') < 1
                   )
                 )
                 BEGIN SELECT RAISE(ABORT, 'analysis result envelope details are invalid'); END;
@@ -961,23 +969,23 @@ class Storage:
                       AND json_extract(NEW.output_json, '$.schema_version') = schema_version
                 ) AND (
                     json_valid(NEW.output_json) = 0
-                  OR (SELECT COUNT(*) FROM json_each(NEW.output_json, '$.filters')) > 20
+                  OR (SELECT COUNT(*) FROM json_each(NEW.output_json, '$.filters')) > {ANALYSIS_FILTER_LIMIT}
                   OR EXISTS (
-                      SELECT 1 FROM json_each(NEW.output_json, '$.filters')
-                      WHERE json_type(value) != 'object'
-                        OR (SELECT COUNT(*) FROM json_each(value)) != 3
-                        OR json_type(value, '$.field_id') != 'text'
+                      SELECT 1 FROM json_each(NEW.output_json, '$.filters') AS filter_
+                      WHERE json_type(filter_.value) != 'object'
+                        OR (SELECT COUNT(*) FROM json_each(filter_.value)) != 3
+                        OR json_type(filter_.value, '$.field_id') != 'text'
                         OR NOT EXISTS (
                             SELECT 1 FROM dataset_mapping_entries
                             WHERE mapping_version_id = (SELECT mapping_version_id FROM analysis_evidence WHERE id = NEW.evidence_id)
-                              AND field_id = json_extract(value, '$.field_id')
+                              AND field_id = json_extract(filter_.value, '$.field_id')
                         )
-                        OR json_extract(value, '$.operator') NOT IN (
+                        OR json_extract(filter_.value, '$.operator') NOT IN (
                             'eq', 'neq', 'in', 'not_in', 'is_blank', 'not_blank', 'gt', 'gte', 'lt', 'lte', 'between'
                         )
-                        OR json_type(value, '$.value_sha256') != 'text'
-                        OR length(json_extract(value, '$.value_sha256')) != 64
-                        OR json_extract(value, '$.value_sha256') GLOB '*[^0-9a-f]*'
+                        OR json_type(filter_.value, '$.value_sha256') != 'text'
+                        OR length(json_extract(filter_.value, '$.value_sha256')) != 64
+                        OR json_extract(filter_.value, '$.value_sha256') GLOB '*[^0-9a-f]*'
                   )
                   OR (SELECT COUNT(*) FROM json_each(NEW.output_json, '$.metric_definitions')) != 5
                   OR json_extract(NEW.output_json, '$.metric_definitions.outcome_rate_denominator') != 'wins + losses + breakevens'
@@ -1003,19 +1011,25 @@ class Storage:
                             AND type != 'null'
                       )
                   )
-                  OR (SELECT COUNT(*) FROM json_each(NEW.output_json, '$.exclusions')) > 20
+                  OR (SELECT COUNT(*) FROM json_each(NEW.output_json, '$.exclusions')) > {_ANALYSIS_EXCLUSION_LIMIT}
                   OR EXISTS (
-                      SELECT 1 FROM json_each(NEW.output_json, '$.exclusions')
-                      WHERE json_type(value) != 'object'
-                        OR (SELECT COUNT(*) FROM json_each(value)) != 3
-                        OR NOT EXISTS (
-                            SELECT 1 FROM dataset_mapping_entries
-                            WHERE mapping_version_id = (SELECT mapping_version_id FROM analysis_evidence WHERE id = NEW.evidence_id)
-                              AND semantic_role = json_extract(value, '$.role')
+                    SELECT 1 FROM json_each(NEW.output_json, '$.exclusions') AS exclusion_
+                    WHERE json_type(exclusion_.value) != 'object'
+                        OR (SELECT COUNT(*) FROM json_each(exclusion_.value)) != 3
+                        OR (
+                            NOT EXISTS (
+                                SELECT 1 FROM dataset_mapping_entries
+                                WHERE mapping_version_id = (SELECT mapping_version_id FROM analysis_evidence WHERE id = NEW.evidence_id)
+                                  AND semantic_role = json_extract(exclusion_.value, '$.role')
+                            ) AND NOT (
+                                length(json_extract(exclusion_.value, '$.role')) = 25
+                                AND substr(json_extract(exclusion_.value, '$.role'), 1, 13) = 'filter:field_'
+                                AND substr(json_extract(exclusion_.value, '$.role'), 14) NOT GLOB '*[^0-9a-f]*'
+                            )
                         )
-                        OR json_extract(value, '$.reason') NOT IN ('blank', 'invalid')
-                        OR json_type(value, '$.count') != 'integer'
-                        OR json_extract(value, '$.count') < 1
+                        OR json_extract(exclusion_.value, '$.reason') NOT IN ('blank', 'invalid')
+                        OR json_type(exclusion_.value, '$.count') != 'integer'
+                        OR json_extract(exclusion_.value, '$.count') < 1
                   )
                 )
                 BEGIN SELECT RAISE(ABORT, 'analysis result envelope details are invalid'); END;
@@ -2372,7 +2386,7 @@ def _analysis_result_envelope_json(
     filters = value["filters"]
     if (
         not isinstance(filters, list)
-        or len(filters) > 20
+        or len(filters) > ANALYSIS_FILTER_LIMIT
         or any(
             not isinstance(filter_, Mapping)
             or set(filter_) != {"field_id", "operator", "value_sha256"}
@@ -2403,11 +2417,11 @@ def _analysis_result_envelope_json(
     exclusions = value["exclusions"]
     if (
         not isinstance(exclusions, list)
-        or len(exclusions) > 20
+        or len(exclusions) > _ANALYSIS_EXCLUSION_LIMIT
         or any(
             not isinstance(exclusion, Mapping)
             or set(exclusion) != {"role", "reason", "count"}
-            or exclusion["role"] not in {"trade_return", "trade_outcome", "trade_timestamp", "mfe", "mae"}
+            or not _analysis_exclusion_role_is_safe(exclusion["role"])
             or exclusion["reason"] not in {"blank", "invalid"}
             or type(exclusion["count"]) is not int
             or exclusion["count"] < 1
@@ -2444,6 +2458,12 @@ def _analysis_result_envelope_json(
     if len(serialized) > 8000:
         raise ValueError("analysis result envelope is invalid")
     return serialized
+
+
+def _analysis_exclusion_role_is_safe(value: object) -> bool:
+    return value in {"trade_return", "trade_outcome", "trade_timestamp", "mfe", "mae"} or (
+        isinstance(value, str) and value.startswith("filter:") and _ANALYSIS_FIELD_ID_PATTERN.fullmatch(value[7:]) is not None
+    )
 
 
 def _analysis_tool_arguments_json(
