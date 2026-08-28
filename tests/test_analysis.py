@@ -11,12 +11,12 @@ from mentor.datasets import MappingEntry, create_inspected_mapping_draft, import
 from mentor.storage import Storage
 
 
-def _confirmed_dataset(tmp_path: Path, contents: str, entries: list[MappingEntry]):
+def _confirmed_dataset(tmp_path: Path, contents: str, entries: list[MappingEntry], *, dataset_id: str = "dataset-analysis"):
     storage = Storage(tmp_path / "mentor.sqlite3")
     storage.initialize()
     source = tmp_path / "trades.csv"
     source.write_text(contents, encoding="utf-8")
-    dataset = import_local_dataset(source, storage, dataset_id_factory=lambda: "dataset-analysis").dataset
+    dataset = import_local_dataset(source, storage, dataset_id_factory=lambda: dataset_id).dataset
     draft = create_inspected_mapping_draft(storage, inspect_local_dataset(storage, dataset.id), entries)
     confirmed = storage.confirm_mapping_version(draft.id)
     return storage, dataset, confirmed
@@ -144,9 +144,6 @@ def test_summarize_results_calculates_r_metrics_in_source_order_and_returns_a_re
 
     result = summarize_results(
         frame,
-        dataset_id=dataset.id,
-        dataset_sha256=dataset.content_sha256,
-        mapping_version_id=mapping.id,
     )
 
     assert result["provenance"] == "USER_EMPIRICAL_EVIDENCE"
@@ -215,9 +212,6 @@ def test_summarize_results_preserves_non_r_returns_and_marks_missing_capabilitie
 
     result = summarize_results(
         frame,
-        dataset_id=dataset.id,
-        dataset_sha256=dataset.content_sha256,
-        mapping_version_id=mapping.id,
     )
 
     assert result["metric_definitions"]["return_unit"] == "percentage"
@@ -248,15 +242,86 @@ def test_summarize_results_uses_the_frame_validated_filter_fingerprint_without_d
 
     result = summarize_results(
         frame,
-        dataset_id=dataset.id,
-        dataset_sha256=dataset.content_sha256,
-        mapping_version_id=mapping.id,
     )
 
     assert result["counts"]["filtered_rows"] == 1
     assert result["filters"] == [
         {"field_id": field_id, "operator": "gt", "value_sha256": "6b86b273ff34fce19d6b804eff5a3f5747ada4eaa22f1d49c01e52ddb7875b4b"}
     ]
+
+
+def test_summarize_results_binds_its_provenance_to_the_validated_frame(tmp_path):
+    storage, dataset, mapping = _confirmed_dataset(
+        tmp_path,
+        "Result\n1\n",
+        [MappingEntry(0, semantic_role="trade_return", unit="R")],
+    )
+    frame = build_analysis_frame(storage, dataset.id, mapping.id, required_roles=("trade_return",))
+
+    result = summarize_results(frame)
+
+    assert result["dataset_id"] == dataset.id
+    assert result["dataset_sha256"] == dataset.content_sha256
+    assert result["mapping_version_id"] == mapping.id
+    assert result["metric_definitions"]["return_unit"] == "R"
+
+
+def test_cross_dataset_evidence_rejects_a_summary_bound_to_another_frame(tmp_path):
+    alpha_storage, alpha_dataset, alpha_mapping = _confirmed_dataset(
+        tmp_path / "alpha", "Result\n1\n", [MappingEntry(0, semantic_role="trade_return", unit="R")]
+    )
+    beta_storage, beta_dataset, beta_mapping = _confirmed_dataset(
+        tmp_path / "beta",
+        "Result\n2\n",
+        [MappingEntry(0, semantic_role="trade_return", unit="R")],
+        dataset_id="dataset-beta",
+    )
+    beta_frame = build_analysis_frame(beta_storage, beta_dataset.id, beta_mapping.id, required_roles=("trade_return",))
+
+    with pytest.raises(ValueError, match="provenance"):
+        alpha_storage.record_analysis_evidence(
+            thread_id=alpha_storage.create_thread("Cross dataset"),
+            origin_turn_number=1,
+            dataset_id=alpha_dataset.id,
+            mapping_version_id=alpha_mapping.id,
+            operation="summarize_results",
+            schema_version="1.0",
+            arguments={"dataset_id": alpha_dataset.id},
+            result=summarize_results(beta_frame),
+        )
+
+
+def test_summarize_results_treats_missing_outcomes_as_ordered_streak_breakers(tmp_path):
+    storage, dataset, mapping = _confirmed_dataset(
+        tmp_path,
+        "Result,Outcome\n1,win\n1,\n1,win\n",
+        [MappingEntry(0, semantic_role="trade_return", unit="R"), MappingEntry(1, semantic_role="trade_outcome")],
+    )
+    frame = build_analysis_frame(
+        storage, dataset.id, mapping.id, required_roles=("trade_return", "trade_outcome")
+    )
+
+    result = summarize_results(frame)
+
+    assert result["metrics"]["wins"] == 2
+    assert result["metrics"]["max_consecutive_wins"] == 1
+    assert result["exclusions"] == [{"role": "trade_outcome", "reason": "blank", "count": 1}]
+
+
+def test_summarize_results_marks_realized_reward_risk_unavailable_when_mean_loss_is_zero(tmp_path):
+    storage, dataset, mapping = _confirmed_dataset(
+        tmp_path,
+        "Result,Outcome\n1,win\n0,loss\n",
+        [MappingEntry(0, semantic_role="trade_return", unit="R"), MappingEntry(1, semantic_role="trade_outcome")],
+    )
+    frame = build_analysis_frame(
+        storage, dataset.id, mapping.id, required_roles=("trade_return", "trade_outcome")
+    )
+
+    result = summarize_results(frame)
+
+    assert result["metrics"]["realized_reward_risk"] is None
+    assert "unavailable_metric" in result["limitations"]
 
 
 def test_analysis_frame_parses_the_verified_bytes_if_the_local_original_is_swapped(tmp_path, monkeypatch):

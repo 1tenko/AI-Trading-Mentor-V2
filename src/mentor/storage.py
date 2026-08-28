@@ -907,6 +907,19 @@ class Storage:
                       json_type(NEW.result_json, '$.metric_definitions.return_unit') != 'null'
                       AND json_extract(NEW.result_json, '$.metric_definitions.return_unit') NOT IN ('R', 'currency', 'points', 'percentage')
                   )
+                  OR json_extract(NEW.result_json, '$.metric_definitions.return_unit') IS NOT (
+                      SELECT unit FROM dataset_mapping_entries
+                      WHERE mapping_version_id = NEW.mapping_version_id AND semantic_role = 'trade_return'
+                  )
+                  OR (
+                      (SELECT unit FROM dataset_mapping_entries
+                       WHERE mapping_version_id = NEW.mapping_version_id AND semantic_role = 'trade_return') IS NOT 'R'
+                      AND EXISTS (
+                          SELECT 1 FROM json_each(NEW.result_json, '$.metrics')
+                          WHERE key IN ('realized_reward_risk', 'cumulative_return', 'max_drawdown', 'recovery_observations')
+                            AND type != 'null'
+                      )
+                  )
                   OR (SELECT COUNT(*) FROM json_each(NEW.result_json, '$.exclusions')) > 20
                   OR EXISTS (
                       SELECT 1 FROM json_each(NEW.result_json, '$.exclusions')
@@ -951,6 +964,21 @@ class Storage:
                   OR (
                       json_type(NEW.output_json, '$.metric_definitions.return_unit') != 'null'
                       AND json_extract(NEW.output_json, '$.metric_definitions.return_unit') NOT IN ('R', 'currency', 'points', 'percentage')
+                  )
+                  OR json_extract(NEW.output_json, '$.metric_definitions.return_unit') IS NOT (
+                      SELECT unit FROM dataset_mapping_entries
+                      WHERE mapping_version_id = (SELECT mapping_version_id FROM analysis_evidence WHERE id = NEW.evidence_id)
+                        AND semantic_role = 'trade_return'
+                  )
+                  OR (
+                      (SELECT unit FROM dataset_mapping_entries
+                       WHERE mapping_version_id = (SELECT mapping_version_id FROM analysis_evidence WHERE id = NEW.evidence_id)
+                         AND semantic_role = 'trade_return') IS NOT 'R'
+                      AND EXISTS (
+                          SELECT 1 FROM json_each(NEW.output_json, '$.metrics')
+                          WHERE key IN ('realized_reward_risk', 'cumulative_return', 'max_drawdown', 'recovery_observations')
+                            AND type != 'null'
+                      )
                   )
                   OR (SELECT COUNT(*) FROM json_each(NEW.output_json, '$.exclusions')) > 20
                   OR EXISTS (
@@ -1842,10 +1870,13 @@ class Storage:
         with self._connect() as connection:
             dataset = connection.execute(
                 """
-                SELECT datasets.content_sha256, dataset_import_specs.id
+                SELECT datasets.content_sha256, dataset_import_specs.id, dataset_mapping_entries.unit
                 FROM datasets
                 JOIN dataset_import_specs ON dataset_import_specs.dataset_id = datasets.id
                 JOIN dataset_mapping_versions ON dataset_mapping_versions.id = ?
+                LEFT JOIN dataset_mapping_entries
+                  ON dataset_mapping_entries.mapping_version_id = dataset_mapping_versions.id
+                 AND dataset_mapping_entries.semantic_role = 'trade_return'
                 WHERE datasets.id = ? AND dataset_mapping_versions.dataset_id = datasets.id
                       AND dataset_mapping_versions.status = 'confirmed'
                 """,
@@ -1860,6 +1891,7 @@ class Storage:
                 mapping_version_id=mapping_version_id,
                 operation=operation,
                 schema_version=schema_version,
+                confirmed_return_unit=None if dataset[2] is None else str(dataset[2]),
             )
             arguments_json = _analysis_evidence_arguments_json(arguments, dataset_id=dataset_id)
             cursor = connection.execute(
@@ -1921,8 +1953,13 @@ class Storage:
         with self._connect() as connection:
             evidence = connection.execute(
                 """
-                SELECT dataset_id, dataset_sha256, mapping_version_id, operation, schema_version
-                FROM analysis_evidence WHERE id = ? AND thread_id = ?
+                SELECT analysis_evidence.dataset_id, analysis_evidence.dataset_sha256, analysis_evidence.mapping_version_id,
+                       analysis_evidence.operation, analysis_evidence.schema_version, dataset_mapping_entries.unit
+                FROM analysis_evidence
+                LEFT JOIN dataset_mapping_entries
+                  ON dataset_mapping_entries.mapping_version_id = analysis_evidence.mapping_version_id
+                 AND dataset_mapping_entries.semantic_role = 'trade_return'
+                WHERE analysis_evidence.id = ? AND analysis_evidence.thread_id = ?
                 """,
                 (evidence_id, thread_id),
             ).fetchone()
@@ -1935,6 +1972,7 @@ class Storage:
                 mapping_version_id=int(evidence[2]),
                 operation=str(evidence[3]),
                 schema_version=str(evidence[4]),
+                confirmed_return_unit=None if evidence[5] is None else str(evidence[5]),
             )
             arguments_json = _analysis_tool_arguments_json(
                 arguments,
@@ -2264,6 +2302,7 @@ def _analysis_result_envelope_json(
     mapping_version_id: int,
     operation: str,
     schema_version: str,
+    confirmed_return_unit: str | None,
 ) -> str:
     if (
         not isinstance(operation, str)
@@ -2332,7 +2371,7 @@ def _analysis_result_envelope_json(
             "return_unit": definitions.get("return_unit"),
             "row_order": definitions.get("row_order"),
         }
-        or definitions["return_unit"] not in {None, "R", "currency", "points", "percentage"}
+        or definitions["return_unit"] != confirmed_return_unit
         or definitions["row_order"] not in {"source", "timestamp"}
     ):
         raise ValueError("analysis result envelope is invalid")
@@ -2362,6 +2401,11 @@ def _analysis_result_envelope_json(
             or (isinstance(metric, float) and not math.isfinite(metric))
             for name, metric in metrics.items()
         )
+    ):
+        raise ValueError("analysis result envelope is invalid")
+    if confirmed_return_unit != "R" and any(
+        metrics.get(name) is not None
+        for name in {"realized_reward_risk", "cumulative_return", "max_drawdown", "recovery_observations"}
     ):
         raise ValueError("analysis result envelope is invalid")
     limitations = value["limitations"]

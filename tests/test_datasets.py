@@ -1322,6 +1322,64 @@ def test_result_envelopes_reject_raw_values_hidden_in_limitations_or_metrics(tmp
             )
 
 
+def test_analysis_envelopes_bind_the_confirmed_mapping_return_unit_in_python_and_sqlite(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    dataset = _dataset(storage)
+    confirmed = storage.confirm_mapping_version(
+        storage.create_mapping_draft(
+            dataset.id, [{"column_ordinal": 0, "semantic_role": "trade_return", "unit": "percentage", "source": "manual"}]
+        ).id
+    )
+    thread_id = storage.create_thread("Unit guard")
+    envelope = _result_envelope(dataset, confirmed.id)
+    percentage_envelope = {
+        **envelope,
+        "metric_definitions": {**envelope["metric_definitions"], "return_unit": "percentage"},
+    }
+
+    with pytest.raises(ValueError, match="analysis result envelope"):
+        storage.record_analysis_evidence(
+            thread_id=thread_id,
+            origin_turn_number=1,
+            dataset_id=dataset.id,
+            mapping_version_id=confirmed.id,
+            operation="summarize_results",
+            schema_version="1",
+            arguments={"dataset_id": dataset.id},
+            result=envelope,
+        )
+    evidence = storage.record_analysis_evidence(
+        thread_id=thread_id,
+        origin_turn_number=1,
+        dataset_id=dataset.id,
+        mapping_version_id=confirmed.id,
+        operation="summarize_results",
+        schema_version="1",
+        arguments={"dataset_id": dataset.id},
+        result=percentage_envelope,
+    )
+    forged_r_output = {
+        **percentage_envelope,
+        "metric_definitions": {**percentage_envelope["metric_definitions"], "return_unit": "R"},
+        "metrics": {"cumulative_return": 1.0},
+    }
+    with sqlite3.connect(storage.database_path) as connection:
+        with pytest.raises(sqlite3.IntegrityError, match="details|envelope"):
+            connection.execute(
+                """
+                INSERT INTO analysis_tool_outputs(thread_id, tool_call_id, evidence_id, arguments_json, output_json)
+                VALUES (?, 'forged-r-unit', ?, ?, ?)
+                """,
+                (
+                    thread_id,
+                    evidence.id,
+                    json.dumps({"dataset_id": dataset.id, "mapping_version_id": confirmed.id, "operation": "summarize_results"}),
+                    json.dumps(forged_r_output),
+                ),
+            )
+
+
 def test_evidence_arguments_are_bounded_metadata_and_not_raw_payloads(tmp_path):
     storage = Storage(tmp_path / "mentor.sqlite3")
     storage.initialize()

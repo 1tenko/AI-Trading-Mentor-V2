@@ -62,8 +62,12 @@ class AnalysisFrame:
     """Mapped local values only; repr deliberately never includes cell values."""
 
     data: pd.DataFrame = field(repr=False, compare=False)
+    dataset_id: str
+    dataset_sha256: str
+    mapping_version_id: int
     fields: tuple[AnalysisField, ...]
     filters: tuple[AnalysisFilter, ...] = field(repr=False)
+    outcome_sequence: tuple[str | None, ...] = field(repr=False)
     required_roles: tuple[str, ...]
     source_rows: int
     filtered_rows: int
@@ -129,10 +133,21 @@ def build_analysis_frame(
     filtered = [row for row in rows if _matches_filters(row, validated_filters, by_id)]
     valid = [row for row in filtered if all(row["states"][role_entries[role].field_id] == "valid" for role in effective_required)]
     exclusions = _exclusions(filtered, role_entries, effective_required)
+    outcome_rows = [
+        row
+        for row in filtered
+        if "trade_outcome" in effective_required
+        and all(
+            row["states"][role_entries[role].field_id] == "valid"
+            for role in effective_required
+            if role != "trade_outcome"
+        )
+    ]
     if order_by == "timestamp":
         timestamp_id = role_entries["trade_timestamp"].field_id
         _validate_timestamp_order(valid, timestamp_id)
         valid.sort(key=lambda row: (row["values"][timestamp_id], row["source_row_ordinal"]))
+        outcome_rows.sort(key=lambda row: (row["values"][timestamp_id], row["source_row_ordinal"]))
         order = AnalysisOrder("timestamp", timestamp_id)
     else:
         order = AnalysisOrder("source")
@@ -146,8 +161,17 @@ def build_analysis_frame(
     no_data_reason = "no_source_rows" if not rows else "no_matching_rows" if not filtered else "no_valid_rows" if not valid else None
     return AnalysisFrame(
         data=data,
+        dataset_id=dataset.id,
+        dataset_sha256=dataset.content_sha256,
+        mapping_version_id=mapping.id,
         fields=fields,
         filters=validated_filters,
+        outcome_sequence=tuple(
+            row["values"][role_entries["trade_outcome"].field_id]
+            if row["states"][role_entries["trade_outcome"].field_id] == "valid"
+            else None
+            for row in outcome_rows
+        ),
         required_roles=effective_required,
         source_rows=len(rows),
         filtered_rows=len(filtered),
@@ -162,29 +186,19 @@ def build_analysis_frame(
 
 def summarize_results(
     frame: AnalysisFrame,
-    *,
-    dataset_id: str,
-    dataset_sha256: str,
-    mapping_version_id: int,
 ) -> dict[str, object]:
     """Calculate the bounded core summary from an already validated frame."""
     if not isinstance(frame, AnalysisFrame):
         raise ValueError("summary requires a validated analysis frame")
-    if not isinstance(dataset_id, str) or not dataset_id or not isinstance(dataset_sha256, str) or len(dataset_sha256) != 64:
-        raise ValueError("summary provenance is invalid")
-    if type(mapping_version_id) is not int or mapping_version_id < 1:
-        raise ValueError("summary provenance is invalid")
-
     has_return = any(field.semantic_role == "trade_return" for field in frame.fields)
-    has_outcome = any(field.semantic_role == "trade_outcome" for field in frame.fields)
+    has_outcome = "trade_outcome" in frame.required_roles
     returns = frame.data["trade_return"].dropna().astype(float).tolist() if has_return else []
-    outcomes = frame.data["trade_outcome"].dropna().tolist() if has_outcome else []
     metrics = {name: None for name in _SUMMARY_METRICS}
     metrics["valid_rows"] = frame.valid_rows
     metrics["excluded_rows"] = frame.excluded_rows
 
     if has_outcome:
-        metrics.update(_outcome_metrics(outcomes))
+        metrics.update(_outcome_metrics(frame.outcome_sequence))
     if has_return and returns:
         metrics.update(_return_metrics(returns, frame, has_outcome))
     if frame.return_unit == "R" and has_return and returns:
@@ -193,9 +207,9 @@ def summarize_results(
     limitations = _summary_limitations(frame, metrics)
     return {
         "provenance": "USER_EMPIRICAL_EVIDENCE",
-        "dataset_id": dataset_id,
-        "dataset_sha256": dataset_sha256,
-        "mapping_version_id": mapping_version_id,
+        "dataset_id": frame.dataset_id,
+        "dataset_sha256": frame.dataset_sha256,
+        "mapping_version_id": frame.mapping_version_id,
         "operation": "summarize_results",
         "schema_version": "1.0",
         "filters": [_filter_descriptor(item) for item in frame.filters],
@@ -284,7 +298,7 @@ def _r_metrics(values: Sequence[float], frame: AnalysisFrame | None) -> dict[str
         paired = frame.data[["trade_return", "trade_outcome"]].dropna()
         winners = paired.loc[paired["trade_outcome"] == "win", "trade_return"]
         losers = paired.loc[paired["trade_outcome"] == "loss", "trade_return"]
-        if not winners.empty and not losers.empty:
+        if not winners.empty and not losers.empty and losers.mean() != 0:
             realized_reward_risk = float(winners.mean() / abs(losers.mean()))
     return {
         "realized_reward_risk": realized_reward_risk,
