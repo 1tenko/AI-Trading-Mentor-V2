@@ -804,6 +804,7 @@ def _result_envelope(dataset, mapping_version_id: int, operation: str = "summari
         "filters": [],
         "metric_definitions": {
             "outcome_rate_denominator": "wins + losses + breakevens",
+            "win_rate_interval": "Wilson 95% interval",
             "quantile_method": "linear",
             "return_unit": "R",
             "row_order": "source",

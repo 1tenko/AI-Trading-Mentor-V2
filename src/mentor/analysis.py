@@ -20,7 +20,7 @@ _OUTCOMES = {"win": "win", "w": "win", "loss": "loss", "l": "loss", "breakeven":
 _FILTER_OPERATORS = frozenset({"eq", "neq", "in", "not_in", "is_blank", "not_blank", "gt", "gte", "lt", "lte", "between"})
 _ORDER_MODES = frozenset({"source", "timestamp"})
 _SUMMARY_METRICS = (
-    "wins", "losses", "breakevens", "win_rate", "loss_rate", "max_consecutive_wins", "max_consecutive_losses",
+    "wins", "losses", "breakevens", "win_rate", "loss_rate", "wilson_95_lower", "wilson_95_upper", "max_consecutive_wins", "max_consecutive_losses",
     "total_return", "mean_return", "median_return", "mean_winning_return", "mean_losing_return", "best_return",
     "worst_return", "realized_reward_risk", "cumulative_return", "max_drawdown", "recovery_observations",
     "minimum", "maximum", "sample_standard_deviation", "first_quartile", "third_quartile", "interquartile_range",
@@ -29,10 +29,11 @@ _SUMMARY_METRICS = (
 )
 _GROUP_LIMIT = 50
 _GROUP_METRICS = (
-    "wins", "losses", "breakevens", "win_rate", "loss_rate",
+    "wins", "losses", "breakevens", "win_rate", "loss_rate", "wilson_95_lower", "wilson_95_upper",
     "total_return", "mean_return", "median_return", "mean_winning_return", "mean_losing_return",
     "best_return", "worst_return", "sample_standard_deviation", "first_quartile", "third_quartile",
-    "interquartile_range", "iqr_outlier_count",
+    "interquartile_range", "iqr_outlier_count", "percentile_05", "percentile_10", "percentile_25",
+    "percentile_50", "percentile_75", "percentile_90", "percentile_95",
 )
 
 
@@ -49,6 +50,7 @@ class AnalysisField:
     column_name: str
     value_type: str
     semantic_role: str | None
+    unit: str | None
     aggregate_labels_allowed: bool
 
 
@@ -294,6 +296,64 @@ def compare_groups(frame: AnalysisFrame, field_id: str, value_a: object, value_b
     }
 
 
+def analyze_over_time(
+    frame: AnalysisFrame, *, mode: Literal["month", "halves", "rolling"], window_size: int | None = None
+) -> dict[str, object]:
+    """Return aggregate chronological slices from a timestamp-validated frame."""
+    if not isinstance(frame, AnalysisFrame) or "trade_timestamp" not in frame.required_roles or frame.order.mode != "timestamp":
+        raise ValueError("temporal analysis requires a timestamp-ordered validated frame")
+    if mode not in {"month", "halves", "rolling"}:
+        raise ValueError("temporal analysis mode is unsupported")
+    if mode == "rolling" and (not isinstance(window_size, int) or isinstance(window_size, bool) or window_size < 1):
+        raise ValueError("rolling window size must be a positive integer")
+    if mode != "rolling" and window_size is not None:
+        raise ValueError("only rolling analysis accepts a window size")
+
+    data = frame.data
+    buckets: list[tuple[str, pd.DataFrame]] = []
+    if mode == "month":
+        for period in sorted({(value.year, value.month) for value in data["trade_timestamp"]}):
+            buckets.append((f"{period[0]:04d}-{period[1]:02d}", data.loc[data["trade_timestamp"].map(lambda value: (value.year, value.month) == period)]))
+    elif mode == "halves":
+        split = (len(data) + 1) // 2
+        if split:
+            buckets.append(("earlier_half", data.iloc[:split]))
+        if split < len(data):
+            buckets.append(("later_half", data.iloc[split:]))
+    elif len(data):
+        assert window_size is not None
+        if window_size > len(data):
+            raise ValueError("rolling window size exceeds valid timestamp rows")
+        buckets = [(f"rolling_{index + 1}", data.iloc[index:index + window_size]) for index in range(len(data) - window_size + 1)]
+
+    metadata = _result_metadata(frame, "analyze_over_time")
+    return {
+        **metadata,
+        "temporal": {
+            "mode": mode,
+            "timestamp_field_id": frame.order.timestamp_field_id,
+            "rolling_window_size": window_size if mode == "rolling" else None,
+        },
+        "buckets": [_temporal_bucket(frame, label, bucket) for label, bucket in buckets],
+        "limitations": _temporal_limitations(frame, mode, len(data)),
+    }
+
+
+def analyze_mfe_mae(frame: AnalysisFrame) -> dict[str, object]:
+    """Return only unit-confirmed MFE/MAE aggregates from a validated frame."""
+    if not isinstance(frame, AnalysisFrame):
+        raise ValueError("MFE/MAE analysis requires a validated analysis frame")
+    metadata = _result_metadata(frame, "analyze_mfe_mae")
+    mfe = _mfe_mae_payload(frame, "mfe")
+    mae = _mfe_mae_payload(frame, "mae")
+    return {
+        **metadata,
+        "mfe": mfe,
+        "mae": mae,
+        "limitations": [f"{role}_unavailable" for role, payload in (("mfe", mfe), ("mae", mae)) if not payload["available"]],
+    }
+
+
 def _result_metadata(frame: AnalysisFrame, operation: str) -> dict[str, object]:
     return {
         "provenance": "USER_EMPIRICAL_EVIDENCE",
@@ -305,6 +365,7 @@ def _result_metadata(frame: AnalysisFrame, operation: str) -> dict[str, object]:
         "filters": [_filter_descriptor(item) for item in frame.filters],
         "metric_definitions": {
             "outcome_rate_denominator": "wins + losses + breakevens",
+            "win_rate_interval": "Wilson 95% interval",
             "quantile_method": "linear",
             "return_unit": frame.return_unit,
             "row_order": frame.order.mode,
@@ -465,6 +526,66 @@ def _group_limitations(frame: AnalysisFrame, total_groups: int, returned_groups:
     return limitations
 
 
+def _temporal_bucket(frame: AnalysisFrame, period: str, data: pd.DataFrame) -> dict[str, object]:
+    ordinals = set(data["source_row_ordinal"].tolist())
+    source_data = frame.source_data.loc[frame.source_data["source_row_ordinal"].isin(ordinals)]
+    filtered_data = frame.filtered_data.loc[frame.filtered_data["source_row_ordinal"].isin(ordinals)]
+    bucket = _subset_frame(frame, source_data, filtered_data, data)
+    payload = _group_payload(bucket, ())
+    timestamps = data["trade_timestamp"]
+    return {
+        "period": period,
+        "start_date": _date_text(timestamps.min()),
+        "end_date": _date_text(timestamps.max()),
+        "counts": payload["counts"],
+        "exclusions": payload["exclusions"],
+        "metrics": payload["metrics"],
+        "limitations": payload["limitations"],
+    }
+
+
+def _temporal_limitations(frame: AnalysisFrame, mode: str, valid_rows: int) -> list[str]:
+    limitations = _summary_limitations(frame, {"valid_rows": valid_rows})
+    if not valid_rows:
+        limitations.append("no_valid_timestamp_rows")
+    if mode == "rolling" and valid_rows == 0:
+        limitations.append("no_rolling_windows")
+    return sorted(set(limitations))
+
+
+def _date_text(value: object) -> str:
+    assert isinstance(value, (datetime, pd.Timestamp))
+    return value.date().isoformat()
+
+
+def _mfe_mae_payload(frame: AnalysisFrame, role: Literal["mfe", "mae"]) -> dict[str, object]:
+    field = next((item for item in frame.fields if item.semantic_role == role), None)
+    if field is None or field.unit is None:
+        return {"available": False, "reason": "missing_confirmed_mapping"}
+    state_column = _state_column(field)
+    data = frame.filtered_data
+    valid = data.loc[data[state_column] == "valid", field.column_name].astype(float)
+    exclusions = [
+        {"reason": reason, "count": int((data[state_column] == reason).sum())}
+        for reason in ("blank", "invalid")
+        if int((data[state_column] == reason).sum())
+    ]
+    metrics = _distribution_metrics(valid)
+    return {
+        "available": True,
+        "field_id": field.field_id,
+        "unit": field.unit,
+        "counts": {
+            "source_rows": frame.source_rows,
+            "filtered_rows": frame.filtered_rows,
+            "valid_rows": len(valid),
+            "excluded_rows": frame.filtered_rows - len(valid),
+        },
+        "exclusions": exclusions,
+        "metrics": metrics,
+    }
+
+
 def _frame_counts(frame: AnalysisFrame) -> dict[str, int]:
     return {
         "source_rows": frame.source_rows,
@@ -524,15 +645,29 @@ def _outcome_metrics(
     losses = sum(outcome == "loss" for outcome in outcomes)
     breakevens = sum(outcome == "breakeven" for outcome in outcomes)
     denominator = wins + losses + breakevens
+    wilson_lower, wilson_upper = _wilson_95(wins, denominator)
     return {
         "wins": wins,
         "losses": losses,
         "breakevens": breakevens,
         "win_rate": wins / denominator if denominator else None,
         "loss_rate": losses / denominator if denominator else None,
+        "wilson_95_lower": wilson_lower,
+        "wilson_95_upper": wilson_upper,
         "max_consecutive_wins": _longest_streak(streak_outcomes, "win"),
         "max_consecutive_losses": _longest_streak(streak_outcomes, "loss"),
     }
+
+
+def _wilson_95(successes: int, total: int) -> tuple[float | None, float | None]:
+    if not total:
+        return None, None
+    z = 1.959963984540054
+    proportion = successes / total
+    denominator = 1 + z * z / total
+    centre = (proportion + z * z / (2 * total)) / denominator
+    margin = z * math.sqrt(proportion * (1 - proportion) / total + z * z / (4 * total * total)) / denominator
+    return centre - margin, centre + margin
 
 
 def _return_metrics(values: Sequence[float], frame: AnalysisFrame, has_outcome: bool) -> dict[str, float | int | None]:
@@ -565,6 +700,32 @@ def _return_metrics(values: Sequence[float], frame: AnalysisFrame, has_outcome: 
         result["mean_winning_return"] = float(winners.mean()) if not winners.empty else None
         result["mean_losing_return"] = float(losers.mean()) if not losers.empty else None
     return result
+
+
+def _distribution_metrics(values: pd.Series) -> dict[str, float | None]:
+    if values.empty:
+        return {
+            "mean": None,
+            "median": None,
+            "minimum": None,
+            "maximum": None,
+            "sample_standard_deviation": None,
+            "percentile_05": None,
+            "percentile_25": None,
+            "percentile_75": None,
+            "percentile_95": None,
+        }
+    return {
+        "mean": float(values.mean()),
+        "median": float(values.median()),
+        "minimum": float(values.min()),
+        "maximum": float(values.max()),
+        "sample_standard_deviation": float(values.std(ddof=1)) if len(values) >= 2 else None,
+        "percentile_05": _quantile(values, 0.05),
+        "percentile_25": _quantile(values, 0.25),
+        "percentile_75": _quantile(values, 0.75),
+        "percentile_95": _quantile(values, 0.95),
+    }
 
 
 def _r_metrics(values: Sequence[float], frame: AnalysisFrame | None) -> dict[str, float | int | None]:
@@ -641,6 +802,7 @@ def _field(entry: "MappingEntry") -> AnalysisField:
         entry.semantic_role or entry.field_id or "",
         entry.value_type or "unknown",
         entry.semantic_role,
+        entry.unit,
         entry.aggregate_labels_allowed,
     )
 

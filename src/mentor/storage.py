@@ -909,8 +909,9 @@ class Storage:
                         OR length(json_extract(value, '$.value_sha256')) != 64
                         OR json_extract(value, '$.value_sha256') GLOB '*[^0-9a-f]*'
                   )
-                  OR (SELECT COUNT(*) FROM json_each(NEW.result_json, '$.metric_definitions')) != 4
+                  OR (SELECT COUNT(*) FROM json_each(NEW.result_json, '$.metric_definitions')) != 5
                   OR json_extract(NEW.result_json, '$.metric_definitions.outcome_rate_denominator') != 'wins + losses + breakevens'
+                  OR json_extract(NEW.result_json, '$.metric_definitions.win_rate_interval') != 'Wilson 95% interval'
                   OR json_extract(NEW.result_json, '$.metric_definitions.quantile_method') != 'linear'
                   OR json_extract(NEW.result_json, '$.metric_definitions.row_order') NOT IN ('source', 'timestamp')
                   OR (
@@ -978,8 +979,9 @@ class Storage:
                         OR length(json_extract(value, '$.value_sha256')) != 64
                         OR json_extract(value, '$.value_sha256') GLOB '*[^0-9a-f]*'
                   )
-                  OR (SELECT COUNT(*) FROM json_each(NEW.output_json, '$.metric_definitions')) != 4
+                  OR (SELECT COUNT(*) FROM json_each(NEW.output_json, '$.metric_definitions')) != 5
                   OR json_extract(NEW.output_json, '$.metric_definitions.outcome_rate_denominator') != 'wins + losses + breakevens'
+                  OR json_extract(NEW.output_json, '$.metric_definitions.win_rate_interval') != 'Wilson 95% interval'
                   OR json_extract(NEW.output_json, '$.metric_definitions.quantile_method') != 'linear'
                   OR json_extract(NEW.output_json, '$.metric_definitions.row_order') NOT IN ('source', 'timestamp')
                   OR (
@@ -2389,6 +2391,7 @@ def _analysis_result_envelope_json(
         not isinstance(definitions, Mapping)
         or dict(definitions) != {
             "outcome_rate_denominator": "wins + losses + breakevens",
+            "win_rate_interval": "Wilson 95% interval",
             "quantile_method": "linear",
             "return_unit": definitions.get("return_unit"),
             "row_order": definitions.get("row_order"),

@@ -155,13 +155,13 @@ on top of core metrics.
 MFE/MAE distribution analysis, and disciplined uncertainty information.
 
 **Acceptance criteria:**
-- [ ] Temporal operations require a valid mapped time field, compatible timezone
+- [x] Temporal operations require a valid mapped time field, compatible timezone
   state, and preserve bucket N.
-- [ ] MFE/MAE is unavailable without mapped fields and never invents units.
-- [ ] Win-rate intervals and R spread are descriptive; no p-value or causal edge detector appears.
+- [x] MFE/MAE is unavailable without mapped fields and never invents units.
+- [x] Win-rate intervals and R spread are descriptive; no p-value or causal edge detector appears.
 
 **Verification:**
-- [ ] Temporal/MFE/MAE/interval fixtures and full pytest pass.
+- [x] Temporal/MFE/MAE/interval fixtures and full pytest pass.
 
 **Dependencies:** Tasks 5–6
 **Files likely touched:** `src/mentor/analysis.py`, `tests/test_analysis.py`,

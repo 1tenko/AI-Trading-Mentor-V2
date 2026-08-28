@@ -6,7 +6,15 @@ from pathlib import Path
 import pytest
 
 import mentor.analysis as analysis_module
-from mentor.analysis import AnalysisFilter, build_analysis_frame, compare_groups, group_results, summarize_results
+from mentor.analysis import (
+    AnalysisFilter,
+    analyze_mfe_mae,
+    analyze_over_time,
+    build_analysis_frame,
+    compare_groups,
+    group_results,
+    summarize_results,
+)
 from mentor.datasets import MappingEntry, create_inspected_mapping_draft, import_local_dataset, inspect_local_dataset
 from mentor.storage import Storage
 
@@ -157,6 +165,7 @@ def test_summarize_results_calculates_r_metrics_in_source_order_and_returns_a_re
     assert result["exclusions"] == []
     assert result["metric_definitions"] == {
         "outcome_rate_denominator": "wins + losses + breakevens",
+        "win_rate_interval": "Wilson 95% interval",
         "quantile_method": "linear",
         "return_unit": "R",
         "row_order": "source",
@@ -167,6 +176,8 @@ def test_summarize_results_calculates_r_metrics_in_source_order_and_returns_a_re
         "breakevens": 1,
         "win_rate": 0.4,
         "loss_rate": 0.4,
+        "wilson_95_lower": 0.11762077423264783,
+        "wilson_95_upper": 0.769275718723987,
         "max_consecutive_wins": 1,
         "max_consecutive_losses": 2,
         "total_return": 2.0,
@@ -608,3 +619,137 @@ def test_compare_groups_rejects_invalid_types_equal_values_and_unknown_fields(tm
         compare_groups(frame, condition_id or "", True, True)
     with pytest.raises(ValueError, match="group"):
         compare_groups(frame, "field-unknown", True, False)
+
+
+def test_temporal_analysis_returns_months_halves_and_fixed_rolling_windows_with_bucket_n(tmp_path):
+    storage, dataset, mapping = _confirmed_dataset(
+        tmp_path,
+        "Result,Outcome,Trade Date,Desk Secret\n2,win,2026-02-02,do-not-disclose\n1,win,2026-01-03,do-not-disclose\n-1,loss,2026-01-20,do-not-disclose\n3,win,2026-03-01,do-not-disclose\n",
+        [
+            MappingEntry(0, semantic_role="trade_return", unit="R"),
+            MappingEntry(1, semantic_role="trade_outcome"),
+            MappingEntry(2, semantic_role="trade_timestamp"),
+        ],
+    )
+    frame = build_analysis_frame(
+        storage,
+        dataset.id,
+        mapping.id,
+        required_roles=("trade_return", "trade_outcome", "trade_timestamp"),
+        order_by="timestamp",
+    )
+
+    monthly = analyze_over_time(frame, mode="month")
+    halves = analyze_over_time(frame, mode="halves")
+    rolling = analyze_over_time(frame, mode="rolling", window_size=2)
+
+    assert [(bucket["period"], bucket["counts"]["valid_rows"]) for bucket in monthly["buckets"]] == [
+        ("2026-01", 2), ("2026-02", 1), ("2026-03", 1)
+    ]
+    assert [(bucket["period"], bucket["counts"]["valid_rows"]) for bucket in halves["buckets"]] == [
+        ("earlier_half", 2), ("later_half", 2)
+    ]
+    assert [(bucket["start_date"], bucket["end_date"], bucket["counts"]["valid_rows"]) for bucket in rolling["buckets"]] == [
+        ("2026-01-03", "2026-01-20", 2),
+        ("2026-01-20", "2026-02-02", 2),
+        ("2026-02-02", "2026-03-01", 2),
+    ]
+    assert "Desk Secret" not in json.dumps(monthly)
+    assert "do-not-disclose" not in json.dumps(monthly)
+
+
+def test_temporal_analysis_rejects_missing_or_mixed_timezone_timestamps(tmp_path):
+    missing_storage, missing_dataset, missing_mapping = _confirmed_dataset(
+        tmp_path / "missing",
+        "Result\n1\n",
+        [MappingEntry(0, semantic_role="trade_return", unit="R")],
+    )
+    missing_frame = build_analysis_frame(
+        missing_storage, missing_dataset.id, missing_mapping.id, required_roles=("trade_return",)
+    )
+    with pytest.raises(ValueError, match="timestamp"):
+        analyze_over_time(missing_frame, mode="month")
+
+    storage, dataset, mapping = _confirmed_dataset(
+        tmp_path / "mixed",
+        "Result,Trade Date\n1,2026-01-01\n2,2026-01-02T00:00:00+00:00\n",
+        [MappingEntry(0, semantic_role="trade_return", unit="R"), MappingEntry(1, semantic_role="trade_timestamp")],
+    )
+    with pytest.raises(ValueError, match="timezone"):
+        build_analysis_frame(
+            storage,
+            dataset.id,
+            mapping.id,
+            required_roles=("trade_return", "trade_timestamp"),
+            order_by="timestamp",
+        )
+
+
+def test_mfe_mae_outputs_confirmed_unit_distributions_and_explicit_unavailability(tmp_path):
+    storage, dataset, mapping = _confirmed_dataset(
+        tmp_path,
+        "Result,MFE,MAE,Desk Secret\n1,4,-2,do-not-disclose\n2,bad,-4,do-not-disclose\n",
+        [
+            MappingEntry(0, semantic_role="trade_return", unit="R"),
+            MappingEntry(1, semantic_role="mfe", unit="points"),
+            MappingEntry(2, semantic_role="mae", unit="points"),
+        ],
+    )
+    frame = build_analysis_frame(storage, dataset.id, mapping.id, required_roles=("trade_return",))
+
+    result = analyze_mfe_mae(frame)
+
+    assert result["mfe"] == {
+        "available": True,
+        "field_id": next(entry.field_id for entry in storage.mapping_entries(mapping.id) if entry.semantic_role == "mfe"),
+        "unit": "points",
+        "counts": {"source_rows": 2, "filtered_rows": 2, "valid_rows": 1, "excluded_rows": 1},
+        "exclusions": [{"reason": "invalid", "count": 1}],
+        "metrics": pytest.approx({"mean": 4.0, "median": 4.0, "minimum": 4.0, "maximum": 4.0, "sample_standard_deviation": None, "percentile_05": 4.0, "percentile_25": 4.0, "percentile_75": 4.0, "percentile_95": 4.0}),
+    }
+    assert result["mae"]["available"] is True
+    assert result["mae"]["unit"] == "points"
+    assert "Desk Secret" not in json.dumps(result)
+    assert "do-not-disclose" not in json.dumps(result)
+
+    absent_storage, absent_dataset, absent_mapping = _confirmed_dataset(
+        tmp_path / "absent", "Result\n1\n", [MappingEntry(0, semantic_role="trade_return", unit="R")]
+    )
+    absent = analyze_mfe_mae(
+        build_analysis_frame(absent_storage, absent_dataset.id, absent_mapping.id, required_roles=("trade_return",))
+    )
+    assert absent["mfe"] == {"available": False, "reason": "missing_confirmed_mapping"}
+    assert absent["mae"] == {"available": False, "reason": "missing_confirmed_mapping"}
+    assert "unit" not in absent["mfe"] and "unit" not in absent["mae"]
+
+
+def test_win_rate_wilson_interval_and_r_spread_are_descriptive_without_inference(tmp_path):
+    storage, dataset, mapping = _confirmed_dataset(
+        tmp_path,
+        "Result,Outcome\n1,win\n-1,loss\n",
+        [MappingEntry(0, semantic_role="trade_return", unit="R"), MappingEntry(1, semantic_role="trade_outcome")],
+    )
+    frame = build_analysis_frame(storage, dataset.id, mapping.id, required_roles=("trade_return", "trade_outcome"))
+
+    result = summarize_results(frame)
+
+    assert result["metrics"]["wilson_95_lower"] == pytest.approx(0.09453120573423071)
+    assert result["metrics"]["wilson_95_upper"] == pytest.approx(0.9054687942657693)
+    assert result["metrics"]["sample_standard_deviation"] == pytest.approx(math.sqrt(2))
+    assert result["metric_definitions"]["win_rate_interval"] == "Wilson 95% interval"
+    assert "small_sample" in result["limitations"]
+    rendered = json.dumps(result).casefold()
+    assert "p-value" not in rendered and "hypothesis" not in rendered and "causal" not in rendered and "edge detector" not in rendered
+
+    zero_storage, zero_dataset, zero_mapping = _confirmed_dataset(
+        tmp_path / "zero",
+        "Result,Outcome\n",
+        [MappingEntry(0, semantic_role="trade_return", unit="R"), MappingEntry(1, semantic_role="trade_outcome")],
+    )
+    zero = summarize_results(
+        build_analysis_frame(zero_storage, zero_dataset.id, zero_mapping.id, required_roles=("trade_return", "trade_outcome"))
+    )
+    assert zero["metrics"]["win_rate"] is None
+    assert zero["metrics"]["wilson_95_lower"] is None
+    assert zero["metrics"]["wilson_95_upper"] is None
+    assert "small_sample" in zero["limitations"]
