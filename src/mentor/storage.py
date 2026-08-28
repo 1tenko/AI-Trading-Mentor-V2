@@ -297,6 +297,7 @@ class Storage:
                     max_label_length INTEGER NOT NULL DEFAULT 0 CHECK(max_label_length >= 0),
                     aggregate_labels_allowed INTEGER NOT NULL DEFAULT 0 CHECK(aggregate_labels_allowed IN (0, 1)),
                     unavailable_reason TEXT,
+                    ambiguous_date_count INTEGER NOT NULL DEFAULT 0 CHECK(ambiguous_date_count >= 0),
                     PRIMARY KEY(mapping_version_id, column_ordinal)
                 );
                 CREATE UNIQUE INDEX IF NOT EXISTS unique_mapping_role
@@ -557,6 +558,7 @@ class Storage:
                 ("max_label_length", "INTEGER NOT NULL DEFAULT 0"),
                 ("aggregate_labels_allowed", "INTEGER NOT NULL DEFAULT 0"),
                 ("unavailable_reason", "TEXT"),
+                ("ambiguous_date_count", "INTEGER NOT NULL DEFAULT 0"),
             ):
                 if column not in mapping_entry_columns:
                     connection.execute(f"ALTER TABLE dataset_mapping_entries ADD COLUMN {column} {declaration}")
@@ -636,6 +638,7 @@ class Storage:
                                 AND parent_entry.max_label_length = child_entry.max_label_length
                                 AND parent_entry.aggregate_labels_allowed = child_entry.aggregate_labels_allowed
                                 AND parent_entry.unavailable_reason IS child_entry.unavailable_reason
+                                AND parent_entry.ambiguous_date_count = child_entry.ambiguous_date_count
                           )
                     )
                     AND NOT EXISTS (
@@ -658,6 +661,7 @@ class Storage:
                                 AND child_entry.max_label_length = parent_entry.max_label_length
                                 AND child_entry.aggregate_labels_allowed = parent_entry.aggregate_labels_allowed
                                 AND child_entry.unavailable_reason IS parent_entry.unavailable_reason
+                                AND child_entry.ambiguous_date_count = parent_entry.ambiguous_date_count
                           )
                     )
                 )
@@ -1624,6 +1628,7 @@ class Storage:
     def create_mapping_draft(
         self, dataset_id: str, entries: list[MappingEntry | Mapping[str, Any]]
     ) -> DatasetMappingVersion:
+        self._validate_inspected_mapping_entries(dataset_id, entries)
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
@@ -1647,6 +1652,17 @@ class Storage:
             ).fetchone()
             if draft is None or draft[1] != "draft":
                 raise ValueError("only a draft mapping version can be confirmed")
+            draft_entries = [
+                _mapping_entry_from_row(row)
+                for row in connection.execute(
+                    "SELECT column_ordinal, semantic_role, unit, analysis_label, source, field_id, value_type, "
+                    "valid_count, blank_count, invalid_count, distinct_count, max_label_length, "
+                    "aggregate_labels_allowed, unavailable_reason, ambiguous_date_count "
+                    "FROM dataset_mapping_entries WHERE mapping_version_id = ? ORDER BY column_ordinal",
+                    (draft_mapping_version_id,),
+                )
+            ]
+            self._validate_inspected_mapping_entries(str(draft[0]), draft_entries)
             next_version = connection.execute(
                 "SELECT COALESCE(MAX(version), 0) + 1 FROM dataset_mapping_versions WHERE dataset_id = ?",
                 (draft[0],),
@@ -1660,16 +1676,7 @@ class Storage:
             self._insert_mapping_entries(
                 connection,
                 confirmed_id,
-                [
-                    MappingEntry(*row)
-                    for row in connection.execute(
-                        "SELECT column_ordinal, semantic_role, unit, analysis_label, source, field_id, value_type, "
-                        "valid_count, blank_count, invalid_count, distinct_count, max_label_length, "
-                        "aggregate_labels_allowed, unavailable_reason "
-                        "FROM dataset_mapping_entries WHERE mapping_version_id = ? ORDER BY column_ordinal",
-                        (draft_mapping_version_id,),
-                    )
-                ],
+                draft_entries,
             )
             connection.execute(
                 "UPDATE dataset_mapping_versions SET status = 'confirmed', confirmed_at = CURRENT_TIMESTAMP WHERE id = ?",
@@ -1693,11 +1700,11 @@ class Storage:
             rows = connection.execute(
                 "SELECT column_ordinal, semantic_role, unit, analysis_label, source, field_id, value_type, "
                 "valid_count, blank_count, invalid_count, distinct_count, max_label_length, "
-                "aggregate_labels_allowed, unavailable_reason "
+                "aggregate_labels_allowed, unavailable_reason, ambiguous_date_count "
                 "FROM dataset_mapping_entries WHERE mapping_version_id = ? ORDER BY column_ordinal",
                 (mapping_version_id,),
             ).fetchall()
-        return [MappingEntry(*row[:12], bool(row[12]), row[13]) for row in rows]
+        return [_mapping_entry_from_row(row) for row in rows]
 
     def set_thread_dataset_scope(self, thread_id: int, dataset_id: str | None) -> None:
         with self._connect() as connection:
@@ -1883,8 +1890,8 @@ class Storage:
             INSERT INTO dataset_mapping_entries(
                 mapping_version_id, column_ordinal, semantic_role, unit, analysis_label, source,
                 field_id, value_type, valid_count, blank_count, invalid_count, distinct_count,
-                max_label_length, aggregate_labels_allowed, unavailable_reason
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                max_label_length, aggregate_labels_allowed, unavailable_reason, ambiguous_date_count
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 (
@@ -1903,10 +1910,63 @@ class Storage:
                     values.get("max_label_length", 0),
                     int(bool(values.get("aggregate_labels_allowed", False))),
                     values.get("unavailable_reason"),
+                    values.get("ambiguous_date_count", 0),
                 )
                 for values in values_by_entry
             ],
         )
+
+    def _validate_inspected_mapping_entries(
+        self, dataset_id: str, entries: list[MappingEntry | Mapping[str, Any]]
+    ) -> None:
+        """Reject incomplete or forged Task 3 snapshots when an immutable original is available."""
+        dataset = self.dataset(dataset_id)
+        if dataset is None:
+            return
+        original = self.database_path.parent / "datasets" / dataset.id / f"original{dataset.original_extension}"
+        if not original.is_file():
+            return  # Task 1 metadata-only compatibility; Task 3 imports always retain an original.
+        from mentor.datasets import (
+            MAX_MODEL_GROUP_LABEL_CHARS,
+            MAX_MODEL_GROUP_LABELS,
+            _field_id,
+            inspect_local_dataset,
+        )
+
+        columns = {column.ordinal: column for column in inspect_local_dataset(self, dataset_id).columns}
+        for entry in entries:
+            values = _dataset_values(entry)
+            column = columns.get(values.get("column_ordinal"))
+            if column is None:
+                continue
+            expected = {
+                "field_id": _field_id(dataset_id, column.ordinal),
+                "value_type": column.value_type,
+                "valid_count": column.valid_count,
+                "blank_count": column.blank_count,
+                "invalid_count": column.invalid_count,
+                "distinct_count": column.distinct_count,
+                "max_label_length": column.max_label_length,
+                "unavailable_reason": column.unavailable_reason,
+                "ambiguous_date_count": column.ambiguous_date_count,
+            }
+            if any(values.get(key) != value for key, value in expected.items()):
+                raise ValueError("mapping entry inspection snapshot is incomplete or invalid")
+            label = values.get("analysis_label")
+            if label is not None and (
+                not isinstance(label, str) or not label or len(label) > MAX_MODEL_GROUP_LABEL_CHARS or " ".join(label.split()) != label
+            ):
+                raise ValueError("mapping entry analysis-safe label is invalid")
+            allowed = values.get("aggregate_labels_allowed")
+            if not isinstance(allowed, bool):
+                raise ValueError("mapping entry aggregate consent is invalid")
+            if allowed and (
+                not isinstance(values.get("analysis_label"), str)
+                or column.value_type not in {"categorical", "boolean"}
+                or column.distinct_count > MAX_MODEL_GROUP_LABELS
+                or column.max_label_length > MAX_MODEL_GROUP_LABEL_CHARS
+            ):
+                raise ValueError("mapping entry aggregate consent is invalid")
 
     def delete_thread(self, thread_id: int) -> bool:
         with self._connect() as connection:
@@ -2061,6 +2121,10 @@ class Storage:
 
 def _dataset_values(value: DatasetImportSpec | DatasetColumn | MappingEntry | Mapping[str, Any]) -> dict[str, Any]:
     return dict(value) if isinstance(value, Mapping) else asdict(value)
+
+
+def _mapping_entry_from_row(row: tuple[Any, ...]) -> MappingEntry:
+    return MappingEntry(*row[:12], bool(row[12]), row[13], False, int(row[14]))
 
 
 def _analysis_result_envelope_json(

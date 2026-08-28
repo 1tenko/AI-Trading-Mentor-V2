@@ -13,6 +13,7 @@ import mentor.datasets as dataset_module
 from mentor.datasets import (
     DatasetImportError,
     MappingEntry,
+    MappingSuggestion,
     create_inspected_mapping_draft,
     inspect_local_dataset,
     import_local_dataset,
@@ -186,7 +187,7 @@ def test_mapping_draft_needs_confirmation_and_exposes_only_safe_opaque_model_fie
         inspection,
         [
             MappingEntry(0, semantic_role="trade_return", unit="R", source="alias"),
-            MappingEntry(1, analysis_label="Trading session", source="manual", model_disclosure=True),
+            MappingEntry(1, analysis_label="Trading session", source="manual"),
         ],
     )
 
@@ -201,7 +202,7 @@ def test_mapping_draft_needs_confirmation_and_exposes_only_safe_opaque_model_fie
             "label": None,
             "value_type": "number",
             "unit": "R",
-            "health": {"valid_count": 2, "blank_count": 0, "invalid_count": 0, "unavailable_reason": None},
+            "health": {"valid_count": 2, "blank_count": 0, "invalid_count": 0, "ambiguous_date_count": 0, "unavailable_reason": None},
             "aggregate_labels_allowed": False,
         },
         {
@@ -210,8 +211,8 @@ def test_mapping_draft_needs_confirmation_and_exposes_only_safe_opaque_model_fie
             "value_type": "categorical",
             "semantic_role": None,
             "unit": None,
-            "health": {"valid_count": 2, "blank_count": 0, "invalid_count": 0, "unavailable_reason": None},
-            "aggregate_labels_allowed": True,
+            "health": {"valid_count": 2, "blank_count": 0, "invalid_count": 0, "ambiguous_date_count": 0, "unavailable_reason": None},
+            "aggregate_labels_allowed": False,
         }
     ]
     assert all(item["field_id"].startswith("field_") for item in context)
@@ -269,6 +270,64 @@ def test_mapping_edits_and_clears_create_new_health_snapshots_and_reject_unsafe_
             inspect_local_dataset(storage, category_dataset.id),
             [MappingEntry(0, analysis_label="Category", model_disclosure=True)],
         )
+
+
+def test_mapping_storage_rejects_forged_or_missing_inspection_snapshot_fields(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    source = tmp_path / "trades.csv"
+    source.write_text("Result_R\n1.5\n", encoding="utf-8")
+    dataset = _importer(storage, tmp_path)(source).dataset
+    inspection = inspect_local_dataset(storage, dataset.id)
+
+    with pytest.raises(ValueError, match="inspection snapshot"):
+        storage.create_mapping_draft(
+            dataset.id, [MappingEntry(0, semantic_role="trade_return", unit="R")]
+        )
+    with pytest.raises(ValueError, match="inspection snapshot"):
+        storage.create_mapping_draft(
+            dataset.id,
+            [
+                MappingEntry(
+                    0,
+                    semantic_role="trade_return",
+                    unit="R",
+                    field_id="field_forged",
+                    value_type="number",
+                    valid_count=99,
+                )
+            ],
+        )
+    draft = create_inspected_mapping_draft(
+        storage, inspection, [MappingEntry(0, semantic_role="trade_return", unit="R")]
+    )
+    with sqlite3.connect(storage.database_path) as connection:
+        connection.execute(
+            "UPDATE dataset_mapping_entries SET field_id = 'field_forged' WHERE mapping_version_id = ?",
+            (draft.id,),
+        )
+    with pytest.raises(ValueError, match="inspection snapshot"):
+        storage.confirm_mapping_version(draft.id)
+
+
+def test_tradedate_alias_keeps_ambiguous_and_impossible_dates_distinct(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    source = tmp_path / "trades.csv"
+    source.write_text("TradeDate\n2026-01-02\n01/02/2026\n2026-99-99\n", encoding="utf-8")
+    dataset = _importer(storage, tmp_path)(source).dataset
+
+    inspection = inspect_local_dataset(storage, dataset.id)
+    column = inspection.columns[0]
+
+    assert (column.value_type, column.valid_count, column.invalid_count, column.ambiguous_date_count) == (
+        "datetime",
+        1,
+        2,
+        1,
+    )
+    assert column.unavailable_reason == "ambiguous_date"
+    assert mapping_suggestions(inspection) == [MappingSuggestion(0, "trade_timestamp", None)]
 
 
 @pytest.mark.parametrize(

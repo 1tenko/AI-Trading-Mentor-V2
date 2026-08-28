@@ -101,6 +101,7 @@ class MappingEntry:
     aggregate_labels_allowed: bool = False
     unavailable_reason: str | None = None
     model_disclosure: bool = False
+    ambiguous_date_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -114,6 +115,7 @@ class DatasetColumnInspection:
     distinct_count: int
     max_label_length: int
     unavailable_reason: str | None = None
+    ambiguous_date_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -304,6 +306,7 @@ def create_inspected_mapping_draft(
                 max_label_length=column.max_label_length,
                 aggregate_labels_allowed=entry.model_disclosure,
                 unavailable_reason=column.unavailable_reason,
+                ambiguous_date_count=column.ambiguous_date_count,
             )
         )
     return storage.create_mapping_draft(inspection.dataset_id, prepared)
@@ -317,7 +320,7 @@ def model_mapping_context(storage: "Storage", mapping_version_id: int) -> list[d
     return [
         {
             "field_id": entry.field_id,
-            "label": entry.analysis_label if entry.aggregate_labels_allowed else None,
+            "label": entry.analysis_label if entry.semantic_role is None or entry.aggregate_labels_allowed else None,
             "value_type": entry.value_type,
             "semantic_role": entry.semantic_role,
             "unit": entry.unit,
@@ -325,13 +328,14 @@ def model_mapping_context(storage: "Storage", mapping_version_id: int) -> list[d
                 "valid_count": entry.valid_count,
                 "blank_count": entry.blank_count,
                 "invalid_count": entry.invalid_count,
+                "ambiguous_date_count": entry.ambiguous_date_count,
                 "unavailable_reason": entry.unavailable_reason,
             },
             "aggregate_labels_allowed": entry.aggregate_labels_allowed,
         }
         for entry in storage.mapping_entries(mapping_version_id)
         if entry.field_id is not None
-        and (entry.semantic_role is not None or (entry.aggregate_labels_allowed and entry.analysis_label is not None))
+        and (entry.semantic_role is not None or entry.analysis_label is not None)
     ]
 
 
@@ -374,10 +378,23 @@ def _inspect_column(ordinal: int, header: str, values: list[object]) -> DatasetC
     if not text:
         return DatasetColumnInspection(ordinal, header, "unknown", 0, blank_count, 0, 0, 0, "no_valid_values")
     if _is_date_header(header):
-        valid_dates = sum(_parse_unambiguous_datetime(value) is not None for value in text)
+        date_states = [_date_parse_state(value) for value in text]
+        valid_dates = date_states.count("valid")
         invalid_count = len(text) - valid_dates
-        reason = "ambiguous_date" if invalid_count else None
-        return DatasetColumnInspection(ordinal, header, "datetime", valid_dates, blank_count, invalid_count, len(set(text)), max(map(len, text)), reason)
+        ambiguous_date_count = date_states.count("ambiguous")
+        reason = "ambiguous_date" if ambiguous_date_count else "invalid_values_excluded" if invalid_count else None
+        return DatasetColumnInspection(
+            ordinal,
+            header,
+            "datetime",
+            valid_dates,
+            blank_count,
+            invalid_count,
+            len(set(text)),
+            max(map(len, text)),
+            reason,
+            ambiguous_date_count,
+        )
     if _HEADER_ALIASES.get(_header_key(header), (None,))[0] == "trade_outcome":
         normalized_outcomes = [_OUTCOME_VALUES.get(value.casefold()) for value in text]
         valid_count = sum(value is not None for value in normalized_outcomes)
@@ -426,7 +443,9 @@ def _header_key(value: str) -> str:
 
 
 def _is_date_header(header: str) -> bool:
-    return bool(_DATE_HEADER_TOKENS.intersection(re.findall(r"[a-z]+", header.casefold())))
+    return _HEADER_ALIASES.get(_header_key(header), (None,))[0] == "trade_timestamp" or bool(
+        _DATE_HEADER_TOKENS.intersection(re.findall(r"[a-z]+", header.casefold()))
+    )
 
 
 def _parse_number(value: str) -> float | None:
@@ -437,13 +456,14 @@ def _parse_number(value: str) -> float | None:
         return None
 
 
-def _parse_unambiguous_datetime(value: str) -> datetime | None:
+def _date_parse_state(value: str) -> str:
     if "/" in value:
-        return None
+        return "ambiguous"
     try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return "valid"
     except ValueError:
-        return None
+        return "invalid"
 
 
 def _blank(value: object) -> bool:
