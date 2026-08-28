@@ -1929,6 +1929,9 @@ class Storage:
         from mentor.datasets import (
             MAX_MODEL_GROUP_LABEL_CHARS,
             MAX_MODEL_GROUP_LABELS,
+            _SEMANTIC_ROLES,
+            _UNIT_ROLES,
+            _UNITS,
             _field_id,
             inspect_local_dataset,
         )
@@ -1952,6 +1955,26 @@ class Storage:
             }
             if any(values.get(key) != value for key, value in expected.items()):
                 raise ValueError("mapping entry inspection snapshot is incomplete or invalid")
+            role = values.get("semantic_role")
+            if role is not None and not isinstance(role, str):
+                raise ValueError("mapping semantic metadata is invalid")
+            if isinstance(role, str):
+                allowed_types = {
+                    "trade_return": {"number"},
+                    "mfe": {"number"},
+                    "mae": {"number"},
+                    "trade_timestamp": {"datetime"},
+                }.get(role, {"categorical"})
+                if role not in _SEMANTIC_ROLES or (
+                    column.valid_count and column.value_type not in allowed_types
+                ):
+                    raise ValueError("mapping semantic metadata is invalid")
+            unit = values.get("unit")
+            source = values.get("source")
+            if (role in _UNIT_ROLES and (not isinstance(unit, str) or unit not in _UNITS)) or (
+                role not in _UNIT_ROLES and values.get("unit") is not None
+            ) or not isinstance(source, str) or source not in {"manual", "alias"}:
+                raise ValueError("mapping semantic metadata is invalid")
             label = values.get("analysis_label")
             if label is not None and (
                 not isinstance(label, str) or not label or len(label) > MAX_MODEL_GROUP_LABEL_CHARS or " ".join(label.split()) != label

@@ -3,6 +3,7 @@ import inspect
 import sqlite3
 import threading
 import zipfile
+from dataclasses import replace
 from hashlib import sha256
 from pathlib import Path
 
@@ -307,6 +308,35 @@ def test_mapping_storage_rejects_forged_or_missing_inspection_snapshot_fields(tm
             (draft.id,),
         )
     with pytest.raises(ValueError, match="inspection snapshot"):
+        storage.confirm_mapping_version(draft.id)
+
+
+def test_mapping_storage_rejects_spoofed_semantic_role_unit_and_source(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    source = tmp_path / "trades.csv"
+    source.write_text("Result_R\n1.5\n", encoding="utf-8")
+    dataset = _importer(storage, tmp_path)(source).dataset
+    draft = create_inspected_mapping_draft(
+        storage,
+        inspect_local_dataset(storage, dataset.id),
+        [MappingEntry(0, semantic_role="trade_return", unit="R")],
+    )
+    entry = storage.mapping_entries(draft.id)[0]
+
+    for spoofed in (
+        replace(entry, semantic_role="made_up"),
+        replace(entry, unit="made_up"),
+        replace(entry, source="made_up"),
+    ):
+        with pytest.raises(ValueError, match="mapping semantic"):
+            storage.create_mapping_draft(dataset.id, [spoofed])
+    with sqlite3.connect(storage.database_path) as connection:
+        connection.execute(
+            "UPDATE dataset_mapping_entries SET semantic_role = 'made_up' WHERE mapping_version_id = ?",
+            (draft.id,),
+        )
+    with pytest.raises(ValueError, match="mapping semantic"):
         storage.confirm_mapping_version(draft.id)
 
 
