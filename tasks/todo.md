@@ -58,19 +58,19 @@ selected-sheet CSV/XLSX parse/import-spec recording, and rollback behavior.
 suggestions, and complete user-confirmed mapping snapshots for Phase 5 roles/units.
 
 **Acceptance criteria:**
-- [ ] Any columns can be inspected before a mapping exists.
-- [ ] Suggestions never become active semantics until confirmed by Theo.
-- [ ] Mapping version preserves role/unit/type health, parser/import policy, and
+- [x] Any columns can be inspected before a mapping exists.
+- [x] Suggestions never become active semantics until confirmed by Theo.
+- [x] Mapping version preserves role/unit/type health, parser/import policy, and
   clear unavailable-capability reasons.
-- [ ] Any generic column exposed to the Mentor has a Theo-approved analysis-safe
+- [x] Any generic column exposed to the Mentor has a Theo-approved analysis-safe
   label and opaque field ID; raw headers remain local by default.
-- [ ] Aggregate group labels are model-disclosed only through the explicit
+- [x] Aggregate group labels are model-disclosed only through the explicit
   categorical/boolean mapping confirmation, with cardinality and length limits.
 
 **Verification:**
-- [ ] Fixtures cover aliases, blank/invalid cells, mapping draft/confirm/edit/clear/versioning,
+- [x] Fixtures cover aliases, blank/invalid cells, mapping draft/confirm/edit/clear/versioning,
   ambiguous dates, and unique-role constraints.
-- [ ] No model call is needed to suggest or confirm mapping.
+- [x] No model call is needed to suggest or confirm mapping.
 
 **Dependencies:** Task 2
 **Files likely touched:** `src/mentor/datasets.py`, `src/mentor/storage.py`,

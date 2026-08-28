@@ -3,6 +3,7 @@
 import csv
 import hashlib
 import io
+import math
 import os
 import re
 import shutil
@@ -13,6 +14,7 @@ import uuid
 import zipfile
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Callable, Iterable, Iterator
 from xml.etree import ElementTree
@@ -31,6 +33,10 @@ MAX_XLSX_ARCHIVE_MEMBERS = 1_000
 MAX_XLSX_ARCHIVE_COMPRESSED_BYTES = MAX_DATASET_BYTES
 MAX_XLSX_ARCHIVE_UNCOMPRESSED_BYTES = 250 * 1024 * 1024
 MAX_XLSX_COMPRESSION_RATIO = 100
+MAX_INSPECTION_PREVIEW_ROWS = 20
+MAX_INSPECTION_CELL_CHARS = 200
+MAX_MODEL_GROUP_LABELS = 20
+MAX_MODEL_GROUP_LABEL_CHARS = 80
 _DATASET_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,79}")
 _CELL_REFERENCE_PATTERN = re.compile(r"([A-Z]+)([1-9][0-9]*)$")
 _IMPORT_LEASE_LOCK = threading.RLock()
@@ -85,6 +91,45 @@ class MappingEntry:
     unit: str | None = None
     analysis_label: str | None = None
     source: str = "manual"
+    field_id: str | None = None
+    value_type: str | None = None
+    valid_count: int = 0
+    blank_count: int = 0
+    invalid_count: int = 0
+    distinct_count: int = 0
+    max_label_length: int = 0
+    aggregate_labels_allowed: bool = False
+    unavailable_reason: str | None = None
+    model_disclosure: bool = False
+
+
+@dataclass(frozen=True)
+class DatasetColumnInspection:
+    ordinal: int
+    original_header: str
+    value_type: str
+    valid_count: int
+    blank_count: int
+    invalid_count: int
+    distinct_count: int
+    max_label_length: int
+    unavailable_reason: str | None = None
+
+
+@dataclass(frozen=True)
+class DatasetInspection:
+    dataset_id: str
+    import_spec: DatasetImportSpec
+    columns: list[DatasetColumnInspection]
+    preview: list[dict[str, str]]
+    mapping_version: DatasetMappingVersion | None = None
+
+
+@dataclass(frozen=True)
+class MappingSuggestion:
+    column_ordinal: int
+    semantic_role: str
+    unit: str | None
 
 
 @dataclass(frozen=True)
@@ -116,6 +161,310 @@ class DatasetImportResult:
     dataset: Dataset
     original_path: Path
     duplicate_row_count: int
+
+
+_SEMANTIC_ROLES = frozenset(
+    {"trade_return", "trade_outcome", "trade_timestamp", "session", "direction", "mfe", "mae", "instrument", "setup"}
+)
+_UNIT_ROLES = frozenset({"trade_return", "mfe", "mae"})
+_UNITS = frozenset({"R", "currency", "points", "percentage"})
+_DATE_HEADER_TOKENS = frozenset({"date", "time", "timestamp", "datetime"})
+_HEADER_ALIASES = {
+    "result": ("trade_return", "R"),
+    "r": ("trade_return", "R"),
+    "resultr": ("trade_return", "R"),
+    "pnlr": ("trade_return", "R"),
+    "returninr": ("trade_return", "R"),
+    "outcome": ("trade_outcome", None),
+    "winloss": ("trade_outcome", None),
+    "date": ("trade_timestamp", None),
+    "time": ("trade_timestamp", None),
+    "timestamp": ("trade_timestamp", None),
+    "datetime": ("trade_timestamp", None),
+    "tradedate": ("trade_timestamp", None),
+    "session": ("session", None),
+    "direction": ("direction", None),
+    "side": ("direction", None),
+    "mfe": ("mfe", None),
+    "mae": ("mae", None),
+    "instrument": ("instrument", None),
+    "symbol": ("instrument", None),
+    "ticker": ("instrument", None),
+    "setup": ("setup", None),
+}
+_NUMERIC_HEADER_KEYS = frozenset(key for key, (role, _) in _HEADER_ALIASES.items() if role in _UNIT_ROLES)
+_OUTCOME_VALUES = {
+    "win": "win",
+    "w": "win",
+    "loss": "loss",
+    "l": "loss",
+    "breakeven": "breakeven",
+    "break even": "breakeven",
+    "be": "breakeven",
+}
+
+
+def inspect_local_dataset(storage: "Storage", dataset_id: str, *, preview_rows: int = MAX_INSPECTION_PREVIEW_ROWS) -> DatasetInspection:
+    """Read one immutable local original for a bounded, local-only inspection."""
+    if not isinstance(preview_rows, int) or not 1 <= preview_rows <= MAX_INSPECTION_PREVIEW_ROWS:
+        raise ValueError(f"preview rows must be between 1 and {MAX_INSPECTION_PREVIEW_ROWS}")
+    dataset = storage.dataset(dataset_id)
+    spec = storage.dataset_import_spec(dataset_id)
+    columns = storage.dataset_columns(dataset_id)
+    if dataset is None or spec is None or not columns:
+        raise ValueError("dataset metadata is unavailable")
+    path = storage.database_path.parent / "datasets" / dataset.id / f"original{dataset.original_extension}"
+    if not path.is_file():
+        raise DatasetImportError("local dataset original is unavailable")
+    if _file_sha256(path) != dataset.content_sha256:
+        raise DatasetImportError("local dataset original no longer matches its immutable hash")
+    headers, rows = _inspection_rows(path, dataset.original_extension, spec)
+    expected_headers = [column.original_header for column in columns]
+    if headers != expected_headers:
+        raise DatasetImportError("local dataset original no longer matches its recorded schema")
+    if len(rows) != dataset.source_row_count:
+        raise DatasetImportError("local dataset original no longer matches its recorded row count")
+    inspected_columns = [_inspect_column(column.ordinal, header, [row[column.ordinal] for row in rows]) for column, header in zip(columns, headers, strict=True)]
+    preview = [
+        {header: _preview_value(value) for header, value in zip(headers, row, strict=True)}
+        for row in rows[:preview_rows]
+    ]
+    return DatasetInspection(dataset.id, spec, inspected_columns, preview)
+
+
+def mapping_suggestions(inspection: DatasetInspection) -> list[MappingSuggestion]:
+    """Return deterministic header hints; callers must still explicitly confirm them."""
+    return [
+        MappingSuggestion(column.ordinal, *_HEADER_ALIASES[_header_key(column.original_header)])
+        for column in inspection.columns
+        if _header_key(column.original_header) in _HEADER_ALIASES
+    ]
+
+
+def create_inspected_mapping_draft(
+    storage: "Storage", inspection: DatasetInspection, entries: list[MappingEntry]
+) -> DatasetMappingVersion:
+    """Persist a local draft with the inspection health snapshot, never active semantics."""
+    verified = inspect_local_dataset(storage, inspection.dataset_id)
+    if inspection != verified:
+        raise ValueError("mapping requires a current local inspection")
+    inspection = verified
+    columns = {column.ordinal: column for column in inspection.columns}
+    roles: set[str] = set()
+    ordinals: set[int] = set()
+    prepared: list[MappingEntry] = []
+    for entry in entries:
+        if not isinstance(entry, MappingEntry) or entry.column_ordinal not in columns:
+            raise ValueError("mapping entries must reference an inspected column")
+        if entry.column_ordinal in ordinals:
+            raise ValueError("mapping columns must be unique")
+        ordinals.add(entry.column_ordinal)
+        column = columns[entry.column_ordinal]
+        if entry.semantic_role is not None:
+            if entry.semantic_role not in _SEMANTIC_ROLES:
+                raise ValueError("semantic role is unsupported")
+            if entry.semantic_role in roles:
+                raise ValueError("semantic roles must be unique")
+            roles.add(entry.semantic_role)
+            allowed_types = {"trade_return": {"number"}, "mfe": {"number"}, "mae": {"number"}, "trade_timestamp": {"datetime"}}.get(
+                entry.semantic_role, {"categorical"}
+            )
+            if column.valid_count and column.value_type not in allowed_types:
+                raise ValueError("semantic role is incompatible with the inspected column type")
+        if entry.semantic_role in _UNIT_ROLES:
+            if entry.unit not in _UNITS:
+                raise ValueError("return, MFE, and MAE mappings require a declared unit")
+        elif entry.unit is not None:
+            raise ValueError("only return, MFE, and MAE mappings may declare a unit")
+        if entry.source not in {"manual", "alias"}:
+            raise ValueError("mapping source must be manual or alias")
+        label = _analysis_label(entry.analysis_label)
+        if entry.model_disclosure:
+            if label is None:
+                raise ValueError("model-disclosed fields require an analysis-safe label")
+            if column.value_type not in {"categorical", "boolean"}:
+                raise ValueError("aggregate labels may be disclosed only for categorical or boolean fields")
+            if column.distinct_count > MAX_MODEL_GROUP_LABELS:
+                raise ValueError("aggregate labels may contain at most 20 distinct values")
+            if column.max_label_length > MAX_MODEL_GROUP_LABEL_CHARS:
+                raise ValueError("aggregate labels may be at most 80 characters")
+        prepared.append(
+            MappingEntry(
+                column_ordinal=entry.column_ordinal,
+                semantic_role=entry.semantic_role,
+                unit=entry.unit,
+                analysis_label=label,
+                source=entry.source,
+                field_id=_field_id(inspection.dataset_id, entry.column_ordinal),
+                value_type=column.value_type,
+                valid_count=column.valid_count,
+                blank_count=column.blank_count,
+                invalid_count=column.invalid_count,
+                distinct_count=column.distinct_count,
+                max_label_length=column.max_label_length,
+                aggregate_labels_allowed=entry.model_disclosure,
+                unavailable_reason=column.unavailable_reason,
+            )
+        )
+    return storage.create_mapping_draft(inspection.dataset_id, prepared)
+
+
+def model_mapping_context(storage: "Storage", mapping_version_id: int) -> list[dict[str, object]]:
+    """Return the confirmed, privacy-safe model contract without raw headers or values."""
+    mapping = storage.mapping_version(mapping_version_id)
+    if mapping is None or mapping.status != "confirmed":
+        return []
+    return [
+        {
+            "field_id": entry.field_id,
+            "label": entry.analysis_label if entry.aggregate_labels_allowed else None,
+            "value_type": entry.value_type,
+            "semantic_role": entry.semantic_role,
+            "unit": entry.unit,
+            "health": {
+                "valid_count": entry.valid_count,
+                "blank_count": entry.blank_count,
+                "invalid_count": entry.invalid_count,
+                "unavailable_reason": entry.unavailable_reason,
+            },
+            "aggregate_labels_allowed": entry.aggregate_labels_allowed,
+        }
+        for entry in storage.mapping_entries(mapping_version_id)
+        if entry.field_id is not None
+        and (entry.semantic_role is not None or (entry.aggregate_labels_allowed and entry.analysis_label is not None))
+    ]
+
+
+def _inspection_rows(path: Path, extension: str, spec: DatasetImportSpec) -> tuple[list[str], list[list[object]]]:
+    if extension == ".csv":
+        if not spec.csv_encoding or not spec.csv_delimiter or not spec.csv_quoting:
+            raise DatasetImportError("CSV import specification is incomplete")
+        text = path.read_text(encoding=spec.csv_encoding, errors="strict")
+        rows = csv.reader(io.StringIO(text, newline=""), delimiter=spec.csv_delimiter, quotechar=spec.csv_quoting, strict=True)
+        try:
+            headers = _headers(next(rows))
+        except StopIteration as error:
+            raise DatasetImportError("CSV has no header row") from error
+        values = [list(row) for row in rows if row and not all(value == "" for value in row)]
+    else:
+        try:
+            workbook = load_workbook(path, read_only=True, data_only=False, keep_links=False)
+        except Exception as error:
+            raise DatasetImportError("XLSX parse failed") from error
+        try:
+            worksheet = workbook[spec.selected_sheet or ""]
+            iterator = worksheet.iter_rows(values_only=True)
+            headers = _headers(next(iterator))
+            values = [list(row) for row in iterator if row and not all(value is None or value == "" for value in row)]
+        except KeyError as error:
+            raise DatasetImportError("selected XLSX worksheet does not exist") from error
+        except StopIteration as error:
+            raise DatasetImportError("XLSX has no header row") from error
+        finally:
+            workbook.close()
+    if any(len(row) != len(headers) for row in values):
+        raise DatasetImportError("dataset rows do not match the header")
+    return headers, values
+
+
+def _inspect_column(ordinal: int, header: str, values: list[object]) -> DatasetColumnInspection:
+    nonblank = [value for value in values if not _blank(value)]
+    blank_count = len(values) - len(nonblank)
+    text = [str(value).strip() for value in nonblank]
+    if not text:
+        return DatasetColumnInspection(ordinal, header, "unknown", 0, blank_count, 0, 0, 0, "no_valid_values")
+    if _is_date_header(header):
+        valid_dates = sum(_parse_unambiguous_datetime(value) is not None for value in text)
+        invalid_count = len(text) - valid_dates
+        reason = "ambiguous_date" if invalid_count else None
+        return DatasetColumnInspection(ordinal, header, "datetime", valid_dates, blank_count, invalid_count, len(set(text)), max(map(len, text)), reason)
+    if _HEADER_ALIASES.get(_header_key(header), (None,))[0] == "trade_outcome":
+        normalized_outcomes = [_OUTCOME_VALUES.get(value.casefold()) for value in text]
+        valid_count = sum(value is not None for value in normalized_outcomes)
+        invalid_count = len(text) - valid_count
+        return DatasetColumnInspection(
+            ordinal,
+            header,
+            "categorical",
+            valid_count,
+            blank_count,
+            invalid_count,
+            len({value for value in normalized_outcomes if value is not None}),
+            max((len(value) for value in normalized_outcomes if value is not None), default=0),
+            "invalid_values_excluded" if invalid_count else None,
+        )
+    numeric_count = sum(_parse_number(value) is not None for value in text)
+    if numeric_count and (numeric_count == len(text) or _header_key(header) in _NUMERIC_HEADER_KEYS):
+        invalid_count = len(text) - numeric_count
+        return DatasetColumnInspection(
+            ordinal,
+            header,
+            "number",
+            numeric_count,
+            blank_count,
+            invalid_count,
+            len(set(text)),
+            max(map(len, text)),
+            "invalid_values_excluded" if invalid_count else None,
+        )
+    normalized = {value.casefold() for value in text}
+    if normalized.issubset({"true", "false", "yes", "no", "y", "n"}):
+        return DatasetColumnInspection(ordinal, header, "boolean", len(text), blank_count, 0, len(normalized), max(map(len, text)))
+    return DatasetColumnInspection(ordinal, header, "categorical", len(text), blank_count, 0, len(set(text)), max(map(len, text)))
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as file:
+        while chunk := file.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _header_key(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", value.casefold())
+
+
+def _is_date_header(header: str) -> bool:
+    return bool(_DATE_HEADER_TOKENS.intersection(re.findall(r"[a-z]+", header.casefold())))
+
+
+def _parse_number(value: str) -> float | None:
+    try:
+        parsed = float(value[:-1]) / 100 if value.endswith("%") else float(value)
+        return parsed if math.isfinite(parsed) else None
+    except ValueError:
+        return None
+
+
+def _parse_unambiguous_datetime(value: str) -> datetime | None:
+    if "/" in value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _blank(value: object) -> bool:
+    return value is None or (isinstance(value, str) and not value.strip())
+
+
+def _preview_value(value: object) -> str:
+    text = "" if value is None else str(value)
+    return text[:MAX_INSPECTION_CELL_CHARS]
+
+
+def _analysis_label(value: str | None) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not (label := " ".join(value.split())) or len(label) > 80:
+        raise ValueError("analysis-safe label must be 1 to 80 characters")
+    return label
+
+
+def _field_id(dataset_id: str, ordinal: int) -> str:
+    return f"field_{hashlib.sha256(f'{dataset_id}:{ordinal}'.encode()).hexdigest()[:12]}"
 
 
 def import_local_dataset(

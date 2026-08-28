@@ -10,7 +10,15 @@ import pytest
 from openpyxl import Workbook
 
 import mentor.datasets as dataset_module
-from mentor.datasets import DatasetImportError, import_local_dataset
+from mentor.datasets import (
+    DatasetImportError,
+    MappingEntry,
+    create_inspected_mapping_draft,
+    inspect_local_dataset,
+    import_local_dataset,
+    mapping_suggestions,
+    model_mapping_context,
+)
 from mentor.storage import Storage
 
 
@@ -110,6 +118,157 @@ def test_local_xlsx_import_uses_only_the_selected_sheet_and_preserves_original(t
             ("Result_R",),
             ("Session",),
         ]
+
+
+def test_local_inspection_previews_raw_headers_and_values_before_any_mapping(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    source = tmp_path / "trades.csv"
+    source.write_text("Result_R,Session,Trade Date\n1.5,London,2026-01-02\n,New York,01/02/2026\n", encoding="utf-8")
+    dataset = _importer(storage, tmp_path)(source).dataset
+
+    inspection = inspect_local_dataset(storage, dataset.id)
+
+    assert inspection.mapping_version is None
+    assert inspection.preview == [
+        {"Result_R": "1.5", "Session": "London", "Trade Date": "2026-01-02"},
+        {"Result_R": "", "Session": "New York", "Trade Date": "01/02/2026"},
+    ]
+    assert [(column.original_header, column.value_type, column.blank_count, column.invalid_count) for column in inspection.columns] == [
+        ("Result_R", "number", 1, 0),
+        ("Session", "categorical", 0, 0),
+        ("Trade Date", "datetime", 0, 1),
+    ]
+    assert inspection.columns[2].unavailable_reason == "ambiguous_date"
+    assert {(suggestion.column_ordinal, suggestion.semantic_role, suggestion.unit) for suggestion in mapping_suggestions(inspection)} == {
+        (0, "trade_return", "R"),
+        (1, "session", None),
+        (2, "trade_timestamp", None),
+    }
+
+
+def test_local_inspection_keeps_blank_and_invalid_numeric_cells_in_health(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    source = tmp_path / "trades.csv"
+    source.write_text("Result_R,Note\n1.5,ok\nnot-a-number,bad\n,blank\n", encoding="utf-8")
+    dataset = _importer(storage, tmp_path)(source).dataset
+
+    column = inspect_local_dataset(storage, dataset.id).columns[0]
+
+    assert (column.value_type, column.valid_count, column.blank_count, column.invalid_count) == ("number", 1, 1, 1)
+    assert column.unavailable_reason == "invalid_values_excluded"
+
+
+def test_local_inspection_uses_controlled_outcome_normalization(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    source = tmp_path / "trades.csv"
+    source.write_text("Outcome\nWin\nloss\nBE\nunknown\n", encoding="utf-8")
+    dataset = _importer(storage, tmp_path)(source).dataset
+
+    column = inspect_local_dataset(storage, dataset.id).columns[0]
+
+    assert (column.value_type, column.valid_count, column.invalid_count, column.distinct_count) == ("categorical", 3, 1, 3)
+    assert column.unavailable_reason == "invalid_values_excluded"
+
+
+def test_mapping_draft_needs_confirmation_and_exposes_only_safe_opaque_model_fields(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    source = tmp_path / "trades.csv"
+    source.write_text("Result_R,Desk Secret\n1.5,London\n-0.5,New York\n", encoding="utf-8")
+    dataset = _importer(storage, tmp_path)(source).dataset
+    inspection = inspect_local_dataset(storage, dataset.id)
+
+    draft = create_inspected_mapping_draft(
+        storage,
+        inspection,
+        [
+            MappingEntry(0, semantic_role="trade_return", unit="R", source="alias"),
+            MappingEntry(1, analysis_label="Trading session", source="manual", model_disclosure=True),
+        ],
+    )
+
+    assert draft.status == "draft"
+    assert model_mapping_context(storage, draft.id) == []
+    confirmed = storage.confirm_mapping_version(draft.id)
+    context = model_mapping_context(storage, confirmed.id)
+    assert context == [
+        {
+            "field_id": context[0]["field_id"],
+            "semantic_role": "trade_return",
+            "label": None,
+            "value_type": "number",
+            "unit": "R",
+            "health": {"valid_count": 2, "blank_count": 0, "invalid_count": 0, "unavailable_reason": None},
+            "aggregate_labels_allowed": False,
+        },
+        {
+            "field_id": context[1]["field_id"],
+            "label": "Trading session",
+            "value_type": "categorical",
+            "semantic_role": None,
+            "unit": None,
+            "health": {"valid_count": 2, "blank_count": 0, "invalid_count": 0, "unavailable_reason": None},
+            "aggregate_labels_allowed": True,
+        }
+    ]
+    assert all(item["field_id"].startswith("field_") for item in context)
+    assert "Desk Secret" not in json.dumps(context)
+    assert "Result_R" not in json.dumps(context)
+
+
+def test_mapping_edits_and_clears_create_new_health_snapshots_and_reject_unsafe_disclosure(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    source = tmp_path / "trades.csv"
+    source.write_text(
+        "Result_R,Session,Flag\n1,London,true\n-1,New York,false\n0,Asia,true\n", encoding="utf-8"
+    )
+    dataset = _importer(storage, tmp_path)(source).dataset
+    inspection = inspect_local_dataset(storage, dataset.id)
+    draft = create_inspected_mapping_draft(
+        storage,
+        inspection,
+            [
+                MappingEntry(0, semantic_role="trade_return", unit="R"),
+                MappingEntry(1, semantic_role="session", analysis_label="Session", model_disclosure=True),
+                MappingEntry(2, analysis_label="Trade flag", model_disclosure=True),
+            ],
+    )
+    confirmed = storage.confirm_mapping_version(draft.id)
+
+    cleared = create_inspected_mapping_draft(
+        storage,
+        inspection,
+        [MappingEntry(0, analysis_label="Return", source="manual")],
+    )
+    cleared_confirmed = storage.confirm_mapping_version(cleared.id)
+
+    assert cleared_confirmed.version > confirmed.version
+    assert storage.mapping_entries(confirmed.id)[0].semantic_role == "trade_return"
+    assert storage.mapping_entries(cleared_confirmed.id)[0].semantic_role is None
+    assert storage.mapping_entries(confirmed.id)[1].valid_count == 3
+    assert storage.mapping_entries(confirmed.id)[1].value_type == "categorical"
+    assert storage.mapping_entries(confirmed.id)[1].aggregate_labels_allowed is True
+    with pytest.raises(ValueError, match="unique"):
+        create_inspected_mapping_draft(
+            storage,
+            inspection,
+            [MappingEntry(0, semantic_role="trade_return", unit="R"), MappingEntry(1, semantic_role="trade_return", unit="R")],
+        )
+    categories = tmp_path / "categories.csv"
+    categories.write_text("Category\n" + "\n".join(f"group-{index}" for index in range(21)) + "\n", encoding="utf-8")
+    category_dataset = import_local_dataset(
+        categories, storage, dataset_id_factory=lambda: "dataset-categories"
+    ).dataset
+    with pytest.raises(ValueError, match="at most 20"):
+        create_inspected_mapping_draft(
+            storage,
+            inspect_local_dataset(storage, category_dataset.id),
+            [MappingEntry(0, analysis_label="Category", model_disclosure=True)],
+        )
 
 
 @pytest.mark.parametrize(

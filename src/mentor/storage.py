@@ -288,6 +288,15 @@ class Storage:
                     unit TEXT,
                     analysis_label TEXT,
                     source TEXT NOT NULL,
+                    field_id TEXT,
+                    value_type TEXT,
+                    valid_count INTEGER NOT NULL DEFAULT 0 CHECK(valid_count >= 0),
+                    blank_count INTEGER NOT NULL DEFAULT 0 CHECK(blank_count >= 0),
+                    invalid_count INTEGER NOT NULL DEFAULT 0 CHECK(invalid_count >= 0),
+                    distinct_count INTEGER NOT NULL DEFAULT 0 CHECK(distinct_count >= 0),
+                    max_label_length INTEGER NOT NULL DEFAULT 0 CHECK(max_label_length >= 0),
+                    aggregate_labels_allowed INTEGER NOT NULL DEFAULT 0 CHECK(aggregate_labels_allowed IN (0, 1)),
+                    unavailable_reason TEXT,
                     PRIMARY KEY(mapping_version_id, column_ordinal)
                 );
                 CREATE UNIQUE INDEX IF NOT EXISTS unique_mapping_role
@@ -535,6 +544,22 @@ class Storage:
                     "ALTER TABLE dataset_mapping_versions "
                     "ADD COLUMN parent_mapping_version_id INTEGER REFERENCES dataset_mapping_versions(id)"
                 )
+            mapping_entry_columns = {
+                row[1] for row in connection.execute("PRAGMA table_info(dataset_mapping_entries)")
+            }
+            for column, declaration in (
+                ("field_id", "TEXT"),
+                ("value_type", "TEXT"),
+                ("valid_count", "INTEGER NOT NULL DEFAULT 0"),
+                ("blank_count", "INTEGER NOT NULL DEFAULT 0"),
+                ("invalid_count", "INTEGER NOT NULL DEFAULT 0"),
+                ("distinct_count", "INTEGER NOT NULL DEFAULT 0"),
+                ("max_label_length", "INTEGER NOT NULL DEFAULT 0"),
+                ("aggregate_labels_allowed", "INTEGER NOT NULL DEFAULT 0"),
+                ("unavailable_reason", "TEXT"),
+            ):
+                if column not in mapping_entry_columns:
+                    connection.execute(f"ALTER TABLE dataset_mapping_entries ADD COLUMN {column} {declaration}")
             pending_import_columns = {
                 row[1] for row in connection.execute("PRAGMA table_info(pending_dataset_imports)")
             }
@@ -602,6 +627,15 @@ class Storage:
                                 AND parent_entry.unit IS child_entry.unit
                                 AND parent_entry.analysis_label IS child_entry.analysis_label
                                 AND parent_entry.source IS child_entry.source
+                                AND parent_entry.field_id IS child_entry.field_id
+                                AND parent_entry.value_type IS child_entry.value_type
+                                AND parent_entry.valid_count = child_entry.valid_count
+                                AND parent_entry.blank_count = child_entry.blank_count
+                                AND parent_entry.invalid_count = child_entry.invalid_count
+                                AND parent_entry.distinct_count = child_entry.distinct_count
+                                AND parent_entry.max_label_length = child_entry.max_label_length
+                                AND parent_entry.aggregate_labels_allowed = child_entry.aggregate_labels_allowed
+                                AND parent_entry.unavailable_reason IS child_entry.unavailable_reason
                           )
                     )
                     AND NOT EXISTS (
@@ -615,6 +649,15 @@ class Storage:
                                 AND child_entry.unit IS parent_entry.unit
                                 AND child_entry.analysis_label IS parent_entry.analysis_label
                                 AND child_entry.source IS parent_entry.source
+                                AND child_entry.field_id IS parent_entry.field_id
+                                AND child_entry.value_type IS parent_entry.value_type
+                                AND child_entry.valid_count = parent_entry.valid_count
+                                AND child_entry.blank_count = parent_entry.blank_count
+                                AND child_entry.invalid_count = parent_entry.invalid_count
+                                AND child_entry.distinct_count = parent_entry.distinct_count
+                                AND child_entry.max_label_length = parent_entry.max_label_length
+                                AND child_entry.aggregate_labels_allowed = parent_entry.aggregate_labels_allowed
+                                AND child_entry.unavailable_reason IS parent_entry.unavailable_reason
                           )
                     )
                 )
@@ -1481,6 +1524,29 @@ class Storage:
             ).fetchone()
         return None if row is None else Dataset(*row)
 
+    def dataset_import_spec(self, dataset_id: str) -> DatasetImportSpec | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT header_row, csv_encoding, csv_delimiter, csv_quoting, parser_version,
+                       row_order_policy, time_parse_policy, selected_sheet
+                FROM dataset_import_specs WHERE dataset_id = ?
+                """,
+                (dataset_id,),
+            ).fetchone()
+        return None if row is None else DatasetImportSpec(*row)
+
+    def dataset_columns(self, dataset_id: str) -> list[DatasetColumn]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT ordinal, original_header, inferred_type, null_count, invalid_count
+                FROM dataset_columns WHERE dataset_id = ? ORDER BY ordinal
+                """,
+                (dataset_id,),
+            ).fetchall()
+        return [DatasetColumn(*row) for row in rows]
+
     def begin_dataset_import(self, dataset_id: str) -> None:
         """Reserve an opaque ID so interrupted filesystem work can be recovered."""
         if not isinstance(dataset_id, str) or _DATASET_ID_PATTERN.fullmatch(dataset_id) is None:
@@ -1597,7 +1663,9 @@ class Storage:
                 [
                     MappingEntry(*row)
                     for row in connection.execute(
-                        "SELECT column_ordinal, semantic_role, unit, analysis_label, source "
+                        "SELECT column_ordinal, semantic_role, unit, analysis_label, source, field_id, value_type, "
+                        "valid_count, blank_count, invalid_count, distinct_count, max_label_length, "
+                        "aggregate_labels_allowed, unavailable_reason "
                         "FROM dataset_mapping_entries WHERE mapping_version_id = ? ORDER BY column_ordinal",
                         (draft_mapping_version_id,),
                     )
@@ -1623,11 +1691,13 @@ class Storage:
     def mapping_entries(self, mapping_version_id: int) -> list[MappingEntry]:
         with self._connect() as connection:
             rows = connection.execute(
-                "SELECT column_ordinal, semantic_role, unit, analysis_label, source "
+                "SELECT column_ordinal, semantic_role, unit, analysis_label, source, field_id, value_type, "
+                "valid_count, blank_count, invalid_count, distinct_count, max_label_length, "
+                "aggregate_labels_allowed, unavailable_reason "
                 "FROM dataset_mapping_entries WHERE mapping_version_id = ? ORDER BY column_ordinal",
                 (mapping_version_id,),
             ).fetchall()
-        return [MappingEntry(*row) for row in rows]
+        return [MappingEntry(*row[:12], bool(row[12]), row[13]) for row in rows]
 
     def set_thread_dataset_scope(self, thread_id: int, dataset_id: str | None) -> None:
         with self._connect() as connection:
@@ -1811,8 +1881,10 @@ class Storage:
         connection.executemany(
             """
             INSERT INTO dataset_mapping_entries(
-                mapping_version_id, column_ordinal, semantic_role, unit, analysis_label, source
-            ) VALUES (?, ?, ?, ?, ?, ?)
+                mapping_version_id, column_ordinal, semantic_role, unit, analysis_label, source,
+                field_id, value_type, valid_count, blank_count, invalid_count, distinct_count,
+                max_label_length, aggregate_labels_allowed, unavailable_reason
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 (
@@ -1822,6 +1894,15 @@ class Storage:
                     values.get("unit"),
                     values.get("analysis_label"),
                     values.get("source", "manual"),
+                    values.get("field_id"),
+                    values.get("value_type"),
+                    values.get("valid_count", 0),
+                    values.get("blank_count", 0),
+                    values.get("invalid_count", 0),
+                    values.get("distinct_count", 0),
+                    values.get("max_label_length", 0),
+                    int(bool(values.get("aggregate_labels_allowed", False))),
+                    values.get("unavailable_reason"),
                 )
                 for values in values_by_entry
             ],
