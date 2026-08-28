@@ -230,11 +230,15 @@ def group_results(frame: AnalysisFrame, group_fields: Sequence[str]) -> dict[str
     fields = _grouping_fields(frame, group_fields)
     group_columns = [field.column_name for field in fields]
     keys = _group_keys(frame.filtered_data, group_columns)
+    source_keys = _group_keys(frame.source_data, group_columns)
     returned_keys = keys[:_GROUP_LIMIT]
     omitted_keys = keys[_GROUP_LIMIT:]
     groups = [_group_payload(_group_frame(frame, fields, key), key) for key in returned_keys]
-    omitted_rows = sum(len(_group_subset(frame.filtered_data, fields, key)) for key in omitted_keys)
+    omitted = [_group_frame(frame, fields, key) for key in source_keys if key not in returned_keys]
+    ungrouped = _ungrouped_frame(frame, fields)
     limitations = _group_limitations(frame, len(keys), len(returned_keys))
+    if ungrouped.filtered_rows:
+        limitations.append("ungrouped_group_values_excluded")
     return {
         **_result_metadata(frame, "group_results"),
         "grouping": {
@@ -243,7 +247,12 @@ def group_results(frame: AnalysisFrame, group_fields: Sequence[str]) -> dict[str
             "total_groups": len(keys),
             "returned_groups": len(returned_keys),
             "omitted_groups": len(omitted_keys),
-            "omitted_group_rows": omitted_rows,
+            "omitted_group_rows": sum(item.filtered_rows for item in omitted),
+        },
+        "omissions": {"counts": _combined_counts(omitted)},
+        "ungrouped": {
+            "counts": _frame_counts(ungrouped),
+            "reasons": _ungrouped_reasons(frame.filtered_data, fields),
         },
         "groups": groups,
         "limitations": limitations,
@@ -253,8 +262,8 @@ def group_results(frame: AnalysisFrame, group_fields: Sequence[str]) -> dict[str
 def compare_groups(frame: AnalysisFrame, field_id: str, value_a: object, value_b: object) -> dict[str, object]:
     """Compare two typed, distinct values in an approved group field without inference."""
     field = _grouping_fields(frame, (field_id,))[0]
-    if not _filter_value_matches(field.value_type, value_a) or not _filter_value_matches(field.value_type, value_b):
-        raise ValueError("comparison values are incompatible with the group field")
+    _validate_comparison_value(frame, field, value_a)
+    _validate_comparison_value(frame, field, value_b)
     if value_a == value_b:
         raise ValueError("comparison values must be distinct")
     a = _group_frame(frame, (field,), (value_a,))
@@ -342,9 +351,26 @@ def _group_subset(data: pd.DataFrame, fields: Sequence[AnalysisField], values: S
 
 
 def _group_frame(frame: AnalysisFrame, fields: Sequence[AnalysisField], values: Sequence[object]) -> AnalysisFrame:
-    source_data = _group_subset(frame.source_data, fields, values)
-    filtered_data = _group_subset(frame.filtered_data, fields, values)
-    data = _group_subset(frame.data, fields, values)
+    return _subset_frame(
+        frame,
+        _group_subset(frame.source_data, fields, values),
+        _group_subset(frame.filtered_data, fields, values),
+        _group_subset(frame.data, fields, values),
+    )
+
+
+def _ungrouped_frame(frame: AnalysisFrame, fields: Sequence[AnalysisField]) -> AnalysisFrame:
+    return _subset_frame(
+        frame,
+        _ungrouped_subset(frame.source_data, fields),
+        _ungrouped_subset(frame.filtered_data, fields),
+        _ungrouped_subset(frame.data, fields),
+    )
+
+
+def _subset_frame(
+    frame: AnalysisFrame, source_data: pd.DataFrame, filtered_data: pd.DataFrame, data: pd.DataFrame
+) -> AnalysisFrame:
     if frame.order.mode == "timestamp" and not data.empty:
         data = data.sort_values(["trade_timestamp", "source_row_ordinal"], kind="stable")
     exclusions = _frame_exclusions(filtered_data, frame)
@@ -370,6 +396,19 @@ def _group_frame(frame: AnalysisFrame, fields: Sequence[AnalysisField], values: 
         order=frame.order,
         no_data_reason=no_data_reason,
     )
+
+
+def _ungrouped_subset(data: pd.DataFrame, fields: Sequence[AnalysisField]) -> pd.DataFrame:
+    if data.empty:
+        return data.copy()
+    state_columns = [_state_column(field) for field in fields]
+    if all(column in data for column in state_columns):
+        mask = pd.Series(False, index=data.index)
+        for column in state_columns:
+            mask |= data[column] != "valid"
+    else:
+        mask = data[[field.column_name for field in fields]].isna().any(axis=1)
+    return data.loc[mask].copy()
 
 
 def _group_outcome_sequence(data: pd.DataFrame, frame: AnalysisFrame) -> tuple[str | None, ...]:
@@ -424,6 +463,43 @@ def _group_limitations(frame: AnalysisFrame, total_groups: int, returned_groups:
     if total_groups > returned_groups:
         limitations.append("groups_omitted")
     return limitations
+
+
+def _frame_counts(frame: AnalysisFrame) -> dict[str, int]:
+    return {
+        "source_rows": frame.source_rows,
+        "filtered_rows": frame.filtered_rows,
+        "valid_rows": frame.valid_rows,
+        "excluded_rows": frame.excluded_rows,
+    }
+
+
+def _combined_counts(frames: Sequence[AnalysisFrame]) -> dict[str, int]:
+    return {name: sum(_frame_counts(frame)[name] for frame in frames) for name in ("source_rows", "filtered_rows", "valid_rows", "excluded_rows")}
+
+
+def _ungrouped_reasons(data: pd.DataFrame, fields: Sequence[AnalysisField]) -> list[dict[str, object]]:
+    reasons: list[dict[str, object]] = []
+    for field in fields:
+        state_column = _state_column(field)
+        for reason in ("blank", "invalid"):
+            count = int((data[state_column] == reason).sum()) if state_column in data else 0
+            if count:
+                reasons.append({"field_id": field.field_id, "reason": reason, "count": count})
+    return reasons
+
+
+def _validate_comparison_value(frame: AnalysisFrame, field: AnalysisField, value: object) -> None:
+    if not _filter_value_matches(field.value_type, value):
+        raise ValueError("comparison values are incompatible with the group field")
+    if isinstance(value, str) and len(value) > 80:
+        raise ValueError("comparison value exceeds the approved mapped field label limit")
+    source_values = _group_keys(frame.source_data, (field.column_name,))
+    approved_values = {key[0] for key in source_values}
+    if len(approved_values) > 20 or value not in approved_values:
+        raise ValueError("comparison value is absent from the approved mapped field domain")
+    if _group_subset(frame.filtered_data, (field,), (value,)).empty:
+        raise ValueError("comparison value has no matching rows after validated filters")
 
 
 def _metric_delta(a: object, b: object) -> float | None:

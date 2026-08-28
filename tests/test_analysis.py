@@ -539,7 +539,29 @@ def test_group_results_handles_empty_filtered_data_without_group_values(tmp_path
 
     assert result["groups"] == []
     assert result["grouping"]["total_groups"] == 0
+    assert result["omissions"]["counts"] == {"source_rows": 1, "filtered_rows": 0, "valid_rows": 0, "excluded_rows": 0}
     assert result["limitations"] == ["no_matching_rows"]
+
+
+def test_group_results_reports_blank_boolean_values_as_ungrouped_accounting(tmp_path):
+    storage, dataset, mapping = _confirmed_dataset(
+        tmp_path,
+        "Result,Condition\n1,true\n1,false\n1,\n",
+        [MappingEntry(0, semantic_role="trade_return", unit="R"), MappingEntry(1, analysis_label="Condition", model_disclosure=True)],
+    )
+    condition_id = next(entry.field_id for entry in storage.mapping_entries(mapping.id) if entry.analysis_label == "Condition")
+    frame = build_analysis_frame(storage, dataset.id, mapping.id, required_roles=("trade_return",))
+
+    result = group_results(frame, (condition_id or "",))
+
+    assert [group["values"] for group in result["groups"]] == [[False], [True]]
+    assert result["ungrouped"] == {
+        "counts": {"source_rows": 1, "filtered_rows": 1, "valid_rows": 1, "excluded_rows": 0},
+        "reasons": [{"field_id": condition_id, "reason": "blank", "count": 1}],
+    }
+    assert result["omissions"]["counts"] == {"source_rows": 0, "filtered_rows": 0, "valid_rows": 0, "excluded_rows": 0}
+    assert sum(group["counts"]["source_rows"] for group in result["groups"]) + result["ungrouped"]["counts"]["source_rows"] == result["counts"]["source_rows"]
+    assert "ungrouped_group_values_excluded" in result["limitations"]
 
 
 def test_compare_groups_returns_both_sides_and_zero_delta_for_equal_metrics(tmp_path):
@@ -564,6 +586,8 @@ def test_compare_groups_returns_both_sides_and_zero_delta_for_equal_metrics(tmp_
     assert "causal" not in json.dumps(result).casefold()
     assert "Desk Secret" not in json.dumps(result)
     assert "do-not-disclose" not in json.dumps(result)
+    with pytest.raises(ValueError, match="absent from the approved mapped field domain"):
+        compare_groups(frame, session_id or "", "London", "Atlantis")
 
 
 def test_compare_groups_rejects_invalid_types_equal_values_and_unknown_fields(tmp_path):
