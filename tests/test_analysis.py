@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 import mentor.analysis as analysis_module
-from mentor.analysis import AnalysisFilter, build_analysis_frame, summarize_results
+from mentor.analysis import AnalysisFilter, build_analysis_frame, compare_groups, group_results, summarize_results
 from mentor.datasets import MappingEntry, create_inspected_mapping_draft, import_local_dataset, inspect_local_dataset
 from mentor.storage import Storage
 
@@ -429,3 +429,158 @@ def test_timestamp_filters_reject_naive_values_for_aware_dataset_times(tmp_path,
             required_roles=("trade_return",),
             filters=(AnalysisFilter(timestamp_id or "", operator, value),),
         )
+
+
+def test_group_results_reports_session_metrics_with_validated_filter_handoff(tmp_path):
+    storage, dataset, mapping = _confirmed_dataset(
+        tmp_path,
+        "Result,Outcome,Session,Desk Secret\n1,win,London,do-not-disclose\n-1,loss,London,do-not-disclose\n2,win,New York,do-not-disclose\nbad,loss,New York,do-not-disclose\n",
+        [
+            MappingEntry(0, semantic_role="trade_return", unit="R"),
+            MappingEntry(1, semantic_role="trade_outcome"),
+            MappingEntry(2, analysis_label="Session", model_disclosure=True),
+        ],
+    )
+    entries = storage.mapping_entries(mapping.id)
+    session_id = next(entry.field_id for entry in entries if entry.analysis_label == "Session")
+    frame = build_analysis_frame(
+        storage,
+        dataset.id,
+        mapping.id,
+        required_roles=("trade_return", "trade_outcome"),
+        filters=(AnalysisFilter(session_id or "", "in", ["London", "New York"]),),
+    )
+
+    result = group_results(frame, (session_id or "",))
+
+    assert result["operation"] == "group_results"
+    assert result["grouping"] == {
+        "field_ids": [session_id],
+        "limit": 50,
+        "total_groups": 2,
+        "returned_groups": 2,
+        "omitted_groups": 0,
+        "omitted_group_rows": 0,
+    }
+    london, new_york = result["groups"]
+    assert london["values"] == ["London"]
+    assert london["counts"] == {"source_rows": 2, "filtered_rows": 2, "valid_rows": 2, "excluded_rows": 0}
+    assert london["metrics"]["mean_return"] == 0.0
+    assert new_york["values"] == ["New York"]
+    assert new_york["counts"] == {"source_rows": 2, "filtered_rows": 2, "valid_rows": 1, "excluded_rows": 1}
+    assert new_york["exclusions"] == [{"role": "trade_return", "reason": "invalid", "count": 1}]
+    assert result["filters"] == [
+        {"field_id": session_id, "operator": "in", "value_sha256": "9fcb3941d9a9dae06bc93589259d603afc167d4c41a32418ca0680c0f0389483"}
+    ]
+    assert "Desk Secret" not in json.dumps(result)
+    assert "do-not-disclose" not in json.dumps(result)
+
+
+def test_group_results_supports_two_columns_and_caps_deterministic_groups(tmp_path):
+    rows = "\n".join(f"1,S{index // 5},Setup{index % 5}" for index in range(55))
+    storage, dataset, mapping = _confirmed_dataset(
+        tmp_path,
+        f"Result,Session,Setup\n{rows}\n",
+        [
+            MappingEntry(0, semantic_role="trade_return", unit="R"),
+            MappingEntry(1, analysis_label="Session", model_disclosure=True),
+            MappingEntry(2, analysis_label="Setup", model_disclosure=True),
+        ],
+    )
+    entries = storage.mapping_entries(mapping.id)
+    session_id = next(entry.field_id for entry in entries if entry.analysis_label == "Session")
+    setup_id = next(entry.field_id for entry in entries if entry.analysis_label == "Setup")
+    frame = build_analysis_frame(storage, dataset.id, mapping.id, required_roles=("trade_return",))
+
+    result = group_results(frame, (session_id or "", setup_id or ""))
+
+    assert result["grouping"]["total_groups"] == 55
+    assert result["grouping"]["returned_groups"] == 50
+    assert result["grouping"]["omitted_groups"] == 5
+    assert result["grouping"]["omitted_group_rows"] == 5
+    assert all(group["values"][0].startswith("S") and group["values"][1].startswith("Setup") for group in result["groups"])
+    with pytest.raises(ValueError, match="one or two"):
+        group_results(frame, (session_id or "", setup_id or "", session_id or ""))
+
+
+@pytest.mark.parametrize(
+"entries,group_field,required_roles",
+[
+    ([MappingEntry(0, semantic_role="trade_return", unit="R")], "trade_return", ("trade_return",)),
+    ([MappingEntry(0, semantic_role="trade_return", unit="R"), MappingEntry(1, analysis_label="Session")], "Session", ("trade_return",)),
+],
+)
+def test_group_results_rejects_non_groupable_or_undisclosed_fields(tmp_path, entries, group_field, required_roles):
+    storage, dataset, mapping = _confirmed_dataset(tmp_path, "Result,Session\n1,London\n", entries)
+    mapped = storage.mapping_entries(mapping.id)
+    field_id = next(entry.field_id for entry in mapped if entry.semantic_role == group_field or entry.analysis_label == group_field)
+    frame = build_analysis_frame(storage, dataset.id, mapping.id, required_roles=required_roles)
+
+    with pytest.raises(ValueError, match="group"):
+        group_results(frame, (field_id or "",))
+
+
+def test_group_results_handles_empty_filtered_data_without_group_values(tmp_path):
+    storage, dataset, mapping = _confirmed_dataset(
+        tmp_path,
+        "Result,Session\n1,London\n",
+        [MappingEntry(0, semantic_role="trade_return", unit="R"), MappingEntry(1, analysis_label="Session", model_disclosure=True)],
+    )
+    session_id = next(entry.field_id for entry in storage.mapping_entries(mapping.id) if entry.analysis_label == "Session")
+    frame = build_analysis_frame(
+        storage,
+        dataset.id,
+        mapping.id,
+        required_roles=("trade_return",),
+        filters=(AnalysisFilter(session_id or "", "eq", "New York"),),
+    )
+
+    result = group_results(frame, (session_id or "",))
+
+    assert result["groups"] == []
+    assert result["grouping"]["total_groups"] == 0
+    assert result["limitations"] == ["no_matching_rows"]
+
+
+def test_compare_groups_returns_both_sides_and_zero_delta_for_equal_metrics(tmp_path):
+    storage, dataset, mapping = _confirmed_dataset(
+        tmp_path,
+        "Result,Session,Desk Secret\n1,London,do-not-disclose\n-1,London,do-not-disclose\n1,New York,do-not-disclose\n-1,New York,do-not-disclose\n",
+        [MappingEntry(0, semantic_role="trade_return", unit="R"), MappingEntry(1, analysis_label="Session", model_disclosure=True)],
+    )
+    session_id = next(entry.field_id for entry in storage.mapping_entries(mapping.id) if entry.analysis_label == "Session")
+    frame = build_analysis_frame(storage, dataset.id, mapping.id, required_roles=("trade_return",))
+
+    result = compare_groups(frame, session_id or "", "London", "New York")
+
+    assert result["operation"] == "compare_groups"
+    assert result["comparison"]["field_id"] == session_id
+    assert result["comparison"]["a"]["value"] == "London"
+    assert result["comparison"]["b"]["value"] == "New York"
+    assert result["comparison"]["a"]["counts"]["valid_rows"] == 2
+    assert result["comparison"]["deltas"]["mean_return"] == 0.0
+    assert result["metric_definitions"]["comparison_delta"] == "A - B for numeric metrics available on both sides"
+    assert "small_sample" in result["limitations"]
+    assert "causal" not in json.dumps(result).casefold()
+    assert "Desk Secret" not in json.dumps(result)
+    assert "do-not-disclose" not in json.dumps(result)
+
+
+def test_compare_groups_rejects_invalid_types_equal_values_and_unknown_fields(tmp_path):
+    storage, dataset, mapping = _confirmed_dataset(
+        tmp_path,
+        "Result,Condition\n1,true\n1,false\n",
+        [MappingEntry(0, semantic_role="trade_return", unit="R"), MappingEntry(1, analysis_label="Condition", model_disclosure=True)],
+    )
+    condition_id = next(entry.field_id for entry in storage.mapping_entries(mapping.id) if entry.analysis_label == "Condition")
+    frame = build_analysis_frame(storage, dataset.id, mapping.id, required_roles=("trade_return",))
+
+    grouped = group_results(frame, (condition_id or "",))
+
+    assert [group["values"] for group in grouped["groups"]] == [[False], [True]]
+    with pytest.raises(ValueError, match="comparison"):
+        compare_groups(frame, condition_id or "", "true", False)
+    with pytest.raises(ValueError, match="distinct"):
+        compare_groups(frame, condition_id or "", True, True)
+    with pytest.raises(ValueError, match="group"):
+        compare_groups(frame, "field-unknown", True, False)

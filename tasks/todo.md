@@ -135,14 +135,14 @@ metrics with a versioned `USER_EMPIRICAL_EVIDENCE` envelope.
 on top of core metrics.
 
 **Acceptance criteria:**
-- [ ] Each group displays N, valid N, exclusions, and bounded standardized metrics.
-- [ ] Comparison returns both sides and defined deltas, not a causal conclusion.
-- [ ] At most two group columns and 50 returned groups are enforced with omission metadata.
+- [x] Each group displays N, valid N, exclusions, and bounded standardized metrics.
+- [x] Comparison returns both sides and defined deltas, not a causal conclusion.
+- [x] At most two group columns and 50 returned groups are enforced with omission metadata.
 
 **Verification:**
-- [ ] Fixtures cover session, boolean condition, empty/small groups, filters,
+- [x] Fixtures cover session, boolean condition, empty/small groups, filters,
   same-value comparisons, and context truncation.
-- [ ] Full pytest passes.
+- [x] Full pytest passes.
 
 **Dependencies:** Task 5
 **Files likely touched:** `src/mentor/analysis.py`, `tests/test_analysis.py`,

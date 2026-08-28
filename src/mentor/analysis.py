@@ -27,6 +27,13 @@ _SUMMARY_METRICS = (
     "iqr_outlier_count", "percentile_05", "percentile_10", "percentile_25", "percentile_50", "percentile_75",
     "percentile_90", "percentile_95", "valid_rows", "excluded_rows",
 )
+_GROUP_LIMIT = 50
+_GROUP_METRICS = (
+    "wins", "losses", "breakevens", "win_rate", "loss_rate",
+    "total_return", "mean_return", "median_return", "mean_winning_return", "mean_losing_return",
+    "best_return", "worst_return", "sample_standard_deviation", "first_quartile", "third_quartile",
+    "interquartile_range", "iqr_outlier_count",
+)
 
 
 @dataclass(frozen=True)
@@ -42,6 +49,7 @@ class AnalysisField:
     column_name: str
     value_type: str
     semantic_role: str | None
+    aggregate_labels_allowed: bool
 
 
 @dataclass(frozen=True)
@@ -62,6 +70,8 @@ class AnalysisFrame:
     """Mapped local values only; repr deliberately never includes cell values."""
 
     data: pd.DataFrame = field(repr=False, compare=False)
+    source_data: pd.DataFrame = field(repr=False, compare=False)
+    filtered_data: pd.DataFrame = field(repr=False, compare=False)
     dataset_id: str
     dataset_sha256: str
     mapping_version_id: int
@@ -152,15 +162,14 @@ def build_analysis_frame(
     else:
         order = AnalysisOrder("source")
 
-    data = pd.DataFrame(
-        [{"source_row_ordinal": row["source_row_ordinal"], **{field.column_name: row["values"][field.field_id] for field in fields}} for row in valid],
-        columns=["source_row_ordinal", *(field.column_name for field in fields)],
-    )
-    if not data.empty:
-        data["source_row_ordinal"] = data["source_row_ordinal"].astype("int64")
+    source_data = _frame_data(rows, fields, include_states=True)
+    filtered_data = _frame_data(filtered, fields, include_states=True)
+    data = _frame_data(valid, fields)
     no_data_reason = "no_source_rows" if not rows else "no_matching_rows" if not filtered else "no_valid_rows" if not valid else None
     return AnalysisFrame(
         data=data,
+        source_data=source_data,
+        filtered_data=filtered_data,
         dataset_id=dataset.id,
         dataset_sha256=dataset.content_sha256,
         mapping_version_id=mapping.id,
@@ -210,11 +219,79 @@ def summarize_results(
 
     limitations = _summary_limitations(frame, metrics)
     return {
+        **_result_metadata(frame, "summarize_results"),
+        "metrics": metrics,
+        "limitations": limitations,
+    }
+
+
+def group_results(frame: AnalysisFrame, group_fields: Sequence[str]) -> dict[str, object]:
+    """Return bounded, privacy-approved descriptive metrics for one or two groups."""
+    fields = _grouping_fields(frame, group_fields)
+    group_columns = [field.column_name for field in fields]
+    keys = _group_keys(frame.filtered_data, group_columns)
+    returned_keys = keys[:_GROUP_LIMIT]
+    omitted_keys = keys[_GROUP_LIMIT:]
+    groups = [_group_payload(_group_frame(frame, fields, key), key) for key in returned_keys]
+    omitted_rows = sum(len(_group_subset(frame.filtered_data, fields, key)) for key in omitted_keys)
+    limitations = _group_limitations(frame, len(keys), len(returned_keys))
+    return {
+        **_result_metadata(frame, "group_results"),
+        "grouping": {
+            "field_ids": [field.field_id for field in fields],
+            "limit": _GROUP_LIMIT,
+            "total_groups": len(keys),
+            "returned_groups": len(returned_keys),
+            "omitted_groups": len(omitted_keys),
+            "omitted_group_rows": omitted_rows,
+        },
+        "groups": groups,
+        "limitations": limitations,
+    }
+
+
+def compare_groups(frame: AnalysisFrame, field_id: str, value_a: object, value_b: object) -> dict[str, object]:
+    """Compare two typed, distinct values in an approved group field without inference."""
+    field = _grouping_fields(frame, (field_id,))[0]
+    if not _filter_value_matches(field.value_type, value_a) or not _filter_value_matches(field.value_type, value_b):
+        raise ValueError("comparison values are incompatible with the group field")
+    if value_a == value_b:
+        raise ValueError("comparison values must be distinct")
+    a = _group_frame(frame, (field,), (value_a,))
+    b = _group_frame(frame, (field,), (value_b,))
+    a_payload = _group_payload(a, (value_a,))
+    b_payload = _group_payload(b, (value_b,))
+    a_payload["value"] = a_payload.pop("values")[0]  # type: ignore[index]
+    b_payload["value"] = b_payload.pop("values")[0]  # type: ignore[index]
+    deltas = {
+        name: _metric_delta(a_payload["metrics"][name], b_payload["metrics"][name])  # type: ignore[index]
+        for name in _GROUP_METRICS
+    }
+    limitations = sorted({"descriptive_comparison_only", *a_payload["limitations"], *b_payload["limitations"]})  # type: ignore[arg-type]
+    metadata = _result_metadata(frame, "compare_groups")
+    return {
+        **metadata,
+        "metric_definitions": {
+            **metadata["metric_definitions"],  # type: ignore[arg-type]
+            "comparison_delta": "A - B for numeric metrics available on both sides",
+        },
+        "comparison": {
+            "field_id": field.field_id,
+            "a": a_payload,
+            "b": b_payload,
+            "deltas": deltas,
+        },
+        "limitations": limitations,
+    }
+
+
+def _result_metadata(frame: AnalysisFrame, operation: str) -> dict[str, object]:
+    return {
         "provenance": "USER_EMPIRICAL_EVIDENCE",
         "dataset_id": frame.dataset_id,
         "dataset_sha256": frame.dataset_sha256,
         "mapping_version_id": frame.mapping_version_id,
-        "operation": "summarize_results",
+        "operation": operation,
         "schema_version": "1.0",
         "filters": [_filter_descriptor(item) for item in frame.filters],
         "metric_definitions": {
@@ -229,12 +306,138 @@ def summarize_results(
             "valid_rows": frame.valid_rows,
             "excluded_rows": frame.excluded_rows,
         },
-        "exclusions": [
-            {"role": item.role, "reason": item.reason, "count": item.count} for item in frame.exclusions
-        ],
-        "metrics": metrics,
-        "limitations": limitations,
+        "exclusions": _exclusion_payload(frame.exclusions),
     }
+
+
+def _grouping_fields(frame: AnalysisFrame, group_fields: Sequence[str]) -> tuple[AnalysisField, ...]:
+    if not isinstance(frame, AnalysisFrame):
+        raise ValueError("groups require a validated analysis frame")
+    if not isinstance(group_fields, Sequence) or isinstance(group_fields, (str, bytes)) or not 1 <= len(group_fields) <= 2:
+        raise ValueError("groups require one or two field IDs")
+    if any(not isinstance(field_id, str) for field_id in group_fields) or len(set(group_fields)) != len(group_fields):
+        raise ValueError("group field IDs must be unique strings")
+    fields_by_id = {field.field_id: field for field in frame.fields}
+    fields = tuple(fields_by_id.get(field_id) for field_id in group_fields)
+    if any(field is None or field.value_type not in {"categorical", "boolean"} or not field.aggregate_labels_allowed for field in fields):
+        raise ValueError("group field is unsupported or not approved for aggregate labels")
+    return fields  # type: ignore[return-value]
+
+
+def _group_keys(data: pd.DataFrame, columns: Sequence[str]) -> list[tuple[object, ...]]:
+    if data.empty:
+        return []
+    rows = data.dropna(subset=list(columns))
+    keys = {tuple(row) for row in rows.loc[:, list(columns)].itertuples(index=False, name=None)}
+    return sorted(keys, key=lambda key: tuple(f"{type(value).__name__}:{value}" for value in key))
+
+
+def _group_subset(data: pd.DataFrame, fields: Sequence[AnalysisField], values: Sequence[object]) -> pd.DataFrame:
+    if data.empty:
+        return data.copy()
+    mask = pd.Series(True, index=data.index)
+    for field, value in zip(fields, values, strict=True):
+        mask &= data[field.column_name] == value
+    return data.loc[mask].copy()
+
+
+def _group_frame(frame: AnalysisFrame, fields: Sequence[AnalysisField], values: Sequence[object]) -> AnalysisFrame:
+    source_data = _group_subset(frame.source_data, fields, values)
+    filtered_data = _group_subset(frame.filtered_data, fields, values)
+    data = _group_subset(frame.data, fields, values)
+    if frame.order.mode == "timestamp" and not data.empty:
+        data = data.sort_values(["trade_timestamp", "source_row_ordinal"], kind="stable")
+    exclusions = _frame_exclusions(filtered_data, frame)
+    outcome_sequence = _group_outcome_sequence(filtered_data, frame)
+    no_data_reason = "no_source_rows" if source_data.empty else "no_matching_rows" if filtered_data.empty else "no_valid_rows" if data.empty else None
+    return AnalysisFrame(
+        data=data,
+        source_data=source_data,
+        filtered_data=filtered_data,
+        dataset_id=frame.dataset_id,
+        dataset_sha256=frame.dataset_sha256,
+        mapping_version_id=frame.mapping_version_id,
+        fields=frame.fields,
+        filters=frame.filters,
+        outcome_sequence=outcome_sequence,
+        required_roles=frame.required_roles,
+        source_rows=len(source_data),
+        filtered_rows=len(filtered_data),
+        valid_rows=len(data),
+        excluded_rows=len(filtered_data) - len(data),
+        exclusions=exclusions,
+        return_unit=frame.return_unit,
+        order=frame.order,
+        no_data_reason=no_data_reason,
+    )
+
+
+def _group_outcome_sequence(data: pd.DataFrame, frame: AnalysisFrame) -> tuple[str | None, ...]:
+    if "trade_outcome" not in frame.required_roles:
+        return ()
+    by_role = {field.semantic_role: field for field in frame.fields if field.semantic_role}
+    ordered = data
+    if frame.order.mode == "timestamp" and not ordered.empty:
+        ordered = ordered.sort_values(["trade_timestamp", "source_row_ordinal"], kind="stable")
+    sequence: list[str | None] = []
+    for _, row in ordered.iterrows():
+        if not all(row[_state_column(by_role[role])] == "valid" for role in frame.required_roles if role not in {"trade_outcome", "trade_return"}):
+            continue
+        outcome = row[by_role["trade_outcome"].column_name]
+        outcome_valid = row[_state_column(by_role["trade_outcome"])] == "valid"
+        return_valid = "trade_return" not in frame.required_roles or row[_state_column(by_role["trade_return"])] == "valid"
+        sequence.append(str(outcome) if outcome_valid and return_valid else None)
+    return tuple(sequence)
+
+
+def _frame_exclusions(data: pd.DataFrame, frame: AnalysisFrame) -> tuple[ExclusionReason, ...]:
+    by_role = {field.semantic_role: field for field in frame.fields if field.semantic_role}
+    reasons: list[ExclusionReason] = []
+    for role in frame.required_roles:
+        states = data[_state_column(by_role[role])] if not data.empty else pd.Series(dtype="object")
+        for reason in ("blank", "invalid"):
+            count = int((states == reason).sum())
+            if count:
+                reasons.append(ExclusionReason(role, reason, count))
+    return tuple(reasons)
+
+
+def _group_payload(frame: AnalysisFrame, values: Sequence[object]) -> dict[str, object]:
+    summary = summarize_results(frame)
+    metrics = summary["metrics"]
+    assert isinstance(metrics, dict)
+    return {
+        "values": [_json_value(value) for value in values],
+        "counts": summary["counts"],
+        "exclusions": summary["exclusions"],
+        "metrics": {name: metrics[name] for name in _GROUP_METRICS},
+        "limitations": summary["limitations"],
+    }
+
+
+def _group_limitations(frame: AnalysisFrame, total_groups: int, returned_groups: int) -> list[str]:
+    limitations: list[str] = []
+    if frame.no_data_reason == "no_matching_rows":
+        limitations.append("no_matching_rows")
+    elif frame.no_data_reason == "no_valid_rows":
+        limitations.append("no_valid_rows")
+    if total_groups > returned_groups:
+        limitations.append("groups_omitted")
+    return limitations
+
+
+def _metric_delta(a: object, b: object) -> float | None:
+    if isinstance(a, (int, float)) and not isinstance(a, bool) and isinstance(b, (int, float)) and not isinstance(b, bool):
+        return float(a - b)
+    return None
+
+
+def _json_value(value: object) -> object:
+    return value.item() if hasattr(value, "item") else value
+
+
+def _exclusion_payload(exclusions: Sequence[ExclusionReason]) -> list[dict[str, object]]:
+    return [{"role": item.role, "reason": item.reason, "count": item.count} for item in exclusions]
 
 
 def _outcome_metrics(
@@ -357,7 +560,36 @@ def _filter_descriptor(filter_: AnalysisFilter) -> dict[str, str]:
 
 
 def _field(entry: "MappingEntry") -> AnalysisField:
-    return AnalysisField(entry.field_id or "", entry.semantic_role or entry.field_id or "", entry.value_type or "unknown", entry.semantic_role)
+    return AnalysisField(
+        entry.field_id or "",
+        entry.semantic_role or entry.field_id or "",
+        entry.value_type or "unknown",
+        entry.semantic_role,
+        entry.aggregate_labels_allowed,
+    )
+
+
+def _frame_data(rows: Sequence[dict[str, object]], fields: Sequence[AnalysisField], *, include_states: bool = False) -> pd.DataFrame:
+    columns = ["source_row_ordinal", *(field.column_name for field in fields)]
+    if include_states:
+        columns.extend(_state_column(field) for field in fields)
+    records = []
+    for row in rows:
+        values = row["values"]
+        states = row["states"]
+        assert isinstance(values, dict) and isinstance(states, dict)
+        record = {"source_row_ordinal": row["source_row_ordinal"], **{field.column_name: values[field.field_id] for field in fields}}
+        if include_states:
+            record.update({_state_column(field): states[field.field_id] for field in fields})
+        records.append(record)
+    data = pd.DataFrame(records, columns=columns)
+    if not data.empty:
+        data["source_row_ordinal"] = data["source_row_ordinal"].astype("int64")
+    return data
+
+
+def _state_column(field: AnalysisField) -> str:
+    return f"__state__{field.field_id}"
 
 
 def _typed_row(ordinal: int, source: list[object], entries: Sequence["MappingEntry"]) -> dict[str, object]:
