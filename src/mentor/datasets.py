@@ -411,6 +411,8 @@ def _inspect_column(
     text = [str(value).strip() for value in nonblank]
     if not text:
         return DatasetColumnInspection(ordinal, header, "unknown", 0, blank_count, 0, 0, 0, "no_valid_values")
+    if semantic_role == "trade_outcome":
+        return _outcome_column_inspection(ordinal, header, text, blank_count)
     if _is_date_header(header):
         date_states = [_date_parse_state(value) for value in text]
         valid_dates = date_states.count("valid")
@@ -429,7 +431,7 @@ def _inspect_column(
             reason,
             ambiguous_date_count,
         )
-    if semantic_role == "trade_outcome" or _HEADER_ALIASES.get(_header_key(header), (None,))[0] == "trade_outcome":
+    if _HEADER_ALIASES.get(_header_key(header), (None,))[0] == "trade_outcome":
         return _outcome_column_inspection(ordinal, header, text, blank_count)
     numeric_count = sum(_parse_number(value) is not None for value in text)
     if numeric_count and (numeric_count == len(text) or _header_key(header) in _NUMERIC_HEADER_KEYS):

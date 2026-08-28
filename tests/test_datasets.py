@@ -361,6 +361,24 @@ def test_manual_trade_outcome_mapping_uses_controlled_values_not_header_alias(tm
     assert storage.mapping_entries(storage.confirm_mapping_version(draft.id).id)[0] == entry
 
 
+def test_explicit_trade_outcome_mapping_overrides_date_like_header_inference(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    source = tmp_path / "trades.csv"
+    source.write_text("Outcome Date\nWin\nunknown\n", encoding="utf-8")
+    dataset = _importer(storage, tmp_path)(source).dataset
+
+    draft = create_inspected_mapping_draft(
+        storage,
+        inspect_local_dataset(storage, dataset.id),
+        [MappingEntry(0, semantic_role="trade_outcome")],
+    )
+    entry = storage.mapping_entries(draft.id)[0]
+
+    assert (entry.value_type, entry.valid_count, entry.invalid_count) == ("categorical", 1, 1)
+    assert entry.unavailable_reason == "invalid_values_excluded"
+
+
 def test_tradedate_alias_keeps_ambiguous_and_impossible_dates_distinct(tmp_path):
     storage = Storage(tmp_path / "mentor.sqlite3")
     storage.initialize()
