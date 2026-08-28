@@ -169,6 +169,10 @@ def build_analysis_frame(
         outcome_sequence=tuple(
             row["values"][role_entries["trade_outcome"].field_id]
             if row["states"][role_entries["trade_outcome"].field_id] == "valid"
+            and (
+                "trade_return" not in effective_required
+                or row["states"][role_entries["trade_return"].field_id] == "valid"
+            )
             else None
             for row in outcome_rows
         ),
