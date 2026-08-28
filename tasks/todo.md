@@ -92,16 +92,16 @@ local file into a pure validated analysis frame with typed filters, stable row
 ordinal, and exclusion accounting.
 
 **Acceptance criteria:**
-- [ ] Every operation has explicit required roles and reports source, filtered,
+- [x] Every operation has explicit required roles and reports source, filtered,
   valid and excluded N with reasons while preserving the confirmed return unit.
-- [ ] Streak/equity order defaults to recorded source row ordinal; explicit time
+- [x] Streak/equity order defaults to recorded source row ordinal; explicit time
   ordering is validated, recorded, and never guessed.
-- [ ] Typed filters reject unknown columns, incompatible values, and unsupported operators.
-- [ ] No malformed value becomes a plausible trade result.
+- [x] Typed filters reject unknown columns, incompatible values, and unsupported operators.
+- [x] No malformed value becomes a plausible trade result.
 
 **Verification:**
-- [ ] Pure-function tests cover type failures, filters, and no-data cases.
-- [ ] Result fixtures contain no raw dataset dump.
+- [x] Pure-function tests cover type failures, filters, and no-data cases.
+- [x] Result fixtures contain no raw dataset dump.
 
 **Dependencies:** Task 3
 **Files likely touched:** `src/mentor/analysis.py`, `src/mentor/datasets.py`,
