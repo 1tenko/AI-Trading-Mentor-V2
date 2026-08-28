@@ -308,6 +308,24 @@ def test_summarize_results_treats_missing_outcomes_as_ordered_streak_breakers(tm
     assert result["exclusions"] == [{"role": "trade_outcome", "reason": "blank", "count": 1}]
 
 
+def test_summarize_results_treats_invalid_required_returns_as_ordered_streak_breakers(tmp_path):
+    storage, dataset, mapping = _confirmed_dataset(
+        tmp_path,
+        "Result,Outcome\n1,win\nbad,loss\n1,win\n",
+        [MappingEntry(0, semantic_role="trade_return", unit="R"), MappingEntry(1, semantic_role="trade_outcome")],
+    )
+    frame = build_analysis_frame(
+        storage, dataset.id, mapping.id, required_roles=("trade_return", "trade_outcome")
+    )
+
+    result = summarize_results(frame)
+
+    assert result["counts"] == {"source_rows": 3, "filtered_rows": 3, "valid_rows": 2, "excluded_rows": 1}
+    assert result["metrics"]["wins"] == 2
+    assert result["metrics"]["max_consecutive_wins"] == 1
+    assert result["exclusions"] == [{"role": "trade_return", "reason": "invalid", "count": 1}]
+
+
 def test_summarize_results_marks_realized_reward_risk_unavailable_when_mean_loss_is_zero(tmp_path):
     storage, dataset, mapping = _confirmed_dataset(
         tmp_path,

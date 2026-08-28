@@ -140,7 +140,7 @@ def build_analysis_frame(
         and all(
             row["states"][role_entries[role].field_id] == "valid"
             for role in effective_required
-            if role != "trade_outcome"
+            if role not in ("trade_outcome", "trade_return")
         )
     ]
     if order_by == "timestamp":
