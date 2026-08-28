@@ -340,6 +340,27 @@ def test_mapping_storage_rejects_spoofed_semantic_role_unit_and_source(tmp_path)
         storage.confirm_mapping_version(draft.id)
 
 
+def test_manual_trade_outcome_mapping_uses_controlled_values_not_header_alias(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    source = tmp_path / "trades.csv"
+    source.write_text("Status\nWin\nunknown\n", encoding="utf-8")
+    dataset = _importer(storage, tmp_path)(source).dataset
+    inspection = inspect_local_dataset(storage, dataset.id)
+
+    assert (inspection.columns[0].valid_count, inspection.columns[0].invalid_count) == (2, 0)
+    draft = create_inspected_mapping_draft(
+        storage,
+        inspection,
+        [MappingEntry(0, semantic_role="trade_outcome")],
+    )
+    entry = storage.mapping_entries(draft.id)[0]
+
+    assert (entry.valid_count, entry.invalid_count, entry.distinct_count) == (1, 1, 1)
+    assert entry.unavailable_reason == "invalid_values_excluded"
+    assert storage.mapping_entries(storage.confirm_mapping_version(draft.id).id)[0] == entry
+
+
 def test_tradedate_alias_keeps_ambiguous_and_impossible_dates_distinct(tmp_path):
     storage = Storage(tmp_path / "mentor.sqlite3")
     storage.initialize()

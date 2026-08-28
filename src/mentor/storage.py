@@ -1933,10 +1933,12 @@ class Storage:
             _UNIT_ROLES,
             _UNITS,
             _field_id,
+            _mapping_columns_for_entries,
             inspect_local_dataset,
         )
 
-        columns = {column.ordinal: column for column in inspect_local_dataset(self, dataset_id).columns}
+        inspection = inspect_local_dataset(self, dataset_id)
+        columns = _mapping_columns_for_entries(self, inspection, entries)
         for entry in entries:
             values = _dataset_values(entry)
             column = columns.get(values.get("column_ordinal"))

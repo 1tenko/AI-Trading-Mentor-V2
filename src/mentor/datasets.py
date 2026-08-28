@@ -251,7 +251,7 @@ def create_inspected_mapping_draft(
     if inspection != verified:
         raise ValueError("mapping requires a current local inspection")
     inspection = verified
-    columns = {column.ordinal: column for column in inspection.columns}
+    columns = _mapping_columns_for_entries(storage, inspection, entries)
     roles: set[str] = set()
     ordinals: set[int] = set()
     prepared: list[MappingEntry] = []
@@ -339,6 +339,38 @@ def model_mapping_context(storage: "Storage", mapping_version_id: int) -> list[d
     ]
 
 
+def _mapping_columns_for_entries(
+    storage: "Storage", inspection: DatasetInspection, entries: Iterable[MappingEntry | object]
+) -> dict[int, DatasetColumnInspection]:
+    columns = {column.ordinal: column for column in inspection.columns}
+    outcome_entries = [entry for entry in entries if _entry_role(entry) == "trade_outcome"]
+    if not outcome_entries:
+        return columns
+    dataset = storage.dataset(inspection.dataset_id)
+    if dataset is None:
+        raise ValueError("dataset metadata is unavailable")
+    headers, rows = _inspection_rows(
+        storage.database_path.parent / "datasets" / dataset.id / f"original{dataset.original_extension}",
+        dataset.original_extension,
+        inspection.import_spec,
+    )
+    for entry in outcome_entries:
+        ordinal = _entry_ordinal(entry)
+        if ordinal in columns:
+            columns[ordinal] = _inspect_column(
+                ordinal, headers[ordinal], [row[ordinal] for row in rows], semantic_role="trade_outcome"
+            )
+    return columns
+
+
+def _entry_role(entry: MappingEntry | object) -> object:
+    return entry.semantic_role if isinstance(entry, MappingEntry) else getattr(entry, "get", lambda _key: None)("semantic_role")
+
+
+def _entry_ordinal(entry: MappingEntry | object) -> int | None:
+    return entry.column_ordinal if isinstance(entry, MappingEntry) else getattr(entry, "get", lambda _key: None)("column_ordinal")
+
+
 def _inspection_rows(path: Path, extension: str, spec: DatasetImportSpec) -> tuple[list[str], list[list[object]]]:
     if extension == ".csv":
         if not spec.csv_encoding or not spec.csv_delimiter or not spec.csv_quoting:
@@ -371,7 +403,9 @@ def _inspection_rows(path: Path, extension: str, spec: DatasetImportSpec) -> tup
     return headers, values
 
 
-def _inspect_column(ordinal: int, header: str, values: list[object]) -> DatasetColumnInspection:
+def _inspect_column(
+    ordinal: int, header: str, values: list[object], *, semantic_role: str | None = None
+) -> DatasetColumnInspection:
     nonblank = [value for value in values if not _blank(value)]
     blank_count = len(values) - len(nonblank)
     text = [str(value).strip() for value in nonblank]
@@ -395,21 +429,8 @@ def _inspect_column(ordinal: int, header: str, values: list[object]) -> DatasetC
             reason,
             ambiguous_date_count,
         )
-    if _HEADER_ALIASES.get(_header_key(header), (None,))[0] == "trade_outcome":
-        normalized_outcomes = [_OUTCOME_VALUES.get(value.casefold()) for value in text]
-        valid_count = sum(value is not None for value in normalized_outcomes)
-        invalid_count = len(text) - valid_count
-        return DatasetColumnInspection(
-            ordinal,
-            header,
-            "categorical",
-            valid_count,
-            blank_count,
-            invalid_count,
-            len({value for value in normalized_outcomes if value is not None}),
-            max((len(value) for value in normalized_outcomes if value is not None), default=0),
-            "invalid_values_excluded" if invalid_count else None,
-        )
+    if semantic_role == "trade_outcome" or _HEADER_ALIASES.get(_header_key(header), (None,))[0] == "trade_outcome":
+        return _outcome_column_inspection(ordinal, header, text, blank_count)
     numeric_count = sum(_parse_number(value) is not None for value in text)
     if numeric_count and (numeric_count == len(text) or _header_key(header) in _NUMERIC_HEADER_KEYS):
         invalid_count = len(text) - numeric_count
@@ -428,6 +449,25 @@ def _inspect_column(ordinal: int, header: str, values: list[object]) -> DatasetC
     if normalized.issubset({"true", "false", "yes", "no", "y", "n"}):
         return DatasetColumnInspection(ordinal, header, "boolean", len(text), blank_count, 0, len(normalized), max(map(len, text)))
     return DatasetColumnInspection(ordinal, header, "categorical", len(text), blank_count, 0, len(set(text)), max(map(len, text)))
+
+
+def _outcome_column_inspection(
+    ordinal: int, header: str, text: list[str], blank_count: int
+) -> DatasetColumnInspection:
+    normalized_outcomes = [_OUTCOME_VALUES.get(value.casefold()) for value in text]
+    valid_count = sum(value is not None for value in normalized_outcomes)
+    invalid_count = len(text) - valid_count
+    return DatasetColumnInspection(
+        ordinal,
+        header,
+        "categorical",
+        valid_count,
+        blank_count,
+        invalid_count,
+        len({value for value in normalized_outcomes if value is not None}),
+        max((len(value) for value in normalized_outcomes if value is not None), default=0),
+        "invalid_values_excluded" if invalid_count else None,
+    )
 
 
 def _file_sha256(path: Path) -> str:
