@@ -198,7 +198,7 @@ def summarize_results(
     metrics["excluded_rows"] = frame.excluded_rows
 
     if has_outcome:
-        metrics.update(_outcome_metrics(frame.outcome_sequence))
+        metrics.update(_outcome_metrics(frame.data["trade_outcome"].tolist(), frame.outcome_sequence))
     if has_return and returns:
         metrics.update(_return_metrics(returns, frame, has_outcome))
     if frame.return_unit == "R" and has_return and returns:
@@ -233,7 +233,10 @@ def summarize_results(
     }
 
 
-def _outcome_metrics(outcomes: Sequence[object]) -> dict[str, float | int | None]:
+def _outcome_metrics(
+    outcomes: Sequence[object], ordered_outcomes: Sequence[object] | None = None
+) -> dict[str, float | int | None]:
+    streak_outcomes = outcomes if ordered_outcomes is None else ordered_outcomes
     wins = sum(outcome == "win" for outcome in outcomes)
     losses = sum(outcome == "loss" for outcome in outcomes)
     breakevens = sum(outcome == "breakeven" for outcome in outcomes)
@@ -244,8 +247,8 @@ def _outcome_metrics(outcomes: Sequence[object]) -> dict[str, float | int | None
         "breakevens": breakevens,
         "win_rate": wins / denominator if denominator else None,
         "loss_rate": losses / denominator if denominator else None,
-        "max_consecutive_wins": _longest_streak(outcomes, "win"),
-        "max_consecutive_losses": _longest_streak(outcomes, "loss"),
+        "max_consecutive_wins": _longest_streak(streak_outcomes, "win"),
+        "max_consecutive_losses": _longest_streak(streak_outcomes, "loss"),
     }
 
 

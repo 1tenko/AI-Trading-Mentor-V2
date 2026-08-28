@@ -322,6 +322,9 @@ def test_summarize_results_treats_invalid_required_returns_as_ordered_streak_bre
 
     assert result["counts"] == {"source_rows": 3, "filtered_rows": 3, "valid_rows": 2, "excluded_rows": 1}
     assert result["metrics"]["wins"] == 2
+    assert result["metrics"]["losses"] == 0
+    assert result["metrics"]["wins"] + result["metrics"]["losses"] + result["metrics"]["breakevens"] == 2
+    assert result["metrics"]["win_rate"] == 1.0
     assert result["metrics"]["max_consecutive_wins"] == 1
     assert result["exclusions"] == [{"role": "trade_return", "reason": "invalid", "count": 1}]
 
