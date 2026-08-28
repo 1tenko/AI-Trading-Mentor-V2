@@ -87,8 +87,9 @@ _ANALYSIS_FIELD_ID_PATTERN = re.compile(r"field_[0-9a-f]{12}")
 _DATASET_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,79}")
 _TOOL_CALL_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}")
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
+_FILTER_CANONICAL_ID_PATTERN = re.compile(r"[0-9a-f]{12}")
 ANALYSIS_FILTER_LIMIT = 20
-_ANALYSIS_EXCLUSION_LIMIT = ANALYSIS_FILTER_LIMIT + 5
+ANALYSIS_EXCLUSION_LIMIT = ANALYSIS_FILTER_LIMIT + 18
 
 
 @dataclass(frozen=True)
@@ -399,15 +400,16 @@ class Storage:
                       OR json_type(NEW.result_json, '$.filters') != 'array'
                       OR json_type(NEW.result_json, '$.metric_definitions') != 'object'
                       OR json_type(NEW.result_json, '$.counts') != 'object'
+                      OR json_type(NEW.result_json, '$.disposition_counts') != 'object'
                       OR json_type(NEW.result_json, '$.exclusions') != 'array'
                       OR json_type(NEW.result_json, '$.metrics') != 'object'
                       OR json_type(NEW.result_json, '$.limitations') != 'array' THEN 1
-                    WHEN (SELECT COUNT(*) FROM json_each(NEW.result_json)) != 12
+                    WHEN (SELECT COUNT(*) FROM json_each(NEW.result_json)) != 13
                       OR EXISTS (
                           SELECT 1 FROM json_each(NEW.result_json)
                           WHERE key NOT IN (
                               'provenance', 'dataset_id', 'dataset_sha256', 'mapping_version_id',
-                              'operation', 'schema_version', 'filters', 'metric_definitions', 'counts',
+                              'operation', 'schema_version', 'filters', 'metric_definitions', 'counts', 'disposition_counts',
                               'exclusions', 'metrics', 'limitations'
                           )
                       ) THEN 1
@@ -415,6 +417,12 @@ class Storage:
                       OR EXISTS (
                           SELECT 1 FROM json_each(NEW.result_json, '$.counts')
                           WHERE key NOT IN ('source_rows', 'filtered_rows', 'valid_rows', 'excluded_rows')
+                             OR type != 'integer' OR value < 0
+                      ) THEN 1
+                    WHEN (SELECT COUNT(*) FROM json_each(NEW.result_json, '$.disposition_counts')) != 5
+                      OR EXISTS (
+                          SELECT 1 FROM json_each(NEW.result_json, '$.disposition_counts')
+                          WHERE key NOT IN ('valid_for_analysis', 'filtered_out', 'filter_invalid', 'required_role_blank', 'required_role_invalid')
                              OR type != 'integer' OR value < 0
                       ) THEN 1
                     WHEN (SELECT COUNT(*) FROM json_each(NEW.result_json, '$.metrics')) > 50
@@ -497,15 +505,16 @@ class Storage:
                       OR json_type(NEW.output_json, '$.filters') != 'array'
                       OR json_type(NEW.output_json, '$.metric_definitions') != 'object'
                       OR json_type(NEW.output_json, '$.counts') != 'object'
+                      OR json_type(NEW.output_json, '$.disposition_counts') != 'object'
                       OR json_type(NEW.output_json, '$.exclusions') != 'array'
                       OR json_type(NEW.output_json, '$.metrics') != 'object'
                       OR json_type(NEW.output_json, '$.limitations') != 'array' THEN 1
-                    WHEN (SELECT COUNT(*) FROM json_each(NEW.output_json)) != 12
+                    WHEN (SELECT COUNT(*) FROM json_each(NEW.output_json)) != 13
                       OR EXISTS (
                           SELECT 1 FROM json_each(NEW.output_json)
                           WHERE key NOT IN (
                               'provenance', 'dataset_id', 'dataset_sha256', 'mapping_version_id',
-                              'operation', 'schema_version', 'filters', 'metric_definitions', 'counts',
+                              'operation', 'schema_version', 'filters', 'metric_definitions', 'counts', 'disposition_counts',
                               'exclusions', 'metrics', 'limitations'
                           )
                       ) THEN 1
@@ -513,6 +522,12 @@ class Storage:
                       OR EXISTS (
                           SELECT 1 FROM json_each(NEW.output_json, '$.counts')
                           WHERE key NOT IN ('source_rows', 'filtered_rows', 'valid_rows', 'excluded_rows')
+                             OR type != 'integer' OR value < 0
+                      ) THEN 1
+                    WHEN (SELECT COUNT(*) FROM json_each(NEW.output_json, '$.disposition_counts')) != 5
+                      OR EXISTS (
+                          SELECT 1 FROM json_each(NEW.output_json, '$.disposition_counts')
+                          WHERE key NOT IN ('valid_for_analysis', 'filtered_out', 'filter_invalid', 'required_role_blank', 'required_role_invalid')
                              OR type != 'integer' OR value < 0
                       ) THEN 1
                     WHEN (SELECT COUNT(*) FROM json_each(NEW.output_json, '$.metrics')) > 50
@@ -745,15 +760,16 @@ class Storage:
                       OR json_type(NEW.output_json, '$.filters') != 'array'
                       OR json_type(NEW.output_json, '$.metric_definitions') != 'object'
                       OR json_type(NEW.output_json, '$.counts') != 'object'
+                      OR json_type(NEW.output_json, '$.disposition_counts') != 'object'
                       OR json_type(NEW.output_json, '$.exclusions') != 'array'
                       OR json_type(NEW.output_json, '$.metrics') != 'object'
                       OR json_type(NEW.output_json, '$.limitations') != 'array' THEN 1
-                    WHEN (SELECT COUNT(*) FROM json_each(NEW.output_json)) != 12
+                    WHEN (SELECT COUNT(*) FROM json_each(NEW.output_json)) != 13
                       OR EXISTS (
                           SELECT 1 FROM json_each(NEW.output_json)
                           WHERE key NOT IN (
                               'provenance', 'dataset_id', 'dataset_sha256', 'mapping_version_id',
-                              'operation', 'schema_version', 'filters', 'metric_definitions', 'counts',
+                              'operation', 'schema_version', 'filters', 'metric_definitions', 'counts', 'disposition_counts',
                               'exclusions', 'metrics', 'limitations'
                           )
                       ) THEN 1
@@ -761,6 +777,12 @@ class Storage:
                       OR EXISTS (
                           SELECT 1 FROM json_each(NEW.output_json, '$.counts')
                           WHERE key NOT IN ('source_rows', 'filtered_rows', 'valid_rows', 'excluded_rows')
+                             OR type != 'integer' OR value < 0
+                      ) THEN 1
+                    WHEN (SELECT COUNT(*) FROM json_each(NEW.output_json, '$.disposition_counts')) != 5
+                      OR EXISTS (
+                          SELECT 1 FROM json_each(NEW.output_json, '$.disposition_counts')
+                          WHERE key NOT IN ('valid_for_analysis', 'filtered_out', 'filter_invalid', 'required_role_blank', 'required_role_invalid')
                              OR type != 'integer' OR value < 0
                       ) THEN 1
                     WHEN (SELECT COUNT(*) FROM json_each(NEW.output_json, '$.metrics')) > 50
@@ -897,7 +919,9 @@ class Storage:
                   OR EXISTS (
                       SELECT 1 FROM json_each(NEW.result_json, '$.filters') AS filter_
                       WHERE json_type(filter_.value) != 'object'
-                        OR (SELECT COUNT(*) FROM json_each(filter_.value)) != 3
+                        OR (SELECT COUNT(*) FROM json_each(filter_.value)) != 5
+                        OR json_type(filter_.value, '$.position') != 'integer'
+                        OR json_extract(filter_.value, '$.position') != CAST(filter_.key AS INTEGER)
                         OR json_type(filter_.value, '$.field_id') != 'text'
                         OR NOT EXISTS (
                             SELECT 1 FROM dataset_mapping_entries
@@ -910,6 +934,9 @@ class Storage:
                         OR json_type(filter_.value, '$.value_sha256') != 'text'
                         OR length(json_extract(filter_.value, '$.value_sha256')) != 64
                         OR json_extract(filter_.value, '$.value_sha256') GLOB '*[^0-9a-f]*'
+                        OR json_type(filter_.value, '$.canonical_id') != 'text'
+                        OR length(json_extract(filter_.value, '$.canonical_id')) != 12
+                        OR json_extract(filter_.value, '$.canonical_id') GLOB '*[^0-9a-f]*'
                   )
                   OR (SELECT COUNT(*) FROM json_each(NEW.result_json, '$.metric_definitions')) != 5
                   OR json_extract(NEW.result_json, '$.metric_definitions.outcome_rate_denominator') != 'wins + losses + breakevens'
@@ -933,25 +960,30 @@ class Storage:
                             AND type != 'null'
                       )
                   )
-                  OR (SELECT COUNT(*) FROM json_each(NEW.result_json, '$.exclusions')) > {_ANALYSIS_EXCLUSION_LIMIT}
+                  OR (SELECT COUNT(*) FROM json_each(NEW.result_json, '$.exclusions')) > {ANALYSIS_EXCLUSION_LIMIT}
                   OR EXISTS (
                     SELECT 1 FROM json_each(NEW.result_json, '$.exclusions') AS exclusion_
                     WHERE json_type(exclusion_.value) != 'object'
-                        OR (SELECT COUNT(*) FROM json_each(exclusion_.value)) != 3
-                        OR (
-                            NOT EXISTS (
-                                SELECT 1 FROM dataset_mapping_entries
-                                WHERE mapping_version_id = NEW.mapping_version_id
-                                  AND semantic_role = json_extract(exclusion_.value, '$.role')
-                            ) AND NOT (
-                                length(json_extract(exclusion_.value, '$.role')) = 25
-                                AND substr(json_extract(exclusion_.value, '$.role'), 1, 13) = 'filter:field_'
-                                AND substr(json_extract(exclusion_.value, '$.role'), 14) NOT GLOB '*[^0-9a-f]*'
-                            )
-                        )
                         OR json_extract(exclusion_.value, '$.reason') NOT IN ('blank', 'invalid')
                         OR json_type(exclusion_.value, '$.count') != 'integer'
                         OR json_extract(exclusion_.value, '$.count') < 1
+                        OR (
+                            json_extract(exclusion_.value, '$.kind') = 'required_role_diagnostic'
+                            AND ((SELECT COUNT(*) FROM json_each(exclusion_.value)) != 4
+                                OR NOT EXISTS (
+                                    SELECT 1 FROM dataset_mapping_entries
+                                    WHERE mapping_version_id = NEW.mapping_version_id
+                                      AND semantic_role = json_extract(exclusion_.value, '$.role')
+                                ))
+                        )
+                        OR (
+                            json_extract(exclusion_.value, '$.kind') = 'filter_invalid'
+                            AND ((SELECT COUNT(*) FROM json_each(exclusion_.value)) != 4
+                                OR NOT EXISTS (
+                                    SELECT 1 FROM json_each(NEW.result_json, '$.filters')
+                                    WHERE json_extract(value, '$.canonical_id') = json_extract(exclusion_.value, '$.canonical_id')))
+                        )
+                        OR json_extract(exclusion_.value, '$.kind') NOT IN ('required_role_diagnostic', 'filter_invalid')
                   )
                 )
                 BEGIN SELECT RAISE(ABORT, 'analysis result envelope details are invalid'); END;
@@ -973,7 +1005,9 @@ class Storage:
                   OR EXISTS (
                       SELECT 1 FROM json_each(NEW.output_json, '$.filters') AS filter_
                       WHERE json_type(filter_.value) != 'object'
-                        OR (SELECT COUNT(*) FROM json_each(filter_.value)) != 3
+                        OR (SELECT COUNT(*) FROM json_each(filter_.value)) != 5
+                        OR json_type(filter_.value, '$.position') != 'integer'
+                        OR json_extract(filter_.value, '$.position') != CAST(filter_.key AS INTEGER)
                         OR json_type(filter_.value, '$.field_id') != 'text'
                         OR NOT EXISTS (
                             SELECT 1 FROM dataset_mapping_entries
@@ -986,6 +1020,9 @@ class Storage:
                         OR json_type(filter_.value, '$.value_sha256') != 'text'
                         OR length(json_extract(filter_.value, '$.value_sha256')) != 64
                         OR json_extract(filter_.value, '$.value_sha256') GLOB '*[^0-9a-f]*'
+                        OR json_type(filter_.value, '$.canonical_id') != 'text'
+                        OR length(json_extract(filter_.value, '$.canonical_id')) != 12
+                        OR json_extract(filter_.value, '$.canonical_id') GLOB '*[^0-9a-f]*'
                   )
                   OR (SELECT COUNT(*) FROM json_each(NEW.output_json, '$.metric_definitions')) != 5
                   OR json_extract(NEW.output_json, '$.metric_definitions.outcome_rate_denominator') != 'wins + losses + breakevens'
@@ -1011,25 +1048,30 @@ class Storage:
                             AND type != 'null'
                       )
                   )
-                  OR (SELECT COUNT(*) FROM json_each(NEW.output_json, '$.exclusions')) > {_ANALYSIS_EXCLUSION_LIMIT}
+                  OR (SELECT COUNT(*) FROM json_each(NEW.output_json, '$.exclusions')) > {ANALYSIS_EXCLUSION_LIMIT}
                   OR EXISTS (
                     SELECT 1 FROM json_each(NEW.output_json, '$.exclusions') AS exclusion_
                     WHERE json_type(exclusion_.value) != 'object'
-                        OR (SELECT COUNT(*) FROM json_each(exclusion_.value)) != 3
-                        OR (
-                            NOT EXISTS (
-                                SELECT 1 FROM dataset_mapping_entries
-                                WHERE mapping_version_id = (SELECT mapping_version_id FROM analysis_evidence WHERE id = NEW.evidence_id)
-                                  AND semantic_role = json_extract(exclusion_.value, '$.role')
-                            ) AND NOT (
-                                length(json_extract(exclusion_.value, '$.role')) = 25
-                                AND substr(json_extract(exclusion_.value, '$.role'), 1, 13) = 'filter:field_'
-                                AND substr(json_extract(exclusion_.value, '$.role'), 14) NOT GLOB '*[^0-9a-f]*'
-                            )
-                        )
                         OR json_extract(exclusion_.value, '$.reason') NOT IN ('blank', 'invalid')
                         OR json_type(exclusion_.value, '$.count') != 'integer'
                         OR json_extract(exclusion_.value, '$.count') < 1
+                        OR (
+                            json_extract(exclusion_.value, '$.kind') = 'required_role_diagnostic'
+                            AND ((SELECT COUNT(*) FROM json_each(exclusion_.value)) != 4
+                                OR NOT EXISTS (
+                                    SELECT 1 FROM dataset_mapping_entries
+                                    WHERE mapping_version_id = (SELECT mapping_version_id FROM analysis_evidence WHERE id = NEW.evidence_id)
+                                      AND semantic_role = json_extract(exclusion_.value, '$.role')
+                                ))
+                        )
+                        OR (
+                            json_extract(exclusion_.value, '$.kind') = 'filter_invalid'
+                            AND ((SELECT COUNT(*) FROM json_each(exclusion_.value)) != 4
+                                OR NOT EXISTS (
+                                    SELECT 1 FROM json_each(NEW.output_json, '$.filters')
+                                    WHERE json_extract(value, '$.canonical_id') = json_extract(exclusion_.value, '$.canonical_id')))
+                        )
+                        OR json_extract(exclusion_.value, '$.kind') NOT IN ('required_role_diagnostic', 'filter_invalid')
                   )
                 )
                 BEGIN SELECT RAISE(ABORT, 'analysis result envelope details are invalid'); END;
@@ -2360,6 +2402,7 @@ def _analysis_result_envelope_json(
         "filters",
         "metric_definitions",
         "counts",
+        "disposition_counts",
         "exclusions",
         "metrics",
         "limitations",
@@ -2380,7 +2423,8 @@ def _analysis_result_envelope_json(
         or set(counts) != {"source_rows", "filtered_rows", "valid_rows", "excluded_rows"}
         or any(type(count) is not int or count < 0 for count in counts.values())
         or counts["source_rows"] < counts["filtered_rows"]
-        or counts["filtered_rows"] != counts["valid_rows"] + counts["excluded_rows"]
+        or counts["filtered_rows"] < counts["valid_rows"]
+        or counts["source_rows"] != counts["valid_rows"] + counts["excluded_rows"]
     ):
         raise ValueError("analysis result envelope is invalid")
     filters = value["filters"]
@@ -2389,15 +2433,31 @@ def _analysis_result_envelope_json(
         or len(filters) > ANALYSIS_FILTER_LIMIT
         or any(
             not isinstance(filter_, Mapping)
-            or set(filter_) != {"field_id", "operator", "value_sha256"}
+            or set(filter_) != {"position", "field_id", "operator", "value_sha256", "canonical_id"}
+            or type(filter_["position"]) is not int
+            or filter_["position"] < 0
             or not isinstance(filter_["field_id"], str)
             or _ANALYSIS_FIELD_ID_PATTERN.fullmatch(filter_["field_id"]) is None
             or not isinstance(filter_["operator"], str)
             or filter_["operator"] not in {"eq", "neq", "in", "not_in", "is_blank", "not_blank", "gt", "gte", "lt", "lte", "between"}
             or not isinstance(filter_["value_sha256"], str)
             or _SHA256_PATTERN.fullmatch(filter_["value_sha256"]) is None
+            or not isinstance(filter_["canonical_id"], str)
+            or _FILTER_CANONICAL_ID_PATTERN.fullmatch(filter_["canonical_id"]) is None
             for filter_ in filters
         )
+    ):
+        raise ValueError("analysis result envelope is invalid")
+    if [filter_["position"] for filter_ in filters] != list(range(len(filters))):
+        raise ValueError("analysis result envelope is invalid")
+    dispositions = value["disposition_counts"]
+    if (
+        not isinstance(dispositions, Mapping)
+        or set(dispositions) != {"valid_for_analysis", "filtered_out", "filter_invalid", "required_role_blank", "required_role_invalid"}
+        or any(type(count) is not int or count < 0 for count in dispositions.values())
+        or sum(dispositions.values()) != counts["source_rows"]
+        or dispositions["valid_for_analysis"] != counts["valid_rows"]
+        or dispositions["valid_for_analysis"] + dispositions["required_role_blank"] + dispositions["required_role_invalid"] != counts["filtered_rows"]
     ):
         raise ValueError("analysis result envelope is invalid")
     definitions = value["metric_definitions"]
@@ -2417,14 +2477,10 @@ def _analysis_result_envelope_json(
     exclusions = value["exclusions"]
     if (
         not isinstance(exclusions, list)
-        or len(exclusions) > _ANALYSIS_EXCLUSION_LIMIT
+        or len(exclusions) > ANALYSIS_EXCLUSION_LIMIT
         or any(
             not isinstance(exclusion, Mapping)
-            or set(exclusion) != {"role", "reason", "count"}
-            or not _analysis_exclusion_role_is_safe(exclusion["role"])
-            or exclusion["reason"] not in {"blank", "invalid"}
-            or type(exclusion["count"]) is not int
-            or exclusion["count"] < 1
+            or not _analysis_exclusion_is_safe(exclusion, filters)
             for exclusion in exclusions
         )
     ):
@@ -2460,9 +2516,25 @@ def _analysis_result_envelope_json(
     return serialized
 
 
-def _analysis_exclusion_role_is_safe(value: object) -> bool:
-    return value in {"trade_return", "trade_outcome", "trade_timestamp", "mfe", "mae"} or (
-        isinstance(value, str) and value.startswith("filter:") and _ANALYSIS_FIELD_ID_PATTERN.fullmatch(value[7:]) is not None
+def _analysis_exclusion_is_safe(exclusion: Mapping[str, Any], filters: list[Mapping[str, Any]]) -> bool:
+    if exclusion.get("kind") == "required_role_diagnostic":
+        return (
+            set(exclusion) == {"kind", "role", "reason", "count"}
+            and exclusion["role"] in {"trade_return", "trade_outcome", "trade_timestamp", "mfe", "mae", "session", "direction", "instrument", "setup"}
+            and exclusion["reason"] in {"blank", "invalid"}
+            and type(exclusion["count"]) is int
+            and exclusion["count"] > 0
+        )
+    if exclusion.get("kind") != "filter_invalid" or set(exclusion) != {
+        "kind", "canonical_id", "reason", "count"
+    }:
+        return False
+    return (
+        isinstance(exclusion["canonical_id"], str)
+        and any(exclusion["canonical_id"] == filter_["canonical_id"] for filter_ in filters)
+        and exclusion["reason"] == "invalid"
+        and type(exclusion["count"]) is int
+        and exclusion["count"] > 0
     )
 
 

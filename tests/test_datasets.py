@@ -810,6 +810,13 @@ def _result_envelope(dataset, mapping_version_id: int, operation: str = "summari
             "row_order": "source",
         },
         "counts": {"source_rows": 3, "filtered_rows": 3, "valid_rows": 3, "excluded_rows": 0},
+        "disposition_counts": {
+            "valid_for_analysis": 3,
+            "filtered_out": 0,
+            "filter_invalid": 0,
+            "required_role_blank": 0,
+            "required_role_invalid": 0,
+        },
         "exclusions": [],
         "metrics": {"valid_rows": 3},
         "limitations": [],

@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Literal, Sequence
 import pandas as pd
 
 from mentor.datasets import DatasetImportError, _inspection_rows_from_bytes
-from mentor.storage import ANALYSIS_FILTER_LIMIT
+from mentor.storage import ANALYSIS_EXCLUSION_LIMIT, ANALYSIS_FILTER_LIMIT
 
 if TYPE_CHECKING:
     from mentor.datasets import MappingEntry
@@ -78,9 +78,23 @@ class AnalysisField:
 
 @dataclass(frozen=True)
 class ExclusionReason:
-    role: str
+    kind: Literal["filter_invalid", "required_role_diagnostic"]
     reason: Literal["blank", "invalid"]
     count: int
+    role: str | None = None
+    filter_position: int | None = None
+    field_id: str | None = None
+    operator: str | None = None
+    canonical_id: str | None = None
+
+
+@dataclass(frozen=True)
+class FilterDescriptor:
+    position: int
+    field_id: str
+    operator: str
+    value_sha256: str
+    canonical_id: str
 
 
 @dataclass(frozen=True)
@@ -101,12 +115,14 @@ class AnalysisFrame:
     mapping_version_id: int
     fields: tuple[AnalysisField, ...]
     filters: tuple[AnalysisFilter, ...] = field(repr=False)
+    filter_descriptors: tuple[FilterDescriptor, ...]
     outcome_sequence: tuple[str | None, ...] = field(repr=False)
     required_roles: tuple[str, ...]
     source_rows: int
     filtered_rows: int
     valid_rows: int
     excluded_rows: int
+    disposition_counts: dict[str, int]
     exclusions: tuple[ExclusionReason, ...]
     return_unit: str | None
     order: AnalysisOrder
@@ -153,6 +169,9 @@ def build_analysis_frame(
     fields = tuple(_field(entry) for entry in entries)
     by_id = {field.field_id: field for field in fields}
     validated_filters = tuple(_validate_filter(filter_, by_id) for filter_ in filters)
+    filter_descriptors = tuple(_filter_descriptor(filter_, position) for position, filter_ in enumerate(validated_filters))
+    if len(filter_descriptors) + 2 * len(effective_required) > ANALYSIS_EXCLUSION_LIMIT:
+        raise ValueError("analysis exclusion detail limit would be exceeded")
     original_path = storage.database_path.parent / "datasets" / dataset.id / f"original{dataset.original_extension}"
     try:
         contents = original_path.read_bytes()
@@ -167,17 +186,17 @@ def build_analysis_frame(
     rows = [_typed_row(index, row, entries) for index, row in enumerate(source_rows)]
     _validate_datetime_filter_timezones(rows, validated_filters, by_id)
     for row in rows:
-        filter_state, invalid_field_id = _evaluate_filters(row, validated_filters, by_id)
+        filter_state, invalid_positions = _evaluate_filters(row, validated_filters, by_id)
         row["filter_state"] = filter_state
-        row["filter_invalid_field_id"] = invalid_field_id
-    filtered = [row for row in rows if row["filter_state"] != "no_match"]
+        row["filter_invalid_positions"] = invalid_positions
+        row["row_disposition"] = _row_disposition(row, effective_required, role_entries)
+    filtered = [row for row in rows if row["filter_state"] == "match"]
     valid = [
         row
         for row in filtered
-        if row["filter_state"] == "match"
-        and all(row["states"][role_entries[role].field_id] == "valid" for role in effective_required)
+        if row["row_disposition"] == "valid_for_analysis"
     ]
-    exclusions = _exclusions(filtered, role_entries, effective_required)
+    exclusions = _exclusions(rows, role_entries, effective_required, filter_descriptors)
     outcome_rows = [
         row
         for row in filtered
@@ -202,7 +221,7 @@ def build_analysis_frame(
 
     source_data = _frame_data(rows, fields, include_states=True)
     filtered_data = _frame_data(filtered, fields, include_states=True)
-    data = _frame_data(valid, fields)
+    data = _frame_data(valid, fields, include_states=True)
     no_data_reason = "no_source_rows" if not rows else "no_matching_rows" if not filtered else "no_valid_rows" if not valid else None
     return AnalysisFrame(
         data=data,
@@ -213,6 +232,7 @@ def build_analysis_frame(
         mapping_version_id=mapping.id,
         fields=fields,
         filters=validated_filters,
+        filter_descriptors=filter_descriptors,
         outcome_sequence=tuple(
             row["values"][role_entries["trade_outcome"].field_id]
             if row["states"][role_entries["trade_outcome"].field_id] == "valid"
@@ -227,7 +247,8 @@ def build_analysis_frame(
         source_rows=len(rows),
         filtered_rows=len(filtered),
         valid_rows=len(valid),
-        excluded_rows=len(filtered) - len(valid),
+        excluded_rows=len(rows) - len(valid),
+        disposition_counts=_disposition_counts(rows),
         exclusions=exclusions,
         return_unit=role_entries.get("trade_return").unit if "trade_return" in role_entries else None,
         order=order,
@@ -267,7 +288,7 @@ def group_results(frame: AnalysisFrame, group_fields: Sequence[str]) -> dict[str
     """Return bounded, privacy-approved descriptive metrics for one or two groups."""
     fields = _grouping_fields(frame, group_fields)
     group_columns = [field.column_name for field in fields]
-    keys = _group_keys(frame.filtered_data, group_columns)
+    keys = _group_keys(frame.data, group_columns)
     source_keys = _group_keys(frame.source_data, group_columns)
     returned_keys = keys[:_GROUP_LIMIT]
     omitted_keys = keys[_GROUP_LIMIT:]
@@ -346,33 +367,35 @@ def analyze_over_time(
         raise ValueError("only rolling analysis accepts a window size")
 
     timestamp_field = _temporal_timestamp_field(frame)
-    filtered_timestamps = _timestamp_valid_rows(frame.filtered_data, timestamp_field)
-    source_timestamps = _timestamp_valid_rows(frame.source_data, timestamp_field)
+    source_timestamps = _timestamp_valid_rows(
+        frame.source_data.loc[frame.source_data["__filter_state"] != "no_match"], timestamp_field
+    )
     buckets: list[tuple[str, pd.DataFrame, pd.DataFrame]] = []
     if mode == "month":
-        for period in sorted({(value.year, value.month) for value in filtered_timestamps["trade_timestamp"]}):
+        for period in sorted({(value.year, value.month) for value in source_timestamps["trade_timestamp"]}):
+            bucket = _month_rows(source_timestamps, period)
             buckets.append(
                 (
                     f"{period[0]:04d}-{period[1]:02d}",
-                    _month_rows(source_timestamps, period),
-                    _month_rows(filtered_timestamps, period),
+                    bucket,
+                    _rows_with_ordinals(frame.filtered_data, bucket),
                 )
             )
     elif mode == "halves":
-        split = (len(filtered_timestamps) + 1) // 2
+        split = (len(source_timestamps) + 1) // 2
         if split:
-            bucket = filtered_timestamps.iloc[:split]
-            buckets.append(("earlier_half", _timestamp_range(source_timestamps, bucket), bucket))
-        if split < len(filtered_timestamps):
-            bucket = filtered_timestamps.iloc[split:]
-            buckets.append(("later_half", _timestamp_range(source_timestamps, bucket), bucket))
-    elif len(filtered_timestamps):
+            bucket = source_timestamps.iloc[:split]
+            buckets.append(("earlier_half", bucket, _rows_with_ordinals(frame.filtered_data, bucket)))
+        if split < len(source_timestamps):
+            bucket = source_timestamps.iloc[split:]
+            buckets.append(("later_half", bucket, _rows_with_ordinals(frame.filtered_data, bucket)))
+    elif len(source_timestamps):
         assert window_size is not None
-        if window_size > len(filtered_timestamps):
+        if window_size > len(source_timestamps):
             raise ValueError("rolling window size exceeds valid timestamp rows")
-        for index in range(len(filtered_timestamps) - window_size + 1):
-            bucket = filtered_timestamps.iloc[index:index + window_size]
-            buckets.append((f"rolling_{index + 1}", _timestamp_range(source_timestamps, bucket), bucket))
+        for index in range(len(source_timestamps) - window_size + 1):
+            bucket = source_timestamps.iloc[index:index + window_size]
+            buckets.append((f"rolling_{index + 1}", bucket, _rows_with_ordinals(frame.filtered_data, bucket)))
 
     if len(buckets) > _TEMPORAL_BUCKET_LIMIT:
         raise AnalysisLimitError(
@@ -393,7 +416,7 @@ def analyze_over_time(
             "returned_buckets": len(buckets),
             "omitted_buckets": 0,
         },
-        "limitations": _temporal_limitations(frame, mode, len(filtered_timestamps)),
+        "limitations": _temporal_limitations(frame, mode, len(source_timestamps)),
     })
 
 
@@ -420,7 +443,7 @@ def _result_metadata(frame: AnalysisFrame, operation: str) -> dict[str, object]:
         "mapping_version_id": frame.mapping_version_id,
         "operation": operation,
         "schema_version": "1.0",
-        "filters": [_filter_descriptor(item) for item in frame.filters],
+        "filters": [_filter_payload(item) for item in frame.filter_descriptors],
         "metric_definitions": {
             "outcome_rate_denominator": "wins + losses + breakevens",
             "win_rate_interval": "Wilson 95% interval",
@@ -434,6 +457,7 @@ def _result_metadata(frame: AnalysisFrame, operation: str) -> dict[str, object]:
             "valid_rows": frame.valid_rows,
             "excluded_rows": frame.excluded_rows,
         },
+        "disposition_counts": frame.disposition_counts,
         "exclusions": _exclusion_payload(frame.exclusions),
     }
 
@@ -492,7 +516,7 @@ def _subset_frame(
 ) -> AnalysisFrame:
     if frame.order.mode == "timestamp" and not data.empty:
         data = data.sort_values(["trade_timestamp", "source_row_ordinal"], kind="stable")
-    exclusions = _frame_exclusions(filtered_data, frame)
+    exclusions = _frame_exclusions(source_data, frame)
     outcome_sequence = _group_outcome_sequence(filtered_data, frame)
     no_data_reason = "no_source_rows" if source_data.empty else "no_matching_rows" if filtered_data.empty else "no_valid_rows" if data.empty else None
     return AnalysisFrame(
@@ -504,12 +528,14 @@ def _subset_frame(
         mapping_version_id=frame.mapping_version_id,
         fields=frame.fields,
         filters=frame.filters,
+        filter_descriptors=frame.filter_descriptors,
         outcome_sequence=outcome_sequence,
         required_roles=frame.required_roles,
         source_rows=len(source_data),
         filtered_rows=len(filtered_data),
         valid_rows=len(data),
-        excluded_rows=len(filtered_data) - len(data),
+        excluded_rows=len(source_data) - len(data),
+        disposition_counts=_dataframe_disposition_counts(source_data),
         exclusions=exclusions,
         return_unit=frame.return_unit,
         order=frame.order,
@@ -551,17 +577,27 @@ def _group_outcome_sequence(data: pd.DataFrame, frame: AnalysisFrame) -> tuple[s
 def _frame_exclusions(data: pd.DataFrame, frame: AnalysisFrame) -> tuple[ExclusionReason, ...]:
     by_role = {field.semantic_role: field for field in frame.fields if field.semantic_role}
     reasons: list[ExclusionReason] = []
+    matched = data.loc[data["__filter_state"] == "match"] if not data.empty else data
     for role in frame.required_roles:
-        states = data[_state_column(by_role[role])] if not data.empty else pd.Series(dtype="object")
+        states = matched[_state_column(by_role[role])] if not matched.empty else pd.Series(dtype="object")
         for reason in ("blank", "invalid"):
             count = int((states == reason).sum())
             if count:
-                reasons.append(ExclusionReason(role, reason, count))
-    required_field_ids = {by_role[role].field_id for role in frame.required_roles}
-    if "__filter_invalid_field_id" in data:
-        for field_id, count in data["__filter_invalid_field_id"].value_counts(dropna=True).items():
-            if isinstance(field_id, str) and field_id not in required_field_ids:
-                reasons.append(ExclusionReason(f"filter:{field_id}", "invalid", int(count)))
+                reasons.append(ExclusionReason("required_role_diagnostic", reason, count, role=role))
+    invalid_positions = data.get("__filter_invalid_positions", pd.Series(dtype="object"))
+    for descriptor in {item.canonical_id: item for item in frame.filter_descriptors}.values():
+        positions = {item.position for item in frame.filter_descriptors if item.canonical_id == descriptor.canonical_id}
+        count = sum(len(positions.intersection(row_positions)) for row_positions in invalid_positions if isinstance(row_positions, tuple))
+        if count:
+            reasons.append(
+                ExclusionReason(
+                    "filter_invalid", "invalid", count,
+                    filter_position=descriptor.position,
+                    field_id=descriptor.field_id,
+                    operator=descriptor.operator,
+                    canonical_id=descriptor.canonical_id,
+                )
+            )
     return tuple(reasons)
 
 
@@ -604,9 +640,8 @@ def _month_rows(data: pd.DataFrame, period: tuple[int, int]) -> pd.DataFrame:
     return data.loc[data["trade_timestamp"].map(lambda value: (value.year, value.month) == period)]
 
 
-def _timestamp_range(data: pd.DataFrame, bucket: pd.DataFrame) -> pd.DataFrame:
-    timestamps = bucket["trade_timestamp"]
-    return data.loc[(data["trade_timestamp"] >= timestamps.min()) & (data["trade_timestamp"] <= timestamps.max())]
+def _rows_with_ordinals(data: pd.DataFrame, rows: pd.DataFrame) -> pd.DataFrame:
+    return data.loc[data["source_row_ordinal"].isin(rows["source_row_ordinal"])]
 
 
 def _temporal_bucket(frame: AnalysisFrame, period: str, source_data: pd.DataFrame, filtered_data: pd.DataFrame) -> dict[str, object]:
@@ -614,7 +649,7 @@ def _temporal_bucket(frame: AnalysisFrame, period: str, source_data: pd.DataFram
     data = frame.data.loc[frame.data["source_row_ordinal"].isin(ordinals)]
     bucket = _subset_frame(frame, source_data, filtered_data, data)
     payload = _group_payload(bucket, ())
-    timestamps = filtered_data["trade_timestamp"]
+    timestamps = source_data["trade_timestamp"]
     return {
         "period": period,
         "start_date": _date_text(timestamps.min()),
@@ -645,7 +680,7 @@ def _mfe_mae_payload(frame: AnalysisFrame, role: Literal["mfe", "mae"]) -> dict[
     if field is None or field.unit is None:
         return {"available": False, "reason": "missing_confirmed_mapping"}
     state_column = _state_column(field)
-    data = frame.filtered_data
+    data = frame.data
     valid = data.loc[data[state_column] == "valid", field.column_name].astype(float)
     exclusions = [
         {"reason": reason, "count": int((data[state_column] == reason).sum())}
@@ -661,7 +696,7 @@ def _mfe_mae_payload(frame: AnalysisFrame, role: Literal["mfe", "mae"]) -> dict[
             "source_rows": frame.source_rows,
             "filtered_rows": frame.filtered_rows,
             "valid_rows": len(valid),
-            "excluded_rows": frame.filtered_rows - len(valid),
+            "excluded_rows": frame.source_rows - len(valid),
         },
         "exclusions": exclusions,
         "metrics": metrics,
@@ -701,8 +736,8 @@ def _validate_comparison_value(frame: AnalysisFrame, field: AnalysisField, value
     approved_values = {key[0] for key in source_values}
     if len(approved_values) > 20 or value not in approved_values:
         raise ValueError("comparison value is absent from the approved mapped field domain")
-    if _group_subset(frame.filtered_data, (field,), (value,)).empty:
-        raise ValueError("comparison value has no matching rows after validated filters")
+    if _group_subset(frame.data, (field,), (value,)).empty:
+        raise ValueError("comparison value has no eligible rows after validated filters")
 
 
 def _metric_delta(a: object, b: object) -> float | None:
@@ -716,7 +751,18 @@ def _json_value(value: object) -> object:
 
 
 def _exclusion_payload(exclusions: Sequence[ExclusionReason]) -> list[dict[str, object]]:
-    return [{"role": item.role, "reason": item.reason, "count": item.count} for item in exclusions]
+    payload: list[dict[str, object]] = []
+    for item in exclusions:
+        if item.kind == "required_role_diagnostic":
+            payload.append({"kind": item.kind, "role": item.role, "reason": item.reason, "count": item.count})
+        else:
+            payload.append({
+                "kind": item.kind,
+                "canonical_id": item.canonical_id,
+                "reason": item.reason,
+                "count": item.count,
+            })
+    return payload
 
 
 def _finite_sum(values: Sequence[float]) -> float:
@@ -922,13 +968,21 @@ def _summary_limitations(frame: AnalysisFrame, metrics: dict[str, object]) -> li
     return limitations
 
 
-def _filter_descriptor(filter_: AnalysisFilter) -> dict[str, str]:
+def _filter_descriptor(filter_: AnalysisFilter, position: int) -> FilterDescriptor:
     value = filter_.value
     encoded = json.dumps(value, default=lambda item: item.isoformat() if isinstance(item, datetime) else None, sort_keys=True, separators=(",", ":"))
+    value_sha256 = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+    canonical_id = hashlib.sha256(f"{filter_.field_id}\0{filter_.operator}\0{value_sha256}".encode("utf-8")).hexdigest()[:12]
+    return FilterDescriptor(position, filter_.field_id, filter_.operator, value_sha256, canonical_id)
+
+
+def _filter_payload(filter_: FilterDescriptor) -> dict[str, object]:
     return {
+        "position": filter_.position,
         "field_id": filter_.field_id,
         "operator": filter_.operator,
-        "value_sha256": hashlib.sha256(encoded.encode("utf-8")).hexdigest(),
+        "value_sha256": filter_.value_sha256,
+        "canonical_id": filter_.canonical_id,
     }
 
 
@@ -946,7 +1000,7 @@ def _field(entry: "MappingEntry") -> AnalysisField:
 def _frame_data(rows: Sequence[dict[str, object]], fields: Sequence[AnalysisField], *, include_states: bool = False) -> pd.DataFrame:
     columns = ["source_row_ordinal", *(field.column_name for field in fields)]
     if include_states:
-        columns.extend((*(_state_column(field) for field in fields), "__filter_state", "__filter_invalid_field_id"))
+        columns.extend((*(_state_column(field) for field in fields), "__filter_state", "__filter_invalid_positions", "__row_disposition"))
     records = []
     for row in rows:
         values = row["values"]
@@ -956,7 +1010,8 @@ def _frame_data(rows: Sequence[dict[str, object]], fields: Sequence[AnalysisFiel
         if include_states:
             record.update({_state_column(field): states[field.field_id] for field in fields})
             record["__filter_state"] = row.get("filter_state", "match")
-            record["__filter_invalid_field_id"] = row.get("filter_invalid_field_id")
+            record["__filter_invalid_positions"] = row.get("filter_invalid_positions", ())
+            record["__row_disposition"] = row.get("row_disposition", "valid_for_analysis")
         records.append(record)
     data = pd.DataFrame(records, columns=columns)
     if not data.empty:
@@ -1084,24 +1139,29 @@ def _timezone_aware(value: object) -> bool:
 
 def _evaluate_filters(
     row: dict[str, object], filters: Sequence[AnalysisFilter], fields: dict[str, AnalysisField]
-) -> tuple[Literal["match", "no_match", "invalid"], str | None]:
+) -> tuple[Literal["match", "no_match", "invalid"], tuple[int, ...]]:
     values = row["values"]
     states = row["states"]
     assert isinstance(values, dict) and isinstance(states, dict)
-    for filter_ in filters:
+    invalid_positions: list[int] = []
+    all_matched = True
+    for position, filter_ in enumerate(filters):
         state = states[filter_.field_id]
         if filter_.operator == "is_blank":
             if state == "invalid":
-                return "invalid", filter_.field_id
+                invalid_positions.append(position)
+                continue
             matched = state == "blank"
         elif filter_.operator == "not_blank":
             if state == "invalid":
-                return "invalid", filter_.field_id
+                invalid_positions.append(position)
+                continue
             matched = state == "valid"
         elif state == "blank":
             matched = False
         elif state == "invalid":
-            return "invalid", filter_.field_id
+            invalid_positions.append(position)
+            continue
         else:
             value = values[filter_.field_id]
             if filter_.operator == "eq": matched = value == filter_.value
@@ -1114,26 +1174,76 @@ def _evaluate_filters(
             elif filter_.operator == "lte": matched = value <= filter_.value  # type: ignore[operator]
             else: matched = filter_.value[0] <= value <= filter_.value[1]  # type: ignore[index,operator]
         if not matched:
-            return "no_match", None
-    return "match", None
+            all_matched = False
+    if invalid_positions:
+        return "invalid", tuple(invalid_positions)
+    return ("match" if all_matched else "no_match"), ()
 
 
-def _exclusions(rows: Sequence[dict[str, object]], roles: dict[str | None, "MappingEntry"], required: Sequence[str]) -> tuple[ExclusionReason, ...]:
-    counts: dict[tuple[str, Literal["blank", "invalid"]], int] = {}
-    required_field_ids = {roles[role].field_id for role in required}
-    for row in rows:
-        states = row["states"]
-        assert isinstance(states, dict)
-        for role in required:
-            state = states[roles[role].field_id or ""]
-            if state in {"blank", "invalid"}:
-                key = (role, state)
-                counts[key] = counts.get(key, 0) + 1
-        filter_field_id = row.get("filter_invalid_field_id")
-        if isinstance(filter_field_id, str) and filter_field_id not in required_field_ids:
-            key = (f"filter:{filter_field_id}", "invalid")
-            counts[key] = counts.get(key, 0) + 1
-    return tuple(ExclusionReason(role, reason, count) for (role, reason), count in sorted(counts.items()))
+def _row_disposition(
+    row: dict[str, object], required: Sequence[str], roles: dict[str | None, "MappingEntry"]
+) -> Literal["valid_for_analysis", "filtered_out", "filter_invalid", "required_role_blank", "required_role_invalid"]:
+    filter_state = row["filter_state"]
+    if filter_state == "invalid":
+        return "filter_invalid"
+    if filter_state == "no_match":
+        return "filtered_out"
+    states = row["states"]
+    assert isinstance(states, dict)
+    required_states = [states[roles[role].field_id or ""] for role in required]
+    if "invalid" in required_states:
+        return "required_role_invalid"
+    if "blank" in required_states:
+        return "required_role_blank"
+    return "valid_for_analysis"
+
+
+def _disposition_counts(rows: Sequence[dict[str, object]]) -> dict[str, int]:
+    names = ("valid_for_analysis", "filtered_out", "filter_invalid", "required_role_blank", "required_role_invalid")
+    return {name: sum(row.get("row_disposition") == name for row in rows) for name in names}
+
+
+def _dataframe_disposition_counts(data: pd.DataFrame) -> dict[str, int]:
+    names = ("valid_for_analysis", "filtered_out", "filter_invalid", "required_role_blank", "required_role_invalid")
+    states = data.get("__row_disposition", pd.Series(dtype="object"))
+    return {name: int((states == name).sum()) for name in names}
+
+
+def _exclusions(
+    rows: Sequence[dict[str, object]],
+    roles: dict[str | None, "MappingEntry"],
+    required: Sequence[str],
+    descriptors: Sequence[FilterDescriptor],
+) -> tuple[ExclusionReason, ...]:
+    reasons: list[ExclusionReason] = []
+    for role in required:
+        states = [
+            row["states"][roles[role].field_id or ""]
+            for row in rows
+            if row["filter_state"] == "match"
+        ]
+        for reason in ("blank", "invalid"):
+            count = states.count(reason)
+            if count:
+                reasons.append(ExclusionReason("required_role_diagnostic", reason, count, role=role))
+    for descriptor in {item.canonical_id: item for item in descriptors}.values():
+        filter_positions = {item.position for item in descriptors if item.canonical_id == descriptor.canonical_id}
+        count = sum(
+            len(filter_positions.intersection(positions))
+            for positions in (row.get("filter_invalid_positions", ()) for row in rows)
+            if isinstance(positions, tuple)
+        )
+        if count:
+            reasons.append(
+                ExclusionReason(
+                    "filter_invalid", "invalid", count,
+                    filter_position=descriptor.position,
+                    field_id=descriptor.field_id,
+                    operator=descriptor.operator,
+                    canonical_id=descriptor.canonical_id,
+                )
+            )
+    return tuple(reasons)
 
 
 def _validate_timestamp_order(rows: Sequence[dict[str, object]], timestamp_field_id: str | None) -> None:

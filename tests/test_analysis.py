@@ -18,7 +18,7 @@ from mentor.analysis import (
     summarize_results,
 )
 from mentor.datasets import MappingEntry, create_inspected_mapping_draft, import_local_dataset, inspect_local_dataset
-from mentor.storage import Storage
+from mentor.storage import ANALYSIS_EXCLUSION_LIMIT, Storage
 
 
 def _confirmed_dataset(tmp_path: Path, contents: str, entries: list[MappingEntry], *, dataset_id: str = "dataset-analysis"):
@@ -118,7 +118,7 @@ def test_analysis_filters_report_no_matching_rows(tmp_path):
         filters=(AnalysisFilter(session_id or "", "eq", "New York"),),
     )
 
-    assert (frame.source_rows, frame.filtered_rows, frame.valid_rows, frame.excluded_rows) == (1, 0, 0, 0)
+    assert (frame.source_rows, frame.filtered_rows, frame.valid_rows, frame.excluded_rows) == (1, 0, 0, 1)
     assert frame.no_data_reason == "no_matching_rows"
 
 
@@ -259,8 +259,15 @@ def test_summarize_results_uses_the_frame_validated_filter_fingerprint_without_d
 
     assert result["counts"]["filtered_rows"] == 1
     assert result["filters"] == [
-        {"field_id": field_id, "operator": "gt", "value_sha256": "6b86b273ff34fce19d6b804eff5a3f5747ada4eaa22f1d49c01e52ddb7875b4b"}
+        {
+            "position": 0,
+            "field_id": field_id,
+            "operator": "gt",
+            "value_sha256": "6b86b273ff34fce19d6b804eff5a3f5747ada4eaa22f1d49c01e52ddb7875b4b",
+            "canonical_id": result["filters"][0]["canonical_id"],
+        }
     ]
+    assert len(result["filters"][0]["canonical_id"]) == 12
 
 
 def test_summarize_results_binds_its_provenance_to_the_validated_frame(tmp_path):
@@ -318,7 +325,7 @@ def test_summarize_results_treats_missing_outcomes_as_ordered_streak_breakers(tm
 
     assert result["metrics"]["wins"] == 2
     assert result["metrics"]["max_consecutive_wins"] == 1
-    assert result["exclusions"] == [{"role": "trade_outcome", "reason": "blank", "count": 1}]
+    assert result["exclusions"] == [{"kind": "required_role_diagnostic", "role": "trade_outcome", "reason": "blank", "count": 1}]
 
 
 def test_summarize_results_treats_invalid_required_returns_as_ordered_streak_breakers(tmp_path):
@@ -340,7 +347,7 @@ def test_summarize_results_treats_invalid_required_returns_as_ordered_streak_bre
     assert result["metrics"]["wins"] + result["metrics"]["losses"] + result["metrics"]["breakevens"] == 2
     assert result["metrics"]["win_rate"] == 1.0
     assert result["metrics"]["max_consecutive_wins"] == 1
-    assert result["exclusions"] == [{"role": "trade_return", "reason": "invalid", "count": 1}]
+    assert result["exclusions"] == [{"kind": "required_role_diagnostic", "role": "trade_return", "reason": "invalid", "count": 1}]
 
 
 def test_summarize_results_uses_a_neutral_breaker_for_invalid_required_return_wins(tmp_path):
@@ -481,10 +488,14 @@ def test_group_results_reports_session_metrics_with_validated_filter_handoff(tmp
     assert london["metrics"]["mean_return"] == 0.0
     assert new_york["values"] == ["New York"]
     assert new_york["counts"] == {"source_rows": 2, "filtered_rows": 2, "valid_rows": 1, "excluded_rows": 1}
-    assert new_york["exclusions"] == [{"role": "trade_return", "reason": "invalid", "count": 1}]
-    assert result["filters"] == [
-        {"field_id": session_id, "operator": "in", "value_sha256": "9fcb3941d9a9dae06bc93589259d603afc167d4c41a32418ca0680c0f0389483"}
-    ]
+    assert new_york["exclusions"] == [{"kind": "required_role_diagnostic", "role": "trade_return", "reason": "invalid", "count": 1}]
+    assert result["filters"] == [{
+        "position": 0,
+        "field_id": session_id,
+        "operator": "in",
+        "value_sha256": "9fcb3941d9a9dae06bc93589259d603afc167d4c41a32418ca0680c0f0389483",
+        "canonical_id": result["filters"][0]["canonical_id"],
+    }]
     assert "Desk Secret" not in json.dumps(result)
     assert "do-not-disclose" not in json.dumps(result)
 
@@ -552,7 +563,7 @@ def test_group_results_handles_empty_filtered_data_without_group_values(tmp_path
 
     assert result["groups"] == []
     assert result["grouping"]["total_groups"] == 0
-    assert result["omissions"]["counts"] == {"source_rows": 1, "filtered_rows": 0, "valid_rows": 0, "excluded_rows": 0}
+    assert result["omissions"]["counts"] == {"source_rows": 1, "filtered_rows": 0, "valid_rows": 0, "excluded_rows": 1}
     assert result["limitations"] == ["no_matching_rows"]
 
 
@@ -687,7 +698,7 @@ def test_temporal_analysis_rejects_missing_or_mixed_timezone_timestamps(tmp_path
         )
 
 
-def test_temporal_analysis_keeps_timestamp_valid_excluded_rows_in_bucket_accounting(tmp_path):
+def test_temporal_analysis_keeps_canonical_excluded_rows_in_bucket_accounting(tmp_path):
     storage, dataset, mapping = _confirmed_dataset(
         tmp_path,
         "Result,Trade Date\n1,2026-01-03\nbad,2026-01-20\nbad,2026-02-01\n",
@@ -710,7 +721,7 @@ def test_temporal_analysis_keeps_timestamp_valid_excluded_rows_in_bucket_account
         "valid_rows": 1,
         "excluded_rows": 1,
     }
-    assert january["exclusions"] == [{"role": "trade_return", "reason": "invalid", "count": 1}]
+    assert january["exclusions"] == [{"kind": "required_role_diagnostic", "role": "trade_return", "reason": "invalid", "count": 1}]
     assert february["counts"] == {"source_rows": 1, "filtered_rows": 1, "valid_rows": 0, "excluded_rows": 1}
     assert (february["start_date"], february["end_date"]) == ("2026-02-01", "2026-02-01")
 
@@ -857,15 +868,14 @@ def test_filter_invalid_values_are_excluded_not_hidden_and_rebuild_reproduces_co
         order_by="timestamp",
     )
 
-    assert (not_blank.filtered_rows, not_blank.valid_rows, not_blank.excluded_rows) == (2, 1, 1)
-    assert {(item.role, item.reason, item.count) for item in not_blank.exclusions} == {("trade_return", "invalid", 1)}
-    assert (is_blank.filtered_rows, is_blank.valid_rows, is_blank.excluded_rows) == (2, 0, 2)
-    assert {(item.role, item.reason, item.count) for item in is_blank.exclusions} == {("trade_return", "blank", 1), ("trade_return", "invalid", 1)}
-    assert (numeric.filtered_rows, numeric.valid_rows, numeric.excluded_rows) == (2, 1, 1)
-    assert (temporal.filtered_rows, temporal.valid_rows, temporal.excluded_rows) == (2, 1, 1)
-    assert {item.role for item in temporal.exclusions} == {"trade_return", "trade_timestamp"}
-    assert group_results(not_blank, (session_id or "",))["groups"][1]["counts"] == {
-        "source_rows": 1, "filtered_rows": 1, "valid_rows": 0, "excluded_rows": 1,
+    assert (not_blank.filtered_rows, not_blank.valid_rows, not_blank.excluded_rows) == (1, 1, 2)
+    assert not_blank.disposition_counts["filter_invalid"] == 1
+    assert (is_blank.filtered_rows, is_blank.valid_rows, is_blank.excluded_rows) == (1, 0, 3)
+    assert is_blank.disposition_counts["required_role_blank"] == 1
+    assert (numeric.filtered_rows, numeric.valid_rows, numeric.excluded_rows) == (1, 1, 2)
+    assert (temporal.filtered_rows, temporal.valid_rows, temporal.excluded_rows) == (1, 1, 2)
+    assert group_results(not_blank, (session_id or "",))["groups"][0]["counts"] == {
+        "source_rows": 2, "filtered_rows": 1, "valid_rows": 1, "excluded_rows": 1,
     }
 
     reopened = Storage(storage.database_path)
@@ -918,8 +928,15 @@ def test_filter_stage_exclusion_for_a_nonrequired_typed_field_is_persistable(tmp
 
     result = summarize_results(frame)
 
-    assert result["counts"] == {"source_rows": 2, "filtered_rows": 2, "valid_rows": 1, "excluded_rows": 1}
-    assert result["exclusions"] == [{"role": f"filter:{score_id}", "reason": "invalid", "count": 1}]
+    assert result["counts"] == {"source_rows": 2, "filtered_rows": 1, "valid_rows": 1, "excluded_rows": 1}
+    assert result["exclusions"] == [
+        {
+            "kind": "filter_invalid",
+            "canonical_id": result["filters"][0]["canonical_id"],
+            "reason": "invalid",
+            "count": 1,
+        }
+    ]
     storage.record_analysis_evidence(
         thread_id=storage.create_thread("Filter exclusion"),
         origin_turn_number=1,
@@ -1040,3 +1057,217 @@ def test_temporal_monthly_limit_fails_closed_but_filtered_range_and_halves_remai
         order_by="timestamp",
     )
     assert len(analyze_over_time(narrowed, mode="month")["buckets"]) == 50
+
+
+def test_canonical_row_disposition_is_filter_order_independent_and_shared_by_mfe_mae(tmp_path):
+    storage, dataset, mapping = _confirmed_dataset(
+        tmp_path,
+        "Result,Session,MFE,Trade Date\n1,London,4,2026-01-01\nbad,New York,99,2026-01-02\n2,London,bad,2026-01-03\n3,New York,7,2026-01-04\n",
+        [
+            MappingEntry(0, semantic_role="trade_return", unit="R"),
+            MappingEntry(1, analysis_label="Session", model_disclosure=True),
+            MappingEntry(2, semantic_role="mfe", unit="points"),
+            MappingEntry(3, semantic_role="trade_timestamp"),
+        ],
+    )
+    entries = storage.mapping_entries(mapping.id)
+    result_id = next(entry.field_id for entry in entries if entry.semantic_role == "trade_return")
+    session_id = next(entry.field_id for entry in entries if entry.analysis_label == "Session")
+    filters = (
+        AnalysisFilter(session_id or "", "eq", "London"),
+        AnalysisFilter(result_id or "", "gt", 0),
+    )
+
+    forward = build_analysis_frame(storage, dataset.id, mapping.id, required_roles=("trade_return",), filters=filters)
+    reverse = build_analysis_frame(storage, dataset.id, mapping.id, required_roles=("trade_return",), filters=tuple(reversed(filters)))
+
+    assert forward.data["source_row_ordinal"].tolist() == reverse.data["source_row_ordinal"].tolist() == [0, 2]
+    assert forward.disposition_counts == reverse.disposition_counts == {
+        "valid_for_analysis": 2,
+        "filtered_out": 1,
+        "filter_invalid": 1,
+        "required_role_blank": 0,
+        "required_role_invalid": 0,
+    }
+    assert summarize_results(forward)["counts"] == {
+        "source_rows": 4,
+        "filtered_rows": 2,
+        "valid_rows": 2,
+        "excluded_rows": 2,
+    }
+    assert analyze_mfe_mae(forward)["mfe"]["counts"] == {
+        "source_rows": 4,
+        "filtered_rows": 2,
+        "valid_rows": 1,
+        "excluded_rows": 3,
+    }
+
+
+def test_filter_permutation_matrix_keeps_dispositions_and_invalid_diagnostics_stable(tmp_path):
+    storage, dataset, mapping = _confirmed_dataset(
+        tmp_path,
+        "Result,MFE,Trade Date,Session\n1,1,2026-01-01,London\nbad,1,2026-01-02,New York\n1,bad,2026-01-03,New York\nbad,bad,2026-01-04,London\n,bad,2026-01-05,London\n1,1,bad,New York\n",
+        [
+            MappingEntry(0, semantic_role="trade_return", unit="R"),
+            MappingEntry(1, semantic_role="mfe", unit="points"),
+            MappingEntry(2, semantic_role="trade_timestamp"),
+            MappingEntry(3, analysis_label="Session"),
+        ],
+    )
+    entries = storage.mapping_entries(mapping.id)
+    by_role = {entry.semantic_role: entry.field_id for entry in entries if entry.semantic_role}
+    session_id = next(entry.field_id for entry in entries if entry.analysis_label == "Session")
+    cases = (
+        (AnalysisFilter(session_id or "", "eq", "London"), AnalysisFilter(by_role["trade_return"] or "", "gt", 0)),
+        (AnalysisFilter(session_id or "", "eq", "London"), AnalysisFilter(by_role["mfe"] or "", "gt", 0)),
+        (AnalysisFilter(by_role["trade_return"] or "", "is_blank"), AnalysisFilter(by_role["mfe"] or "", "gt", 0)),
+        (AnalysisFilter(by_role["trade_timestamp"] or "", "gte", datetime(2026, 1, 1)), AnalysisFilter(session_id or "", "eq", "London")),
+    )
+
+    for filters in cases:
+        first = build_analysis_frame(storage, dataset.id, mapping.id, required_roles=("trade_return",), filters=filters)
+        second = build_analysis_frame(storage, dataset.id, mapping.id, required_roles=("trade_return",), filters=tuple(reversed(filters)))
+        first_diagnostics = sorted((item.canonical_id, item.count) for item in first.exclusions if item.kind == "filter_invalid")
+        second_diagnostics = sorted((item.canonical_id, item.count) for item in second.exclusions if item.kind == "filter_invalid")
+
+        assert first.data["source_row_ordinal"].tolist() == second.data["source_row_ordinal"].tolist()
+        assert first.disposition_counts == second.disposition_counts
+        assert first_diagnostics == second_diagnostics
+
+
+def test_all_deterministic_operations_share_the_frame_eligible_population(tmp_path):
+    storage, dataset, mapping = _confirmed_dataset(
+        tmp_path,
+        "Result,MFE,Trade Date,Session\n1,4,2026-01-01,A\n2,bad,2026-01-02,B\nbad,7,2026-01-03,A\n3,8,2026-01-04,B\n",
+        [
+            MappingEntry(0, semantic_role="trade_return", unit="R"),
+            MappingEntry(1, semantic_role="mfe", unit="points"),
+            MappingEntry(2, semantic_role="trade_timestamp"),
+            MappingEntry(3, analysis_label="Session", model_disclosure=True),
+        ],
+    )
+    session_id = next(entry.field_id for entry in storage.mapping_entries(mapping.id) if entry.analysis_label == "Session")
+    frame = build_analysis_frame(
+        storage, dataset.id, mapping.id, required_roles=("trade_return", "trade_timestamp"), order_by="timestamp"
+    )
+
+    results = (
+        summarize_results(frame),
+        group_results(frame, (session_id or "",)),
+        compare_groups(frame, session_id or "", "A", "B"),
+        analyze_over_time(frame, mode="halves"),
+        analyze_mfe_mae(frame),
+    )
+
+    assert {tuple(sorted(result["counts"].items())) for result in results} == {
+        (("excluded_rows", 1), ("filtered_rows", 4), ("source_rows", 4), ("valid_rows", 3))
+    }
+    assert analyze_mfe_mae(frame)["mfe"]["counts"]["valid_rows"] == 2
+
+
+@pytest.mark.parametrize(
+    ("rows", "expected"),
+    [
+        ("1,2026-01-01\n", [(1, 1)]),
+        ("1,2026-01-01\n2,2026-01-01\n", [(1, 1), (1, 2)]),
+        ("1,2026-01-01\n2,2026-01-01\n3,2026-01-01\n4,2026-01-01\n", [(2, 3), (2, 7)]),
+        ("1,2026-01-01\n2,2026-01-01\n3,2026-01-01\n4,2026-01-01\n5,2026-01-01\n", [(3, 6), (2, 9)]),
+    ],
+)
+def test_temporal_halves_use_disjoint_timestamp_and_source_ordinal_membership(tmp_path, rows, expected):
+    storage, dataset, mapping = _confirmed_dataset(
+        tmp_path,
+        f"Result,Trade Date\n{rows}",
+        [MappingEntry(0, semantic_role="trade_return", unit="R"), MappingEntry(1, semantic_role="trade_timestamp")],
+    )
+    frame = build_analysis_frame(
+        storage, dataset.id, mapping.id, required_roles=("trade_return", "trade_timestamp"), order_by="timestamp"
+    )
+
+    buckets = analyze_over_time(frame, mode="halves")["buckets"]
+
+    assert [(bucket["counts"]["valid_rows"], bucket["metrics"]["total_return"]) for bucket in buckets] == expected
+    assert sum(bucket["counts"]["valid_rows"] for bucket in buckets) == frame.valid_rows
+
+
+def test_persisted_filter_invalid_diagnostic_is_bound_to_the_recorded_filter(tmp_path):
+    storage, dataset, mapping = _confirmed_dataset(
+        tmp_path,
+        "Result,Session\n1,London\nbad,New York\n",
+        [MappingEntry(0, semantic_role="trade_return", unit="R"), MappingEntry(1, analysis_label="Session")],
+    )
+    entries = storage.mapping_entries(mapping.id)
+    result_id = next(entry.field_id for entry in entries if entry.semantic_role == "trade_return")
+    session_id = next(entry.field_id for entry in entries if entry.analysis_label == "Session")
+    result = summarize_results(
+        build_analysis_frame(
+            storage,
+            dataset.id,
+            mapping.id,
+            required_roles=("trade_return",),
+            filters=(AnalysisFilter(session_id or "", "eq", "London"), AnalysisFilter(result_id or "", "gt", 0)),
+        )
+    )
+    evidence = storage.record_analysis_evidence(
+        thread_id=storage.create_thread("Provenance"),
+        origin_turn_number=1,
+        dataset_id=dataset.id,
+        mapping_version_id=mapping.id,
+        operation="summarize_results",
+        schema_version="1.0",
+        arguments={"dataset_id": dataset.id},
+        result=result,
+    )
+    storage.record_analysis_tool_output(evidence.thread_id, "call_1", evidence.id, result)
+
+    restarted = Storage(storage.database_path)
+    restarted.initialize()
+    persisted = restarted.analysis_tool_outputs(evidence.thread_id)[0]["output"]
+    diagnostic = next(item for item in persisted["exclusions"] if item["kind"] == "filter_invalid")
+
+    recorded_filter = next(item for item in persisted["filters"] if item["canonical_id"] == diagnostic["canonical_id"])
+    assert recorded_filter["field_id"] == result_id and recorded_filter["operator"] == "gt"
+    assert "bad" not in json.dumps(persisted)
+
+
+def test_maximum_accepted_filter_diagnostics_fit_the_persisted_exclusion_envelope(tmp_path):
+    storage, dataset, mapping = _confirmed_dataset(
+        tmp_path,
+        "Result,Outcome,Trade Date,Session,Direction,MFE,MAE,Instrument,Setup\n"
+        "bad,win,2026-01-01,L,S,1,-1,ES,A\n"
+        "1,,,,,,,,\n"
+        "1,bad,bad,L,S,bad,bad,ES,A\n",
+        [
+            MappingEntry(0, semantic_role="trade_return", unit="R"),
+            MappingEntry(1, semantic_role="trade_outcome"),
+            MappingEntry(2, semantic_role="trade_timestamp"),
+            MappingEntry(3, semantic_role="session"),
+            MappingEntry(4, semantic_role="direction"),
+            MappingEntry(5, semantic_role="mfe", unit="points"),
+            MappingEntry(6, semantic_role="mae", unit="points"),
+            MappingEntry(7, semantic_role="instrument"),
+            MappingEntry(8, semantic_role="setup"),
+        ],
+    )
+    result_id = next(entry.field_id for entry in storage.mapping_entries(mapping.id) if entry.semantic_role == "trade_return")
+    frame = build_analysis_frame(
+        storage,
+        dataset.id,
+        mapping.id,
+        required_roles=("trade_return", "trade_outcome", "trade_timestamp", "session", "direction", "mfe", "mae", "instrument", "setup"),
+        filters=tuple(AnalysisFilter(result_id or "", "in", [1, 100 + index]) for index in range(20)),
+    )
+    result = summarize_results(frame)
+
+    assert len(result["exclusions"]) <= ANALYSIS_EXCLUSION_LIMIT
+    assert len(json.dumps(result, separators=(",", ":"))) <= 8000
+    storage.record_analysis_evidence(
+        thread_id=storage.create_thread("Capacity"),
+        origin_turn_number=1,
+        dataset_id=dataset.id,
+        mapping_version_id=mapping.id,
+        operation="summarize_results",
+        schema_version="1.0",
+        arguments={"dataset_id": dataset.id},
+        result=result,
+    )
