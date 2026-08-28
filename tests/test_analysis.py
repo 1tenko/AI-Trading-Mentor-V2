@@ -324,6 +324,23 @@ def test_summarize_results_marks_realized_reward_risk_unavailable_when_mean_loss
     assert "unavailable_metric" in result["limitations"]
 
 
+def test_summarize_results_requires_trade_return_for_return_metrics(tmp_path):
+    storage, dataset, mapping = _confirmed_dataset(
+        tmp_path,
+        "Result,Outcome\nbad,win\n2,loss\n",
+        [MappingEntry(0, semantic_role="trade_return", unit="R"), MappingEntry(1, semantic_role="trade_outcome")],
+    )
+    frame = build_analysis_frame(storage, dataset.id, mapping.id, required_roles=("trade_outcome",))
+
+    result = summarize_results(frame)
+
+    assert result["counts"] == {"source_rows": 2, "filtered_rows": 2, "valid_rows": 2, "excluded_rows": 0}
+    assert result["metrics"]["wins"] == 1
+    assert result["metrics"]["total_return"] is None
+    assert result["metrics"]["cumulative_return"] is None
+    assert "unavailable_metric" in result["limitations"]
+
+
 def test_analysis_frame_parses_the_verified_bytes_if_the_local_original_is_swapped(tmp_path, monkeypatch):
     storage, dataset, mapping = _confirmed_dataset(
         tmp_path,

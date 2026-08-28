@@ -190,7 +190,7 @@ def summarize_results(
     """Calculate the bounded core summary from an already validated frame."""
     if not isinstance(frame, AnalysisFrame):
         raise ValueError("summary requires a validated analysis frame")
-    has_return = any(field.semantic_role == "trade_return" for field in frame.fields)
+    has_return = "trade_return" in frame.required_roles
     has_outcome = "trade_outcome" in frame.required_roles
     returns = frame.data["trade_return"].dropna().astype(float).tolist() if has_return else []
     metrics = {name: None for name in _SUMMARY_METRICS}

@@ -880,7 +880,17 @@ class Storage:
                 DROP TRIGGER IF EXISTS analysis_evidence_envelope_details_are_safe;
                 CREATE TRIGGER analysis_evidence_envelope_details_are_safe
                 BEFORE INSERT ON analysis_evidence
-                WHEN json_valid(NEW.result_json) = 0
+                WHEN EXISTS (
+                    SELECT 1 FROM dataset_mapping_versions
+                    JOIN datasets ON datasets.id = dataset_mapping_versions.dataset_id
+                    JOIN dataset_import_specs ON dataset_import_specs.dataset_id = datasets.id
+                    WHERE dataset_mapping_versions.id = NEW.mapping_version_id
+                      AND dataset_mapping_versions.dataset_id = NEW.dataset_id
+                      AND dataset_mapping_versions.status = 'confirmed'
+                      AND datasets.content_sha256 = NEW.dataset_sha256
+                      AND dataset_import_specs.id = NEW.import_spec_id
+                ) AND (
+                    json_valid(NEW.result_json) = 0
                   OR (SELECT COUNT(*) FROM json_each(NEW.result_json, '$.filters')) > 20
                   OR EXISTS (
                       SELECT 1 FROM json_each(NEW.result_json, '$.filters')
@@ -934,11 +944,22 @@ class Storage:
                         OR json_type(value, '$.count') != 'integer'
                         OR json_extract(value, '$.count') < 1
                   )
+                )
                 BEGIN SELECT RAISE(ABORT, 'analysis result envelope details are invalid'); END;
                 DROP TRIGGER IF EXISTS analysis_tool_output_envelope_details_are_safe;
                 CREATE TRIGGER analysis_tool_output_envelope_details_are_safe
                 BEFORE INSERT ON analysis_tool_outputs
-                WHEN json_valid(NEW.output_json) = 0
+                WHEN EXISTS (
+                    SELECT 1 FROM analysis_evidence
+                    WHERE id = NEW.evidence_id AND thread_id = NEW.thread_id
+                      AND json_extract(NEW.output_json, '$.provenance') = 'USER_EMPIRICAL_EVIDENCE'
+                      AND json_extract(NEW.output_json, '$.dataset_id') = dataset_id
+                      AND json_extract(NEW.output_json, '$.dataset_sha256') = dataset_sha256
+                      AND json_extract(NEW.output_json, '$.mapping_version_id') = mapping_version_id
+                      AND json_extract(NEW.output_json, '$.operation') = operation
+                      AND json_extract(NEW.output_json, '$.schema_version') = schema_version
+                ) AND (
+                    json_valid(NEW.output_json) = 0
                   OR (SELECT COUNT(*) FROM json_each(NEW.output_json, '$.filters')) > 20
                   OR EXISTS (
                       SELECT 1 FROM json_each(NEW.output_json, '$.filters')
@@ -994,6 +1015,7 @@ class Storage:
                         OR json_type(value, '$.count') != 'integer'
                         OR json_extract(value, '$.count') < 1
                   )
+                )
                 BEGIN SELECT RAISE(ABORT, 'analysis result envelope details are invalid'); END;
                 DROP TRIGGER IF EXISTS confirmed_mapping_parent_entries_cannot_insert;
                 CREATE TRIGGER confirmed_mapping_parent_entries_cannot_insert
