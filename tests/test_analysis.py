@@ -685,6 +685,73 @@ def test_temporal_analysis_rejects_missing_or_mixed_timezone_timestamps(tmp_path
         )
 
 
+def test_temporal_analysis_keeps_timestamp_valid_excluded_rows_in_bucket_accounting(tmp_path):
+    storage, dataset, mapping = _confirmed_dataset(
+        tmp_path,
+        "Result,Trade Date\n1,2026-01-03\nbad,2026-01-20\nbad,2026-02-01\n",
+        [MappingEntry(0, semantic_role="trade_return", unit="R"), MappingEntry(1, semantic_role="trade_timestamp")],
+    )
+    frame = build_analysis_frame(
+        storage,
+        dataset.id,
+        mapping.id,
+        required_roles=("trade_return", "trade_timestamp"),
+        order_by="timestamp",
+    )
+
+    result = analyze_over_time(frame, mode="month")
+
+    january, february = result["buckets"]
+    assert january["counts"] == {
+        "source_rows": 2,
+        "filtered_rows": 2,
+        "valid_rows": 1,
+        "excluded_rows": 1,
+    }
+    assert january["exclusions"] == [{"role": "trade_return", "reason": "invalid", "count": 1}]
+    assert february["counts"] == {"source_rows": 1, "filtered_rows": 1, "valid_rows": 0, "excluded_rows": 1}
+    assert (february["start_date"], february["end_date"]) == ("2026-02-01", "2026-02-01")
+
+
+def test_timestamp_order_rejects_mixed_timezones_in_excluded_timestamp_valid_rows(tmp_path):
+    storage, dataset, mapping = _confirmed_dataset(
+        tmp_path,
+        "Result,Trade Date\n1,2026-01-01\nbad,2026-01-02T00:00:00+00:00\n",
+        [MappingEntry(0, semantic_role="trade_return", unit="R"), MappingEntry(1, semantic_role="trade_timestamp")],
+    )
+
+    with pytest.raises(ValueError, match="timezone"):
+        build_analysis_frame(
+            storage,
+            dataset.id,
+            mapping.id,
+            required_roles=("trade_return", "trade_timestamp"),
+            order_by="timestamp",
+        )
+
+
+def test_temporal_rolling_buckets_are_capped_with_deterministic_omission_metadata(tmp_path):
+    rows = "\n".join(f"1,2026-{1 + index // 28:02d}-{1 + index % 28:02d}" for index in range(55))
+    storage, dataset, mapping = _confirmed_dataset(
+        tmp_path,
+        f"Result,Trade Date\n{rows}\n",
+        [MappingEntry(0, semantic_role="trade_return", unit="R"), MappingEntry(1, semantic_role="trade_timestamp")],
+    )
+    frame = build_analysis_frame(
+        storage,
+        dataset.id,
+        mapping.id,
+        required_roles=("trade_return", "trade_timestamp"),
+        order_by="timestamp",
+    )
+
+    result = analyze_over_time(frame, mode="rolling", window_size=2)
+
+    assert [bucket["period"] for bucket in result["buckets"]] == [f"rolling_{index}" for index in range(1, 51)]
+    assert result["omissions"] == {"total_buckets": 54, "returned_buckets": 50, "omitted_buckets": 4}
+    assert "temporal_buckets_omitted" in result["limitations"]
+
+
 def test_mfe_mae_outputs_confirmed_unit_distributions_and_explicit_unavailability(tmp_path):
     storage, dataset, mapping = _confirmed_dataset(
         tmp_path,

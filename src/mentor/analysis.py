@@ -28,6 +28,7 @@ _SUMMARY_METRICS = (
     "percentile_90", "percentile_95", "valid_rows", "excluded_rows",
 )
 _GROUP_LIMIT = 50
+_TEMPORAL_BUCKET_LIMIT = 50
 _GROUP_METRICS = (
     "wins", "losses", "breakevens", "win_rate", "loss_rate", "wilson_95_lower", "wilson_95_upper",
     "total_return", "mean_return", "median_return", "mean_winning_return", "mean_losing_return",
@@ -157,7 +158,9 @@ def build_analysis_frame(
     ]
     if order_by == "timestamp":
         timestamp_id = role_entries["trade_timestamp"].field_id
-        _validate_timestamp_order(valid, timestamp_id)
+        _validate_timestamp_order(
+            [row for row in rows if row["states"][timestamp_id or ""] == "valid"], timestamp_id
+        )
         valid.sort(key=lambda row: (row["values"][timestamp_id], row["source_row_ordinal"]))
         outcome_rows.sort(key=lambda row: (row["values"][timestamp_id], row["source_row_ordinal"]))
         order = AnalysisOrder("timestamp", timestamp_id)
@@ -309,24 +312,38 @@ def analyze_over_time(
     if mode != "rolling" and window_size is not None:
         raise ValueError("only rolling analysis accepts a window size")
 
-    data = frame.data
-    buckets: list[tuple[str, pd.DataFrame]] = []
+    timestamp_field = _temporal_timestamp_field(frame)
+    filtered_timestamps = _timestamp_valid_rows(frame.filtered_data, timestamp_field)
+    source_timestamps = _timestamp_valid_rows(frame.source_data, timestamp_field)
+    buckets: list[tuple[str, pd.DataFrame, pd.DataFrame]] = []
     if mode == "month":
-        for period in sorted({(value.year, value.month) for value in data["trade_timestamp"]}):
-            buckets.append((f"{period[0]:04d}-{period[1]:02d}", data.loc[data["trade_timestamp"].map(lambda value: (value.year, value.month) == period)]))
+        for period in sorted({(value.year, value.month) for value in filtered_timestamps["trade_timestamp"]}):
+            buckets.append(
+                (
+                    f"{period[0]:04d}-{period[1]:02d}",
+                    _month_rows(source_timestamps, period),
+                    _month_rows(filtered_timestamps, period),
+                )
+            )
     elif mode == "halves":
-        split = (len(data) + 1) // 2
+        split = (len(filtered_timestamps) + 1) // 2
         if split:
-            buckets.append(("earlier_half", data.iloc[:split]))
-        if split < len(data):
-            buckets.append(("later_half", data.iloc[split:]))
-    elif len(data):
+            bucket = filtered_timestamps.iloc[:split]
+            buckets.append(("earlier_half", _timestamp_range(source_timestamps, bucket), bucket))
+        if split < len(filtered_timestamps):
+            bucket = filtered_timestamps.iloc[split:]
+            buckets.append(("later_half", _timestamp_range(source_timestamps, bucket), bucket))
+    elif len(filtered_timestamps):
         assert window_size is not None
-        if window_size > len(data):
+        if window_size > len(filtered_timestamps):
             raise ValueError("rolling window size exceeds valid timestamp rows")
-        buckets = [(f"rolling_{index + 1}", data.iloc[index:index + window_size]) for index in range(len(data) - window_size + 1)]
+        for index in range(len(filtered_timestamps) - window_size + 1):
+            bucket = filtered_timestamps.iloc[index:index + window_size]
+            buckets.append((f"rolling_{index + 1}", _timestamp_range(source_timestamps, bucket), bucket))
 
     metadata = _result_metadata(frame, "analyze_over_time")
+    returned_buckets = buckets[:_TEMPORAL_BUCKET_LIMIT] if mode == "rolling" else buckets
+    omitted_buckets = len(buckets) - len(returned_buckets)
     return {
         **metadata,
         "temporal": {
@@ -334,8 +351,13 @@ def analyze_over_time(
             "timestamp_field_id": frame.order.timestamp_field_id,
             "rolling_window_size": window_size if mode == "rolling" else None,
         },
-        "buckets": [_temporal_bucket(frame, label, bucket) for label, bucket in buckets],
-        "limitations": _temporal_limitations(frame, mode, len(data)),
+        "buckets": [_temporal_bucket(frame, label, source, filtered) for label, source, filtered in returned_buckets],
+        "omissions": {
+            "total_buckets": len(buckets),
+            "returned_buckets": len(returned_buckets),
+            "omitted_buckets": omitted_buckets,
+        },
+        "limitations": _temporal_limitations(frame, mode, len(filtered_timestamps), omitted_buckets),
     }
 
 
@@ -526,13 +548,32 @@ def _group_limitations(frame: AnalysisFrame, total_groups: int, returned_groups:
     return limitations
 
 
-def _temporal_bucket(frame: AnalysisFrame, period: str, data: pd.DataFrame) -> dict[str, object]:
-    ordinals = set(data["source_row_ordinal"].tolist())
-    source_data = frame.source_data.loc[frame.source_data["source_row_ordinal"].isin(ordinals)]
-    filtered_data = frame.filtered_data.loc[frame.filtered_data["source_row_ordinal"].isin(ordinals)]
+def _temporal_timestamp_field(frame: AnalysisFrame) -> AnalysisField:
+    field = next((item for item in frame.fields if item.semantic_role == "trade_timestamp"), None)
+    if field is None:
+        raise ValueError("temporal analysis requires a confirmed timestamp field")
+    return field
+
+
+def _timestamp_valid_rows(data: pd.DataFrame, field: AnalysisField) -> pd.DataFrame:
+    return data.loc[data[_state_column(field)] == "valid"].sort_values([field.column_name, "source_row_ordinal"], kind="stable")
+
+
+def _month_rows(data: pd.DataFrame, period: tuple[int, int]) -> pd.DataFrame:
+    return data.loc[data["trade_timestamp"].map(lambda value: (value.year, value.month) == period)]
+
+
+def _timestamp_range(data: pd.DataFrame, bucket: pd.DataFrame) -> pd.DataFrame:
+    timestamps = bucket["trade_timestamp"]
+    return data.loc[(data["trade_timestamp"] >= timestamps.min()) & (data["trade_timestamp"] <= timestamps.max())]
+
+
+def _temporal_bucket(frame: AnalysisFrame, period: str, source_data: pd.DataFrame, filtered_data: pd.DataFrame) -> dict[str, object]:
+    ordinals = set(filtered_data["source_row_ordinal"].tolist())
+    data = frame.data.loc[frame.data["source_row_ordinal"].isin(ordinals)]
     bucket = _subset_frame(frame, source_data, filtered_data, data)
     payload = _group_payload(bucket, ())
-    timestamps = data["trade_timestamp"]
+    timestamps = filtered_data["trade_timestamp"]
     return {
         "period": period,
         "start_date": _date_text(timestamps.min()),
@@ -544,12 +585,14 @@ def _temporal_bucket(frame: AnalysisFrame, period: str, data: pd.DataFrame) -> d
     }
 
 
-def _temporal_limitations(frame: AnalysisFrame, mode: str, valid_rows: int) -> list[str]:
-    limitations = _summary_limitations(frame, {"valid_rows": valid_rows})
-    if not valid_rows:
+def _temporal_limitations(frame: AnalysisFrame, mode: str, timestamp_rows: int, omitted_buckets: int) -> list[str]:
+    limitations = _summary_limitations(frame, {"valid_rows": timestamp_rows})
+    if not timestamp_rows:
         limitations.append("no_valid_timestamp_rows")
-    if mode == "rolling" and valid_rows == 0:
+    if mode == "rolling" and timestamp_rows == 0:
         limitations.append("no_rolling_windows")
+    if omitted_buckets:
+        limitations.append("temporal_buckets_omitted")
     return sorted(set(limitations))
 
 
