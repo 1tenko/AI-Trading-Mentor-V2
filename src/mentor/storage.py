@@ -1,6 +1,7 @@
 """Small SQLite store for private Trading Mentor state."""
 
 import json
+import hashlib
 import math
 import re
 import sqlite3
@@ -23,15 +24,23 @@ from mentor.datasets import (
 _ANALYSIS_LIMITATION_CODES = frozenset(
     {
         "ambiguous_date",
+        "descriptive_comparison_only",
         "derived_outcome",
         "incompatible_timezone",
         "insufficient_valid_rows",
         "invalid_values_excluded",
+        "mae_unavailable",
         "missing_required_role",
+        "mfe_unavailable",
         "no_matching_rows",
+        "no_rolling_windows",
+        "no_valid_timestamp_rows",
+        "no_valid_rows",
         "omitted_groups",
+        "groups_omitted",
         "small_sample",
         "unavailable_metric",
+        "ungrouped_group_values_excluded",
         "unsupported_operation",
     }
 )
@@ -84,6 +93,181 @@ _ANALYSIS_METRIC_NAMES = frozenset(
 _ANALYSIS_OPERATION_PATTERN = re.compile(r"[a-z][a-z0-9_]{0,63}")
 _ANALYSIS_SCHEMA_VERSION_PATTERN = re.compile(r"[0-9]+(?:\.[0-9]+){0,2}")
 _ANALYSIS_FIELD_ID_PATTERN = re.compile(r"field_[0-9a-f]{12}")
+
+
+def validate_completed_evidence_envelope(value: Mapping[str, Any]) -> None:
+    """Fail closed unless a completed empirical envelope reconciles itself."""
+    if not isinstance(value, Mapping):
+        raise ValueError("analysis result envelope is invalid")
+    operation = value.get("operation")
+    base = {
+        "provenance", "dataset_id", "dataset_sha256", "mapping_version_id", "operation", "schema_version",
+        "filters", "metric_definitions", "counts", "disposition_counts", "exclusion_contract", "exclusions", "limitations",
+    }
+    extras = {
+        "summarize_results": {"metrics"},
+        "group_results": {"grouping", "omissions", "ungrouped", "groups"},
+        "compare_groups": {"comparison"},
+        "analyze_over_time": {"temporal", "buckets", "omissions"},
+        "analyze_mfe_mae": {"mfe", "mae"},
+    }
+    if operation not in extras or set(value) != base | extras[operation]:
+        raise ValueError("analysis result envelope is invalid")
+    if value["provenance"] != "USER_EMPIRICAL_EVIDENCE" or type(value["mapping_version_id"]) is not int or value["mapping_version_id"] < 1:
+        raise ValueError("analysis result envelope is invalid")
+    counts = value["counts"]
+    if not _analysis_counts_are_valid(counts):
+        raise ValueError("analysis result envelope is invalid")
+    dispositions = value["disposition_counts"]
+    if (
+        not isinstance(dispositions, Mapping)
+        or set(dispositions) != {"valid_for_analysis", "filtered_out", "filter_invalid", "required_role_blank", "required_role_invalid"}
+        or any(type(count) is not int or count < 0 for count in dispositions.values())
+        or sum(dispositions.values()) != counts["source_rows"]
+        or dispositions["valid_for_analysis"] != counts["valid_rows"]
+        or dispositions["valid_for_analysis"] + dispositions["required_role_blank"] + dispositions["required_role_invalid"] != counts["filtered_rows"]
+    ):
+        raise ValueError("analysis result envelope is invalid")
+    if value["exclusion_contract"] != {
+        "row_dispositions_exclusive": True,
+        "diagnostic_exclusions_exclusive": False,
+        "diagnostic_exclusions_may_overlap": True,
+    }:
+        raise ValueError("analysis result envelope is invalid")
+    filters = value["filters"]
+    if not isinstance(filters, list) or len(filters) > ANALYSIS_FILTER_LIMIT:
+        raise ValueError("analysis result envelope is invalid")
+    filter_ids: set[str] = set()
+    for filter_ in filters:
+        if not _filter_spec_is_valid(filter_, value["mapping_version_id"]) or filter_["canonical_id"] in filter_ids:
+            raise ValueError("analysis result envelope is invalid")
+        filter_ids.add(filter_["canonical_id"])
+    exclusions = value["exclusions"]
+    if not isinstance(exclusions, list) or len(exclusions) > ANALYSIS_EXCLUSION_LIMIT:
+        raise ValueError("analysis result envelope is invalid")
+    if any(not _analysis_exclusion_is_safe(item, filters) for item in exclusions):
+        raise ValueError("analysis result envelope is invalid")
+    definitions = value["metric_definitions"]
+    expected_definitions = {
+        "outcome_rate_denominator": "wins + losses + breakevens",
+        "win_rate_interval": "Wilson 95% interval",
+        "quantile_method": "linear",
+        "return_unit": definitions.get("return_unit") if isinstance(definitions, Mapping) else None,
+        "row_order": definitions.get("row_order") if isinstance(definitions, Mapping) else None,
+    }
+    if operation == "compare_groups":
+        expected_definitions["comparison_delta"] = "A - B for numeric metrics available on both sides"
+    if not isinstance(definitions, Mapping) or dict(definitions) != expected_definitions or definitions["row_order"] not in {"source", "timestamp"}:
+        raise ValueError("analysis result envelope is invalid")
+    if "metrics" in value and not _analysis_metrics_are_valid(value["metrics"]):
+        raise ValueError("analysis result envelope is invalid")
+    limitations = value["limitations"]
+    if not isinstance(limitations, list) or len(limitations) > 20 or any(item not in _ANALYSIS_LIMITATION_CODES for item in limitations):
+        raise ValueError("analysis result envelope is invalid")
+    if operation == "group_results":
+        _validate_group_envelope(value, counts)
+    try:
+        serialized = json.dumps(value, separators=(",", ":"), allow_nan=False)
+    except (TypeError, ValueError) as error:
+        raise ValueError("analysis result envelope is invalid") from error
+    if len(serialized) > (8000 if operation == "summarize_results" else 64000):
+        raise ValueError("analysis result envelope is invalid")
+
+
+def _analysis_counts_are_valid(value: object) -> bool:
+    return (
+        isinstance(value, Mapping) and set(value) == {"source_rows", "filtered_rows", "valid_rows", "excluded_rows"}
+        and all(type(count) is int and count >= 0 for count in value.values())
+        and value["source_rows"] >= value["filtered_rows"] >= value["valid_rows"]
+        and value["source_rows"] == value["valid_rows"] + value["excluded_rows"]
+    )
+
+
+def _filter_spec_is_valid(filter_: object, mapping_version_id: int) -> bool:
+    if not isinstance(filter_, Mapping) or set(filter_) != {"field_id", "operator", "value_spec", "canonical_id"}:
+        return False
+    spec = filter_["value_spec"]
+    if (
+        not isinstance(filter_["field_id"], str) or _ANALYSIS_FIELD_ID_PATTERN.fullmatch(filter_["field_id"]) is None
+        or filter_["operator"] not in {"eq", "neq", "in", "not_in", "is_blank", "not_blank", "gt", "gte", "lt", "lte", "between"}
+        or not isinstance(filter_["canonical_id"], str) or _FILTER_CANONICAL_ID_PATTERN.fullmatch(filter_["canonical_id"]) is None
+        or not isinstance(spec, Mapping) or set(spec) != {"mapping_version_id", "value_type", "unit", "values"}
+        or spec["mapping_version_id"] != mapping_version_id or spec["value_type"] not in {"number", "datetime", "boolean", "categorical"}
+        or spec["unit"] not in {None, "R", "currency", "points", "percentage"} or not isinstance(spec["values"], list)
+    ):
+        return False
+    values = spec["values"]
+    if filter_["operator"] in {"is_blank", "not_blank"}:
+        valid_values = not values
+    elif filter_["operator"] == "between":
+        valid_values = len(values) == 2
+    else:
+        valid_values = bool(values)
+    if not valid_values or not all(_filter_value_is_typed(value, spec["value_type"]) for value in values):
+        return False
+    canonical = json.dumps({"field_id": filter_["field_id"], "operator": filter_["operator"], "value_spec": dict(spec)}, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:12] == filter_["canonical_id"]
+
+
+def _filter_value_is_typed(value: object, value_type: object) -> bool:
+    if value_type == "number":
+        return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(float(value))
+    if value_type == "datetime":
+        return isinstance(value, str) and len(value) <= 64
+    if value_type == "boolean":
+        return isinstance(value, bool)
+    return isinstance(value, str) and len(value) <= 80
+
+
+def _analysis_metrics_are_valid(metrics: object) -> bool:
+    return isinstance(metrics, Mapping) and len(metrics) <= 50 and all(
+        isinstance(name, str) and name in _ANALYSIS_METRIC_NAMES and type(metric) in (int, float, type(None))
+        and (not isinstance(metric, float) or math.isfinite(metric)) for name, metric in metrics.items()
+    )
+
+
+def _validate_group_envelope(value: Mapping[str, Any], counts: Mapping[str, int]) -> None:
+    grouping, omissions, ungrouped, groups = value["grouping"], value["omissions"], value["ungrouped"], value["groups"]
+    if (
+        not isinstance(grouping, Mapping) or set(grouping) != {"field_ids", "limit", "total_groups", "returned_groups", "omitted_groups", "groupable_filtered_rows", "returned_group_rows", "omitted_group_rows"}
+        or grouping["limit"] != 50 or not isinstance(groups, list) or len(groups) != grouping["returned_groups"]
+        or grouping["total_groups"] != grouping["returned_groups"] + grouping["omitted_groups"]
+        or not isinstance(omissions, Mapping) or set(omissions) != {"counts"} or not _analysis_counts_are_valid(omissions["counts"])
+        or not isinstance(ungrouped, Mapping) or not _analysis_counts_are_valid(ungrouped.get("counts"))
+    ):
+        raise ValueError("analysis result envelope is invalid")
+    if any(not isinstance(group, Mapping) or not _group_counts_are_valid(group.get("counts")) for group in groups):
+        raise ValueError("analysis result envelope is invalid")
+    returned_rows = sum(group["counts"]["filtered_rows"] for group in groups)
+    if (
+        grouping["returned_group_rows"] != returned_rows
+        or grouping["omitted_group_rows"] != omissions["counts"]["filtered_rows"]
+        or grouping["groupable_filtered_rows"] != returned_rows + omissions["counts"]["filtered_rows"]
+        or counts["filtered_rows"] != grouping["groupable_filtered_rows"] + ungrouped["counts"]["filtered_rows"]
+    ):
+        raise ValueError("analysis result envelope is invalid")
+
+
+def _group_counts_are_valid(value: object) -> bool:
+    return (
+        isinstance(value, Mapping)
+        and set(value) == {"source_rows", "filtered_rows", "valid_rows", "excluded_rows", "required_role_excluded_rows"}
+        and _analysis_counts_are_valid({key: value[key] for key in ("source_rows", "filtered_rows", "valid_rows", "excluded_rows")})
+        and type(value["required_role_excluded_rows"]) is int
+        and value["required_role_excluded_rows"] >= 0
+        and value["filtered_rows"] == value["valid_rows"] + value["required_role_excluded_rows"]
+    )
+
+
+def _validate_filter_mapping_specs(connection: sqlite3.Connection, envelope: Mapping[str, Any], mapping_version_id: int) -> None:
+    for filter_ in envelope["filters"]:
+        row = connection.execute(
+            "SELECT value_type, unit FROM dataset_mapping_entries WHERE mapping_version_id = ? AND field_id = ?",
+            (mapping_version_id, filter_["field_id"]),
+        ).fetchone()
+        spec = filter_["value_spec"]
+        if row is None or spec["mapping_version_id"] != mapping_version_id or tuple(row) != (spec["value_type"], spec["unit"]):
+            raise ValueError("analysis result envelope does not match its confirmed mapping")
 _DATASET_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,79}")
 _TOOL_CALL_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}")
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
@@ -388,7 +572,7 @@ class Storage:
                           AND datasets.content_sha256 = NEW.dataset_sha256
                           AND dataset_import_specs.id = NEW.import_spec_id
                     ) THEN 1
-                    WHEN length(NEW.result_json) > 8000 THEN 1
+                    WHEN (NEW.operation = 'summarize_results' AND length(NEW.result_json) > 8000) OR length(NEW.result_json) > 64000 THEN 1
                     WHEN json_type(NEW.result_json, '$') != 'object'
                       OR json_type(NEW.result_json, '$.provenance') != 'text'
                       OR json_extract(NEW.result_json, '$.provenance') != 'USER_EMPIRICAL_EVIDENCE'
@@ -401,16 +585,18 @@ class Storage:
                       OR json_type(NEW.result_json, '$.metric_definitions') != 'object'
                       OR json_type(NEW.result_json, '$.counts') != 'object'
                       OR json_type(NEW.result_json, '$.disposition_counts') != 'object'
+                      OR json_type(NEW.result_json, '$.exclusion_contract') != 'object'
                       OR json_type(NEW.result_json, '$.exclusions') != 'array'
-                      OR json_type(NEW.result_json, '$.metrics') != 'object'
+                      OR (json_extract(NEW.result_json, '$.operation') = 'summarize_results' AND json_type(NEW.result_json, '$.metrics') != 'object')
                       OR json_type(NEW.result_json, '$.limitations') != 'array' THEN 1
-                    WHEN (SELECT COUNT(*) FROM json_each(NEW.result_json)) != 13
+                    WHEN (SELECT COUNT(*) FROM json_each(NEW.result_json)) < 14
                       OR EXISTS (
                           SELECT 1 FROM json_each(NEW.result_json)
                           WHERE key NOT IN (
                               'provenance', 'dataset_id', 'dataset_sha256', 'mapping_version_id',
                               'operation', 'schema_version', 'filters', 'metric_definitions', 'counts', 'disposition_counts',
-                              'exclusions', 'metrics', 'limitations'
+                              'exclusion_contract', 'exclusions', 'metrics', 'limitations', 'grouping', 'omissions', 'ungrouped',
+                              'groups', 'comparison', 'temporal', 'buckets', 'mfe', 'mae'
                           )
                       ) THEN 1
                     WHEN (SELECT COUNT(*) FROM json_each(NEW.result_json, '$.counts')) != 4
@@ -434,10 +620,10 @@ class Storage:
                       OR EXISTS (
                           SELECT 1 FROM json_each(NEW.result_json, '$.limitations')
                           WHERE type != 'text' OR value NOT IN (
-                              'ambiguous_date', 'derived_outcome', 'incompatible_timezone',
-                              'insufficient_valid_rows', 'invalid_values_excluded', 'missing_required_role',
-                              'no_matching_rows', 'omitted_groups', 'small_sample', 'unavailable_metric',
-                              'unsupported_operation'
+                              'ambiguous_date', 'descriptive_comparison_only', 'derived_outcome', 'incompatible_timezone',
+                              'insufficient_valid_rows', 'invalid_values_excluded', 'mae_unavailable', 'missing_required_role', 'mfe_unavailable',
+                              'no_matching_rows', 'no_rolling_windows', 'no_valid_timestamp_rows', 'no_valid_rows', 'omitted_groups', 'groups_omitted',
+                              'small_sample', 'unavailable_metric', 'ungrouped_group_values_excluded', 'unsupported_operation'
                           )
                       ) THEN 1
                     ELSE 0
@@ -500,22 +686,24 @@ class Storage:
                           AND json_extract(NEW.output_json, '$.operation') = operation
                           AND json_extract(NEW.output_json, '$.schema_version') = schema_version
                     ) THEN 1
-                    WHEN length(NEW.output_json) > 8000
+                    WHEN (json_extract(NEW.output_json, '$.operation') = 'summarize_results' AND length(NEW.output_json) > 8000) OR length(NEW.output_json) > 64000
                       OR json_type(NEW.output_json, '$') != 'object'
                       OR json_type(NEW.output_json, '$.filters') != 'array'
                       OR json_type(NEW.output_json, '$.metric_definitions') != 'object'
                       OR json_type(NEW.output_json, '$.counts') != 'object'
                       OR json_type(NEW.output_json, '$.disposition_counts') != 'object'
+                      OR json_type(NEW.output_json, '$.exclusion_contract') != 'object'
                       OR json_type(NEW.output_json, '$.exclusions') != 'array'
-                      OR json_type(NEW.output_json, '$.metrics') != 'object'
+                      OR (json_extract(NEW.output_json, '$.operation') = 'summarize_results' AND json_type(NEW.output_json, '$.metrics') != 'object')
                       OR json_type(NEW.output_json, '$.limitations') != 'array' THEN 1
-                    WHEN (SELECT COUNT(*) FROM json_each(NEW.output_json)) != 13
+                    WHEN (SELECT COUNT(*) FROM json_each(NEW.output_json)) < 14
                       OR EXISTS (
                           SELECT 1 FROM json_each(NEW.output_json)
                           WHERE key NOT IN (
                               'provenance', 'dataset_id', 'dataset_sha256', 'mapping_version_id',
                               'operation', 'schema_version', 'filters', 'metric_definitions', 'counts', 'disposition_counts',
-                              'exclusions', 'metrics', 'limitations'
+                              'exclusion_contract', 'exclusions', 'metrics', 'limitations', 'grouping', 'omissions', 'ungrouped',
+                              'groups', 'comparison', 'temporal', 'buckets', 'mfe', 'mae'
                           )
                       ) THEN 1
                     WHEN (SELECT COUNT(*) FROM json_each(NEW.output_json, '$.counts')) != 4
@@ -539,10 +727,10 @@ class Storage:
                       OR EXISTS (
                           SELECT 1 FROM json_each(NEW.output_json, '$.limitations')
                           WHERE type != 'text' OR value NOT IN (
-                              'ambiguous_date', 'derived_outcome', 'incompatible_timezone',
-                              'insufficient_valid_rows', 'invalid_values_excluded', 'missing_required_role',
-                              'no_matching_rows', 'omitted_groups', 'small_sample', 'unavailable_metric',
-                              'unsupported_operation'
+                              'ambiguous_date', 'descriptive_comparison_only', 'derived_outcome', 'incompatible_timezone',
+                              'insufficient_valid_rows', 'invalid_values_excluded', 'mae_unavailable', 'missing_required_role', 'mfe_unavailable',
+                              'no_matching_rows', 'no_rolling_windows', 'no_valid_timestamp_rows', 'no_valid_rows', 'omitted_groups', 'groups_omitted',
+                              'small_sample', 'unavailable_metric', 'ungrouped_group_values_excluded', 'unsupported_operation'
                           )
                       ) THEN 1
                     ELSE 0
@@ -755,22 +943,24 @@ class Storage:
                           AND json_extract(NEW.output_json, '$.operation') = operation
                           AND json_extract(NEW.output_json, '$.schema_version') = schema_version
                     ) THEN 1
-                    WHEN length(NEW.output_json) > 8000
+                    WHEN (json_extract(NEW.output_json, '$.operation') = 'summarize_results' AND length(NEW.output_json) > 8000) OR length(NEW.output_json) > 64000
                       OR json_type(NEW.output_json, '$') != 'object'
                       OR json_type(NEW.output_json, '$.filters') != 'array'
                       OR json_type(NEW.output_json, '$.metric_definitions') != 'object'
                       OR json_type(NEW.output_json, '$.counts') != 'object'
                       OR json_type(NEW.output_json, '$.disposition_counts') != 'object'
+                      OR json_type(NEW.output_json, '$.exclusion_contract') != 'object'
                       OR json_type(NEW.output_json, '$.exclusions') != 'array'
-                      OR json_type(NEW.output_json, '$.metrics') != 'object'
+                      OR (json_extract(NEW.output_json, '$.operation') = 'summarize_results' AND json_type(NEW.output_json, '$.metrics') != 'object')
                       OR json_type(NEW.output_json, '$.limitations') != 'array' THEN 1
-                    WHEN (SELECT COUNT(*) FROM json_each(NEW.output_json)) != 13
+                    WHEN (SELECT COUNT(*) FROM json_each(NEW.output_json)) < 14
                       OR EXISTS (
                           SELECT 1 FROM json_each(NEW.output_json)
                           WHERE key NOT IN (
                               'provenance', 'dataset_id', 'dataset_sha256', 'mapping_version_id',
                               'operation', 'schema_version', 'filters', 'metric_definitions', 'counts', 'disposition_counts',
-                              'exclusions', 'metrics', 'limitations'
+                              'exclusion_contract', 'exclusions', 'metrics', 'limitations', 'grouping', 'omissions', 'ungrouped',
+                              'groups', 'comparison', 'temporal', 'buckets', 'mfe', 'mae'
                           )
                       ) THEN 1
                     WHEN (SELECT COUNT(*) FROM json_each(NEW.output_json, '$.counts')) != 4
@@ -794,10 +984,10 @@ class Storage:
                       OR EXISTS (
                           SELECT 1 FROM json_each(NEW.output_json, '$.limitations')
                           WHERE type != 'text' OR value NOT IN (
-                              'ambiguous_date', 'derived_outcome', 'incompatible_timezone',
-                              'insufficient_valid_rows', 'invalid_values_excluded', 'missing_required_role',
-                              'no_matching_rows', 'omitted_groups', 'small_sample', 'unavailable_metric',
-                              'unsupported_operation'
+                              'ambiguous_date', 'descriptive_comparison_only', 'derived_outcome', 'incompatible_timezone',
+                              'insufficient_valid_rows', 'invalid_values_excluded', 'mae_unavailable', 'missing_required_role', 'mfe_unavailable',
+                              'no_matching_rows', 'no_rolling_windows', 'no_valid_timestamp_rows', 'no_valid_rows', 'omitted_groups', 'groups_omitted',
+                              'small_sample', 'unavailable_metric', 'ungrouped_group_values_excluded', 'unsupported_operation'
                           )
                       ) THEN 1
                     ELSE 0
@@ -919,9 +1109,7 @@ class Storage:
                   OR EXISTS (
                       SELECT 1 FROM json_each(NEW.result_json, '$.filters') AS filter_
                       WHERE json_type(filter_.value) != 'object'
-                        OR (SELECT COUNT(*) FROM json_each(filter_.value)) != 5
-                        OR json_type(filter_.value, '$.position') != 'integer'
-                        OR json_extract(filter_.value, '$.position') != CAST(filter_.key AS INTEGER)
+                        OR (SELECT COUNT(*) FROM json_each(filter_.value)) != 4
                         OR json_type(filter_.value, '$.field_id') != 'text'
                         OR NOT EXISTS (
                             SELECT 1 FROM dataset_mapping_entries
@@ -931,9 +1119,10 @@ class Storage:
                         OR json_extract(filter_.value, '$.operator') NOT IN (
                             'eq', 'neq', 'in', 'not_in', 'is_blank', 'not_blank', 'gt', 'gte', 'lt', 'lte', 'between'
                         )
-                        OR json_type(filter_.value, '$.value_sha256') != 'text'
-                        OR length(json_extract(filter_.value, '$.value_sha256')) != 64
-                        OR json_extract(filter_.value, '$.value_sha256') GLOB '*[^0-9a-f]*'
+                        OR json_type(filter_.value, '$.value_spec') != 'object'
+                        OR (SELECT COUNT(*) FROM json_each(filter_.value, '$.value_spec')) != 4
+                        OR json_extract(filter_.value, '$.value_spec.mapping_version_id') != NEW.mapping_version_id
+                        OR json_type(filter_.value, '$.value_spec.values') != 'array'
                         OR json_type(filter_.value, '$.canonical_id') != 'text'
                         OR length(json_extract(filter_.value, '$.canonical_id')) != 12
                         OR json_extract(filter_.value, '$.canonical_id') GLOB '*[^0-9a-f]*'
@@ -1005,9 +1194,7 @@ class Storage:
                   OR EXISTS (
                       SELECT 1 FROM json_each(NEW.output_json, '$.filters') AS filter_
                       WHERE json_type(filter_.value) != 'object'
-                        OR (SELECT COUNT(*) FROM json_each(filter_.value)) != 5
-                        OR json_type(filter_.value, '$.position') != 'integer'
-                        OR json_extract(filter_.value, '$.position') != CAST(filter_.key AS INTEGER)
+                        OR (SELECT COUNT(*) FROM json_each(filter_.value)) != 4
                         OR json_type(filter_.value, '$.field_id') != 'text'
                         OR NOT EXISTS (
                             SELECT 1 FROM dataset_mapping_entries
@@ -1017,9 +1204,10 @@ class Storage:
                         OR json_extract(filter_.value, '$.operator') NOT IN (
                             'eq', 'neq', 'in', 'not_in', 'is_blank', 'not_blank', 'gt', 'gte', 'lt', 'lte', 'between'
                         )
-                        OR json_type(filter_.value, '$.value_sha256') != 'text'
-                        OR length(json_extract(filter_.value, '$.value_sha256')) != 64
-                        OR json_extract(filter_.value, '$.value_sha256') GLOB '*[^0-9a-f]*'
+                        OR json_type(filter_.value, '$.value_spec') != 'object'
+                        OR (SELECT COUNT(*) FROM json_each(filter_.value, '$.value_spec')) != 4
+                        OR json_extract(filter_.value, '$.value_spec.mapping_version_id') != (SELECT mapping_version_id FROM analysis_evidence WHERE id = NEW.evidence_id)
+                        OR json_type(filter_.value, '$.value_spec.values') != 'array'
                         OR json_type(filter_.value, '$.canonical_id') != 'text'
                         OR length(json_extract(filter_.value, '$.canonical_id')) != 12
                         OR json_extract(filter_.value, '$.canonical_id') GLOB '*[^0-9a-f]*'
@@ -1973,6 +2161,7 @@ class Storage:
                 schema_version=schema_version,
                 confirmed_return_unit=None if dataset[2] is None else str(dataset[2]),
             )
+            _validate_filter_mapping_specs(connection, result, mapping_version_id)
             arguments_json = _analysis_evidence_arguments_json(arguments, dataset_id=dataset_id)
             cursor = connection.execute(
                 """
@@ -2054,6 +2243,7 @@ class Storage:
                 schema_version=str(evidence[4]),
                 confirmed_return_unit=None if evidence[5] is None else str(evidence[5]),
             )
+            _validate_filter_mapping_specs(connection, output, int(evidence[2]))
             arguments_json = _analysis_tool_arguments_json(
                 arguments,
                 dataset_id=str(evidence[0]),
@@ -2072,20 +2262,21 @@ class Storage:
         with self._connect() as connection:
             rows = connection.execute(
                 """
-                SELECT tool_call_id, evidence_id, arguments_json, output_json
-                FROM analysis_tool_outputs WHERE thread_id = ? ORDER BY tool_call_id
+                SELECT analysis_tool_outputs.tool_call_id, analysis_tool_outputs.evidence_id,
+                       analysis_tool_outputs.arguments_json, analysis_tool_outputs.output_json,
+                       analysis_evidence.mapping_version_id
+                FROM analysis_tool_outputs JOIN analysis_evidence ON analysis_evidence.id = analysis_tool_outputs.evidence_id
+                WHERE analysis_tool_outputs.thread_id = ? ORDER BY analysis_tool_outputs.tool_call_id
                 """,
                 (thread_id,),
             ).fetchall()
-        return [
-            {
-                "tool_call_id": row[0],
-                "evidence_id": row[1],
-                "arguments": json.loads(row[2]),
-                "output": json.loads(row[3]),
-            }
-            for row in rows
-        ]
+            outputs = []
+            for row in rows:
+                output = json.loads(row[3])
+                validate_completed_evidence_envelope(output)
+                _validate_filter_mapping_specs(connection, output, int(row[4]))
+                outputs.append({"tool_call_id": row[0], "evidence_id": row[1], "arguments": json.loads(row[2]), "output": output})
+            return outputs
 
     def _insert_mapping_entries(
         self,
@@ -2389,131 +2580,19 @@ def _analysis_result_envelope_json(
         or _ANALYSIS_OPERATION_PATTERN.fullmatch(operation) is None
         or not isinstance(schema_version, str)
         or _ANALYSIS_SCHEMA_VERSION_PATTERN.fullmatch(schema_version) is None
-        or len(schema_version) > 32
     ):
         raise ValueError("analysis identifier is invalid")
-    if not isinstance(value, Mapping) or set(value) != {
-        "provenance",
-        "dataset_id",
-        "dataset_sha256",
-        "mapping_version_id",
-        "operation",
-        "schema_version",
-        "filters",
-        "metric_definitions",
-        "counts",
-        "disposition_counts",
-        "exclusions",
-        "metrics",
-        "limitations",
-    }:
-        raise ValueError("analysis result envelope is invalid")
+    validate_completed_evidence_envelope(value)
     if (
-        value["provenance"] != "USER_EMPIRICAL_EVIDENCE"
-        or value["dataset_id"] != dataset_id
+        value["dataset_id"] != dataset_id
         or value["dataset_sha256"] != dataset_sha256
         or value["mapping_version_id"] != mapping_version_id
         or value["operation"] != operation
         or value["schema_version"] != schema_version
+        or value["metric_definitions"].get("return_unit") != confirmed_return_unit
     ):
         raise ValueError("analysis result envelope does not match its evidence provenance")
-    counts = value["counts"]
-    if (
-        not isinstance(counts, Mapping)
-        or set(counts) != {"source_rows", "filtered_rows", "valid_rows", "excluded_rows"}
-        or any(type(count) is not int or count < 0 for count in counts.values())
-        or counts["source_rows"] < counts["filtered_rows"]
-        or counts["filtered_rows"] < counts["valid_rows"]
-        or counts["source_rows"] != counts["valid_rows"] + counts["excluded_rows"]
-    ):
-        raise ValueError("analysis result envelope is invalid")
-    filters = value["filters"]
-    if (
-        not isinstance(filters, list)
-        or len(filters) > ANALYSIS_FILTER_LIMIT
-        or any(
-            not isinstance(filter_, Mapping)
-            or set(filter_) != {"position", "field_id", "operator", "value_sha256", "canonical_id"}
-            or type(filter_["position"]) is not int
-            or filter_["position"] < 0
-            or not isinstance(filter_["field_id"], str)
-            or _ANALYSIS_FIELD_ID_PATTERN.fullmatch(filter_["field_id"]) is None
-            or not isinstance(filter_["operator"], str)
-            or filter_["operator"] not in {"eq", "neq", "in", "not_in", "is_blank", "not_blank", "gt", "gte", "lt", "lte", "between"}
-            or not isinstance(filter_["value_sha256"], str)
-            or _SHA256_PATTERN.fullmatch(filter_["value_sha256"]) is None
-            or not isinstance(filter_["canonical_id"], str)
-            or _FILTER_CANONICAL_ID_PATTERN.fullmatch(filter_["canonical_id"]) is None
-            for filter_ in filters
-        )
-    ):
-        raise ValueError("analysis result envelope is invalid")
-    if [filter_["position"] for filter_ in filters] != list(range(len(filters))):
-        raise ValueError("analysis result envelope is invalid")
-    dispositions = value["disposition_counts"]
-    if (
-        not isinstance(dispositions, Mapping)
-        or set(dispositions) != {"valid_for_analysis", "filtered_out", "filter_invalid", "required_role_blank", "required_role_invalid"}
-        or any(type(count) is not int or count < 0 for count in dispositions.values())
-        or sum(dispositions.values()) != counts["source_rows"]
-        or dispositions["valid_for_analysis"] != counts["valid_rows"]
-        or dispositions["valid_for_analysis"] + dispositions["required_role_blank"] + dispositions["required_role_invalid"] != counts["filtered_rows"]
-    ):
-        raise ValueError("analysis result envelope is invalid")
-    definitions = value["metric_definitions"]
-    if (
-        not isinstance(definitions, Mapping)
-        or dict(definitions) != {
-            "outcome_rate_denominator": "wins + losses + breakevens",
-            "win_rate_interval": "Wilson 95% interval",
-            "quantile_method": "linear",
-            "return_unit": definitions.get("return_unit"),
-            "row_order": definitions.get("row_order"),
-        }
-        or definitions["return_unit"] != confirmed_return_unit
-        or definitions["row_order"] not in {"source", "timestamp"}
-    ):
-        raise ValueError("analysis result envelope is invalid")
-    exclusions = value["exclusions"]
-    if (
-        not isinstance(exclusions, list)
-        or len(exclusions) > ANALYSIS_EXCLUSION_LIMIT
-        or any(
-            not isinstance(exclusion, Mapping)
-            or not _analysis_exclusion_is_safe(exclusion, filters)
-            for exclusion in exclusions
-        )
-    ):
-        raise ValueError("analysis result envelope is invalid")
-    metrics = value["metrics"]
-    if (
-        not isinstance(metrics, Mapping)
-        or len(metrics) > 50
-        or any(
-            not isinstance(name, str)
-            or name not in _ANALYSIS_METRIC_NAMES
-            or type(metric) not in (int, float, type(None))
-            or (isinstance(metric, float) and not math.isfinite(metric))
-            for name, metric in metrics.items()
-        )
-    ):
-        raise ValueError("analysis result envelope is invalid")
-    if confirmed_return_unit != "R" and any(
-        metrics.get(name) is not None
-        for name in {"realized_reward_risk", "cumulative_return", "max_drawdown", "recovery_observations"}
-    ):
-        raise ValueError("analysis result envelope is invalid")
-    limitations = value["limitations"]
-    if (
-        not isinstance(limitations, list)
-        or len(limitations) > 20
-        or any(item not in _ANALYSIS_LIMITATION_CODES for item in limitations)
-    ):
-        raise ValueError("analysis result envelope is invalid")
-    serialized = json.dumps(value, separators=(",", ":"), allow_nan=False)
-    if len(serialized) > 8000:
-        raise ValueError("analysis result envelope is invalid")
-    return serialized
+    return json.dumps(value, separators=(",", ":"), allow_nan=False)
 
 
 def _analysis_exclusion_is_safe(exclusion: Mapping[str, Any], filters: list[Mapping[str, Any]]) -> bool:

@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Literal, Sequence
 import pandas as pd
 
 from mentor.datasets import DatasetImportError, _inspection_rows_from_bytes
-from mentor.storage import ANALYSIS_EXCLUSION_LIMIT, ANALYSIS_FILTER_LIMIT
+from mentor.storage import ANALYSIS_EXCLUSION_LIMIT, ANALYSIS_FILTER_LIMIT, validate_completed_evidence_envelope
 
 if TYPE_CHECKING:
     from mentor.datasets import MappingEntry
@@ -93,7 +93,7 @@ class FilterDescriptor:
     position: int
     field_id: str
     operator: str
-    value_sha256: str
+    value_spec: dict[str, object]
     canonical_id: str
 
 
@@ -169,7 +169,12 @@ def build_analysis_frame(
     fields = tuple(_field(entry) for entry in entries)
     by_id = {field.field_id: field for field in fields}
     validated_filters = tuple(_validate_filter(filter_, by_id) for filter_ in filters)
-    filter_descriptors = tuple(_filter_descriptor(filter_, position) for position, filter_ in enumerate(validated_filters))
+    filter_descriptors = _canonical_filter_descriptors(validated_filters, by_id, mapping.id)
+    filters_by_id = {
+        _canonical_filter_descriptors((filter_,), by_id, mapping.id)[0].canonical_id: filter_
+        for filter_ in validated_filters
+    }
+    validated_filters = tuple(filters_by_id[item.canonical_id] for item in filter_descriptors)
     if len(filter_descriptors) + 2 * len(effective_required) > ANALYSIS_EXCLUSION_LIMIT:
         raise ValueError("analysis exclusion detail limit would be exceeded")
     original_path = storage.database_path.parent / "datasets" / dataset.id / f"original{dataset.original_extension}"
@@ -288,12 +293,13 @@ def group_results(frame: AnalysisFrame, group_fields: Sequence[str]) -> dict[str
     """Return bounded, privacy-approved descriptive metrics for one or two groups."""
     fields = _grouping_fields(frame, group_fields)
     group_columns = [field.column_name for field in fields]
-    keys = _group_keys(frame.data, group_columns)
-    source_keys = _group_keys(frame.source_data, group_columns)
+    # The filtered population with valid group labels is authoritative. A
+    # member with no valid metric rows remains a returned group.
+    keys = _group_keys(frame.filtered_data, group_columns)
     returned_keys = keys[:_GROUP_LIMIT]
     omitted_keys = keys[_GROUP_LIMIT:]
     groups = [_group_payload(_group_frame(frame, fields, key), key) for key in returned_keys]
-    omitted = [_group_frame(frame, fields, key) for key in source_keys if key not in returned_keys]
+    omitted = [_group_frame(frame, fields, key) for key in omitted_keys]
     ungrouped = _ungrouped_frame(frame, fields)
     limitations = _group_limitations(frame, len(keys), len(returned_keys))
     if ungrouped.filtered_rows:
@@ -306,6 +312,8 @@ def group_results(frame: AnalysisFrame, group_fields: Sequence[str]) -> dict[str
             "total_groups": len(keys),
             "returned_groups": len(returned_keys),
             "omitted_groups": len(omitted_keys),
+            "groupable_filtered_rows": sum(item["counts"]["filtered_rows"] for item in groups) + sum(item.filtered_rows for item in omitted),
+            "returned_group_rows": sum(item["counts"]["filtered_rows"] for item in groups),
             "omitted_group_rows": sum(item.filtered_rows for item in omitted),
         },
         "omissions": {"counts": _combined_counts(omitted)},
@@ -458,6 +466,11 @@ def _result_metadata(frame: AnalysisFrame, operation: str) -> dict[str, object]:
             "excluded_rows": frame.excluded_rows,
         },
         "disposition_counts": frame.disposition_counts,
+        "exclusion_contract": {
+            "row_dispositions_exclusive": True,
+            "diagnostic_exclusions_exclusive": False,
+            "diagnostic_exclusions_may_overlap": True,
+        },
         "exclusions": _exclusion_payload(frame.exclusions),
     }
 
@@ -605,12 +618,13 @@ def _group_payload(frame: AnalysisFrame, values: Sequence[object]) -> dict[str, 
     summary = summarize_results(frame)
     metrics = summary["metrics"]
     assert isinstance(metrics, dict)
+    counts = {**summary["counts"], "required_role_excluded_rows": frame.filtered_rows - frame.valid_rows}
     return {
         "values": [_json_value(value) for value in values],
-        "counts": summary["counts"],
+        "counts": counts,
         "exclusions": summary["exclusions"],
         "metrics": {name: metrics[name] for name in _GROUP_METRICS},
-        "limitations": summary["limitations"],
+        "limitations": sorted({*summary["limitations"], *(["no_valid_rows"] if frame.filtered_rows and not frame.valid_rows else [])}),
     }
 
 
@@ -649,12 +663,14 @@ def _temporal_bucket(frame: AnalysisFrame, period: str, source_data: pd.DataFram
     data = frame.data.loc[frame.data["source_row_ordinal"].isin(ordinals)]
     bucket = _subset_frame(frame, source_data, filtered_data, data)
     payload = _group_payload(bucket, ())
+    counts = dict(payload["counts"])
+    del counts["required_role_excluded_rows"]
     timestamps = source_data["trade_timestamp"]
     return {
         "period": period,
         "start_date": _date_text(timestamps.min()),
         "end_date": _date_text(timestamps.max()),
-        "counts": payload["counts"],
+        "counts": counts,
         "exclusions": payload["exclusions"],
         "metrics": payload["metrics"],
         "limitations": payload["limitations"],
@@ -775,6 +791,7 @@ def _finite_sum(values: Sequence[float]) -> float:
 def _finalize_evidence(result: dict[str, object]) -> dict[str, object]:
     """Reject an empirical envelope containing an unrepresentable real metric."""
     _assert_finite_evidence(result)
+    validate_completed_evidence_envelope(result)
     return result
 
 
@@ -968,20 +985,49 @@ def _summary_limitations(frame: AnalysisFrame, metrics: dict[str, object]) -> li
     return limitations
 
 
-def _filter_descriptor(filter_: AnalysisFilter, position: int) -> FilterDescriptor:
-    value = filter_.value
-    encoded = json.dumps(value, default=lambda item: item.isoformat() if isinstance(item, datetime) else None, sort_keys=True, separators=(",", ":"))
-    value_sha256 = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
-    canonical_id = hashlib.sha256(f"{filter_.field_id}\0{filter_.operator}\0{value_sha256}".encode("utf-8")).hexdigest()[:12]
-    return FilterDescriptor(position, filter_.field_id, filter_.operator, value_sha256, canonical_id)
+def _canonical_filter_descriptors(
+    filters: Sequence[AnalysisFilter], fields: dict[str, AnalysisField], mapping_version_id: int
+) -> tuple[FilterDescriptor, ...]:
+    """Exact duplicate predicates are deterministically deduplicated before evaluation."""
+    descriptors: dict[str, tuple[str, str, dict[str, object]]] = {}
+    for filter_ in filters:
+        field = fields[filter_.field_id]
+        values = () if filter_.operator in {"is_blank", "not_blank"} else (
+            filter_.value if filter_.operator in {"in", "not_in", "between"} else (filter_.value,)
+        )
+        canonical_values = [_filter_json_value(value) for value in values]
+        if filter_.operator in {"in", "not_in"}:
+            canonical_values.sort(key=lambda value: json.dumps(value, sort_keys=True, separators=(",", ":")))
+        value_spec = {
+            "mapping_version_id": mapping_version_id,
+            "value_type": field.value_type,
+            "unit": field.unit,
+            "values": canonical_values,
+        }
+        encoded = json.dumps(
+            {"field_id": field.field_id, "operator": filter_.operator, "value_spec": value_spec},
+            sort_keys=True, separators=(",", ":"), allow_nan=False,
+        )
+        descriptors[hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:12]] = (field.field_id, filter_.operator, value_spec)
+    return tuple(
+        FilterDescriptor(position, field_id, operator, value_spec, canonical_id)
+        for position, (canonical_id, (field_id, operator, value_spec)) in enumerate(sorted(descriptors.items()))
+    )
+
+
+def _filter_json_value(value: object) -> object:
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    return value
 
 
 def _filter_payload(filter_: FilterDescriptor) -> dict[str, object]:
     return {
-        "position": filter_.position,
         "field_id": filter_.field_id,
         "operator": filter_.operator,
-        "value_sha256": filter_.value_sha256,
+        "value_spec": filter_.value_spec,
         "canonical_id": filter_.canonical_id,
     }
 

@@ -817,6 +817,11 @@ def _result_envelope(dataset, mapping_version_id: int, operation: str = "summari
             "required_role_blank": 0,
             "required_role_invalid": 0,
         },
+        "exclusion_contract": {
+            "row_dispositions_exclusive": True,
+            "diagnostic_exclusions_exclusive": False,
+            "diagnostic_exclusions_may_overlap": True,
+        },
         "exclusions": [],
         "metrics": {"valid_rows": 3},
         "limitations": [],

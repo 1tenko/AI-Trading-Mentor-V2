@@ -18,7 +18,7 @@ from mentor.analysis import (
     summarize_results,
 )
 from mentor.datasets import MappingEntry, create_inspected_mapping_draft, import_local_dataset, inspect_local_dataset
-from mentor.storage import ANALYSIS_EXCLUSION_LIMIT, Storage
+from mentor.storage import ANALYSIS_EXCLUSION_LIMIT, Storage, validate_completed_evidence_envelope
 
 
 def _confirmed_dataset(tmp_path: Path, contents: str, entries: list[MappingEntry], *, dataset_id: str = "dataset-analysis"):
@@ -260,10 +260,9 @@ def test_summarize_results_uses_the_frame_validated_filter_fingerprint_without_d
     assert result["counts"]["filtered_rows"] == 1
     assert result["filters"] == [
         {
-            "position": 0,
             "field_id": field_id,
             "operator": "gt",
-            "value_sha256": "6b86b273ff34fce19d6b804eff5a3f5747ada4eaa22f1d49c01e52ddb7875b4b",
+            "value_spec": {"mapping_version_id": mapping.id, "value_type": "number", "unit": "R", "values": [1.0]},
             "canonical_id": result["filters"][0]["canonical_id"],
         }
     ]
@@ -478,22 +477,23 @@ def test_group_results_reports_session_metrics_with_validated_filter_handoff(tmp
         "field_ids": [session_id],
         "limit": 50,
         "total_groups": 2,
-        "returned_groups": 2,
-        "omitted_groups": 0,
-        "omitted_group_rows": 0,
+            "returned_groups": 2,
+            "omitted_groups": 0,
+            "groupable_filtered_rows": 4,
+            "returned_group_rows": 4,
+            "omitted_group_rows": 0,
     }
     london, new_york = result["groups"]
     assert london["values"] == ["London"]
-    assert london["counts"] == {"source_rows": 2, "filtered_rows": 2, "valid_rows": 2, "excluded_rows": 0}
+    assert london["counts"] == {"source_rows": 2, "filtered_rows": 2, "valid_rows": 2, "excluded_rows": 0, "required_role_excluded_rows": 0}
     assert london["metrics"]["mean_return"] == 0.0
     assert new_york["values"] == ["New York"]
-    assert new_york["counts"] == {"source_rows": 2, "filtered_rows": 2, "valid_rows": 1, "excluded_rows": 1}
+    assert new_york["counts"] == {"source_rows": 2, "filtered_rows": 2, "valid_rows": 1, "excluded_rows": 1, "required_role_excluded_rows": 1}
     assert new_york["exclusions"] == [{"kind": "required_role_diagnostic", "role": "trade_return", "reason": "invalid", "count": 1}]
     assert result["filters"] == [{
-        "position": 0,
         "field_id": session_id,
         "operator": "in",
-        "value_sha256": "9fcb3941d9a9dae06bc93589259d603afc167d4c41a32418ca0680c0f0389483",
+        "value_spec": {"mapping_version_id": mapping.id, "value_type": "categorical", "unit": None, "values": ["London", "New York"]},
         "canonical_id": result["filters"][0]["canonical_id"],
     }]
     assert "Desk Secret" not in json.dumps(result)
@@ -563,7 +563,7 @@ def test_group_results_handles_empty_filtered_data_without_group_values(tmp_path
 
     assert result["groups"] == []
     assert result["grouping"]["total_groups"] == 0
-    assert result["omissions"]["counts"] == {"source_rows": 1, "filtered_rows": 0, "valid_rows": 0, "excluded_rows": 1}
+    assert result["omissions"]["counts"] == {"source_rows": 0, "filtered_rows": 0, "valid_rows": 0, "excluded_rows": 0}
     assert result["limitations"] == ["no_matching_rows"]
 
 
@@ -875,7 +875,7 @@ def test_filter_invalid_values_are_excluded_not_hidden_and_rebuild_reproduces_co
     assert (numeric.filtered_rows, numeric.valid_rows, numeric.excluded_rows) == (1, 1, 2)
     assert (temporal.filtered_rows, temporal.valid_rows, temporal.excluded_rows) == (1, 1, 2)
     assert group_results(not_blank, (session_id or "",))["groups"][0]["counts"] == {
-        "source_rows": 2, "filtered_rows": 1, "valid_rows": 1, "excluded_rows": 1,
+        "source_rows": 2, "filtered_rows": 1, "valid_rows": 1, "excluded_rows": 1, "required_role_excluded_rows": 0,
     }
 
     reopened = Storage(storage.database_path)
@@ -887,7 +887,7 @@ def test_filter_invalid_values_are_excluded_not_hidden_and_rebuild_reproduces_co
     assert summarize_results(rebuilt)["exclusions"] == summarize_results(not_blank)["exclusions"]
 
 
-def test_filter_limit_is_shared_and_every_accepted_filter_is_recorded(tmp_path):
+def test_filter_limit_is_shared_and_exact_duplicates_are_deduplicated(tmp_path):
     storage, dataset, mapping = _confirmed_dataset(
         tmp_path, "Result,Session\n1,London\n", [MappingEntry(0, semantic_role="trade_return", unit="R"), MappingEntry(1, analysis_label="Session")]
     )
@@ -896,7 +896,7 @@ def test_filter_limit_is_shared_and_every_accepted_filter_is_recorded(tmp_path):
 
     frame = build_analysis_frame(storage, dataset.id, mapping.id, required_roles=("trade_return",), filters=at_limit)
 
-    assert len(summarize_results(frame)["filters"]) == 20
+    assert len(summarize_results(frame)["filters"]) == 1
     evidence = storage.record_analysis_evidence(
         thread_id=storage.create_thread("Filter limit"),
         origin_turn_number=1,
@@ -1228,6 +1228,124 @@ def test_persisted_filter_invalid_diagnostic_is_bound_to_the_recorded_filter(tmp
     recorded_filter = next(item for item in persisted["filters"] if item["canonical_id"] == diagnostic["canonical_id"])
     assert recorded_filter["field_id"] == result_id and recorded_filter["operator"] == "gt"
     assert "bad" not in json.dumps(persisted)
+
+
+def test_same_field_filters_have_replayable_specs_and_nonexclusive_diagnostics(tmp_path):
+    storage, dataset, mapping = _confirmed_dataset(
+        tmp_path,
+        "Result,Session\n1,London\nbad,London\n4,New York\n",
+        [
+            MappingEntry(0, semantic_role="trade_return", unit="R"),
+            MappingEntry(1, analysis_label="Session", model_disclosure=True),
+        ],
+    )
+    result_id = next(entry.field_id for entry in storage.mapping_entries(mapping.id) if entry.semantic_role == "trade_return")
+    result = summarize_results(build_analysis_frame(
+        storage, dataset.id, mapping.id, required_roles=("trade_return",),
+        filters=(AnalysisFilter(result_id or "", "gt", 0), AnalysisFilter(result_id or "", "lt", 3)),
+    ))
+
+    assert result["exclusion_contract"] == {
+        "row_dispositions_exclusive": True,
+        "diagnostic_exclusions_exclusive": False,
+        "diagnostic_exclusions_may_overlap": True,
+    }
+    assert {(item["operator"], tuple(item["value_spec"]["values"])) for item in result["filters"]} == {("gt", (0.0,)), ("lt", (3.0,))}
+    assert len({item["canonical_id"] for item in result["filters"]}) == 2
+    assert result["disposition_counts"]["filter_invalid"] == 1
+    assert {item["canonical_id"] for item in result["exclusions"] if item["kind"] == "filter_invalid"} == {
+        item["canonical_id"] for item in result["filters"]
+    }
+    duplicate = summarize_results(build_analysis_frame(
+        storage, dataset.id, mapping.id, required_roles=("trade_return",),
+        filters=(AnalysisFilter(result_id or "", "gt", 0), AnalysisFilter(result_id or "", "gt", 0), AnalysisFilter(result_id or "", "lt", 3)),
+    ))
+    assert duplicate["filters"] == result["filters"]
+    assert duplicate["counts"] == result["counts"]
+
+    evidence = storage.record_analysis_evidence(
+        thread_id=storage.create_thread("Same field filters"), origin_turn_number=1,
+        dataset_id=dataset.id, mapping_version_id=mapping.id, operation="summarize_results",
+        schema_version="1.0", arguments={"dataset_id": dataset.id}, result=result,
+    )
+    storage.record_analysis_tool_output(evidence.thread_id, "same-field", evidence.id, result)
+    restarted = Storage(storage.database_path)
+    restarted.initialize()
+    replayed = restarted.analysis_tool_outputs(evidence.thread_id)[0]["output"]
+    assert replayed["filters"] == result["filters"]
+    assert replayed["exclusions"] == result["exclusions"]
+
+
+def test_group_results_keeps_excluded_only_groups_and_reconciles_group_universe(tmp_path):
+    storage, dataset, mapping = _confirmed_dataset(
+        tmp_path,
+        "Result,Session\n1,NYAM\n2,NYAM\nbad,Asia\nbad,Asia\n",
+        [
+            MappingEntry(0, semantic_role="trade_return", unit="R"),
+            MappingEntry(1, analysis_label="Session", model_disclosure=True),
+        ],
+    )
+    session_id = next(entry.field_id for entry in storage.mapping_entries(mapping.id) if entry.analysis_label == "Session")
+    result = group_results(build_analysis_frame(
+        storage, dataset.id, mapping.id, required_roles=("trade_return",)
+    ), (session_id or "",))
+
+    nyam, asia = result["groups"]
+    assert (nyam["values"], nyam["counts"]) == (["Asia"], {"source_rows": 2, "filtered_rows": 2, "valid_rows": 0, "excluded_rows": 2, "required_role_excluded_rows": 2})
+    assert asia["values"] == ["NYAM"]
+    assert "no_valid_rows" in nyam["limitations"]
+    assert result["grouping"]["groupable_filtered_rows"] == 4
+    assert result["grouping"]["returned_group_rows"] == 4
+    assert result["grouping"]["omitted_group_rows"] == 0
+    assert result["ungrouped"]["counts"]["filtered_rows"] == 0
+    evidence = storage.record_analysis_evidence(
+        thread_id=storage.create_thread("Excluded-only group"), origin_turn_number=1,
+        dataset_id=dataset.id, mapping_version_id=mapping.id, operation="group_results",
+        schema_version="1.0", arguments={"dataset_id": dataset.id}, result=result,
+    )
+    storage.record_analysis_tool_output(evidence.thread_id, "excluded-group", evidence.id, result)
+    restarted = Storage(storage.database_path)
+    restarted.initialize()
+    assert restarted.analysis_tool_outputs(evidence.thread_id)[0]["output"] == result
+
+
+def test_completed_evidence_envelope_fails_closed_on_nonexclusive_contract_or_bad_filter_reference(tmp_path):
+    storage, dataset, mapping = _confirmed_dataset(
+        tmp_path, "Result\n1\nbad\n", [MappingEntry(0, semantic_role="trade_return", unit="R")]
+    )
+    field_id = storage.mapping_entries(mapping.id)[0].field_id
+    result = summarize_results(build_analysis_frame(
+        storage, dataset.id, mapping.id, required_roles=("trade_return",), filters=(AnalysisFilter(field_id or "", "gt", 0),)
+    ))
+    invalid_contract = {**result, "exclusion_contract": {**result["exclusion_contract"], "diagnostic_exclusions_exclusive": True}}
+    invalid_reference = {**result, "exclusions": [{**result["exclusions"][0], "canonical_id": "0" * 12}]}
+    with pytest.raises(ValueError, match="envelope"):
+        validate_completed_evidence_envelope(invalid_contract)
+    with pytest.raises(ValueError, match="envelope"):
+        validate_completed_evidence_envelope(invalid_reference)
+
+
+def test_group_limit_keeps_boundary_excluded_only_group_instead_of_omitting_it(tmp_path):
+    pairs = [(f"S{index // 17}", f"K{index % 17}") for index in range(51)]
+    ordered_pairs = sorted(pairs)
+    rows = "\n".join([*(f"1,{session},{setup}" for session, setup in ordered_pairs[:49]), f"bad,{ordered_pairs[49][0]},{ordered_pairs[49][1]}", f"1,{ordered_pairs[50][0]},{ordered_pairs[50][1]}"])
+    storage, dataset, mapping = _confirmed_dataset(
+        tmp_path, f"Result,Session,Setup\n{rows}\n",
+        [
+            MappingEntry(0, semantic_role="trade_return", unit="R"),
+            MappingEntry(1, analysis_label="Session", model_disclosure=True),
+            MappingEntry(2, analysis_label="Setup", model_disclosure=True),
+        ],
+    )
+    session_id = next(entry.field_id for entry in storage.mapping_entries(mapping.id) if entry.analysis_label == "Session")
+    setup_id = next(entry.field_id for entry in storage.mapping_entries(mapping.id) if entry.analysis_label == "Setup")
+    result = group_results(build_analysis_frame(storage, dataset.id, mapping.id, required_roles=("trade_return",)), (session_id or "", setup_id or ""))
+
+    assert result["grouping"]["returned_groups"] == 50
+    assert result["grouping"]["omitted_groups"] == 1
+    assert result["groups"][-1]["values"] == list(ordered_pairs[49])
+    assert result["groups"][-1]["counts"]["valid_rows"] == 0
+    assert result["grouping"]["omitted_group_rows"] == 1
 
 
 def test_maximum_accepted_filter_diagnostics_fit_the_persisted_exclusion_envelope(tmp_path):
