@@ -1390,6 +1390,49 @@ def test_group_partition_rejects_corruption_before_persistence_and_on_replay(tmp
         storage.analysis_tool_outputs(evidence.thread_id)
 
 
+def test_group_partition_rejects_impossible_omissions_and_overclaiming_ungrouped_reasons(tmp_path):
+    storage, dataset, mapping = _confirmed_dataset(
+        tmp_path,
+        "Result,Session,Setup\n1,London,A\n1,London,A\n1,New York,B\n1,,\n",
+        [
+            MappingEntry(0, semantic_role="trade_return", unit="R"),
+            MappingEntry(1, analysis_label="Session", model_disclosure=True),
+            MappingEntry(2, analysis_label="Setup", model_disclosure=True),
+        ],
+    )
+    entries = storage.mapping_entries(mapping.id)
+    result_id = next(entry.field_id for entry in entries if entry.semantic_role == "trade_return")
+    session_id = next(entry.field_id for entry in entries if entry.analysis_label == "Session")
+    setup_id = next(entry.field_id for entry in entries if entry.analysis_label == "Setup")
+    result = group_results(build_analysis_frame(
+        storage, dataset.id, mapping.id, required_roles=("trade_return",)
+    ), (session_id or "", setup_id or ""))
+
+    assert result["group_evidence"]["ungrouped"]["reasons"] == [
+        {"field_id": session_id, "reason": "blank", "count": 1},
+        {"field_id": setup_id, "reason": "blank", "count": 1},
+    ]
+    validate_completed_evidence_envelope(result)
+
+    too_many_omitted = deepcopy(result)
+    too_many_omitted["group_evidence"]["returned_groups"][0].update(filtered_rows=1, valid_rows=1)
+    too_many_omitted["group_evidence"]["omitted"] = {
+        "group_count": 2, "filtered_rows": 1, "valid_rows": 1, "excluded_rows": 0,
+    }
+    unrelated_reason = deepcopy(result)
+    unrelated_reason["group_evidence"]["ungrouped"]["reasons"][0]["field_id"] = result_id
+    duplicate_reason = deepcopy(result)
+    duplicate_reason["group_evidence"]["ungrouped"]["reasons"].append(
+        deepcopy(duplicate_reason["group_evidence"]["ungrouped"]["reasons"][0])
+    )
+    overcounted_reason = deepcopy(result)
+    overcounted_reason["group_evidence"]["ungrouped"]["reasons"][0]["count"] = 2
+
+    for corrupted in (too_many_omitted, unrelated_reason, duplicate_reason, overcounted_reason):
+        with pytest.raises(ValueError, match="envelope"):
+            validate_completed_evidence_envelope(corrupted)
+
+
 def test_completed_evidence_envelope_fails_closed_on_nonexclusive_contract_or_bad_filter_reference(tmp_path):
     storage, dataset, mapping = _confirmed_dataset(
         tmp_path, "Result\n1\nbad\n", [MappingEntry(0, semantic_role="trade_return", unit="R")]

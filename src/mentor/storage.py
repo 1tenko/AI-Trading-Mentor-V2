@@ -237,7 +237,7 @@ def _validate_group_envelope(value: Mapping[str, Any], counts: Mapping[str, int]
         or not isinstance(partition, Mapping) or set(partition) != {"returned_groups", "omitted", "ungrouped"}
         or not isinstance(partition["returned_groups"], list) or len(partition["returned_groups"]) > 50
         or not _omitted_population_is_valid(partition["omitted"])
-        or not _ungrouped_population_is_valid(partition["ungrouped"])
+        or not _ungrouped_population_is_valid(partition["ungrouped"], grouping["field_ids"])
     ):
         raise ValueError("analysis result envelope is invalid")
     groups = partition["returned_groups"]
@@ -291,25 +291,35 @@ def _omitted_population_is_valid(value: object) -> bool:
         and type(value["group_count"]) is int and value["group_count"] >= 0
         and _population_counts_are_valid(value)
         and (value["group_count"] == 0) == (value["filtered_rows"] == 0)
+        and value["group_count"] <= value["filtered_rows"]
     )
 
 
-def _ungrouped_population_is_valid(value: object) -> bool:
-    return (
+def _ungrouped_population_is_valid(value: object, grouping_field_ids: list[object]) -> bool:
+    """Reason counts are per grouping field, so multi-field invalid rows may overlap."""
+    if not (
         isinstance(value, Mapping)
         and set(value) == {"filtered_rows", "valid_rows", "excluded_rows", "reasons"}
         and _population_counts_are_valid(value)
         and isinstance(value["reasons"], list)
         and (value["filtered_rows"] == 0) == (not value["reasons"])
-        and all(
+    ):
+        return False
+    identities: set[tuple[str, str]] = set()
+    for reason in value["reasons"]:
+        if not (
             isinstance(reason, Mapping)
             and set(reason) == {"field_id", "reason", "count"}
-            and isinstance(reason["field_id"], str) and _ANALYSIS_FIELD_ID_PATTERN.fullmatch(reason["field_id"]) is not None
+            and isinstance(reason["field_id"], str) and reason["field_id"] in grouping_field_ids
             and reason["reason"] in {"blank", "invalid"}
-            and type(reason["count"]) is int and reason["count"] > 0
-            for reason in value["reasons"]
-        )
-    )
+            and type(reason["count"]) is int and 0 < reason["count"] <= value["filtered_rows"]
+        ):
+            return False
+        identity = (reason["field_id"], reason["reason"])
+        if identity in identities:
+            return False
+        identities.add(identity)
+    return True
 
 
 def _validate_filter_mapping_specs(connection: sqlite3.Connection, envelope: Mapping[str, Any], mapping_version_id: int) -> None:
