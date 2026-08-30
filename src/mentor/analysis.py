@@ -129,6 +129,57 @@ class AnalysisFrame:
     no_data_reason: Literal["no_source_rows", "no_matching_rows", "no_valid_rows"] | None
 
 
+@dataclass(frozen=True)
+class GroupEvidenceGroup:
+    key: tuple[object, ...]
+    frame: AnalysisFrame = field(repr=False, compare=False)
+
+    def payload(self) -> dict[str, object]:
+        summary = summarize_results(self.frame)
+        metrics = summary["metrics"]
+        assert isinstance(metrics, dict)
+        counts = _partition_counts((self.frame,))
+        return {
+            "key": [_json_value(value) for value in self.key],
+            **counts,
+            "metrics": {name: metrics[name] for name in _GROUP_METRICS},
+            "limitations": sorted({*summary["limitations"], *(["no_valid_rows"] if self.frame.filtered_rows and not self.frame.valid_rows else [])}),
+        }
+
+
+@dataclass(frozen=True)
+class GroupEvidencePartition:
+    """The sole grouped population accounting boundary before serialization."""
+
+    frame: AnalysisFrame = field(repr=False, compare=False)
+    returned_groups: tuple[GroupEvidenceGroup, ...]
+    omitted_groups: tuple[AnalysisFrame, ...] = field(repr=False, compare=False)
+    ungrouped: AnalysisFrame = field(repr=False, compare=False)
+    ungrouped_reasons: tuple[dict[str, object], ...]
+
+    def __post_init__(self) -> None:
+        keys = tuple(group.key for group in self.returned_groups)
+        populations = tuple(group.frame for group in self.returned_groups) + self.omitted_groups + (self.ungrouped,)
+        ordinals = [ordinal for population in populations for ordinal in population.filtered_data["source_row_ordinal"].tolist()]
+        expected = self.frame.filtered_data["source_row_ordinal"].tolist()
+        if (
+            len(keys) != len(set(keys))
+            or any(not group.frame.filtered_rows for group in self.returned_groups)
+            or any(not population.filtered_rows for population in self.omitted_groups)
+            or len(ordinals) != len(set(ordinals))
+            or set(ordinals) != set(expected)
+            or _partition_counts(populations) != _partition_counts((self.frame,))
+        ):
+            raise ValueError("group evidence partition is invalid")
+
+    def payload(self) -> dict[str, object]:
+        return {
+            "returned_groups": [group.payload() for group in self.returned_groups],
+            "omitted": {"group_count": len(self.omitted_groups), **_partition_counts(self.omitted_groups)},
+            "ungrouped": {**_partition_counts((self.ungrouped,)), "reasons": list(self.ungrouped_reasons)},
+        }
+
+
 def build_analysis_frame(
     storage: "Storage",
     dataset_id: str,
@@ -298,30 +349,25 @@ def group_results(frame: AnalysisFrame, group_fields: Sequence[str]) -> dict[str
     keys = _group_keys(frame.filtered_data, group_columns)
     returned_keys = keys[:_GROUP_LIMIT]
     omitted_keys = keys[_GROUP_LIMIT:]
-    groups = [_group_payload(_group_frame(frame, fields, key), key) for key in returned_keys]
-    omitted = [_group_frame(frame, fields, key) for key in omitted_keys]
-    ungrouped = _ungrouped_frame(frame, fields)
+    partition = GroupEvidencePartition(
+        frame=frame,
+        returned_groups=tuple(GroupEvidenceGroup(key, _group_frame(frame, fields, key)) for key in returned_keys),
+        omitted_groups=tuple(_group_frame(frame, fields, key) for key in omitted_keys),
+        ungrouped=_ungrouped_frame(frame, fields),
+        ungrouped_reasons=tuple(_ungrouped_reasons(frame.filtered_data, fields)),
+    )
     limitations = _group_limitations(frame, len(keys), len(returned_keys))
-    if ungrouped.filtered_rows:
+    if partition.ungrouped.filtered_rows:
         limitations.append("ungrouped_group_values_excluded")
+    metadata = _result_metadata(frame, "group_results")
+    metadata["counts"] = {"source_rows": frame.source_rows, **_partition_counts((frame,))}
     return _finalize_evidence({
-        **_result_metadata(frame, "group_results"),
+        **metadata,
         "grouping": {
             "field_ids": [field.field_id for field in fields],
             "limit": _GROUP_LIMIT,
-            "total_groups": len(keys),
-            "returned_groups": len(returned_keys),
-            "omitted_groups": len(omitted_keys),
-            "groupable_filtered_rows": sum(item["counts"]["filtered_rows"] for item in groups) + sum(item.filtered_rows for item in omitted),
-            "returned_group_rows": sum(item["counts"]["filtered_rows"] for item in groups),
-            "omitted_group_rows": sum(item.filtered_rows for item in omitted),
         },
-        "omissions": {"counts": _combined_counts(omitted)},
-        "ungrouped": {
-            "counts": _frame_counts(ungrouped),
-            "reasons": _ungrouped_reasons(frame.filtered_data, fields),
-        },
-        "groups": groups,
+        "group_evidence": partition.payload(),
         "limitations": limitations,
     })
 
@@ -719,17 +765,14 @@ def _mfe_mae_payload(frame: AnalysisFrame, role: Literal["mfe", "mae"]) -> dict[
     }
 
 
-def _frame_counts(frame: AnalysisFrame) -> dict[str, int]:
+def _partition_counts(frames: Sequence[AnalysisFrame]) -> dict[str, int]:
+    valid_rows = sum(frame.valid_rows for frame in frames)
+    filtered_rows = sum(frame.filtered_rows for frame in frames)
     return {
-        "source_rows": frame.source_rows,
-        "filtered_rows": frame.filtered_rows,
-        "valid_rows": frame.valid_rows,
-        "excluded_rows": frame.excluded_rows,
+        "filtered_rows": filtered_rows,
+        "valid_rows": valid_rows,
+        "excluded_rows": filtered_rows - valid_rows,
     }
-
-
-def _combined_counts(frames: Sequence[AnalysisFrame]) -> dict[str, int]:
-    return {name: sum(_frame_counts(frame)[name] for frame in frames) for name in ("source_rows", "filtered_rows", "valid_rows", "excluded_rows")}
 
 
 def _ungrouped_reasons(data: pd.DataFrame, fields: Sequence[AnalysisField]) -> list[dict[str, object]]:

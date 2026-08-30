@@ -106,7 +106,7 @@ def validate_completed_evidence_envelope(value: Mapping[str, Any]) -> None:
     }
     extras = {
         "summarize_results": {"metrics"},
-        "group_results": {"grouping", "omissions", "ungrouped", "groups"},
+        "group_results": {"grouping", "group_evidence"},
         "compare_groups": {"comparison"},
         "analyze_over_time": {"temporal", "buckets", "omissions"},
         "analyze_mfe_mae": {"mfe", "mae"},
@@ -116,7 +116,7 @@ def validate_completed_evidence_envelope(value: Mapping[str, Any]) -> None:
     if value["provenance"] != "USER_EMPIRICAL_EVIDENCE" or type(value["mapping_version_id"]) is not int or value["mapping_version_id"] < 1:
         raise ValueError("analysis result envelope is invalid")
     counts = value["counts"]
-    if not _analysis_counts_are_valid(counts):
+    if not (_group_total_counts_are_valid(counts) if operation == "group_results" else _analysis_counts_are_valid(counts)):
         raise ValueError("analysis result envelope is invalid")
     dispositions = value["disposition_counts"]
     if (
@@ -227,35 +227,88 @@ def _analysis_metrics_are_valid(metrics: object) -> bool:
 
 
 def _validate_group_envelope(value: Mapping[str, Any], counts: Mapping[str, int]) -> None:
-    grouping, omissions, ungrouped, groups = value["grouping"], value["omissions"], value["ungrouped"], value["groups"]
+    grouping, partition = value["grouping"], value["group_evidence"]
     if (
-        not isinstance(grouping, Mapping) or set(grouping) != {"field_ids", "limit", "total_groups", "returned_groups", "omitted_groups", "groupable_filtered_rows", "returned_group_rows", "omitted_group_rows"}
-        or grouping["limit"] != 50 or not isinstance(groups, list) or len(groups) != grouping["returned_groups"]
-        or grouping["total_groups"] != grouping["returned_groups"] + grouping["omitted_groups"]
-        or not isinstance(omissions, Mapping) or set(omissions) != {"counts"} or not _analysis_counts_are_valid(omissions["counts"])
-        or not isinstance(ungrouped, Mapping) or not _analysis_counts_are_valid(ungrouped.get("counts"))
+        not isinstance(grouping, Mapping) or set(grouping) != {"field_ids", "limit"}
+        or grouping["limit"] != 50
+        or not isinstance(grouping["field_ids"], list) or not 1 <= len(grouping["field_ids"]) <= 2
+        or len(set(grouping["field_ids"])) != len(grouping["field_ids"])
+        or any(not isinstance(field_id, str) or _ANALYSIS_FIELD_ID_PATTERN.fullmatch(field_id) is None for field_id in grouping["field_ids"])
+        or not isinstance(partition, Mapping) or set(partition) != {"returned_groups", "omitted", "ungrouped"}
+        or not isinstance(partition["returned_groups"], list) or len(partition["returned_groups"]) > 50
+        or not _omitted_population_is_valid(partition["omitted"])
+        or not _ungrouped_population_is_valid(partition["ungrouped"])
     ):
         raise ValueError("analysis result envelope is invalid")
-    if any(not isinstance(group, Mapping) or not _group_counts_are_valid(group.get("counts")) for group in groups):
+    groups = partition["returned_groups"]
+    if any(not _returned_group_is_valid(group, len(grouping["field_ids"])) for group in groups):
         raise ValueError("analysis result envelope is invalid")
-    returned_rows = sum(group["counts"]["filtered_rows"] for group in groups)
-    if (
-        grouping["returned_group_rows"] != returned_rows
-        or grouping["omitted_group_rows"] != omissions["counts"]["filtered_rows"]
-        or grouping["groupable_filtered_rows"] != returned_rows + omissions["counts"]["filtered_rows"]
-        or counts["filtered_rows"] != grouping["groupable_filtered_rows"] + ungrouped["counts"]["filtered_rows"]
+    keys = [tuple(group["key"]) for group in groups]
+    populations = [*groups, partition["omitted"], partition["ungrouped"]]
+    if len(keys) != len(set(keys)) or any(
+        sum(population[name] for population in populations) != counts[name]
+        for name in ("filtered_rows", "valid_rows", "excluded_rows")
     ):
         raise ValueError("analysis result envelope is invalid")
 
 
-def _group_counts_are_valid(value: object) -> bool:
+def _group_total_counts_are_valid(value: object) -> bool:
     return (
         isinstance(value, Mapping)
-        and set(value) == {"source_rows", "filtered_rows", "valid_rows", "excluded_rows", "required_role_excluded_rows"}
-        and _analysis_counts_are_valid({key: value[key] for key in ("source_rows", "filtered_rows", "valid_rows", "excluded_rows")})
-        and type(value["required_role_excluded_rows"]) is int
-        and value["required_role_excluded_rows"] >= 0
-        and value["filtered_rows"] == value["valid_rows"] + value["required_role_excluded_rows"]
+        and set(value) == {"source_rows", "filtered_rows", "valid_rows", "excluded_rows"}
+        and all(type(count) is int and count >= 0 for count in value.values())
+        and value["source_rows"] >= value["filtered_rows"]
+        and value["filtered_rows"] == value["valid_rows"] + value["excluded_rows"]
+    )
+
+
+def _population_counts_are_valid(value: object) -> bool:
+    return (
+        isinstance(value, Mapping)
+        and all(type(value.get(name)) is int and value[name] >= 0 for name in ("filtered_rows", "valid_rows", "excluded_rows"))
+        and value["filtered_rows"] == value["valid_rows"] + value["excluded_rows"]
+    )
+
+
+def _returned_group_is_valid(value: object, key_size: int) -> bool:
+    return (
+        isinstance(value, Mapping)
+        and set(value) == {"key", "filtered_rows", "valid_rows", "excluded_rows", "metrics", "limitations"}
+        and isinstance(value["key"], list) and len(value["key"]) == key_size
+        and all(type(item) in (str, bool) and (not isinstance(item, str) or len(item) <= 80) for item in value["key"])
+        and _population_counts_are_valid(value)
+        and value["filtered_rows"] > 0
+        and _analysis_metrics_are_valid(value["metrics"])
+        and isinstance(value["limitations"], list) and len(value["limitations"]) <= 20
+        and all(item in _ANALYSIS_LIMITATION_CODES for item in value["limitations"])
+    )
+
+
+def _omitted_population_is_valid(value: object) -> bool:
+    return (
+        isinstance(value, Mapping)
+        and set(value) == {"group_count", "filtered_rows", "valid_rows", "excluded_rows"}
+        and type(value["group_count"]) is int and value["group_count"] >= 0
+        and _population_counts_are_valid(value)
+        and (value["group_count"] == 0) == (value["filtered_rows"] == 0)
+    )
+
+
+def _ungrouped_population_is_valid(value: object) -> bool:
+    return (
+        isinstance(value, Mapping)
+        and set(value) == {"filtered_rows", "valid_rows", "excluded_rows", "reasons"}
+        and _population_counts_are_valid(value)
+        and isinstance(value["reasons"], list)
+        and (value["filtered_rows"] == 0) == (not value["reasons"])
+        and all(
+            isinstance(reason, Mapping)
+            and set(reason) == {"field_id", "reason", "count"}
+            and isinstance(reason["field_id"], str) and _ANALYSIS_FIELD_ID_PATTERN.fullmatch(reason["field_id"]) is not None
+            and reason["reason"] in {"blank", "invalid"}
+            and type(reason["count"]) is int and reason["count"] > 0
+            for reason in value["reasons"]
+        )
     )
 
 
@@ -595,8 +648,8 @@ class Storage:
                           WHERE key NOT IN (
                               'provenance', 'dataset_id', 'dataset_sha256', 'mapping_version_id',
                               'operation', 'schema_version', 'filters', 'metric_definitions', 'counts', 'disposition_counts',
-                              'exclusion_contract', 'exclusions', 'metrics', 'limitations', 'grouping', 'omissions', 'ungrouped',
-                              'groups', 'comparison', 'temporal', 'buckets', 'mfe', 'mae'
+                              'exclusion_contract', 'exclusions', 'metrics', 'limitations', 'grouping', 'group_evidence',
+                              'comparison', 'temporal', 'buckets', 'omissions', 'mfe', 'mae'
                           )
                       ) THEN 1
                     WHEN (SELECT COUNT(*) FROM json_each(NEW.result_json, '$.counts')) != 4
@@ -702,8 +755,8 @@ class Storage:
                           WHERE key NOT IN (
                               'provenance', 'dataset_id', 'dataset_sha256', 'mapping_version_id',
                               'operation', 'schema_version', 'filters', 'metric_definitions', 'counts', 'disposition_counts',
-                              'exclusion_contract', 'exclusions', 'metrics', 'limitations', 'grouping', 'omissions', 'ungrouped',
-                              'groups', 'comparison', 'temporal', 'buckets', 'mfe', 'mae'
+                              'exclusion_contract', 'exclusions', 'metrics', 'limitations', 'grouping', 'group_evidence',
+                              'comparison', 'temporal', 'buckets', 'omissions', 'mfe', 'mae'
                           )
                       ) THEN 1
                     WHEN (SELECT COUNT(*) FROM json_each(NEW.output_json, '$.counts')) != 4
@@ -959,8 +1012,8 @@ class Storage:
                           WHERE key NOT IN (
                               'provenance', 'dataset_id', 'dataset_sha256', 'mapping_version_id',
                               'operation', 'schema_version', 'filters', 'metric_definitions', 'counts', 'disposition_counts',
-                              'exclusion_contract', 'exclusions', 'metrics', 'limitations', 'grouping', 'omissions', 'ungrouped',
-                              'groups', 'comparison', 'temporal', 'buckets', 'mfe', 'mae'
+                              'exclusion_contract', 'exclusions', 'metrics', 'limitations', 'grouping', 'group_evidence',
+                              'comparison', 'temporal', 'buckets', 'omissions', 'mfe', 'mae'
                           )
                       ) THEN 1
                     WHEN (SELECT COUNT(*) FROM json_each(NEW.output_json, '$.counts')) != 4

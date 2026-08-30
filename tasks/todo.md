@@ -176,21 +176,21 @@ one self-validating `GroupEvidencePartition`; preserve healthy Task 4–7
 calculation behavior without resetting or rewriting it unnecessarily.
 
 **Acceptance criteria:**
-- [ ] A filtered population partitions only into returned groups, one omitted
+- [x] A filtered population partitions only into returned groups, one omitted
   aggregate, and ungrouped rows; each returned group partitions into valid and
   excluded analysis rows.
-- [ ] Zero-valid real groups remain visible; omitted and ungrouped populations
+- [x] Zero-valid real groups remain visible; omitted and ungrouped populations
   remain distinct; no duplicate writable totals can contradict the partition.
-- [ ] The partition rejects contradictions on production, persistence, replay,
+- [x] The partition rejects contradictions on production, persistence, replay,
   and pre-tool validation.
 
 **Verification:**
-- [ ] Known-value fixtures prove all three reconciliation equalities; individual
+- [x] Known-value fixtures prove all three reconciliation equalities; individual
   omitted/ungrouped `filtered = valid + excluded`; exact-once production
   source-row allocation; unique returned keys; no overlap/synthetic rows;
   excluded-only groups; omission limits; and replay structural rejection for
   each invalid partition field.
-- [ ] Existing Task 4–7 fixtures and full pytest remain green.
+- [x] Existing Task 4–7 fixtures and full pytest remain green.
 
 **Dependencies:** Tasks 4–7
 **Files likely touched:** `src/mentor/analysis.py`, `src/mentor/storage.py`,

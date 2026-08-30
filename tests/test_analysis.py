@@ -1,5 +1,6 @@
 import json
 import math
+from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
 
@@ -473,23 +474,13 @@ def test_group_results_reports_session_metrics_with_validated_filter_handoff(tmp
     result = group_results(frame, (session_id or "",))
 
     assert result["operation"] == "group_results"
-    assert result["grouping"] == {
-        "field_ids": [session_id],
-        "limit": 50,
-        "total_groups": 2,
-            "returned_groups": 2,
-            "omitted_groups": 0,
-            "groupable_filtered_rows": 4,
-            "returned_group_rows": 4,
-            "omitted_group_rows": 0,
-    }
-    london, new_york = result["groups"]
-    assert london["values"] == ["London"]
-    assert london["counts"] == {"source_rows": 2, "filtered_rows": 2, "valid_rows": 2, "excluded_rows": 0, "required_role_excluded_rows": 0}
+    assert result["grouping"] == {"field_ids": [session_id], "limit": 50}
+    london, new_york = result["group_evidence"]["returned_groups"]
+    assert london["key"] == ["London"]
+    assert {name: london[name] for name in ("filtered_rows", "valid_rows", "excluded_rows")} == {"filtered_rows": 2, "valid_rows": 2, "excluded_rows": 0}
     assert london["metrics"]["mean_return"] == 0.0
-    assert new_york["values"] == ["New York"]
-    assert new_york["counts"] == {"source_rows": 2, "filtered_rows": 2, "valid_rows": 1, "excluded_rows": 1, "required_role_excluded_rows": 1}
-    assert new_york["exclusions"] == [{"kind": "required_role_diagnostic", "role": "trade_return", "reason": "invalid", "count": 1}]
+    assert new_york["key"] == ["New York"]
+    assert {name: new_york[name] for name in ("filtered_rows", "valid_rows", "excluded_rows")} == {"filtered_rows": 2, "valid_rows": 1, "excluded_rows": 1}
     assert result["filters"] == [{
         "field_id": session_id,
         "operator": "in",
@@ -518,11 +509,10 @@ def test_group_results_supports_two_columns_and_caps_deterministic_groups(tmp_pa
 
     result = group_results(frame, (session_id or "", setup_id or ""))
 
-    assert result["grouping"]["total_groups"] == 55
-    assert result["grouping"]["returned_groups"] == 50
-    assert result["grouping"]["omitted_groups"] == 5
-    assert result["grouping"]["omitted_group_rows"] == 5
-    assert all(group["values"][0].startswith("S") and group["values"][1].startswith("Setup") for group in result["groups"])
+    partition = result["group_evidence"]
+    assert len(partition["returned_groups"]) == 50
+    assert partition["omitted"] == {"group_count": 5, "filtered_rows": 5, "valid_rows": 5, "excluded_rows": 0}
+    assert all(group["key"][0].startswith("S") and group["key"][1].startswith("Setup") for group in partition["returned_groups"])
     with pytest.raises(ValueError, match="one or two"):
         group_results(frame, (session_id or "", setup_id or "", session_id or ""))
 
@@ -561,9 +551,8 @@ def test_group_results_handles_empty_filtered_data_without_group_values(tmp_path
 
     result = group_results(frame, (session_id or "",))
 
-    assert result["groups"] == []
-    assert result["grouping"]["total_groups"] == 0
-    assert result["omissions"]["counts"] == {"source_rows": 0, "filtered_rows": 0, "valid_rows": 0, "excluded_rows": 0}
+    assert result["group_evidence"]["returned_groups"] == []
+    assert result["group_evidence"]["omitted"] == {"group_count": 0, "filtered_rows": 0, "valid_rows": 0, "excluded_rows": 0}
     assert result["limitations"] == ["no_matching_rows"]
 
 
@@ -578,13 +567,14 @@ def test_group_results_reports_blank_boolean_values_as_ungrouped_accounting(tmp_
 
     result = group_results(frame, (condition_id or "",))
 
-    assert [group["values"] for group in result["groups"]] == [[False], [True]]
-    assert result["ungrouped"] == {
-        "counts": {"source_rows": 1, "filtered_rows": 1, "valid_rows": 1, "excluded_rows": 0},
+    partition = result["group_evidence"]
+    assert [group["key"] for group in partition["returned_groups"]] == [[False], [True]]
+    assert partition["ungrouped"] == {
+        "filtered_rows": 1, "valid_rows": 1, "excluded_rows": 0,
         "reasons": [{"field_id": condition_id, "reason": "blank", "count": 1}],
     }
-    assert result["omissions"]["counts"] == {"source_rows": 0, "filtered_rows": 0, "valid_rows": 0, "excluded_rows": 0}
-    assert sum(group["counts"]["source_rows"] for group in result["groups"]) + result["ungrouped"]["counts"]["source_rows"] == result["counts"]["source_rows"]
+    assert partition["omitted"] == {"group_count": 0, "filtered_rows": 0, "valid_rows": 0, "excluded_rows": 0}
+    assert sum(group["filtered_rows"] for group in partition["returned_groups"]) + partition["ungrouped"]["filtered_rows"] == result["counts"]["filtered_rows"]
     assert "ungrouped_group_values_excluded" in result["limitations"]
 
 
@@ -625,7 +615,7 @@ def test_compare_groups_rejects_invalid_types_equal_values_and_unknown_fields(tm
 
     grouped = group_results(frame, (condition_id or "",))
 
-    assert [group["values"] for group in grouped["groups"]] == [[False], [True]]
+    assert [group["key"] for group in grouped["group_evidence"]["returned_groups"]] == [[False], [True]]
     with pytest.raises(ValueError, match="comparison"):
         compare_groups(frame, condition_id or "", "true", False)
     with pytest.raises(ValueError, match="distinct"):
@@ -874,9 +864,7 @@ def test_filter_invalid_values_are_excluded_not_hidden_and_rebuild_reproduces_co
     assert is_blank.disposition_counts["required_role_blank"] == 1
     assert (numeric.filtered_rows, numeric.valid_rows, numeric.excluded_rows) == (1, 1, 2)
     assert (temporal.filtered_rows, temporal.valid_rows, temporal.excluded_rows) == (1, 1, 2)
-    assert group_results(not_blank, (session_id or "",))["groups"][0]["counts"] == {
-        "source_rows": 2, "filtered_rows": 1, "valid_rows": 1, "excluded_rows": 1, "required_role_excluded_rows": 0,
-    }
+    assert group_results(not_blank, (session_id or "",))["group_evidence"]["returned_groups"][0]["filtered_rows"] == 1
 
     reopened = Storage(storage.database_path)
     reopened.initialize()
@@ -1290,14 +1278,12 @@ def test_group_results_keeps_excluded_only_groups_and_reconciles_group_universe(
         storage, dataset.id, mapping.id, required_roles=("trade_return",)
     ), (session_id or "",))
 
-    nyam, asia = result["groups"]
-    assert (nyam["values"], nyam["counts"]) == (["Asia"], {"source_rows": 2, "filtered_rows": 2, "valid_rows": 0, "excluded_rows": 2, "required_role_excluded_rows": 2})
-    assert asia["values"] == ["NYAM"]
-    assert "no_valid_rows" in nyam["limitations"]
-    assert result["grouping"]["groupable_filtered_rows"] == 4
-    assert result["grouping"]["returned_group_rows"] == 4
-    assert result["grouping"]["omitted_group_rows"] == 0
-    assert result["ungrouped"]["counts"]["filtered_rows"] == 0
+    asia, nyam = result["group_evidence"]["returned_groups"]
+    assert ({name: asia[name] for name in ("key", "filtered_rows", "valid_rows", "excluded_rows")}) == {"key": ["Asia"], "filtered_rows": 2, "valid_rows": 0, "excluded_rows": 2}
+    assert nyam["key"] == ["NYAM"]
+    assert "no_valid_rows" in asia["limitations"]
+    assert result["group_evidence"]["omitted"]["filtered_rows"] == 0
+    assert result["group_evidence"]["ungrouped"]["filtered_rows"] == 0
     evidence = storage.record_analysis_evidence(
         thread_id=storage.create_thread("Excluded-only group"), origin_turn_number=1,
         dataset_id=dataset.id, mapping_version_id=mapping.id, operation="group_results",
@@ -1307,6 +1293,101 @@ def test_group_results_keeps_excluded_only_groups_and_reconciles_group_universe(
     restarted = Storage(storage.database_path)
     restarted.initialize()
     assert restarted.analysis_tool_outputs(evidence.thread_id)[0]["output"] == result
+
+
+def test_group_results_emits_one_reconciled_partition_for_returned_omitted_and_ungrouped_rows(tmp_path):
+    storage, dataset, mapping = _confirmed_dataset(
+        tmp_path,
+        "Result,Session\n1,London\nbad,London\n1,Asia\n1,\nbad,\n",
+        [
+            MappingEntry(0, semantic_role="trade_return", unit="R"),
+            MappingEntry(1, analysis_label="Session", model_disclosure=True),
+        ],
+    )
+    session_id = next(entry.field_id for entry in storage.mapping_entries(mapping.id) if entry.analysis_label == "Session")
+    result = group_results(build_analysis_frame(
+        storage, dataset.id, mapping.id, required_roles=("trade_return",)
+    ), (session_id or "",))
+
+    partition = result["group_evidence"]
+    returned = partition["returned_groups"]
+    assert [(group["key"], group["filtered_rows"], group["valid_rows"], group["excluded_rows"]) for group in returned] == [
+        (["Asia"], 1, 1, 0),
+        (["London"], 2, 1, 1),
+    ]
+    assert partition["omitted"] == {"group_count": 0, "filtered_rows": 0, "valid_rows": 0, "excluded_rows": 0}
+    assert partition["ungrouped"] == {
+        "filtered_rows": 2,
+        "valid_rows": 1,
+        "excluded_rows": 1,
+        "reasons": [{"field_id": session_id, "reason": "blank", "count": 2}],
+    }
+    assert all(group["filtered_rows"] == group["valid_rows"] + group["excluded_rows"] for group in returned)
+    assert partition["omitted"]["filtered_rows"] == partition["omitted"]["valid_rows"] + partition["omitted"]["excluded_rows"]
+    assert partition["ungrouped"]["filtered_rows"] == partition["ungrouped"]["valid_rows"] + partition["ungrouped"]["excluded_rows"]
+    assert {
+        name: sum(group[name] for group in returned) + partition["omitted"][name] + partition["ungrouped"][name]
+        for name in ("filtered_rows", "valid_rows", "excluded_rows")
+    } == {name: result["counts"][name] for name in ("filtered_rows", "valid_rows", "excluded_rows")}
+
+
+def test_group_partition_rejects_corruption_before_persistence_and_on_replay(tmp_path):
+    storage, dataset, mapping = _confirmed_dataset(
+        tmp_path,
+        "Result,Session\n1,London\n-1,New York\n",
+        [
+            MappingEntry(0, semantic_role="trade_return", unit="R"),
+            MappingEntry(1, analysis_label="Session", model_disclosure=True),
+        ],
+    )
+    session_id = next(entry.field_id for entry in storage.mapping_entries(mapping.id) if entry.analysis_label == "Session")
+    result = group_results(build_analysis_frame(
+        storage, dataset.id, mapping.id, required_roles=("trade_return",)
+    ), (session_id or "",))
+    corruptions = []
+    duplicate_key = deepcopy(result)
+    duplicate_key["group_evidence"]["returned_groups"].append(deepcopy(duplicate_key["group_evidence"]["returned_groups"][0]))
+    corruptions.append(duplicate_key)
+    zero_returned = deepcopy(result)
+    zero_returned["group_evidence"]["returned_groups"][0].update(filtered_rows=0, valid_rows=0, excluded_rows=0)
+    corruptions.append(zero_returned)
+    impossible_omitted = deepcopy(result)
+    impossible_omitted["group_evidence"]["omitted"]["group_count"] = 1
+    corruptions.append(impossible_omitted)
+    impossible_ungrouped = deepcopy(result)
+    impossible_ungrouped["group_evidence"]["ungrouped"]["excluded_rows"] = 1
+    corruptions.append(impossible_ungrouped)
+    overlap = deepcopy(result)
+    overlap["group_evidence"]["returned_groups"][0]["filtered_rows"] += 1
+    overlap["group_evidence"]["returned_groups"][0]["excluded_rows"] += 1
+    corruptions.append(overlap)
+
+    for corrupted in corruptions:
+        with pytest.raises(ValueError, match="envelope"):
+            validate_completed_evidence_envelope(corrupted)
+        with pytest.raises(ValueError, match="envelope"):
+            storage.record_analysis_evidence(
+                thread_id=storage.create_thread("Invalid group partition"), origin_turn_number=1,
+                dataset_id=dataset.id, mapping_version_id=mapping.id, operation="group_results",
+                schema_version="1.0", arguments={"dataset_id": dataset.id}, result=corrupted,
+            )
+
+    evidence = storage.record_analysis_evidence(
+        thread_id=storage.create_thread("Replay group partition"), origin_turn_number=1,
+        dataset_id=dataset.id, mapping_version_id=mapping.id, operation="group_results",
+        schema_version="1.0", arguments={"dataset_id": dataset.id}, result=result,
+    )
+    storage.record_analysis_tool_output(evidence.thread_id, "group-partition", evidence.id, result)
+    corrupted_replay = deepcopy(result)
+    corrupted_replay["group_evidence"]["returned_groups"][0]["key"] = ["New York"]
+    with storage._connect() as connection:
+        connection.execute("DROP TRIGGER analysis_tool_outputs_are_immutable")
+        connection.execute(
+            "UPDATE analysis_tool_outputs SET output_json = ? WHERE thread_id = ?",
+            (json.dumps(corrupted_replay), evidence.thread_id),
+        )
+    with pytest.raises(ValueError, match="envelope"):
+        storage.analysis_tool_outputs(evidence.thread_id)
 
 
 def test_completed_evidence_envelope_fails_closed_on_nonexclusive_contract_or_bad_filter_reference(tmp_path):
@@ -1341,11 +1422,12 @@ def test_group_limit_keeps_boundary_excluded_only_group_instead_of_omitting_it(t
     setup_id = next(entry.field_id for entry in storage.mapping_entries(mapping.id) if entry.analysis_label == "Setup")
     result = group_results(build_analysis_frame(storage, dataset.id, mapping.id, required_roles=("trade_return",)), (session_id or "", setup_id or ""))
 
-    assert result["grouping"]["returned_groups"] == 50
-    assert result["grouping"]["omitted_groups"] == 1
-    assert result["groups"][-1]["values"] == list(ordered_pairs[49])
-    assert result["groups"][-1]["counts"]["valid_rows"] == 0
-    assert result["grouping"]["omitted_group_rows"] == 1
+    partition = result["group_evidence"]
+    assert len(partition["returned_groups"]) == 50
+    assert partition["omitted"]["group_count"] == 1
+    assert partition["returned_groups"][-1]["key"] == list(ordered_pairs[49])
+    assert partition["returned_groups"][-1]["valid_rows"] == 0
+    assert partition["omitted"]["filtered_rows"] == 1
 
 
 def test_maximum_accepted_filter_diagnostics_fit_the_persisted_exclusion_envelope(tmp_path):
