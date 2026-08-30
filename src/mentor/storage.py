@@ -1490,6 +1490,7 @@ class Storage:
     def append_thread_items(self, thread_id: int, items: list[dict]) -> tuple[int, int] | None:
         if not items:
             return None
+        item_json = [_persistent_json(item) for item in items]
         with self._connect() as connection:
             row = connection.execute(
                 "SELECT COALESCE(MAX(position), -1) FROM thread_items WHERE thread_id = ?",
@@ -1499,8 +1500,8 @@ class Storage:
             connection.executemany(
                 "INSERT INTO thread_items(thread_id, position, item_json) VALUES (?, ?, ?)",
                 [
-                    (thread_id, start + index, json.dumps(item))
-                    for index, item in enumerate(items)
+                    (thread_id, start + index, value)
+                    for index, value in enumerate(item_json)
                 ],
             )
             title = _user_text(items[0])
@@ -1530,16 +1531,18 @@ class Storage:
 
     def replace_replay_items(self, thread_id: int, items: list[dict]) -> None:
         """Atomically replace only the server-owned model replay state."""
+        item_json = [_persistent_json(item) for item in items]
         with self._connect() as connection:
             connection.execute("DELETE FROM thread_replay_items WHERE thread_id = ?", (thread_id,))
             connection.executemany(
                 "INSERT INTO thread_replay_items(thread_id, position, item_json) VALUES (?, ?, ?)",
-                [(thread_id, position, json.dumps(item)) for position, item in enumerate(items)],
+                [(thread_id, position, value) for position, value in enumerate(item_json)],
             )
 
     def append_replay_items(self, thread_id: int, items: list[dict]) -> None:
         if not items:
             return
+        item_json = [_persistent_json(item) for item in items]
         with self._connect() as connection:
             exists = connection.execute(
                 "SELECT 1 FROM thread_replay_items WHERE thread_id = ? LIMIT 1", (thread_id,)
@@ -1553,17 +1556,18 @@ class Storage:
             start = int(row[0]) + 1
             connection.executemany(
                 "INSERT INTO thread_replay_items(thread_id, position, item_json) VALUES (?, ?, ?)",
-                [(thread_id, start + index, json.dumps(item)) for index, item in enumerate(items)],
+                [(thread_id, start + index, value) for index, value in enumerate(item_json)],
             )
 
     def record_response_diagnostics(
         self, thread_id: int, response_id: str, diagnostic: dict
     ) -> None:
+        diagnostic_json = _persistent_json(diagnostic)
         with self._connect() as connection:
             connection.execute(
                 "INSERT OR REPLACE INTO response_diagnostics(response_id, thread_id, diagnostic_json) "
                 "VALUES (?, ?, ?)",
-                (response_id, thread_id, json.dumps(diagnostic)),
+                (response_id, thread_id, diagnostic_json),
             )
 
     def response_diagnostics(self, thread_id: int) -> list[dict]:
@@ -1590,6 +1594,10 @@ class Storage:
         raw_start_position: int | None = None,
         raw_end_position: int | None = None,
     ) -> None:
+        citations_json = _persistent_json(citations)
+        evidence_json = _persistent_json(evidence)
+        diagnostics_json = None if diagnostics is None else _persistent_json(diagnostics)
+        profile_update_json = None if profile_update is None else _persistent_json(profile_update)
         with self._connect() as connection:
             row = connection.execute(
                 "SELECT COALESCE(MAX(turn_number), 0) FROM display_turns WHERE thread_id = ?",
@@ -1608,10 +1616,10 @@ class Storage:
                     int(row[0]) + 1,
                     user_text,
                     answer_markdown,
-                    json.dumps(citations),
-                    json.dumps(evidence),
-                    None if diagnostics is None else json.dumps(diagnostics),
-                    None if profile_update is None else json.dumps(profile_update),
+                    citations_json,
+                    evidence_json,
+                    diagnostics_json,
+                    profile_update_json,
                     response_id,
                     status,
                     incomplete_reason,
@@ -2630,6 +2638,27 @@ class Storage:
 
 def _dataset_values(value: DatasetImportSpec | DatasetColumn | MappingEntry | Mapping[str, Any]) -> dict[str, Any]:
     return dict(value) if isinstance(value, Mapping) else asdict(value)
+
+
+def _persistent_json(value: object) -> str:
+    if _contains_ephemeral_qualitative_evidence(value):
+        raise ValueError("ephemeral qualitative evidence cannot be persisted")
+    return json.dumps(value)
+
+
+def _contains_ephemeral_qualitative_evidence(value: object) -> bool:
+    if isinstance(value, Mapping):
+        if value.get("provenance") == "USER_SUPPLIED_QUALITATIVE_DATA" and value.get("operation") == "read_text_evidence":
+            return True
+        return any(_contains_ephemeral_qualitative_evidence(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_contains_ephemeral_qualitative_evidence(item) for item in value)
+    if isinstance(value, str) and value[:1] in "[{":
+        try:
+            return _contains_ephemeral_qualitative_evidence(json.loads(value))
+        except json.JSONDecodeError:
+            return False
+    return False
 
 
 def _mapping_entry_from_row(row: tuple[Any, ...]) -> MappingEntry:

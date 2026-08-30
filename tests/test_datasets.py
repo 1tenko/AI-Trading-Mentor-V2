@@ -298,6 +298,39 @@ def test_text_evidence_is_ephemeral_and_cannot_enter_analysis_persistence(tmp_pa
     assert storage.analysis_tool_outputs(thread_id) == []
 
 
+def test_returned_text_evidence_is_rejected_from_replay_and_diagnostics(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    source = tmp_path / "trades.csv"
+    note = "synthetic-ephemeral-replay-note"
+    source.write_text(f"Journal\n{note}\n", encoding="utf-8")
+    dataset = _importer(storage, tmp_path)(source).dataset
+    mapping = storage.confirm_mapping_version(create_inspected_mapping_draft(
+        storage,
+        inspect_local_dataset(storage, dataset.id),
+        [MappingEntry(0, analysis_label="Journal", mentor_access="allow_row_values_when_analysing_notes")],
+    ).id)
+    evidence = read_text_evidence(
+        storage, dataset.id, mapping.id, text_field_ids=(storage.mapping_entries(mapping.id)[0].field_id or "",),
+        include_approved_notes=True, use_guard=TextEvidenceUseGuard(),
+    )
+    thread_id = storage.create_thread("Ephemeral replay")
+
+    with pytest.raises(ValueError, match="ephemeral qualitative"):
+        storage.replace_replay_items(thread_id, [{"type": "function_call_output", "output": evidence}])
+    with pytest.raises(ValueError, match="ephemeral qualitative"):
+        storage.record_response_diagnostics(thread_id, "response-note", {"tool_output": evidence})
+    storage.replace_replay_items(thread_id, [{"type": "compaction", "status": "completed"}])
+    with pytest.raises(ValueError, match="ephemeral qualitative"):
+        storage.append_replay_items(thread_id, [{"type": "function_call_output", "output": evidence}])
+    storage.record_response_diagnostics(thread_id, "response-safe", {"status": "completed"})
+
+    with sqlite3.connect(storage.database_path) as connection:
+        assert note not in "\n".join(connection.iterdump())
+    assert storage.replay_items(thread_id) == [{"type": "compaction", "status": "completed"}]
+    assert storage.response_diagnostics(thread_id) == [{"status": "completed"}]
+
+
 def test_legacy_mapping_migration_defaults_text_access_to_denied(tmp_path):
     database_path = tmp_path / "legacy.sqlite3"
     contents = "Journal\nlegacy synthetic note\n"
