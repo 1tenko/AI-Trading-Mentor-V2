@@ -2657,6 +2657,8 @@ def _contains_ephemeral_qualitative_evidence(value: object, *, scan_json_strings
     if isinstance(value, Mapping):
         if value.get("provenance") == "USER_SUPPLIED_QUALITATIVE_DATA" and value.get("operation") == "read_text_evidence":
             return not _is_safe_qualitative_audit_metadata(value)
+        if _is_raw_qualitative_items(value.get("items")):
+            return True
         return any(
             _contains_ephemeral_qualitative_evidence(
                 item, scan_json_strings=scan_json_strings and not (value.get("type") == "message" and key == "content")
@@ -2665,12 +2667,38 @@ def _contains_ephemeral_qualitative_evidence(value: object, *, scan_json_strings
         )
     if isinstance(value, (list, tuple)):
         return any(_contains_ephemeral_qualitative_evidence(item, scan_json_strings=scan_json_strings) for item in value)
-    if scan_json_strings and isinstance(value, str) and value.lstrip()[:1] in "[{":
-        try:
-            return _contains_ephemeral_qualitative_evidence(json.loads(value.lstrip()), scan_json_strings=True)
-        except json.JSONDecodeError:
-            return False
+    if scan_json_strings and isinstance(value, str):
+        decoder = json.JSONDecoder()
+        for candidate in (value.lstrip(), *(line.lstrip() for line in value.splitlines()[1:])):
+            if candidate[:1] not in "[{":
+                continue
+            try:
+                parsed, _ = decoder.raw_decode(candidate)
+            except json.JSONDecodeError:
+                continue
+            if _contains_ephemeral_qualitative_evidence(parsed, scan_json_strings=True):
+                return True
     return False
+
+
+def _is_raw_qualitative_items(value: object) -> bool:
+    if not isinstance(value, list):
+        return False
+    return any(
+        isinstance(item, Mapping)
+        and any(
+            isinstance(cells, list)
+            and any(
+                isinstance(cell, Mapping)
+                and set(cell) == {"field_id", "label", "value"}
+                and isinstance(cell["field_id"], str)
+                and _ANALYSIS_FIELD_ID_PATTERN.fullmatch(cell["field_id"]) is not None
+                for cell in cells
+            )
+            for cells in (item.get("text"), item.get("context"))
+        )
+        for item in value
+    )
 
 
 def _is_safe_qualitative_audit_metadata(value: Mapping[str, object]) -> bool:

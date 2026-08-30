@@ -328,7 +328,13 @@ def test_returned_text_evidence_is_rejected_from_replay_and_diagnostics(tmp_path
     with pytest.raises(ValueError, match="ephemeral qualitative"):
         storage.record_response_diagnostics(thread_id, "response-wrapped", {"payload": f" \n{json.dumps(evidence)}"})
     with pytest.raises(ValueError, match="ephemeral qualitative"):
+        storage.record_response_diagnostics(thread_id, "response-prefixed", {"payload": f"tool result:\n{json.dumps(evidence)}"})
+    with pytest.raises(ValueError, match="ephemeral qualitative"):
         storage.replace_replay_items(thread_id, [{"type": "function_call_output", "output": f" \n{json.dumps(evidence)}"}])
+    with pytest.raises(ValueError, match="ephemeral qualitative"):
+        storage.replace_replay_items(thread_id, [{"type": "function_call_output", "output": f"tool result:\n{json.dumps(evidence)}"}])
+    with pytest.raises(ValueError, match="ephemeral qualitative"):
+        storage.append_replay_items(thread_id, [{"type": "function_call_output", "output": {"items": evidence["items"]}}])
     with pytest.raises(ValueError, match="ephemeral qualitative"):
         storage.record_display_turn(
             thread_id, user_text="Question", answer_markdown="Answer", citations=[], evidence=[evidence], diagnostics=None,
