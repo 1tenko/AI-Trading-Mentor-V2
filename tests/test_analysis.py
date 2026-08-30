@@ -166,8 +166,11 @@ def test_text_evidence_bounds_cells_total_characters_and_unavailable_context_wit
         include_approved_notes=True, use_guard=TextEvidenceUseGuard(),
     )
 
-    assert (evidence["usable_text_rows"], evidence["returned_rows"], evidence["omitted_rows"]) == (21, 20, 1)
-    assert evidence["characters_returned"] == 24_000
+    assert evidence["usable_text_rows"] == 21
+    assert evidence["returned_rows"] < 21
+    assert evidence["omitted_rows"] == 21 - evidence["returned_rows"]
+    assert evidence["characters_returned"] < 24_000
+    assert len(json.dumps(evidence, separators=(",", ":"))) <= 24_000
     assert evidence["cell_truncated"] is True
     assert evidence["row_truncated"] is True
     assert evidence["complete"] is False
@@ -220,6 +223,30 @@ def test_text_evidence_rejects_mixed_timestamp_timezones_before_ordering(tmp_pat
             storage, dataset.id, mapping.id, text_field_ids=(journal_id,), order_by="timestamp",
             include_approved_notes=True, use_guard=TextEvidenceUseGuard(),
         )
+
+
+def test_text_evidence_caps_the_entire_envelope_when_a_canonical_filter_value_is_long(tmp_path):
+    storage, dataset, mapping = _confirmed_dataset(
+        tmp_path,
+        "Journal,Session\nsynthetic note,London\n",
+        [
+            MappingEntry(0, analysis_label="Journal", mentor_access="allow_row_values_when_analysing_notes"),
+            MappingEntry(1, analysis_label="Session", mentor_access="allow_row_values_when_analysing_notes"),
+        ],
+    )
+    journal_id, session_id = (entry.field_id or "" for entry in storage.mapping_entries(mapping.id))
+    long_value = "x" * 30_000
+
+    evidence = read_text_evidence(
+        storage, dataset.id, mapping.id, text_field_ids=(journal_id,),
+        filters=(AnalysisFilter(session_id, "eq", long_value),),
+        include_approved_notes=True, use_guard=TextEvidenceUseGuard(),
+    )
+
+    encoded = json.dumps(evidence, separators=(",", ":"))
+    assert evidence["matching_rows"] == 0
+    assert len(encoded) <= 24_000
+    assert long_value not in encoded
 
 
 def test_analysis_frame_types_valid_rows_and_exclusions_without_exposing_raw_data(tmp_path):

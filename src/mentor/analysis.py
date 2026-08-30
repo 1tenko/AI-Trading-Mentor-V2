@@ -425,7 +425,7 @@ def read_text_evidence(
     omitted_rows = len(candidates) - returned_rows
     row_truncated |= omitted_rows > 0
     complete = omitted_rows == 0 and not cell_truncated and not row_truncated
-    return {
+    evidence: dict[str, object] = {
         "provenance": "USER_SUPPLIED_QUALITATIVE_DATA",
         "dataset_id": dataset.id,
         "dataset_sha256": dataset.content_sha256,
@@ -433,7 +433,7 @@ def read_text_evidence(
         "operation": "read_text_evidence",
         "text_fields": [_safe_text_field(entries[field_id]) for field_id in text_field_ids],
         "context_fields": [_safe_text_field(entries[field_id]) for field_id in context_field_ids],
-        "filters": [_filter_payload(item) for item in frame.filter_descriptors],
+        "filters": [_text_filter_payload(item) for item in frame.filter_descriptors],
         "ordering": {"mode": order_by, "timestamp_field_id": timestamp_id if order_by == "timestamp" else None},
         "bounds": {"text_field_limit": _TEXT_FIELD_LIMIT, "context_field_limit": _TEXT_FIELD_LIMIT, "row_limit": _TEXT_ROW_LIMIT, "cell_character_limit": _TEXT_CELL_LIMIT, "character_limit": _TEXT_CHARACTER_LIMIT},
         "matching_rows": len(rows),
@@ -446,6 +446,7 @@ def read_text_evidence(
         "complete": complete,
         "items": items,
     }
+    return _fit_text_evidence_output(evidence)
 
 
 def _field_ids_are_bounded(field_ids: Sequence[str], limit: int, *, required: bool = True) -> bool:
@@ -460,6 +461,69 @@ def _field_ids_are_bounded(field_ids: Sequence[str], limit: int, *, required: bo
 
 def _safe_text_field(entry: "MappingEntry") -> dict[str, str]:
     return {"field_id": entry.field_id or "", "label": entry.analysis_label or entry.semantic_role or entry.field_id or ""}
+
+
+def _text_filter_payload(descriptor: FilterDescriptor) -> dict[str, object]:
+    return {
+        "field_id": descriptor.field_id,
+        "operator": descriptor.operator,
+        "canonical_id": descriptor.canonical_id,
+    }
+
+
+def _fit_text_evidence_output(evidence: dict[str, object]) -> dict[str, object]:
+    """Keep all qualitative output, including audit metadata, inside its envelope."""
+    items = evidence["items"]
+    assert isinstance(items, list)
+    trimmed = False
+    while _text_evidence_size(evidence) > _TEXT_CHARACTER_LIMIT:
+        cell = _last_text_cell(items)
+        if cell is None:
+            raise ValueError("qualitative evidence metadata exceeds its character limit")
+        item, key, index = cell
+        values = item[key]
+        assert isinstance(values, list)
+        value = values[index]["value"]
+        assert isinstance(value, str)
+        overflow = _text_evidence_size(evidence) - _TEXT_CHARACTER_LIMIT
+        if len(value) > overflow:
+            values[index]["value"] = value[:-overflow]
+        else:
+            values.pop(index)
+            if not values:
+                item.pop(key)
+                if key == "text":
+                    items.remove(item)
+        trimmed = True
+    if trimmed:
+        evidence["cell_truncated"] = True
+    returned_rows = len(items)
+    usable_rows = evidence["usable_text_rows"]
+    assert isinstance(usable_rows, int)
+    evidence["returned_rows"] = returned_rows
+    evidence["omitted_rows"] = usable_rows - returned_rows
+    evidence["characters_returned"] = sum(
+        len(cell["value"])
+        for item in items
+        for key in ("text", "context")
+        for cell in item.get(key, [])
+    )
+    evidence["row_truncated"] = bool(evidence["row_truncated"]) or evidence["omitted_rows"] > 0 or trimmed
+    evidence["complete"] = not evidence["cell_truncated"] and not evidence["row_truncated"]
+    return evidence
+
+
+def _last_text_cell(items: list[dict[str, object]]) -> tuple[dict[str, object], str, int] | None:
+    for key in ("text", "context"):
+        for item in reversed(items):
+            values = item.get(key)
+            if isinstance(values, list) and values:
+                return item, key, len(values) - 1
+    return None
+
+
+def _text_evidence_size(evidence: dict[str, object]) -> int:
+    return len(json.dumps(evidence, separators=(",", ":")))
 
 
 def _row_value(row: dict[str, object], entry: "MappingEntry") -> object:

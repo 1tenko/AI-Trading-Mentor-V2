@@ -285,8 +285,83 @@ def test_text_evidence_is_ephemeral_and_cannot_enter_analysis_persistence(tmp_pa
         )
     with sqlite3.connect(storage.database_path) as connection:
         assert note not in "\n".join(connection.iterdump())
+        for table in (
+            "thread_items",
+            "thread_replay_items",
+            "response_diagnostics",
+            "display_turns",
+            "analysis_evidence",
+            "analysis_tool_outputs",
+        ):
+            assert note not in repr(connection.execute(f"SELECT * FROM {table}").fetchall())
     assert storage.analysis_evidence(thread_id) == []
     assert storage.analysis_tool_outputs(thread_id) == []
+
+
+def test_legacy_mapping_migration_defaults_text_access_to_denied(tmp_path):
+    database_path = tmp_path / "legacy.sqlite3"
+    contents = "Journal\nlegacy synthetic note\n"
+    original = tmp_path / "datasets" / "legacy" / "original.csv"
+    original.parent.mkdir(parents=True)
+    original.write_text(contents, encoding="utf-8")
+    with sqlite3.connect(database_path) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE datasets (
+                id TEXT PRIMARY KEY, original_name TEXT NOT NULL, content_sha256 TEXT NOT NULL,
+                original_extension TEXT NOT NULL, byte_size INTEGER NOT NULL, source_row_count INTEGER NOT NULL,
+                status TEXT NOT NULL, imported_at TEXT NOT NULL
+            );
+            CREATE TABLE dataset_import_specs (
+                id INTEGER PRIMARY KEY, dataset_id TEXT NOT NULL UNIQUE, selected_sheet TEXT,
+                header_row INTEGER NOT NULL, csv_encoding TEXT, csv_delimiter TEXT, csv_quoting TEXT,
+                parser_version TEXT, row_order_policy TEXT, time_parse_policy TEXT, created_at TEXT NOT NULL
+            );
+            CREATE TABLE dataset_columns (
+                dataset_id TEXT NOT NULL, ordinal INTEGER NOT NULL, original_header TEXT NOT NULL,
+                inferred_type TEXT NOT NULL, null_count INTEGER NOT NULL, invalid_count INTEGER NOT NULL,
+                PRIMARY KEY(dataset_id, ordinal)
+            );
+            CREATE TABLE dataset_mapping_versions (
+                id INTEGER PRIMARY KEY, dataset_id TEXT NOT NULL, version INTEGER NOT NULL,
+                status TEXT NOT NULL, created_at TEXT NOT NULL, confirmed_at TEXT, UNIQUE(dataset_id, version)
+            );
+            CREATE TABLE dataset_mapping_entries (
+                mapping_version_id INTEGER NOT NULL, column_ordinal INTEGER NOT NULL, semantic_role TEXT,
+                unit TEXT, analysis_label TEXT, source TEXT NOT NULL, field_id TEXT, value_type TEXT,
+                valid_count INTEGER NOT NULL, blank_count INTEGER NOT NULL, invalid_count INTEGER NOT NULL,
+                distinct_count INTEGER NOT NULL, max_label_length INTEGER NOT NULL,
+                aggregate_labels_allowed INTEGER NOT NULL, unavailable_reason TEXT,
+                ambiguous_date_count INTEGER NOT NULL, PRIMARY KEY(mapping_version_id, column_ordinal)
+            );
+            """
+        )
+        connection.execute(
+            "INSERT INTO datasets VALUES ('legacy', 'legacy.csv', ?, '.csv', ?, 1, 'ready', '2026-08-27T00:00:00Z')",
+            (sha256(contents.encode()).hexdigest(), len(contents.encode())),
+        )
+        connection.execute(
+            "INSERT INTO dataset_import_specs VALUES (1, 'legacy', NULL, 0, 'utf-8', ',', '\"', 'pandas-3.0.5', 'source', 'unambiguous_only', '2026-08-27T00:00:00Z')"
+        )
+        connection.execute("INSERT INTO dataset_columns VALUES ('legacy', 0, 'Journal', 'categorical', 0, 0)")
+        connection.execute(
+            "INSERT INTO dataset_mapping_versions VALUES (1, 'legacy', 1, 'confirmed', '2026-08-27T00:00:00Z', '2026-08-27T00:00:00Z')"
+        )
+        connection.execute(
+            "INSERT INTO dataset_mapping_entries VALUES (1, 0, NULL, NULL, 'Journal', 'manual', 'field_0123456789ab', "
+            "'categorical', 1, 0, 0, 1, 22, 0, NULL, 0)"
+        )
+
+    storage = Storage(database_path)
+    storage.initialize()
+    entry = storage.mapping_entries(1)[0]
+
+    assert entry.mentor_access == "aggregates_only"
+    with pytest.raises(ValueError, match="not approved"):
+        read_text_evidence(
+            storage, "legacy", 1, text_field_ids=(entry.field_id or "",),
+            include_approved_notes=True, use_guard=TextEvidenceUseGuard(),
+        )
 
 
 def test_mapping_edits_and_clears_create_new_health_snapshots_and_reject_unsafe_disclosure(tmp_path):
