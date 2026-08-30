@@ -13,10 +13,10 @@ import time
 import uuid
 import zipfile
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path, PurePosixPath
-from typing import TYPE_CHECKING, Callable, Iterable, Iterator
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Iterator, Mapping
 from xml.etree import ElementTree
 
 from openpyxl import load_workbook
@@ -38,6 +38,104 @@ MAX_INSPECTION_CELL_CHARS = 200
 MAX_MODEL_GROUP_LABELS = 20
 MAX_MODEL_GROUP_LABEL_CHARS = 80
 MENTOR_ACCESS_POLICIES = frozenset({"aggregates_only", "allow_row_values_when_analysing_notes"})
+
+
+class QualitativeDisclosureCapability:
+    """Server-owned, one-turn permission for local qualitative disclosure."""
+
+    __slots__ = ("_used", "_active", "_transported")
+
+    def __init__(self) -> None:
+        self._used = False
+        self._active = True
+        self._transported = False
+
+    def consume(self) -> None:
+        if not self._active:
+            raise ValueError("qualitative disclosure capability is expired")
+        if self._used:
+            raise ValueError("qualitative evidence is limited to one call per turn")
+        self._used = True
+
+    def consume_transport(self) -> None:
+        if not self._active:
+            raise ValueError("qualitative disclosure capability is expired")
+        if not self._used or self._transported:
+            raise ValueError("qualitative disclosure transport is unavailable")
+        self._transported = True
+
+    def release(self) -> None:
+        self._active = False
+
+    @property
+    def active(self) -> bool:
+        return self._active
+
+
+@dataclass(frozen=True, slots=True)
+class QualitativeEvidenceMetadata:
+    """The only persistable projection of qualitative source data."""
+
+    _payload: Mapping[str, object] = field(repr=False)
+
+    def to_dict(self) -> dict[str, object]:
+        return dict(self._payload)
+
+
+class EphemeralQualitativeEvidence:
+    """In-memory raw qualitative data; deliberately not serializable or persistable."""
+
+    __slots__ = ("_metadata", "_items", "_capability")
+
+    def __init__(
+        self,
+        *,
+        metadata: QualitativeEvidenceMetadata,
+        items: list[dict[str, object]],
+        capability: QualitativeDisclosureCapability,
+    ) -> None:
+        self._metadata = metadata
+        self._items = items
+        self._capability = capability
+
+    def __repr__(self) -> str:
+        metadata = self._metadata.to_dict()
+        return (
+            "<EphemeralQualitativeEvidence "
+            f"rows={metadata['returned_rows']} chars={metadata['characters_returned']} "
+            f"complete={metadata['complete']}>"
+        )
+
+    __str__ = __repr__
+
+    def to_persistable_metadata(self) -> QualitativeEvidenceMetadata:
+        return self._metadata
+
+    def to_model_transport(self) -> "QualitativeModelTransport":
+        self._capability.consume_transport()
+        return QualitativeModelTransport(self)
+
+    def _function_output(self) -> dict[str, object]:
+        if not self._capability.active:
+            raise ValueError("qualitative disclosure capability is expired")
+        return self._metadata.to_dict() | {"items": self._items}
+
+
+class QualitativeModelTransport:
+    """Immediate-only model transport for one ephemeral evidence object."""
+
+    __slots__ = ("_evidence",)
+
+    def __init__(self, evidence: EphemeralQualitativeEvidence) -> None:
+        self._evidence = evidence
+
+    def __repr__(self) -> str:
+        return "<QualitativeModelTransport>"
+
+    __str__ = __repr__
+
+    def function_output(self) -> dict[str, object]:
+        return self._evidence._function_output()
 _DATASET_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,79}")
 _CELL_REFERENCE_PATTERN = re.compile(r"([A-Z]+)([1-9][0-9]*)$")
 _IMPORT_LEASE_LOCK = threading.RLock()

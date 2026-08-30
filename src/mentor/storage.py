@@ -5,7 +5,7 @@ import hashlib
 import math
 import re
 import sqlite3
-from dataclasses import asdict
+from dataclasses import asdict, fields, is_dataclass
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
@@ -16,7 +16,10 @@ from mentor.datasets import (
     DatasetColumn,
     DatasetImportSpec,
     DatasetMappingVersion,
+    EphemeralQualitativeEvidence,
     MappingEntry,
+    QualitativeEvidenceMetadata,
+    QualitativeModelTransport,
     ThreadDatasetScope,
 )
 
@@ -592,6 +595,12 @@ class Storage:
                     arguments_json TEXT NOT NULL,
                     output_json TEXT NOT NULL,
                     PRIMARY KEY(thread_id, tool_call_id)
+                );
+                CREATE TABLE IF NOT EXISTS qualitative_evidence_metadata (
+                    thread_id INTEGER NOT NULL REFERENCES threads(id),
+                    origin_turn_number INTEGER NOT NULL CHECK(origin_turn_number > 0),
+                    metadata_json TEXT NOT NULL,
+                    PRIMARY KEY(thread_id, origin_turn_number)
                 );
                 CREATE TRIGGER IF NOT EXISTS datasets_are_immutable
                 BEFORE UPDATE ON datasets
@@ -1585,6 +1594,29 @@ class Storage:
             ).fetchall()
         return [json.loads(row[0]) for row in rows]
 
+    def record_qualitative_metadata(
+        self, thread_id: int, origin_turn_number: int, metadata: QualitativeEvidenceMetadata
+    ) -> None:
+        """Persist only the explicit safe projection of one qualitative disclosure."""
+        if not isinstance(metadata, QualitativeEvidenceMetadata):
+            raise ValueError("qualitative metadata must be an explicit safe projection")
+        payload = metadata.to_dict()
+        if not _is_safe_qualitative_audit_metadata(payload):
+            raise ValueError("qualitative metadata is invalid")
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT OR REPLACE INTO qualitative_evidence_metadata(thread_id, origin_turn_number, metadata_json) VALUES (?, ?, ?)",
+                (thread_id, origin_turn_number, json.dumps(payload, separators=(",", ":"))),
+            )
+
+    def qualitative_metadata(self, thread_id: int) -> list[dict[str, object]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT metadata_json FROM qualitative_evidence_metadata WHERE thread_id = ? ORDER BY origin_turn_number",
+                (thread_id,),
+            ).fetchall()
+        return [json.loads(row[0]) for row in rows]
+
     def record_display_turn(
         self,
         thread_id: int,
@@ -2215,6 +2247,8 @@ class Storage:
         result: Mapping[str, Any],
         display_turn_number: int | None = None,
     ) -> AnalysisEvidence:
+        if _contains_ephemeral_qualitative_evidence(result) or _contains_ephemeral_qualitative_evidence(arguments):
+            raise ValueError("ephemeral qualitative evidence cannot be persisted")
         with self._connect() as connection:
             dataset = connection.execute(
                 """
@@ -2297,6 +2331,8 @@ class Storage:
         *,
         arguments: Mapping[str, Any] | None = None,
     ) -> None:
+        if _contains_ephemeral_qualitative_evidence(output) or _contains_ephemeral_qualitative_evidence(arguments):
+            raise ValueError("ephemeral qualitative evidence cannot be persisted")
         if not isinstance(tool_call_id, str) or _TOOL_CALL_ID_PATTERN.fullmatch(tool_call_id) is None:
             raise ValueError("analysis tool call identifier is invalid")
         with self._connect() as connection:
@@ -2508,6 +2544,7 @@ class Storage:
             )
             connection.execute("DELETE FROM analysis_tool_outputs WHERE thread_id = ?", (thread_id,))
             connection.execute("DELETE FROM analysis_evidence WHERE thread_id = ?", (thread_id,))
+            connection.execute("DELETE FROM qualitative_evidence_metadata WHERE thread_id = ?", (thread_id,))
             connection.execute("DELETE FROM thread_dataset_scopes WHERE thread_id = ?", (thread_id,))
             connection.execute("DELETE FROM display_turns WHERE thread_id = ?", (thread_id,))
             connection.execute("DELETE FROM response_diagnostics WHERE thread_id = ?", (thread_id,))
@@ -2653,52 +2690,17 @@ def _persistent_json(value: object) -> str:
     return json.dumps(value)
 
 
-def _contains_ephemeral_qualitative_evidence(value: object, *, scan_json_strings: bool = True) -> bool:
+def _contains_ephemeral_qualitative_evidence(value: object) -> bool:
+    """Reject the typed capability, not text that happens to resemble it."""
+    if isinstance(value, (EphemeralQualitativeEvidence, QualitativeModelTransport)):
+        return True
     if isinstance(value, Mapping):
-        if value.get("provenance") == "USER_SUPPLIED_QUALITATIVE_DATA" and value.get("operation") == "read_text_evidence":
-            return not _is_safe_qualitative_audit_metadata(value)
-        if _is_raw_qualitative_items(value.get("items")):
-            return True
-        return any(
-            _contains_ephemeral_qualitative_evidence(
-                item, scan_json_strings=scan_json_strings and not (value.get("type") == "message" and key == "content")
-            )
-            for key, item in value.items()
-        )
+        return any(_contains_ephemeral_qualitative_evidence(item) for item in value.values())
     if isinstance(value, (list, tuple)):
-        return any(_contains_ephemeral_qualitative_evidence(item, scan_json_strings=scan_json_strings) for item in value)
-    if scan_json_strings and isinstance(value, str):
-        decoder = json.JSONDecoder()
-        for candidate in (value.lstrip(), *(line.lstrip() for line in value.splitlines()[1:])):
-            if candidate[:1] not in "[{":
-                continue
-            try:
-                parsed, _ = decoder.raw_decode(candidate)
-            except json.JSONDecodeError:
-                continue
-            if _contains_ephemeral_qualitative_evidence(parsed, scan_json_strings=True):
-                return True
+        return any(_contains_ephemeral_qualitative_evidence(item) for item in value)
+    if is_dataclass(value) and not isinstance(value, type):
+        return any(_contains_ephemeral_qualitative_evidence(getattr(value, item.name)) for item in fields(value))
     return False
-
-
-def _is_raw_qualitative_items(value: object) -> bool:
-    if not isinstance(value, list):
-        return False
-    return any(
-        isinstance(item, Mapping)
-        and any(
-            isinstance(cells, list)
-            and any(
-                isinstance(cell, Mapping)
-                and set(cell) == {"field_id", "label", "value"}
-                and isinstance(cell["field_id"], str)
-                and _ANALYSIS_FIELD_ID_PATTERN.fullmatch(cell["field_id"]) is not None
-                for cell in cells
-            )
-            for cells in (item.get("text"), item.get("context"))
-        )
-        for item in value
-    )
 
 
 def _is_safe_qualitative_audit_metadata(value: Mapping[str, object]) -> bool:

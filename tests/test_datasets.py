@@ -11,7 +11,14 @@ import pytest
 from openpyxl import Workbook
 
 import mentor.datasets as dataset_module
-from mentor.analysis import TextEvidenceUseGuard, qualitative_evidence_audit_metadata, read_text_evidence
+from mentor.analysis import (
+    EphemeralQualitativeEvidence,
+    QualitativeDisclosureCapability,
+    QualitativeEvidenceMetadata,
+    TextEvidenceUseGuard,
+    qualitative_evidence_audit_metadata,
+    read_text_evidence,
+)
 from mentor.datasets import (
     DatasetImportError,
     MappingEntry,
@@ -271,8 +278,8 @@ def test_text_evidence_is_ephemeral_and_cannot_enter_analysis_persistence(tmp_pa
     )
     thread_id = storage.create_thread("Qualitative evidence")
 
-    assert evidence["items"][0]["text"][0]["value"] == note
-    with pytest.raises(ValueError, match="analysis result envelope"):
+    assert evidence.to_model_transport().function_output()["items"][0]["text"][0]["value"] == note
+    with pytest.raises(ValueError, match="ephemeral qualitative"):
         storage.record_analysis_evidence(
             thread_id=thread_id,
             origin_turn_number=1,
@@ -326,16 +333,6 @@ def test_returned_text_evidence_is_rejected_from_replay_and_diagnostics(tmp_path
     with pytest.raises(ValueError, match="ephemeral qualitative"):
         storage.append_thread_items(thread_id, [{"type": "function_call_output", "output": {"wrapper": evidence}}])
     with pytest.raises(ValueError, match="ephemeral qualitative"):
-        storage.record_response_diagnostics(thread_id, "response-wrapped", {"payload": f" \n{json.dumps(evidence)}"})
-    with pytest.raises(ValueError, match="ephemeral qualitative"):
-        storage.record_response_diagnostics(thread_id, "response-prefixed", {"payload": f"tool result:\n{json.dumps(evidence)}"})
-    with pytest.raises(ValueError, match="ephemeral qualitative"):
-        storage.replace_replay_items(thread_id, [{"type": "function_call_output", "output": f" \n{json.dumps(evidence)}"}])
-    with pytest.raises(ValueError, match="ephemeral qualitative"):
-        storage.replace_replay_items(thread_id, [{"type": "function_call_output", "output": f"tool result:\n{json.dumps(evidence)}"}])
-    with pytest.raises(ValueError, match="ephemeral qualitative"):
-        storage.append_replay_items(thread_id, [{"type": "function_call_output", "output": {"items": evidence["items"]}}])
-    with pytest.raises(ValueError, match="ephemeral qualitative"):
         storage.record_display_turn(
             thread_id, user_text="Question", answer_markdown="Answer", citations=[], evidence=[evidence], diagnostics=None,
             response_id=None, status="completed", incomplete_reason=None,
@@ -355,6 +352,8 @@ def test_returned_text_evidence_is_rejected_from_replay_and_diagnostics(tmp_path
         response_id=None, status="completed", incomplete_reason=None,
     )
 
+    storage.record_qualitative_metadata(thread_id, 1, evidence.to_persistable_metadata())
+
     with sqlite3.connect(storage.database_path) as connection:
         for table, columns in (
             ("thread_items", "item_json"),
@@ -367,6 +366,65 @@ def test_returned_text_evidence_is_rejected_from_replay_and_diagnostics(tmp_path
     assert storage.replay_items(thread_id)[-1]["output"] == audit
     assert storage.response_diagnostics(thread_id) == [{"status": "completed", "qualitative_audit": audit}]
     assert storage.display_turns(thread_id)[0]["answer_markdown"] == note
+    assert storage.qualitative_metadata(thread_id) == [audit]
+
+
+def test_qualitative_evidence_is_typed_ephemeral_and_only_metadata_persists(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    source = tmp_path / "trades.csv"
+    note = "Market looked weak so I entered short."
+    source.write_text(f"Journal\n{note}\n", encoding="utf-8")
+    dataset = _importer(storage, tmp_path)(source).dataset
+    mapping = storage.confirm_mapping_version(create_inspected_mapping_draft(
+        storage,
+        inspect_local_dataset(storage, dataset.id),
+        [MappingEntry(0, analysis_label="Journal", mentor_access="allow_row_values_when_analysing_notes")],
+    ).id)
+    field_id = storage.mapping_entries(mapping.id)[0].field_id or ""
+    capability = QualitativeDisclosureCapability()
+    evidence = read_text_evidence(
+        storage, dataset.id, mapping.id, text_field_ids=(field_id,),
+        include_approved_notes=True, use_guard=capability,
+    )
+    thread_id = storage.create_thread("Typed evidence")
+
+    assert isinstance(evidence, EphemeralQualitativeEvidence)
+    assert note not in repr(evidence)
+    with pytest.raises(TypeError):
+        json.dumps(evidence)
+    metadata = evidence.to_persistable_metadata()
+    assert isinstance(metadata, QualitativeEvidenceMetadata)
+    assert note not in json.dumps(metadata.to_dict())
+    transport = evidence.to_model_transport()
+    assert note not in repr(transport)
+    assert transport.function_output()["items"][0]["text"][0]["value"] == note
+
+    for wrapped in (evidence, {"result": evidence}, [evidence], {"diagnostic": evidence}):
+        with pytest.raises(ValueError, match="ephemeral qualitative"):
+            storage.record_response_diagnostics(thread_id, "response-rejected", {"value": wrapped})
+    with pytest.raises(ValueError, match="ephemeral qualitative"):
+        storage.append_replay_items(thread_id, [{"type": "function_call_output", "output": transport}])
+
+    storage.record_response_diagnostics(thread_id, "response-safe", {"qualitative_metadata": metadata.to_dict()})
+    storage.append_thread_items(thread_id, [{"role": "user", "content": [{"type": "input_text", "text": note}]}])
+    capability.release()
+    with pytest.raises(ValueError, match="expired"):
+        transport.function_output()
+    with pytest.raises(ValueError, match="expired"):
+        evidence.to_model_transport()
+    with pytest.raises(ValueError, match="expired"):
+        read_text_evidence(
+            storage, dataset.id, mapping.id, text_field_ids=(field_id,),
+            include_approved_notes=True, use_guard=capability,
+        )
+
+    assert storage.thread_items(thread_id)[0]["content"][0]["text"] == note
+    assert storage.response_diagnostics(thread_id) == [{"qualitative_metadata": metadata.to_dict()}]
+    storage.record_qualitative_metadata(thread_id, 1, metadata)
+    assert storage.qualitative_metadata(thread_id) == [metadata.to_dict()]
+    assert storage.delete_thread(thread_id) is True
+    assert storage.qualitative_metadata(thread_id) == []
 
 
 def test_legacy_mapping_migration_defaults_text_access_to_denied(tmp_path):

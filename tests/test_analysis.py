@@ -76,13 +76,14 @@ def test_text_evidence_requires_explicit_mapping_permission_and_consent(tmp_path
         include_approved_notes=True,
         use_guard=TextEvidenceUseGuard(),
     )
+    payload = evidence.to_model_transport().function_output()
 
-    assert evidence["provenance"] == "USER_SUPPLIED_QUALITATIVE_DATA"
-    assert evidence["matching_rows"] == 2
-    assert evidence["usable_text_rows"] == 2
-    assert evidence["returned_rows"] == 2
-    assert [item["text"][0]["value"] for item in evidence["items"]] == ["synthetic first", "synthetic third"]
-    assert "Result" not in json.dumps(evidence)
+    assert payload["provenance"] == "USER_SUPPLIED_QUALITATIVE_DATA"
+    assert payload["matching_rows"] == 2
+    assert payload["usable_text_rows"] == 2
+    assert payload["returned_rows"] == 2
+    assert [item["text"][0]["value"] for item in payload["items"]] == ["synthetic first", "synthetic third"]
+    assert "Result" not in json.dumps(payload)
 
 
 def test_text_evidence_rejects_unapproved_fields_wrong_scope_and_raw_inputs(tmp_path):
@@ -138,15 +139,16 @@ def test_text_evidence_short_note_row_bound_and_deterministic_completeness(tmp_p
         storage, dataset.id, mapping.id, text_field_ids=(journal_id,), order_by="timestamp",
         include_approved_notes=True, use_guard=TextEvidenceUseGuard(),
     )
+    payload = evidence.to_model_transport().function_output()
 
-    assert evidence["matching_rows"] == count
-    assert evidence["usable_text_rows"] == count
-    assert evidence["returned_rows"] == min(count, 100)
-    assert evidence["omitted_rows"] == max(count - 100, 0)
-    assert evidence["complete"] is expected_complete
-    assert evidence["row_truncated"] is (count > 100)
-    assert [item["text"][0]["value"] for item in evidence["items"]][:2] == ["synthetic note 000", "synthetic note 028"]
-    assert "source_row_ordinal" not in json.dumps(evidence)
+    assert payload["matching_rows"] == count
+    assert payload["usable_text_rows"] == count
+    assert payload["returned_rows"] == min(count, 100)
+    assert payload["omitted_rows"] == max(count - 100, 0)
+    assert payload["complete"] is expected_complete
+    assert payload["row_truncated"] is (count > 100)
+    assert [item["text"][0]["value"] for item in payload["items"]][:2] == ["synthetic note 000", "synthetic note 028"]
+    assert "source_row_ordinal" not in json.dumps(payload)
 
 
 def test_text_evidence_bounds_cells_total_characters_and_unavailable_context_without_losing_text(tmp_path):
@@ -165,17 +167,18 @@ def test_text_evidence_bounds_cells_total_characters_and_unavailable_context_wit
         storage, dataset.id, mapping.id, text_field_ids=(journal_id,), context_field_ids=(session_id,),
         include_approved_notes=True, use_guard=TextEvidenceUseGuard(),
     )
+    payload = evidence.to_model_transport().function_output()
 
-    assert evidence["usable_text_rows"] == 21
-    assert evidence["returned_rows"] < 21
-    assert evidence["omitted_rows"] == 21 - evidence["returned_rows"]
-    assert evidence["characters_returned"] < 24_000
-    assert len(json.dumps(evidence, separators=(",", ":"))) <= 24_000
-    assert evidence["cell_truncated"] is True
-    assert evidence["row_truncated"] is True
-    assert evidence["complete"] is False
-    assert evidence["items"][0]["context"][0]["value"] == "London"
-    assert evidence["items"][1]["unavailable_context_field_ids"] == [session_id]
+    assert payload["usable_text_rows"] == 21
+    assert payload["returned_rows"] < 21
+    assert payload["omitted_rows"] == 21 - payload["returned_rows"]
+    assert payload["characters_returned"] < 24_000
+    assert len(json.dumps(payload, separators=(",", ":"))) <= 24_000
+    assert payload["cell_truncated"] is True
+    assert payload["row_truncated"] is True
+    assert payload["complete"] is False
+    assert payload["items"][0]["context"][0]["value"] == "London"
+    assert payload["items"][1]["unavailable_context_field_ids"] == [session_id]
 
 
 def test_text_evidence_revocation_requires_a_new_confirmed_mapping_and_consumes_each_guard_once(tmp_path):
@@ -194,9 +197,10 @@ def test_text_evidence_revocation_requires_a_new_confirmed_mapping_and_consumes_
     journal_id = storage.mapping_entries(allowed.id)[0].field_id or ""
     guard = TextEvidenceUseGuard()
 
-    assert read_text_evidence(
+    evidence = read_text_evidence(
         storage, dataset.id, allowed.id, text_field_ids=(journal_id,), include_approved_notes=True, use_guard=guard
-    )["returned_rows"] == 1
+    )
+    assert evidence.to_model_transport().function_output()["returned_rows"] == 1
     with pytest.raises(ValueError, match="one call per turn"):
         read_text_evidence(
             storage, dataset.id, allowed.id, text_field_ids=(journal_id,), include_approved_notes=True, use_guard=guard
@@ -242,9 +246,10 @@ def test_text_evidence_caps_the_entire_envelope_when_a_canonical_filter_value_is
         filters=(AnalysisFilter(session_id, "eq", long_value),),
         include_approved_notes=True, use_guard=TextEvidenceUseGuard(),
     )
+    payload = evidence.to_model_transport().function_output()
 
-    encoded = json.dumps(evidence, separators=(",", ":"))
-    assert evidence["matching_rows"] == 0
+    encoded = json.dumps(payload, separators=(",", ":"))
+    assert payload["matching_rows"] == 0
     assert len(encoded) <= 24_000
     assert long_value not in encoded
 

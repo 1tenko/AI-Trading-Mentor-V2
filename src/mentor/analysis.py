@@ -10,7 +10,13 @@ from typing import TYPE_CHECKING, Literal, Sequence
 
 import pandas as pd
 
-from mentor.datasets import DatasetImportError, _inspection_rows_from_bytes
+from mentor.datasets import (
+    DatasetImportError,
+    EphemeralQualitativeEvidence,
+    QualitativeDisclosureCapability,
+    QualitativeEvidenceMetadata,
+    _inspection_rows_from_bytes,
+)
 from mentor.storage import ANALYSIS_EXCLUSION_LIMIT, ANALYSIS_FILTER_LIMIT, validate_completed_evidence_envelope
 
 if TYPE_CHECKING:
@@ -70,16 +76,7 @@ class AnalysisNumericError(ValueError):
         super().__init__(self.code)
 
 
-@dataclass
-class TextEvidenceUseGuard:
-    """Caller-owned per-turn guard; this boundary consumes it once."""
-
-    used: bool = False
-
-    def consume(self) -> None:
-        if self.used:
-            raise ValueError("qualitative evidence is limited to one call per turn")
-        self.used = True
+TextEvidenceUseGuard = QualitativeDisclosureCapability
 
 
 @dataclass(frozen=True)
@@ -338,12 +335,12 @@ def read_text_evidence(
     filters: Sequence[AnalysisFilter] = (),
     order_by: Literal["source", "timestamp"] = "source",
     include_approved_notes: bool = False,
-    use_guard: TextEvidenceUseGuard,
-) -> dict[str, object]:
+    use_guard: QualitativeDisclosureCapability,
+) -> EphemeralQualitativeEvidence:
     """Return only explicitly approved, bounded local qualitative values."""
     if include_approved_notes is not True:
         raise ValueError("explicit approved-notes consent is required")
-    if not isinstance(use_guard, TextEvidenceUseGuard):
+    if not isinstance(use_guard, QualitativeDisclosureCapability):
         raise ValueError("qualitative evidence requires a caller-owned use guard")
     use_guard.consume()
     if (
@@ -431,6 +428,7 @@ def read_text_evidence(
         "dataset_sha256": dataset.content_sha256,
         "mapping_version_id": mapping.id,
         "operation": "read_text_evidence",
+        "include_approved_notes": True,
         "text_fields": [_safe_text_field(entries[field_id]) for field_id in text_field_ids],
         "context_fields": [_safe_text_field(entries[field_id]) for field_id in context_field_ids],
         "filters": [_text_filter_payload(item) for item in frame.filter_descriptors],
@@ -446,7 +444,9 @@ def read_text_evidence(
         "complete": complete,
         "items": items,
     }
-    return _fit_text_evidence_output(evidence)
+    fitted = _fit_text_evidence_output(evidence)
+    metadata = QualitativeEvidenceMetadata({key: value for key, value in fitted.items() if key != "items"})
+    return EphemeralQualitativeEvidence(metadata=metadata, items=items, capability=use_guard)
 
 
 def _field_ids_are_bounded(field_ids: Sequence[str], limit: int, *, required: bool = True) -> bool:
@@ -472,23 +472,12 @@ def _text_filter_payload(descriptor: FilterDescriptor) -> dict[str, object]:
 
 
 def qualitative_evidence_audit_metadata(
-    evidence: dict[str, object], *, include_approved_notes: bool
+    evidence: EphemeralQualitativeEvidence, *, include_approved_notes: bool
 ) -> dict[str, object]:
     """Project ephemeral text evidence into the only persistence-safe audit record."""
-    keys = (
-        "provenance", "operation", "dataset_id", "dataset_sha256", "mapping_version_id", "text_fields",
-        "context_fields", "filters", "ordering", "bounds", "matching_rows", "usable_text_rows",
-        "returned_rows", "omitted_rows", "characters_returned", "cell_truncated", "row_truncated", "complete",
-    )
-    if (
-        not isinstance(evidence, dict)
-        or evidence.get("provenance") != "USER_SUPPLIED_QUALITATIVE_DATA"
-        or evidence.get("operation") != "read_text_evidence"
-        or any(key not in evidence for key in keys)
-        or type(include_approved_notes) is not bool
-    ):
+    if not isinstance(evidence, EphemeralQualitativeEvidence) or include_approved_notes is not True:
         raise ValueError("qualitative evidence is invalid")
-    return {key: evidence[key] for key in keys} | {"include_approved_notes": include_approved_notes}
+    return evidence.to_persistable_metadata().to_dict()
 
 
 def _fit_text_evidence_output(evidence: dict[str, object]) -> dict[str, object]:
