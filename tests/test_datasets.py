@@ -11,7 +11,7 @@ import pytest
 from openpyxl import Workbook
 
 import mentor.datasets as dataset_module
-from mentor.analysis import TextEvidenceUseGuard, read_text_evidence
+from mentor.analysis import TextEvidenceUseGuard, qualitative_evidence_audit_metadata, read_text_evidence
 from mentor.datasets import (
     DatasetImportError,
     MappingEntry,
@@ -315,20 +315,52 @@ def test_returned_text_evidence_is_rejected_from_replay_and_diagnostics(tmp_path
         include_approved_notes=True, use_guard=TextEvidenceUseGuard(),
     )
     thread_id = storage.create_thread("Ephemeral replay")
+    audit = qualitative_evidence_audit_metadata(evidence, include_approved_notes=True)
+    assert "items" not in audit
+    assert note not in json.dumps(audit)
 
     with pytest.raises(ValueError, match="ephemeral qualitative"):
         storage.replace_replay_items(thread_id, [{"type": "function_call_output", "output": evidence}])
     with pytest.raises(ValueError, match="ephemeral qualitative"):
         storage.record_response_diagnostics(thread_id, "response-note", {"tool_output": evidence})
+    with pytest.raises(ValueError, match="ephemeral qualitative"):
+        storage.append_thread_items(thread_id, [{"type": "function_call_output", "output": {"wrapper": evidence}}])
+    with pytest.raises(ValueError, match="ephemeral qualitative"):
+        storage.record_response_diagnostics(thread_id, "response-wrapped", {"payload": f" \n{json.dumps(evidence)}"})
+    with pytest.raises(ValueError, match="ephemeral qualitative"):
+        storage.replace_replay_items(thread_id, [{"type": "function_call_output", "output": f" \n{json.dumps(evidence)}"}])
+    with pytest.raises(ValueError, match="ephemeral qualitative"):
+        storage.record_display_turn(
+            thread_id, user_text="Question", answer_markdown="Answer", citations=[], evidence=[evidence], diagnostics=None,
+            response_id=None, status="completed", incomplete_reason=None,
+        )
+    with pytest.raises(ValueError, match="ephemeral qualitative"):
+        storage.record_display_turn(
+            thread_id, user_text="Question", answer_markdown="Answer", citations=[], evidence=[], diagnostics={"tool_output": evidence},
+            response_id=None, status="completed", incomplete_reason=None,
+        )
     storage.replace_replay_items(thread_id, [{"type": "compaction", "status": "completed"}])
     with pytest.raises(ValueError, match="ephemeral qualitative"):
         storage.append_replay_items(thread_id, [{"type": "function_call_output", "output": evidence}])
-    storage.record_response_diagnostics(thread_id, "response-safe", {"status": "completed"})
+    storage.record_response_diagnostics(thread_id, "response-safe", {"status": "completed", "qualitative_audit": audit})
+    storage.append_replay_items(thread_id, [{"type": "function_call_output", "output": audit}])
+    storage.record_display_turn(
+        thread_id, user_text="Question", answer_markdown=note, citations=[], evidence=[], diagnostics={"qualitative_audit": audit},
+        response_id=None, status="completed", incomplete_reason=None,
+    )
 
     with sqlite3.connect(storage.database_path) as connection:
-        assert note not in "\n".join(connection.iterdump())
-    assert storage.replay_items(thread_id) == [{"type": "compaction", "status": "completed"}]
-    assert storage.response_diagnostics(thread_id) == [{"status": "completed"}]
+        for table, columns in (
+            ("thread_items", "item_json"),
+            ("thread_replay_items", "item_json"),
+            ("response_diagnostics", "diagnostic_json"),
+        ):
+            assert note not in "\n".join(row[0] for row in connection.execute(f"SELECT {columns} FROM {table}"))
+        display_metadata = connection.execute("SELECT evidence_json, diagnostic_json FROM display_turns").fetchall()
+        assert note not in repr(display_metadata)
+    assert storage.replay_items(thread_id)[-1]["output"] == audit
+    assert storage.response_diagnostics(thread_id) == [{"status": "completed", "qualitative_audit": audit}]
+    assert storage.display_turns(thread_id)[0]["answer_markdown"] == note
 
 
 def test_legacy_mapping_migration_defaults_text_access_to_denied(tmp_path):

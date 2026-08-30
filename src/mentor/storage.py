@@ -93,6 +93,13 @@ _ANALYSIS_METRIC_NAMES = frozenset(
 _ANALYSIS_OPERATION_PATTERN = re.compile(r"[a-z][a-z0-9_]{0,63}")
 _ANALYSIS_SCHEMA_VERSION_PATTERN = re.compile(r"[0-9]+(?:\.[0-9]+){0,2}")
 _ANALYSIS_FIELD_ID_PATTERN = re.compile(r"field_[0-9a-f]{12}")
+_QUALITATIVE_AUDIT_KEYS = frozenset(
+    {
+        "provenance", "operation", "dataset_id", "dataset_sha256", "mapping_version_id", "include_approved_notes",
+        "text_fields", "context_fields", "filters", "ordering", "bounds", "matching_rows", "usable_text_rows",
+        "returned_rows", "omitted_rows", "characters_returned", "cell_truncated", "row_truncated", "complete",
+    }
+)
 
 
 def validate_completed_evidence_envelope(value: Mapping[str, Any]) -> None:
@@ -2646,19 +2653,102 @@ def _persistent_json(value: object) -> str:
     return json.dumps(value)
 
 
-def _contains_ephemeral_qualitative_evidence(value: object) -> bool:
+def _contains_ephemeral_qualitative_evidence(value: object, *, scan_json_strings: bool = True) -> bool:
     if isinstance(value, Mapping):
         if value.get("provenance") == "USER_SUPPLIED_QUALITATIVE_DATA" and value.get("operation") == "read_text_evidence":
-            return True
-        return any(_contains_ephemeral_qualitative_evidence(item) for item in value.values())
+            return not _is_safe_qualitative_audit_metadata(value)
+        return any(
+            _contains_ephemeral_qualitative_evidence(
+                item, scan_json_strings=scan_json_strings and not (value.get("type") == "message" and key == "content")
+            )
+            for key, item in value.items()
+        )
     if isinstance(value, (list, tuple)):
-        return any(_contains_ephemeral_qualitative_evidence(item) for item in value)
-    if isinstance(value, str) and value[:1] in "[{":
+        return any(_contains_ephemeral_qualitative_evidence(item, scan_json_strings=scan_json_strings) for item in value)
+    if scan_json_strings and isinstance(value, str) and value.lstrip()[:1] in "[{":
         try:
-            return _contains_ephemeral_qualitative_evidence(json.loads(value))
+            return _contains_ephemeral_qualitative_evidence(json.loads(value.lstrip()), scan_json_strings=True)
         except json.JSONDecodeError:
             return False
     return False
+
+
+def _is_safe_qualitative_audit_metadata(value: Mapping[str, object]) -> bool:
+    if set(value) != _QUALITATIVE_AUDIT_KEYS:
+        return False
+    if (
+        value["provenance"] != "USER_SUPPLIED_QUALITATIVE_DATA"
+        or value["operation"] != "read_text_evidence"
+        or not _safe_identifier(value["dataset_id"], 80)
+        or not isinstance(value["dataset_sha256"], str)
+        or re.fullmatch(r"[0-9a-f]{64}", value["dataset_sha256"]) is None
+        or type(value["mapping_version_id"]) is not int
+        or value["mapping_version_id"] < 1
+        or type(value["include_approved_notes"]) is not bool
+        or not _safe_qualitative_fields(value["text_fields"])
+        or not _safe_qualitative_fields(value["context_fields"])
+        or not _safe_qualitative_filters(value["filters"])
+        or not _safe_qualitative_ordering(value["ordering"])
+        or value["bounds"] != {
+            "text_field_limit": 3, "context_field_limit": 3, "row_limit": 100,
+            "cell_character_limit": 1_200, "character_limit": 24_000,
+        }
+    ):
+        return False
+    counts = ("matching_rows", "usable_text_rows", "returned_rows", "omitted_rows", "characters_returned")
+    if any(type(value[name]) is not int or value[name] < 0 for name in counts):
+        return False
+    if value["returned_rows"] + value["omitted_rows"] != value["usable_text_rows"] or value["usable_text_rows"] > value["matching_rows"]:
+        return False
+    if value["characters_returned"] > 24_000 or any(type(value[name]) is not bool for name in ("cell_truncated", "row_truncated", "complete")):
+        return False
+    return value["complete"] is (not value["cell_truncated"] and not value["row_truncated"] and value["omitted_rows"] == 0)
+
+
+def _safe_identifier(value: object, maximum_length: int) -> bool:
+    return isinstance(value, str) and 1 <= len(value) <= maximum_length and re.fullmatch(r"[A-Za-z0-9_-]+", value) is not None
+
+
+def _safe_qualitative_fields(value: object) -> bool:
+    return (
+        isinstance(value, list)
+        and len(value) <= 3
+        and all(
+            isinstance(field, Mapping)
+            and set(field) == {"field_id", "label"}
+            and isinstance(field["field_id"], str)
+            and _ANALYSIS_FIELD_ID_PATTERN.fullmatch(field["field_id"]) is not None
+            and isinstance(field["label"], str)
+            and 1 <= len(field["label"]) <= 80
+            for field in value
+        )
+    )
+
+
+def _safe_qualitative_filters(value: object) -> bool:
+    return (
+        isinstance(value, list)
+        and len(value) <= ANALYSIS_FILTER_LIMIT
+        and all(
+            isinstance(filter_, Mapping)
+            and set(filter_) == {"field_id", "operator", "canonical_id"}
+            and isinstance(filter_["field_id"], str)
+            and _ANALYSIS_FIELD_ID_PATTERN.fullmatch(filter_["field_id"]) is not None
+            and filter_["operator"] in {"eq", "neq", "in", "not_in", "is_blank", "not_blank", "gt", "gte", "lt", "lte", "between"}
+            and isinstance(filter_["canonical_id"], str)
+            and re.fullmatch(r"[0-9a-f]{12}", filter_["canonical_id"]) is not None
+            for filter_ in value
+        )
+    )
+
+
+def _safe_qualitative_ordering(value: object) -> bool:
+    return (
+        isinstance(value, Mapping)
+        and set(value) == {"mode", "timestamp_field_id"}
+        and value["mode"] in {"source", "timestamp"}
+        and (value["timestamp_field_id"] is None or isinstance(value["timestamp_field_id"], str) and _ANALYSIS_FIELD_ID_PATTERN.fullmatch(value["timestamp_field_id"]) is not None)
+    )
 
 
 def _mapping_entry_from_row(row: tuple[Any, ...]) -> MappingEntry:

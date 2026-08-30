@@ -471,6 +471,26 @@ def _text_filter_payload(descriptor: FilterDescriptor) -> dict[str, object]:
     }
 
 
+def qualitative_evidence_audit_metadata(
+    evidence: dict[str, object], *, include_approved_notes: bool
+) -> dict[str, object]:
+    """Project ephemeral text evidence into the only persistence-safe audit record."""
+    keys = (
+        "provenance", "operation", "dataset_id", "dataset_sha256", "mapping_version_id", "text_fields",
+        "context_fields", "filters", "ordering", "bounds", "matching_rows", "usable_text_rows",
+        "returned_rows", "omitted_rows", "characters_returned", "cell_truncated", "row_truncated", "complete",
+    )
+    if (
+        not isinstance(evidence, dict)
+        or evidence.get("provenance") != "USER_SUPPLIED_QUALITATIVE_DATA"
+        or evidence.get("operation") != "read_text_evidence"
+        or any(key not in evidence for key in keys)
+        or type(include_approved_notes) is not bool
+    ):
+        raise ValueError("qualitative evidence is invalid")
+    return {key: evidence[key] for key in keys} | {"include_approved_notes": include_approved_notes}
+
+
 def _fit_text_evidence_output(evidence: dict[str, object]) -> dict[str, object]:
     """Keep all qualitative output, including audit metadata, inside its envelope."""
     items = evidence["items"]
