@@ -11,6 +11,7 @@ import pytest
 from openpyxl import Workbook
 
 import mentor.datasets as dataset_module
+from mentor.analysis import TextEvidenceUseGuard, read_text_evidence
 from mentor.datasets import (
     DatasetImportError,
     MappingEntry,
@@ -205,6 +206,7 @@ def test_mapping_draft_needs_confirmation_and_exposes_only_safe_opaque_model_fie
             "unit": "R",
             "health": {"valid_count": 2, "blank_count": 0, "invalid_count": 0, "ambiguous_date_count": 0, "unavailable_reason": None},
             "aggregate_labels_allowed": False,
+            "mentor_access": "aggregates_only",
         },
         {
             "field_id": context[1]["field_id"],
@@ -214,11 +216,77 @@ def test_mapping_draft_needs_confirmation_and_exposes_only_safe_opaque_model_fie
             "unit": None,
             "health": {"valid_count": 2, "blank_count": 0, "invalid_count": 0, "ambiguous_date_count": 0, "unavailable_reason": None},
             "aggregate_labels_allowed": False,
+            "mentor_access": "aggregates_only",
         }
     ]
     assert all(item["field_id"].startswith("field_") for item in context)
     assert "Desk Secret" not in json.dumps(context)
     assert "Result_R" not in json.dumps(context)
+
+
+def test_mapping_text_access_is_default_denied_and_persisted_immutably(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    source = tmp_path / "trades.csv"
+    source.write_text("Journal,Session\nsynthetic note,London\n", encoding="utf-8")
+    dataset = _importer(storage, tmp_path)(source).dataset
+    inspection = inspect_local_dataset(storage, dataset.id)
+
+    default_draft = create_inspected_mapping_draft(
+        storage, inspection, [MappingEntry(0, analysis_label="Journal")]
+    )
+    approved_draft = create_inspected_mapping_draft(
+        storage,
+        inspection,
+        [
+            MappingEntry(
+                0,
+                analysis_label="Journal",
+                mentor_access="allow_row_values_when_analysing_notes",
+            )
+        ],
+    )
+
+    assert storage.mapping_entries(default_draft.id)[0].mentor_access == "aggregates_only"
+    approved = storage.confirm_mapping_version(approved_draft.id)
+    assert storage.mapping_entries(approved.id)[0].mentor_access == "allow_row_values_when_analysing_notes"
+
+
+def test_text_evidence_is_ephemeral_and_cannot_enter_analysis_persistence(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    source = tmp_path / "trades.csv"
+    note = "synthetic-private-note-ephemeral"
+    source.write_text(f"Journal\n{note}\n", encoding="utf-8")
+    dataset = _importer(storage, tmp_path)(source).dataset
+    mapping = storage.confirm_mapping_version(create_inspected_mapping_draft(
+        storage,
+        inspect_local_dataset(storage, dataset.id),
+        [MappingEntry(0, analysis_label="Journal", mentor_access="allow_row_values_when_analysing_notes")],
+    ).id)
+    journal_id = storage.mapping_entries(mapping.id)[0].field_id or ""
+    evidence = read_text_evidence(
+        storage, dataset.id, mapping.id, text_field_ids=(journal_id,),
+        include_approved_notes=True, use_guard=TextEvidenceUseGuard(),
+    )
+    thread_id = storage.create_thread("Qualitative evidence")
+
+    assert evidence["items"][0]["text"][0]["value"] == note
+    with pytest.raises(ValueError, match="analysis result envelope"):
+        storage.record_analysis_evidence(
+            thread_id=thread_id,
+            origin_turn_number=1,
+            dataset_id=dataset.id,
+            mapping_version_id=mapping.id,
+            operation="read_text_evidence",
+            schema_version="1.0",
+            arguments={"dataset_id": dataset.id},
+            result=evidence,
+        )
+    with sqlite3.connect(storage.database_path) as connection:
+        assert note not in "\n".join(connection.iterdump())
+    assert storage.analysis_evidence(thread_id) == []
+    assert storage.analysis_tool_outputs(thread_id) == []
 
 
 def test_mapping_edits_and_clears_create_new_health_snapshots_and_reject_unsafe_disclosure(tmp_path):

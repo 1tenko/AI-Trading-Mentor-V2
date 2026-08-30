@@ -16,7 +16,9 @@ from mentor.analysis import (
     build_analysis_frame,
     compare_groups,
     group_results,
+    read_text_evidence,
     summarize_results,
+    TextEvidenceUseGuard,
 )
 from mentor.datasets import MappingEntry, create_inspected_mapping_draft, import_local_dataset, inspect_local_dataset
 from mentor.storage import ANALYSIS_EXCLUSION_LIMIT, Storage, validate_completed_evidence_envelope
@@ -31,6 +33,193 @@ def _confirmed_dataset(tmp_path: Path, contents: str, entries: list[MappingEntry
     draft = create_inspected_mapping_draft(storage, inspect_local_dataset(storage, dataset.id), entries)
     confirmed = storage.confirm_mapping_version(draft.id)
     return storage, dataset, confirmed
+
+
+def test_text_evidence_requires_explicit_mapping_permission_and_consent(tmp_path):
+    storage, dataset, mapping = _confirmed_dataset(
+        tmp_path,
+        "Result,Trade Date,Journal,Session\n"
+        "bad,2026-01-03,synthetic third,London\n"
+        "1,2026-01-01,synthetic first,London\n"
+        "2,2026-01-02,synthetic second,New York\n",
+        [
+            MappingEntry(0, semantic_role="trade_return", unit="R"),
+            MappingEntry(1, semantic_role="trade_timestamp", mentor_access="allow_row_values_when_analysing_notes"),
+            MappingEntry(2, analysis_label="Journal", mentor_access="allow_row_values_when_analysing_notes"),
+            MappingEntry(3, analysis_label="Session", mentor_access="allow_row_values_when_analysing_notes"),
+        ],
+    )
+    entries = storage.mapping_entries(mapping.id)
+    ids = {entry.analysis_label or entry.semantic_role: entry.field_id for entry in entries}
+
+    with pytest.raises(ValueError, match="consent"):
+        read_text_evidence(
+            storage,
+            dataset.id,
+            mapping.id,
+            text_field_ids=(ids["Journal"] or "",),
+            context_field_ids=(ids["Session"] or "",),
+            filters=(AnalysisFilter(ids["Session"] or "", "eq", "London"),),
+            order_by="timestamp",
+            include_approved_notes=False,
+            use_guard=TextEvidenceUseGuard(),
+        )
+
+    evidence = read_text_evidence(
+        storage,
+        dataset.id,
+        mapping.id,
+        text_field_ids=(ids["Journal"] or "",),
+        context_field_ids=(ids["Session"] or "",),
+        filters=(AnalysisFilter(ids["Session"] or "", "eq", "London"),),
+        order_by="timestamp",
+        include_approved_notes=True,
+        use_guard=TextEvidenceUseGuard(),
+    )
+
+    assert evidence["provenance"] == "USER_SUPPLIED_QUALITATIVE_DATA"
+    assert evidence["matching_rows"] == 2
+    assert evidence["usable_text_rows"] == 2
+    assert evidence["returned_rows"] == 2
+    assert [item["text"][0]["value"] for item in evidence["items"]] == ["synthetic first", "synthetic third"]
+    assert "Result" not in json.dumps(evidence)
+
+
+def test_text_evidence_rejects_unapproved_fields_wrong_scope_and_raw_inputs(tmp_path):
+    storage, dataset, mapping = _confirmed_dataset(
+        tmp_path,
+        "Journal,Session\nsynthetic note,London\n",
+        [
+            MappingEntry(0, analysis_label="Journal", mentor_access="allow_row_values_when_analysing_notes"),
+            MappingEntry(1, analysis_label="Session"),
+        ],
+    )
+    journal_id, session_id = (entry.field_id or "" for entry in storage.mapping_entries(mapping.id))
+
+    with pytest.raises(ValueError, match="not approved"):
+        read_text_evidence(
+            storage, dataset.id, mapping.id, text_field_ids=(journal_id,), context_field_ids=(session_id,),
+            include_approved_notes=True, use_guard=TextEvidenceUseGuard()
+        )
+    with pytest.raises(ValueError, match="field is not approved"):
+        read_text_evidence(
+            storage, dataset.id, mapping.id, text_field_ids=(session_id,), include_approved_notes=True, use_guard=TextEvidenceUseGuard()
+        )
+    with pytest.raises(ValueError, match="confirmed mapping"):
+        read_text_evidence(
+            storage, "wrong-dataset", mapping.id, text_field_ids=(journal_id,), include_approved_notes=True, use_guard=TextEvidenceUseGuard()
+        )
+    with pytest.raises(ValueError, match="confirmed mapping"):
+        read_text_evidence(
+            storage, dataset.id, mapping.id + 100, text_field_ids=(journal_id,), include_approved_notes=True, use_guard=TextEvidenceUseGuard()
+        )
+    for raw_input in ({"raw_header": "Journal"}, {"path": "C:/private.csv"}, {"dataframe": object()}, {"sql": "SELECT *"}, {"python": "open()"}):
+        with pytest.raises(TypeError):
+            read_text_evidence(  # type: ignore[call-arg]
+                storage, dataset.id, mapping.id, text_field_ids=(journal_id,), include_approved_notes=True,
+                use_guard=TextEvidenceUseGuard(), **raw_input
+            )
+
+
+@pytest.mark.parametrize(("count", "expected_complete"), [(50, True), (100, True), (200, False)])
+def test_text_evidence_short_note_row_bound_and_deterministic_completeness(tmp_path, count, expected_complete):
+    rows = "\n".join(f"2026-01-{(index % 28) + 1:02d},synthetic note {index:03d}" for index in range(count))
+    storage, dataset, mapping = _confirmed_dataset(
+        tmp_path,
+        f"Trade Date,Journal\n{rows}\n",
+        [
+            MappingEntry(0, semantic_role="trade_timestamp", mentor_access="allow_row_values_when_analysing_notes"),
+            MappingEntry(1, analysis_label="Journal", mentor_access="allow_row_values_when_analysing_notes"),
+        ],
+    )
+    journal_id = storage.mapping_entries(mapping.id)[1].field_id or ""
+
+    evidence = read_text_evidence(
+        storage, dataset.id, mapping.id, text_field_ids=(journal_id,), order_by="timestamp",
+        include_approved_notes=True, use_guard=TextEvidenceUseGuard(),
+    )
+
+    assert evidence["matching_rows"] == count
+    assert evidence["usable_text_rows"] == count
+    assert evidence["returned_rows"] == min(count, 100)
+    assert evidence["omitted_rows"] == max(count - 100, 0)
+    assert evidence["complete"] is expected_complete
+    assert evidence["row_truncated"] is (count > 100)
+    assert [item["text"][0]["value"] for item in evidence["items"]][:2] == ["synthetic note 000", "synthetic note 028"]
+    assert "source_row_ordinal" not in json.dumps(evidence)
+
+
+def test_text_evidence_bounds_cells_total_characters_and_unavailable_context_without_losing_text(tmp_path):
+    rows = "\n".join(f"{'x' * 1_300},{'London' if index == 0 else ''}" for index in range(21))
+    storage, dataset, mapping = _confirmed_dataset(
+        tmp_path,
+        f"Journal,Session\n{rows}\n",
+        [
+            MappingEntry(0, analysis_label="Journal", mentor_access="allow_row_values_when_analysing_notes"),
+            MappingEntry(1, analysis_label="Session", mentor_access="allow_row_values_when_analysing_notes"),
+        ],
+    )
+    journal_id, session_id = (entry.field_id or "" for entry in storage.mapping_entries(mapping.id))
+
+    evidence = read_text_evidence(
+        storage, dataset.id, mapping.id, text_field_ids=(journal_id,), context_field_ids=(session_id,),
+        include_approved_notes=True, use_guard=TextEvidenceUseGuard(),
+    )
+
+    assert (evidence["usable_text_rows"], evidence["returned_rows"], evidence["omitted_rows"]) == (21, 20, 1)
+    assert evidence["characters_returned"] == 24_000
+    assert evidence["cell_truncated"] is True
+    assert evidence["row_truncated"] is True
+    assert evidence["complete"] is False
+    assert evidence["items"][0]["context"][0]["value"] == "London"
+    assert evidence["items"][1]["unavailable_context_field_ids"] == [session_id]
+
+
+def test_text_evidence_revocation_requires_a_new_confirmed_mapping_and_consumes_each_guard_once(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    source = tmp_path / "trades.csv"
+    source.write_text("Journal\nsynthetic note\n", encoding="utf-8")
+    dataset = import_local_dataset(source, storage, dataset_id_factory=lambda: "text-revocation").dataset
+    inspection = inspect_local_dataset(storage, dataset.id)
+    allowed = storage.confirm_mapping_version(create_inspected_mapping_draft(
+        storage, inspection, [MappingEntry(0, analysis_label="Journal", mentor_access="allow_row_values_when_analysing_notes")]
+    ).id)
+    revoked = storage.confirm_mapping_version(create_inspected_mapping_draft(
+        storage, inspection, [MappingEntry(0, analysis_label="Journal")]
+    ).id)
+    journal_id = storage.mapping_entries(allowed.id)[0].field_id or ""
+    guard = TextEvidenceUseGuard()
+
+    assert read_text_evidence(
+        storage, dataset.id, allowed.id, text_field_ids=(journal_id,), include_approved_notes=True, use_guard=guard
+    )["returned_rows"] == 1
+    with pytest.raises(ValueError, match="one call per turn"):
+        read_text_evidence(
+            storage, dataset.id, allowed.id, text_field_ids=(journal_id,), include_approved_notes=True, use_guard=guard
+        )
+    with pytest.raises(ValueError, match="not approved"):
+        read_text_evidence(
+            storage, dataset.id, revoked.id, text_field_ids=(journal_id,), include_approved_notes=True, use_guard=TextEvidenceUseGuard()
+        )
+
+
+def test_text_evidence_rejects_mixed_timestamp_timezones_before_ordering(tmp_path):
+    storage, dataset, mapping = _confirmed_dataset(
+        tmp_path,
+        "Trade Date,Journal\n2026-01-01,synthetic naive\n2026-01-02T00:00:00Z,synthetic aware\n",
+        [
+            MappingEntry(0, semantic_role="trade_timestamp", mentor_access="allow_row_values_when_analysing_notes"),
+            MappingEntry(1, analysis_label="Journal", mentor_access="allow_row_values_when_analysing_notes"),
+        ],
+    )
+    journal_id = storage.mapping_entries(mapping.id)[1].field_id or ""
+
+    with pytest.raises(ValueError, match="compatible timezone"):
+        read_text_evidence(
+            storage, dataset.id, mapping.id, text_field_ids=(journal_id,), order_by="timestamp",
+            include_approved_notes=True, use_guard=TextEvidenceUseGuard(),
+        )
 
 
 def test_analysis_frame_types_valid_rows_and_exclusions_without_exposing_raw_data(tmp_path):

@@ -32,6 +32,10 @@ _SUMMARY_METRICS = (
 _GROUP_LIMIT = 50
 _TEMPORAL_BUCKET_LIMIT = 50
 _FILTER_LIMIT = ANALYSIS_FILTER_LIMIT
+_TEXT_FIELD_LIMIT = 3
+_TEXT_ROW_LIMIT = 100
+_TEXT_CELL_LIMIT = 1_200
+_TEXT_CHARACTER_LIMIT = 24_000
 _GROUP_METRICS = (
     "wins", "losses", "breakevens", "win_rate", "loss_rate", "wilson_95_lower", "wilson_95_upper",
     "total_return", "mean_return", "median_return", "mean_winning_return", "mean_losing_return",
@@ -64,6 +68,18 @@ class AnalysisNumericError(ValueError):
 
     def __init__(self):
         super().__init__(self.code)
+
+
+@dataclass
+class TextEvidenceUseGuard:
+    """Caller-owned per-turn guard; this boundary consumes it once."""
+
+    used: bool = False
+
+    def consume(self) -> None:
+        if self.used:
+            raise ValueError("qualitative evidence is limited to one call per turn")
+        self.used = True
 
 
 @dataclass(frozen=True)
@@ -193,8 +209,8 @@ def build_analysis_frame(
     if not isinstance(required_roles, Sequence) or isinstance(required_roles, (str, bytes)):
         raise ValueError("required_roles must be an explicit sequence")
     required = tuple(required_roles)
-    if not required or any(not isinstance(role, str) for role in required) or len(set(required)) != len(required):
-        raise ValueError("required_roles must be a non-empty unique sequence")
+    if any(not isinstance(role, str) for role in required) or len(set(required)) != len(required):
+        raise ValueError("required_roles must be a unique sequence")
     if order_by not in _ORDER_MODES:
         raise ValueError("analysis order is unsupported")
     if len(filters) > _FILTER_LIMIT:
@@ -310,6 +326,177 @@ def build_analysis_frame(
         order=order,
         no_data_reason=no_data_reason,
     )
+
+
+def read_text_evidence(
+    storage: "Storage",
+    dataset_id: str,
+    mapping_version_id: int,
+    *,
+    text_field_ids: Sequence[str],
+    context_field_ids: Sequence[str] = (),
+    filters: Sequence[AnalysisFilter] = (),
+    order_by: Literal["source", "timestamp"] = "source",
+    include_approved_notes: bool = False,
+    use_guard: TextEvidenceUseGuard,
+) -> dict[str, object]:
+    """Return only explicitly approved, bounded local qualitative values."""
+    if include_approved_notes is not True:
+        raise ValueError("explicit approved-notes consent is required")
+    if not isinstance(use_guard, TextEvidenceUseGuard):
+        raise ValueError("qualitative evidence requires a caller-owned use guard")
+    use_guard.consume()
+    if (
+        not _field_ids_are_bounded(text_field_ids, _TEXT_FIELD_LIMIT)
+        or not _field_ids_are_bounded(context_field_ids, _TEXT_FIELD_LIMIT, required=False)
+        or set(text_field_ids) & set(context_field_ids)
+    ):
+        raise ValueError("text and context fields must be unique bounded field IDs")
+
+    dataset = storage.dataset(dataset_id)
+    mapping = storage.mapping_version(mapping_version_id)
+    if dataset is None or mapping is None or mapping.status != "confirmed" or mapping.dataset_id != dataset_id:
+        raise ValueError("text evidence requires a confirmed mapping for the dataset")
+    entries = {entry.field_id: entry for entry in storage.mapping_entries(mapping_version_id) if entry.field_id}
+    selected_ids = (*text_field_ids, *context_field_ids)
+    if any(field_id not in entries for field_id in selected_ids):
+        raise ValueError("text evidence field is unsupported")
+    if any(entries[field_id].mentor_access != "allow_row_values_when_analysing_notes" for field_id in selected_ids):
+        raise ValueError("text evidence field is not approved")
+    if any(entries[field_id].value_type != "categorical" for field_id in text_field_ids):
+        raise ValueError("text evidence fields must be mapped text")
+    timestamp_id = next((entry.field_id for entry in entries.values() if entry.semantic_role == "trade_timestamp"), None)
+    if order_by not in _ORDER_MODES:
+        raise ValueError("text evidence order is unsupported")
+    if order_by == "timestamp" and (
+        timestamp_id is None or entries[timestamp_id].mentor_access != "allow_row_values_when_analysing_notes"
+    ):
+        raise ValueError("timestamp order requires an approved timestamp field")
+
+    frame = build_analysis_frame(
+        storage, dataset_id, mapping_version_id, required_roles=(), filters=filters, order_by="source"
+    )
+    rows = frame.filtered_data.to_dict("records")
+    if order_by == "timestamp":
+        if _mixed_timezone([
+            _row_value(row, entries[timestamp_id])
+            for row in rows
+            if row[_state_column(_field(entries[timestamp_id]))] == "valid"
+        ]):
+            raise ValueError("timestamp order requires compatible timezone data")
+        rows.sort(
+            key=lambda row: (
+                0 if row[_state_column(_field(entries[timestamp_id]))] == "valid" else 1,
+                _row_value(row, entries[timestamp_id]) if row[_state_column(_field(entries[timestamp_id]))] == "valid" else datetime.max,
+                row["source_row_ordinal"],
+            )
+        )
+    candidates = [
+        row
+        for row in rows
+        if any(row[_state_column(_field(entries[field_id]))] == "valid" for field_id in text_field_ids)
+    ]
+    character_count = 0
+    cell_truncated = False
+    row_truncated = False
+    items: list[dict[str, object]] = []
+    for row in candidates[:_TEXT_ROW_LIMIT]:
+        text, _, text_truncated, character_count = _bounded_text_values(
+            row, text_field_ids, entries, character_count
+        )
+        cell_truncated |= text_truncated
+        if not text:
+            row_truncated = True
+            if character_count >= _TEXT_CHARACTER_LIMIT:
+                break
+            continue
+        context, unavailable, context_truncated, character_count = _bounded_text_values(
+            row, context_field_ids, entries, character_count
+        )
+        cell_truncated |= context_truncated
+        row_truncated |= text_truncated or context_truncated
+        item: dict[str, object] = {"text": text}
+        if context:
+            item["context"] = context
+        if unavailable:
+            item["unavailable_context_field_ids"] = unavailable
+        items.append(item)
+    returned_rows = len(items)
+    omitted_rows = len(candidates) - returned_rows
+    row_truncated |= omitted_rows > 0
+    complete = omitted_rows == 0 and not cell_truncated and not row_truncated
+    return {
+        "provenance": "USER_SUPPLIED_QUALITATIVE_DATA",
+        "dataset_id": dataset.id,
+        "dataset_sha256": dataset.content_sha256,
+        "mapping_version_id": mapping.id,
+        "operation": "read_text_evidence",
+        "text_fields": [_safe_text_field(entries[field_id]) for field_id in text_field_ids],
+        "context_fields": [_safe_text_field(entries[field_id]) for field_id in context_field_ids],
+        "filters": [_filter_payload(item) for item in frame.filter_descriptors],
+        "ordering": {"mode": order_by, "timestamp_field_id": timestamp_id if order_by == "timestamp" else None},
+        "bounds": {"text_field_limit": _TEXT_FIELD_LIMIT, "context_field_limit": _TEXT_FIELD_LIMIT, "row_limit": _TEXT_ROW_LIMIT, "cell_character_limit": _TEXT_CELL_LIMIT, "character_limit": _TEXT_CHARACTER_LIMIT},
+        "matching_rows": len(rows),
+        "usable_text_rows": len(candidates),
+        "returned_rows": returned_rows,
+        "omitted_rows": omitted_rows,
+        "characters_returned": character_count,
+        "cell_truncated": cell_truncated,
+        "row_truncated": row_truncated,
+        "complete": complete,
+        "items": items,
+    }
+
+
+def _field_ids_are_bounded(field_ids: Sequence[str], limit: int, *, required: bool = True) -> bool:
+    return (
+        isinstance(field_ids, Sequence)
+        and not isinstance(field_ids, (str, bytes))
+        and (1 if required else 0) <= len(field_ids) <= limit
+        and all(isinstance(field_id, str) and field_id for field_id in field_ids)
+        and len(set(field_ids)) == len(field_ids)
+    )
+
+
+def _safe_text_field(entry: "MappingEntry") -> dict[str, str]:
+    return {"field_id": entry.field_id or "", "label": entry.analysis_label or entry.semantic_role or entry.field_id or ""}
+
+
+def _row_value(row: dict[str, object], entry: "MappingEntry") -> object:
+    return row[_field(entry).column_name]
+
+
+def _bounded_text_values(
+    row: dict[str, object],
+    field_ids: Sequence[str],
+    entries: dict[str, "MappingEntry"],
+    character_count: int,
+) -> tuple[list[dict[str, str]], list[str], bool, int]:
+    values: list[dict[str, str]] = []
+    unavailable: list[str] = []
+    truncated = False
+    for field_id in field_ids:
+        entry = entries[field_id]
+        if row[_state_column(_field(entry))] != "valid":
+            unavailable.append(field_id)
+            continue
+        value = "".join(character for character in " ".join(str(_row_value(row, entry)).split()) if character.isprintable())
+        if not value:
+            unavailable.append(field_id)
+            continue
+        if len(value) > _TEXT_CELL_LIMIT:
+            value = value[:_TEXT_CELL_LIMIT]
+            truncated = True
+        remaining = _TEXT_CHARACTER_LIMIT - character_count
+        if remaining <= 0:
+            truncated = True
+            break
+        if len(value) > remaining:
+            value = value[:remaining]
+            truncated = True
+        character_count += len(value)
+        values.append({**_safe_text_field(entry), "value": value})
+    return values, unavailable, truncated, character_count
 
 
 def summarize_results(

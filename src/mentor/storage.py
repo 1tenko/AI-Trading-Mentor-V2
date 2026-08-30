@@ -547,6 +547,7 @@ class Storage:
                     distinct_count INTEGER NOT NULL DEFAULT 0 CHECK(distinct_count >= 0),
                     max_label_length INTEGER NOT NULL DEFAULT 0 CHECK(max_label_length >= 0),
                     aggregate_labels_allowed INTEGER NOT NULL DEFAULT 0 CHECK(aggregate_labels_allowed IN (0, 1)),
+                    mentor_access TEXT NOT NULL DEFAULT 'aggregates_only' CHECK(mentor_access IN ('aggregates_only', 'allow_row_values_when_analysing_notes')),
                     unavailable_reason TEXT,
                     ambiguous_date_count INTEGER NOT NULL DEFAULT 0 CHECK(ambiguous_date_count >= 0),
                     PRIMARY KEY(mapping_version_id, column_ordinal)
@@ -835,6 +836,7 @@ class Storage:
                 ("distinct_count", "INTEGER NOT NULL DEFAULT 0"),
                 ("max_label_length", "INTEGER NOT NULL DEFAULT 0"),
                 ("aggregate_labels_allowed", "INTEGER NOT NULL DEFAULT 0"),
+                ("mentor_access", "TEXT NOT NULL DEFAULT 'aggregates_only'"),
                 ("unavailable_reason", "TEXT"),
                 ("ambiguous_date_count", "INTEGER NOT NULL DEFAULT 0"),
             ):
@@ -2120,7 +2122,7 @@ class Storage:
                 for row in connection.execute(
                     "SELECT column_ordinal, semantic_role, unit, analysis_label, source, field_id, value_type, "
                     "valid_count, blank_count, invalid_count, distinct_count, max_label_length, "
-                    "aggregate_labels_allowed, unavailable_reason, ambiguous_date_count "
+                    "aggregate_labels_allowed, mentor_access, unavailable_reason, ambiguous_date_count "
                     "FROM dataset_mapping_entries WHERE mapping_version_id = ? ORDER BY column_ordinal",
                     (draft_mapping_version_id,),
                 )
@@ -2163,7 +2165,7 @@ class Storage:
             rows = connection.execute(
                 "SELECT column_ordinal, semantic_role, unit, analysis_label, source, field_id, value_type, "
                 "valid_count, blank_count, invalid_count, distinct_count, max_label_length, "
-                "aggregate_labels_allowed, unavailable_reason, ambiguous_date_count "
+                "aggregate_labels_allowed, mentor_access, unavailable_reason, ambiguous_date_count "
                 "FROM dataset_mapping_entries WHERE mapping_version_id = ? ORDER BY column_ordinal",
                 (mapping_version_id,),
             ).fetchall()
@@ -2366,8 +2368,8 @@ class Storage:
             INSERT INTO dataset_mapping_entries(
                 mapping_version_id, column_ordinal, semantic_role, unit, analysis_label, source,
                 field_id, value_type, valid_count, blank_count, invalid_count, distinct_count,
-                max_label_length, aggregate_labels_allowed, unavailable_reason, ambiguous_date_count
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                max_label_length, aggregate_labels_allowed, mentor_access, unavailable_reason, ambiguous_date_count
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 (
@@ -2385,6 +2387,7 @@ class Storage:
                     values.get("distinct_count", 0),
                     values.get("max_label_length", 0),
                     int(bool(values.get("aggregate_labels_allowed", False))),
+                    values.get("mentor_access", "aggregates_only"),
                     values.get("unavailable_reason"),
                     values.get("ambiguous_date_count", 0),
                 )
@@ -2461,6 +2464,11 @@ class Storage:
             allowed = values.get("aggregate_labels_allowed")
             if not isinstance(allowed, bool):
                 raise ValueError("mapping entry aggregate consent is invalid")
+            if values.get("mentor_access", "aggregates_only") not in {
+                "aggregates_only",
+                "allow_row_values_when_analysing_notes",
+            }:
+                raise ValueError("mapping Mentor access policy is invalid")
             if allowed and (
                 not isinstance(values.get("analysis_label"), str)
                 or column.value_type not in {"categorical", "boolean"}
@@ -2625,7 +2633,7 @@ def _dataset_values(value: DatasetImportSpec | DatasetColumn | MappingEntry | Ma
 
 
 def _mapping_entry_from_row(row: tuple[Any, ...]) -> MappingEntry:
-    return MappingEntry(*row[:12], bool(row[12]), row[13], False, int(row[14]))
+    return MappingEntry(*row[:12], bool(row[12]), row[13], row[14], False, int(row[15]))
 
 
 def _analysis_result_envelope_json(

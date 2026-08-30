@@ -205,21 +205,21 @@ introduces no Responses call or final mapping/compose UI; Task 9 exposes the
 approved controls.
 
 **Acceptance criteria:**
-- [ ] Text is denied by default; only a confirmed mapping version with an
+- [x] Text is denied by default; only a confirmed mapping version with an
   explicitly approved field can expose bounded text or structured row context.
-- [ ] A server-validated, default-false per-turn consent signal is required in
+- [x] A server-validated, default-false per-turn consent signal is required in
   addition to mapping permission; the model cannot set or reuse that signal.
-- [ ] The local text envelope applies canonical filters, deterministic order,
+- [x] The local text envelope applies canonical filters, deterministic order,
   row/cell/character bounds, sanitization, and complete-or-explicitly-partial
   metadata without raw header/path/file disclosure.
-- [ ] Raw text is absent from persisted evidence, diagnostics, and replay;
+- [x] Raw text is absent from persisted evidence, diagnostics, and replay;
   only safe disclosure metadata is retained.
 
 **Verification:**
-- [ ] Privacy-safe 50/100/200-note and long-journal fixtures prove default
+- [x] Privacy-safe 50/100/200-note and long-journal fixtures prove default
   denial, permission/revocation versioning, model-independent consent, bounds,
   truncation, ordering, incomplete metadata, and context-field permission.
-- [ ] No OpenAI/network call is needed; full pytest remains green.
+- [x] No OpenAI/network call is needed; full pytest remains green.
 
 **Dependencies:** Task 7A, Task 3
 **Files likely touched:** `src/mentor/datasets.py`, `src/mentor/analysis.py`,
@@ -229,10 +229,10 @@ approved controls.
 
 ### Amended Checkpoint B: Deterministic and qualitative evidence boundary
 
-- [ ] Tasks 4–7B and full pytest are green.
+- [x] Tasks 4–7B and full pytest are green.
 - [ ] Numeric evidence preserves N, exclusions, reproducibility, and
   `USER_EMPIRICAL_EVIDENCE`; grouped evidence is one validated partition.
-- [ ] Text disclosure is explicit, local-default-denied, bounded, and
+- [x] Text disclosure is explicit, local-default-denied, bounded, and
   complete-or-explicitly-partial; raw text never enters replay/persistence.
 - [ ] Independent deterministic/privacy review finds no P0/P1 evidence-boundary
   issue before Task 8 begins.

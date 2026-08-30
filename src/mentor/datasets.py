@@ -37,6 +37,7 @@ MAX_INSPECTION_PREVIEW_ROWS = 20
 MAX_INSPECTION_CELL_CHARS = 200
 MAX_MODEL_GROUP_LABELS = 20
 MAX_MODEL_GROUP_LABEL_CHARS = 80
+MENTOR_ACCESS_POLICIES = frozenset({"aggregates_only", "allow_row_values_when_analysing_notes"})
 _DATASET_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,79}")
 _CELL_REFERENCE_PATTERN = re.compile(r"([A-Z]+)([1-9][0-9]*)$")
 _IMPORT_LEASE_LOCK = threading.RLock()
@@ -99,6 +100,7 @@ class MappingEntry:
     distinct_count: int = 0
     max_label_length: int = 0
     aggregate_labels_allowed: bool = False
+    mentor_access: str = "aggregates_only"
     unavailable_reason: str | None = None
     model_disclosure: bool = False
     ambiguous_date_count: int = 0
@@ -290,6 +292,8 @@ def create_inspected_mapping_draft(
                 raise ValueError("aggregate labels may contain at most 20 distinct values")
             if column.max_label_length > MAX_MODEL_GROUP_LABEL_CHARS:
                 raise ValueError("aggregate labels may be at most 80 characters")
+        if entry.mentor_access not in MENTOR_ACCESS_POLICIES:
+            raise ValueError("Mentor access policy is unsupported")
         prepared.append(
             MappingEntry(
                 column_ordinal=entry.column_ordinal,
@@ -305,6 +309,7 @@ def create_inspected_mapping_draft(
                 distinct_count=column.distinct_count,
                 max_label_length=column.max_label_length,
                 aggregate_labels_allowed=entry.model_disclosure,
+                mentor_access=entry.mentor_access,
                 unavailable_reason=column.unavailable_reason,
                 ambiguous_date_count=column.ambiguous_date_count,
             )
@@ -332,6 +337,7 @@ def model_mapping_context(storage: "Storage", mapping_version_id: int) -> list[d
                 "unavailable_reason": entry.unavailable_reason,
             },
             "aggregate_labels_allowed": entry.aggregate_labels_allowed,
+            "mentor_access": entry.mentor_access,
         }
         for entry in storage.mapping_entries(mapping_version_id)
         if entry.field_id is not None
