@@ -1,7 +1,8 @@
 # Phase 5 Design: Backtest / Empirical Data Analysis Foundation
 
-**Status:** Proposed for implementation planning approval
+**Status:** Amended for Theo review; implementation paused at the architecture breaker
 **Date:** 2026-08-27
+**Amendment:** 2026-08-30 architecture-breaker amendment
 **Builds on:** accepted Phase 4, commit `50a7cd1cf2658f4b51baf10fa5f7c5d69907ef25`
 **Branch:** `feature/phase-5-backtest-analysis`
 
@@ -13,7 +14,9 @@ flow is:
 
 ```text
 local file -> deterministic import and validation -> typed local analysis
--> bounded reproducible result -> GPT-5.6 Sol interpretation -> Theo
+-> bounded reproducible numeric evidence
+-> optional bounded, user-approved qualitative text disclosure
+-> GPT-5.6 Sol interpretation -> Theo
 ```
 
 This is reusable data-analysis capability, not a scientific strategy project.
@@ -39,8 +42,10 @@ work belongs to Phases 6 and 7.
 4. **Evidence is not causation.** A measured association is
    `USER_EMPIRICAL_EVIDENCE`; it is not direct source teaching, an AI
    hypothesis, or proof that a filter causes better performance.
-5. **Bounded context.** Large rows, raw files, and unbounded group output stay
-   local. Sol receives deliberately bounded metadata and results.
+5. **Bounded, explicit disclosure.** Raw files, unapproved cells, and
+   unbounded group/text output stay local. Sol receives deliberately bounded
+   numeric evidence and, only after an explicit per-field opt-in, bounded
+   qualitative text evidence.
 6. **No hidden scope.** The active dataset is visible and thread-local. The
    app never silently analyzes the last uploaded file.
 
@@ -56,12 +61,14 @@ authority or Phase 4 profile semantics.
 | dataset-foundation | Immutable dataset metadata, local file lifecycle, safe import preflight | — |
 | dataset-schema | Preview, type inspection, visible semantic mapping and validation | dataset-foundation |
 | deterministic-analysis | Typed calculation operations and reproducible result envelope | dataset-schema |
-| empirical-mentor | Server-owned analysis functions, provenance and bounded Sol context | deterministic-analysis |
-| data-workspace | Data upload/preview/mapping UI and visible thread-local active scope | dataset-schema, empirical-mentor |
+| qualitative-evidence | Explicit text-field disclosure policy and bounded local text retrieval | dataset-schema, deterministic-analysis |
+| empirical-mentor | Server-owned analysis functions, provenance and bounded Sol context | deterministic-analysis, qualitative-evidence |
+| data-workspace | Data upload/preview/mapping UI and visible thread-local active scope | dataset-schema, qualitative-evidence, empirical-mentor |
 | phase5-evaluation | Deterministic, privacy, chat, and browser acceptance coverage | all above |
 
 Build order: `dataset-foundation -> dataset-schema -> deterministic-analysis ->
-empirical-mentor -> data-workspace -> phase5-evaluation`.
+qualitative-evidence -> empirical-mentor -> data-workspace ->
+phase5-evaluation`.
 
 ## Data-engine decision
 
@@ -157,6 +164,27 @@ short analysis-safe label. The model receives that label and an opaque field ID,
 not the raw header; the server resolves the ID locally. The confirmed mapping
 version is the analysis authority and is shown with results.
 
+### Text-field and row-disclosure policy (2026-08-30 amendment)
+
+The mapping can identify any user-selected text column as a **qualitative
+analysis field**. It is not a special `notes` role: its original header remains
+local and Theo supplies a short safe display/analysis label. Every mapped field
+has one visible immutable `Mentor access` choice in its mapping version:
+
+| Choice | Meaning |
+|---|---|
+| **Aggregates only** (default) | The field can support the existing approved aggregate/group behavior where eligible; its individual cell values never leave the local process. For a text field, this means no text is available to Sol. |
+| **Allow row values when analysing notes** | Only this approved text field, or separately approved structured context field, may be returned by the bounded qualitative-evidence tool for an explicit notes-analysis request. |
+
+The local-only mapping UI shows Theo the original header needed to select a
+column, plus its safe display label. The Mentor-facing context and every tool
+payload contain only the safe label and opaque field ID, never the raw header.
+A change to either label, type, or access choice creates a new confirmed
+immutable mapping version. Revoking access therefore prevents future disclosure;
+it does not rewrite historic Mentor answers. Unapproved text, unapproved
+structured context, hidden workbook data, raw headers, paths, and filenames
+never reach Sol.
+
 `trade_outcome` uses a documented controlled vocabulary (`win`, `loss`,
 `breakeven`) with visible normalisation. When absent but a numeric
 `trade_return` is valid, outcome may be deterministically derived as
@@ -178,6 +206,7 @@ arguments; it calculates locally and returns a bounded structured result.
 | `compare_groups` | column plus two disjoint values | side-by-side metrics, deltas, N and limitations |
 | `analyze_mfe_mae` | MFE and/or MAE role | valid N and unit-labelled location/distribution metrics |
 | `analyze_over_time` | valid timestamp role | chronological buckets, halves or a declared rolling window |
+| `read_text_evidence` | explicitly approved qualitative text field(s) | bounded, ordered user-supplied text plus only explicitly approved row context and completeness metadata |
 
 Every operation accepts typed filters whose `field_id` is an approved semantic
 role or user-approved analysis field, never an arbitrary raw header:
@@ -188,24 +217,129 @@ operators: eq, neq, in, not_in, is_blank, not_blank, gt, gte, lt, lte, between
 ```
 
 At most two grouping columns, bounded filters, and 50 returned groups are
-allowed; omitted groups are explicit. There is no standalone free-form
-`filter_results` tool: the validated filter model is an argument to each
-relevant operation.
+allowed. There is no standalone free-form `filter_results` tool: the validated
+filter model is an argument to each relevant operation.
+
+### Authoritative grouped-evidence partition (2026-08-30 amendment)
+
+Every grouped result owns exactly one normalized `GroupEvidencePartition`.
+It is the only persisted/replayed/tool-exposed representation of group
+population accounting; presentation totals and omission metadata are derived
+from it and are never independently writable.
+
+```text
+filtered population
+  = returned groups + omitted groups + ungrouped rows
+
+each returned group
+  = valid analysis rows + excluded analysis rows
+```
+
+`returned_groups` contains real group keys from the filtered population for
+which the grouping key is valid. Each group has only its authoritative
+`filtered_rows`, `valid_rows`, `excluded_rows`, metric payload, and explicit
+limitations. A zero-valid group remains visible: for example, an Asia group
+with 8 filtered rows, 0 valid rows, 8 excluded rows, unavailable metrics, and
+`no_valid_rows` is a real returned group, not an omission.
+
+`omitted` is one aggregate for real groups outside the bounded returned-group
+limit: `group_count`, `filtered_rows`, `valid_rows`, and `excluded_rows`, plus
+only safe contract-required metadata. It cannot stand for a returned group
+whose metric rows were invalid. `ungrouped` is a separate aggregate for rows
+whose grouping key itself cannot produce a valid group; it is never used for a
+metric exclusion, an omitted group, or a filter exclusion.
+
+The following exact equalities are required when the partition is produced,
+before persistence, on replay, and before tool exposure:
+
+```text
+filtered_rows = sum(returned.filtered_rows) + omitted.filtered_rows + ungrouped.filtered_rows
+valid_rows    = sum(returned.valid_rows)    + omitted.valid_rows    + ungrouped.valid_rows
+excluded_rows = sum(returned.excluded_rows) + omitted.excluded_rows + ungrouped.excluded_rows
+
+for every returned group:
+  filtered_rows = valid_rows + excluded_rows
+
+omitted.filtered_rows = omitted.valid_rows + omitted.excluded_rows
+ungrouped.filtered_rows = ungrouped.valid_rows + ungrouped.excluded_rows
+```
+
+No zero-row synthetic population or overlap between returned, omitted, and
+ungrouped populations is valid. Production must route every filtered source-row
+identity into exactly one returned group, the omitted aggregate, or ungrouped;
+returned group keys must be unique. Replay validates the serialized structural
+equalities and uniqueness. A failed validation rejects the complete envelope
+rather than repairing or guessing at persisted evidence.
+
+### Qualitative text evidence contract (2026-08-30 amendment)
+
+`read_text_evidence` is a future server-owned typed custom function, not a
+filesystem/DataFrame capability for Sol. Its arguments are opaque approved text
+field ID(s), the same canonical typed filters used by deterministic analysis,
+optional separately approved structured-context field ID(s), and an approved
+deterministic ordering request. The server validates active dataset and mapping
+version, per-field permission, filter compatibility, row eligibility, ordering,
+sanitization, and every bound before returning data.
+
+Mapping permission is necessary but not sufficient for a disclosure. Each chat
+submission has a server-validated, one-turn **Include approved notes in this
+answer** consent signal, defaulting to false. The static UI sets it deliberately
+for the current message; the model cannot set, broaden, or replay it. The text
+tool rejects a request without this signal, even for an approved field, and the
+server records only safe consent/mapping metadata. This makes it clear when a
+turn may send approved note values to Sol and prevents an incidental model tool
+call from becoming user consent.
+
+The local engine never interprets prose. Phase 5 does not add local NLP,
+embeddings, vector/text-index storage, topic modelling, sentiment analysis,
+automatic text classification, or theme counting. It only filters, orders,
+bounds, sanitizes, and returns approved text. Sol may interpret that bounded
+material, but a theme or theme count remains model-coded qualitative content,
+not deterministic empirical evidence.
+
+Initial limits are deliberately separate from the numeric aggregate envelope:
+
+| Evidence class | Initial bound per Mentor turn |
+|---|---|
+| Deterministic aggregate evidence | 8,000 sanitized characters across at most two deterministic analysis calls |
+| Qualitative text evidence | one text call; at most 3 text fields, 3 context fields, 100 usable rows, 1,200 characters per cell, and 24,000 sanitized characters in total |
+
+The text tool orders by a valid approved timestamp then stable source-row
+ordinal, or by stable source-row ordinal when no valid time order is requested.
+Its `matching_rows` population is the rows accepted by the canonical filters;
+it does not require a valid return/MFE/MAE merely because a combined Mentor turn
+also has numeric evidence. `usable_text_rows` is the matching population with
+nonblank approved text. An approved structured context value that is invalid or
+blank is absent for that item and reported as unavailable context; it does not
+silently remove the approved text row.
+It returns no path, filename, raw header, unapproved field, hidden cell, or
+arbitrary row identity. Its envelope reports matching rows, rows with usable
+text, rows returned, rows omitted, characters returned, deterministic order,
+and whether any cell or row was truncated. When all usable text fits, all is
+returned; otherwise the result is explicitly partial. The Mentor must call a
+partial qualitative review partial, never exhaustive, and may suggest a narrow
+filter or another bounded review.
+
+The initial limits are to be exercised against privacy-safe fixtures of 50,
+100, and 200 short notes plus long journal entries before Task 8. They bound
+external disclosure and Sol input cost without making normal retail-journal
+analysis useless; any future increase is a user-approved privacy/cost change.
 
 ### Tool orchestration safety
 
 The current Phase 4 dispatcher handles only one profile mutation. Task 8 must
 replace that narrow internal boundary with one bounded generic local-function
 dispatcher, not bolt analysis calls onto the profile continuation. It supports
-the existing profile function and the six approved analysis functions, preserves
-native raw File Search, and preserves citation-repair behavior.
+the existing profile function, deterministic analysis functions, and the one
+approved qualitative-evidence function, preserves native raw File Search, and
+preserves citation-repair behavior.
 
-- A response may make one **analysis batch** of at most three parallel approved
-  analysis calls, followed by exactly one terminal continuation. A single shared
-  8,000-character serialized-result budget applies across the entire batch
-  before persistence, replay, or model continuation; deterministic per-result
-  truncation records every omission. It cannot enter an arbitrary local-tool
-  loop or make sequential extra analysis calls.
+- A response may make one **analysis batch** of at most three approved calls,
+  followed by exactly one terminal continuation: at most two deterministic
+  aggregate calls and at most one `read_text_evidence` call. The separate
+  numeric and qualitative budgets above apply before model continuation. It
+  cannot enter an arbitrary local-tool loop or make sequential extra analysis
+  calls.
 - A profile mutation retains its existing single-call idempotence and terminal
   continuation contract. A response that mixes a profile mutation with analysis
   calls is rejected as `mixed_local_tool_batch_not_supported`; the terminal
@@ -221,10 +355,13 @@ native raw File Search, and preserves citation-repair behavior.
   empirical basis and configuration faithfully rather than applying current
   dataset selection/settings to old text.
 
-Every result includes `USER_EMPIRICAL_EVIDENCE`, local dataset ID/hash, mapping
-and analysis versions, operation, filters, grouping, source/filtered/valid/
-excluded N, metric definitions, results, and limitations. It is reproducible
-but is not a future project, hypothesis, or decision record.
+Deterministic results include `USER_EMPIRICAL_EVIDENCE`, local dataset ID/hash,
+mapping and analysis versions, operation, filters, grouping, source/filtered/
+valid/excluded N, metric definitions, results, and limitations. Qualitative
+results identify `USER_SUPPLIED_QUALITATIVE_DATA`, approved safe field labels,
+filter/mapping identity, disclosure bounds, and completeness metadata, but do
+not turn a model theme into a measured fact. Neither is a future project,
+hypothesis, or decision record.
 
 This follows the existing Responses custom-function pattern. Current official
 documentation describes custom functions as application-defined code with typed
@@ -281,7 +418,7 @@ turn a post-hoc observation into a filter.
 ## Provenance, Mentor behavior, and bounded context
 
 Phase 5 introduces `USER_EMPIRICAL_EVIDENCE`: deterministic results from
-Theo's local dataset. The taxonomy is:
+Theo's local dataset. The existing product taxonomy remains:
 
 1. Direct source teaching
 2. Source synthesis / inference
@@ -289,11 +426,22 @@ Theo's local dataset. The taxonomy is:
 4. **User empirical evidence**
 5. User decision
 
-The Mentor labels empirical observations as user empirical evidence and keeps
-them distinct from Jacob teaching, source synthesis, AI hypotheses, and future
-user decisions. A source lookup is not needed to restate a local metric. If
-Jacob methodology matters, native File Search remains the raw authority and its
-claims retain Phase 2 citation rules.
+The following Phase-5 evidence labels refine that taxonomy without changing
+source authority:
+
+| Label | Authority and permitted claim |
+|---|---|
+| `USER_EMPIRICAL_EVIDENCE` | Deterministic Python/pandas result from the validated frame; counts, metrics, filters, and comparisons. |
+| `USER_SUPPLIED_QUALITATIVE_DATA` | Bounded raw text from an explicitly approved field; it is user-provided material, not a deterministic theme/category. |
+| `AI_QUALITATIVE_INTERPRETATION` | Sol's qualified reading of disclosed notes, such as a pattern that appears repeatedly in the reviewed material. Never present it as a deterministic count or empirical fact. |
+| `AI_RESEARCH_HYPOTHESIS` / `AI_RECOMMENDATION` | A proposed test or next analysis; neither is a measured conclusion or user decision. |
+
+The Mentor labels deterministic observations as user empirical evidence and
+keeps them distinct from disclosed notes, Jacob teaching, source synthesis,
+AI qualitative interpretation, AI hypotheses, recommendations, and future user
+decisions. A source lookup is not needed to restate a local metric or profile
+of disclosed notes. If Jacob methodology matters, native File Search remains
+the raw authority and its claims retain Phase 2 citation rules.
 
 Sol may call several local analyses in one Mentor turn but uses a normal
 function-call continuation rather than a paid model request per calculation.
@@ -303,22 +451,31 @@ and profile boundaries remain unchanged.
 | Context content | Limit / rule |
 |---|---|
 | Active dataset context | ~2,000 characters: opaque local dataset label, hash prefix, semantic roles, capability and row health; no raw filename, headers, or values by default |
-| Analysis batch result | 8,000 characters shared across all calls after deterministic sanitizer/truncation; max 50 groups per call plus omission metadata |
-| Representative raw rows | Never supplied by default. A future per-column explicit model-disclosure allowlist is required before any bounded value samples are supported. |
-| Raw spreadsheet | Never sent to Sol, File Search, vector store, Git, logs, or external storage |
-| Chat replay | Bounded sanitized evidence envelope/metadata only; no file contents, DataFrame, raw identifiers, or free-text cells |
+| Deterministic aggregate evidence | 8,000 characters across at most two calls; max 50 groups per call; normalized partition omission metadata is mandatory |
+| Qualitative text evidence | One explicit approved-field call only; 100 usable rows, 1,200 characters/cell, 24,000 characters total, and mandatory completeness metadata |
+| Representative raw rows | Never supplied by default. Only explicitly approved row values may appear in a qualitative-evidence call. |
+| Raw spreadsheet and all non-disclosed content | Never sent to Sol, File Search, vector store, Git, logs, or external storage |
+| Chat replay | Deterministic evidence plus safe qualitative-disclosure metadata only; no raw text payload, file contents, DataFrame, raw identifiers, or free-text cells |
 
 The local UI may show the complete bounded preview because it remains loopback
-only. The Mentor sees aggregates by default. No row samples reach the model in
-Phase 5. A categorical/boolean mapping entry may separately and explicitly
-check **Allow aggregate labels to Mentor** during confirmation; this is the
-only Phase-5 path for a group label/value to leave the local analysis engine.
-It is eligible only for at most 20 distinct labels with each label at most 80
-characters; arbitrary long/free-text and high-cardinality columns are ineligible
-and not model-groupable. The sanitizer still applies redaction, cardinality,
-batch-length, persistence, and replay limits. Limits are measured with
-deterministic fixtures. A result that cannot fit says what was omitted; it never
-silently invents a conclusion.
+only. The Mentor sees aggregates by default. A categorical/boolean mapping entry
+may separately and explicitly check **Allow aggregate labels to Mentor** during
+confirmation; it is eligible only for at most 20 distinct labels with each label
+at most 80 characters. Separately, the visible `Mentor access` choice permits
+bounded row values only through `read_text_evidence`. Arbitrary long/free-text
+and high-cardinality columns remain ineligible for grouping. The sanitizer still
+applies disclosure permission, redaction, cardinality, batch-length,
+persistence, and replay limits. A result that cannot fit says what was omitted;
+it never silently invents a conclusion.
+
+Raw qualitative text uses **ephemeral disclosure semantics**. It is supplied to
+Sol only for the terminal turn that explicitly requested it. `AnalysisEvidence`,
+tool diagnostics, and stateless replay retain safe field/filter/budget/
+completeness metadata, not raw excerpts or text payloads. The terminal Mentor
+answer remains normal conversation content; reopening a thread must not
+automatically retrieve notes again. Because the immutable original dataset is
+local, a later explicit request can re-read currently approved text
+deterministically under its current mapping version.
 
 ## Dataset UI and scope
 
@@ -335,6 +492,14 @@ conversation; a new thread starts with no dataset. Each analysis call receives
 an explicit dataset ID and is rejected if it does not match the active scope.
 This prevents hidden global state and leaves simple dataset identity for Phase
 6 to associate with a project later.
+
+Mapping confirmation visibly shows each field's safe label, semantic/type use,
+and `Mentor access` choice. A text field defaults to **Aggregates only** and
+requires Theo to choose **Allow row values when analysing notes** before a
+future notes-analysis request can disclose it. The same choice is required for
+any structured row-context field. The UI makes clear that this permits bounded
+values from that one field to be sent to the Mentor only when Theo asks for
+notes analysis; it does not disclose the workbook or other columns.
 
 ### Ownership, deletion, and historic fidelity
 
@@ -360,10 +525,13 @@ Deterministic coverage must prove import/hash/immutability/signature/archive/
 formula preflight and atomic cleanup; preview and immutable confirmed mapping
 snapshots; type/exclusion/duplicate/ambiguous-date behavior; exact metrics,
 row-order streak/drawdown/distributions; groups/filters/comparisons; time/MFE/
-MAE/intervals; strict bounded generic tool dispatch; thread deletion/foreign-key
-cleanup; bounded disclosure sanitization/replay; privacy; and Phase 1–4
-regressions. Model fixtures must prove tool use, no fabricated arithmetic,
-provenance separation, and no unsupported MFE/MAE or causality claim.
+MAE/intervals; normalized group-partition reconciliation and replay rejection;
+strict bounded generic tool dispatch; explicit text permission/default denial;
+text filters/order/truncation/completeness; ephemeral text replay metadata;
+thread deletion/foreign-key cleanup; privacy; and Phase 1–4 regressions. Model
+fixtures must prove tool use, no fabricated arithmetic, provenance separation,
+no unsupported MFE/MAE or causality claim, and that AI thematic interpretation
+is not rendered as deterministic empirical evidence.
 
 Human examples are:
 
@@ -374,6 +542,10 @@ Human examples are:
 4. Session question: grouped deterministic results with N.
 5. Time question: chronological evidence only when a valid date exists.
 6. Missing MFE: says it cannot calculate average MFE.
+7. `Date | Session | Setup | Result_R | SMT | Notes`: a combined request shows
+   deterministic evidence, disclosed-note completeness, AI qualitative
+   interpretation, and an explicitly labelled next research question without
+   treating a theme as a measured category.
 
 Theo alone decides pass/fail after deterministic and browser checks. Passing
 Phase 5 does not authorize Phase 6 or 7.
@@ -412,8 +584,11 @@ Phase 5 succeeds only when Theo can inspect a local CSV/XLSX without a fixed
 schema; mapping is visible, editable and confirmed; every statistic is
 deterministic and reproducible from dataset hash/mapping version; N/exclusions
 and unavailable inputs are clear; Sol interprets bounded results without
-fabricated arithmetic or causal proof; provenance is distinct; raw uploads
-remain local; scope is clear per thread; and Theo passes the human quality gate.
+fabricated arithmetic or causal proof; grouped results are a self-validating
+partition; explicitly approved text can be read only through a bounded,
+complete-or-explicitly-partial disclosure; deterministic metrics and AI thematic
+interpretation remain distinct; raw uploads remain local; scope is clear per
+thread; and Theo passes the human quality gate.
 
 ## Open implementation choices
 

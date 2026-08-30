@@ -1,6 +1,7 @@
 # Phase 5 Task List — Backtest / Empirical Data Analysis Foundation
 
-**Status:** Planning complete; do not implement until Theo separately approves.
+**Status:** 2026-08-30 architecture-breaker amendment awaiting Theo review;
+implementation is stopped before Task 8.
 Phase 4 passed and is recorded in [`docs/phase-4-acceptance.md`](../docs/phase-4-acceptance.md).
 
 ## dataset-foundation
@@ -168,11 +169,73 @@ MFE/MAE distribution analysis, and disciplined uncertainty information.
 `src/mentor/datasets.py`
 **Estimated scope:** Small
 
-### Checkpoint B: Deterministic evidence engine
+### Task 7A: Normalize authoritative group-evidence partition
 
-- [ ] Tasks 4–7 and full pytest are green.
-- [ ] Results preserve N, exclusions, reproducibility, and `USER_EMPIRICAL_EVIDENCE`.
-- [ ] Independent calculation review finds no arithmetic or type-boundary issue.
+**Description:** Replace the currently provisional grouped-evidence shape with
+one self-validating `GroupEvidencePartition`; preserve healthy Task 4–7
+calculation behavior without resetting or rewriting it unnecessarily.
+
+**Acceptance criteria:**
+- [ ] A filtered population partitions only into returned groups, one omitted
+  aggregate, and ungrouped rows; each returned group partitions into valid and
+  excluded analysis rows.
+- [ ] Zero-valid real groups remain visible; omitted and ungrouped populations
+  remain distinct; no duplicate writable totals can contradict the partition.
+- [ ] The partition rejects contradictions on production, persistence, replay,
+  and pre-tool validation.
+
+**Verification:**
+- [ ] Known-value fixtures prove all three reconciliation equalities; individual
+  omitted/ungrouped `filtered = valid + excluded`; exact-once production
+  source-row allocation; unique returned keys; no overlap/synthetic rows;
+  excluded-only groups; omission limits; and replay structural rejection for
+  each invalid partition field.
+- [ ] Existing Task 4–7 fixtures and full pytest remain green.
+
+**Dependencies:** Tasks 4–7
+**Files likely touched:** `src/mentor/analysis.py`, `src/mentor/storage.py`,
+`tests/test_analysis.py`, `tests/test_storage.py`
+**Estimated scope:** Medium
+
+### Task 7B: Add explicit qualitative-text evidence boundary
+
+**Description:** Extend immutable mapping snapshots with per-field Mentor access
+policy and add local-only bounded text-evidence retrieval semantics. This task
+introduces no Responses call or final mapping/compose UI; Task 9 exposes the
+approved controls.
+
+**Acceptance criteria:**
+- [ ] Text is denied by default; only a confirmed mapping version with an
+  explicitly approved field can expose bounded text or structured row context.
+- [ ] A server-validated, default-false per-turn consent signal is required in
+  addition to mapping permission; the model cannot set or reuse that signal.
+- [ ] The local text envelope applies canonical filters, deterministic order,
+  row/cell/character bounds, sanitization, and complete-or-explicitly-partial
+  metadata without raw header/path/file disclosure.
+- [ ] Raw text is absent from persisted evidence, diagnostics, and replay;
+  only safe disclosure metadata is retained.
+
+**Verification:**
+- [ ] Privacy-safe 50/100/200-note and long-journal fixtures prove default
+  denial, permission/revocation versioning, model-independent consent, bounds,
+  truncation, ordering, incomplete metadata, and context-field permission.
+- [ ] No OpenAI/network call is needed; full pytest remains green.
+
+**Dependencies:** Task 7A, Task 3
+**Files likely touched:** `src/mentor/datasets.py`, `src/mentor/analysis.py`,
+`src/mentor/storage.py`, `tests/test_datasets.py`, `tests/test_analysis.py`,
+`tests/test_storage.py`
+**Estimated scope:** Medium
+
+### Amended Checkpoint B: Deterministic and qualitative evidence boundary
+
+- [ ] Tasks 4–7B and full pytest are green.
+- [ ] Numeric evidence preserves N, exclusions, reproducibility, and
+  `USER_EMPIRICAL_EVIDENCE`; grouped evidence is one validated partition.
+- [ ] Text disclosure is explicit, local-default-denied, bounded, and
+  complete-or-explicitly-partial; raw text never enters replay/persistence.
+- [ ] Independent deterministic/privacy review finds no P0/P1 evidence-boundary
+  issue before Task 8 begins.
 
 ## empirical-mentor and data-workspace
 
@@ -180,26 +243,29 @@ MFE/MAE distribution analysis, and disciplined uncertainty information.
 
 **Description:** Replace the narrow profile-only dispatcher with a bounded
 generic local-function dispatcher, then add strict analysis functions,
-empirical provenance instructions, and replay-safe evidence storage.
+numeric/qualitative provenance instructions, and replay-safe evidence storage.
 
 **Acceptance criteria:**
 - [ ] Sol can request only approved inspect/summarize/group/compare/MFE-MAE/time
-  operations through an analysis batch capped at three calls and one terminal continuation.
+  operations plus `read_text_evidence` through an analysis batch capped at
+  three calls (at most two aggregate and one text call) and one terminal continuation.
 - [ ] Existing profile mutation idempotence remains one call/continuation;
   profile-plus-analysis mixed batches are safely rejected, while File Search and
   citation repair retain their existing behavior.
 - [ ] Arguments are locally validated against the active thread dataset.
-- [ ] Sol receives bounded results, not raw spreadsheets, and distinguishes local
-  evidence, Jacob teaching, hypotheses, and user decisions.
+- [ ] Sol receives bounded results, not raw spreadsheets, and distinguishes
+  deterministic user empirical evidence, disclosed user qualitative data, AI
+  qualitative interpretation, Jacob teaching, hypotheses, and user decisions.
 
 **Verification:**
 - [ ] Chat fixtures prove multi-call dispatch/continuation, invalid/mixed-call
-  rejections, replay evidence linkage, shared 8,000-character batch/replay
-  budget, no fabricated arithmetic, provenance separation, bounded sanitized
-  payloads, and existing citation behavior.
+  rejections, permission/scope failure for text requests, numeric/text budgets,
+  replay evidence linkage without raw text, partial-text wording, no fabricated
+  arithmetic, provenance separation, bounded sanitized payloads, and existing
+  citation behavior.
 - [ ] No paid call is needed for deterministic tests.
 
-**Dependencies:** Tasks 4–7
+**Dependencies:** Amended Checkpoint B
 **Files likely touched:** `src/mentor/chat_service.py`, `src/mentor/analysis.py`,
 `src/mentor/storage.py`, `tests/test_chat_service.py`, `tests/test_analysis.py`
 **Estimated scope:** Medium
@@ -207,16 +273,26 @@ empirical provenance instructions, and replay-safe evidence storage.
 ### Task 9: Build the minimal Data workspace and visible thread scope
 
 **Description:** Add static loopback UI/API paths for local upload, inspection,
-mapping confirmation, dataset list, and select/change/clear active dataset in chat.
+mapping confirmation including per-field Mentor access, dataset list, and
+select/change/clear active dataset in chat; add the one-turn **Include approved
+notes in this answer** compose control.
 
 **Acceptance criteria:**
 - [ ] Upload -> preview -> mapping -> select is usable without a spreadsheet editor.
 - [ ] Active dataset is visible, persists per conversation, is never silently
   inherited by a new thread, and historic evidence retains its original settings.
+- [ ] Text fields and optional structured context fields are visibly denied by
+  default; Theo can approve/revoke future row disclosure through a new mapping
+  version. The loopback mapping UI may show Theo raw headers to select a column,
+  but headers never reach Sol, replay/evidence payloads, logs, or non-loopback
+  surfaces; the rest of the workbook remains undisclosed.
+- [ ] The compose control is clear, defaults off for every message, and shows
+  that it only permits already approved fields for that one response.
 - [ ] Accessible controls, errors, and existing chat/profile UI remain intact.
 
 **Verification:**
-- [ ] Server/API and browser smoke cover import/mapping/scope/clear/reload.
+- [ ] Server/API and browser smoke cover import/mapping/access choice/one-turn
+  consent/scope/clear/reload and user-visible text-disclosure state.
 - [ ] Console is clean; upload bytes travel only in the loopback upload request,
   never to OpenAI, File Search/vector stores, logs, Git, or non-loopback endpoints.
 
@@ -228,21 +304,24 @@ mapping confirmation, dataset list, and select/change/clear active dataset in ch
 ### Checkpoint C: End-to-end local data flow
 
 - [ ] Tasks 8–9 focused suites and full pytest are green.
-- [ ] Browser flow shows visible thread-local scope and no raw-data network path.
+- [ ] Browser flow shows visible thread-local scope, explicit text-disclosure
+  state, and no unapproved raw-data network path.
 - [ ] Existing Phase 1–4 chat/profile/source behavior remains green.
 
 ## phase5-evaluation
 
 ### Task 10: Run Phase 5 acceptance evaluation and stop for Theo
 
-**Description:** Assemble privacy-safe fixtures for the approved examples, run
-deterministic/browser/full checks, obtain independent review, and present the
-human quality gate without beginning Phase 6.
+**Description:** Assemble privacy-safe numeric-and-notes fixtures for the
+approved examples, run deterministic/browser/full checks, obtain independent
+review, and present the human quality gate without beginning Phase 6.
 
 **Acceptance criteria:**
-- [ ] All design acceptance examples are covered by fixtures and the local UI.
+- [ ] All design acceptance examples, including a combined numeric-plus-approved
+  notes analysis, are covered by fixtures and the local UI.
 - [ ] Privacy, Git diff, bounded-context/sanitizer, source/provenance, deletion/
-  historic-evidence, and Phase 1–4 regression checks are recorded.
+  historic-evidence, text completeness/replay, and Phase 1–4 regression checks
+  are recorded.
 - [ ] Theo receives a clear pass/fail gate; no Projects, web research, or
   scientific supervisor begins.
 
