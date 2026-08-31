@@ -304,6 +304,162 @@ def test_qualitative_citation_repair_uses_safe_replay_without_redisclosing_notes
     assert all(tool.get("type") != "function" for tool in responses.calls[2]["tools"])
 
 
+def test_qualitative_exchange_reasoning_is_ephemeral_but_same_turn_citation_repair_succeeds(tmp_path):
+    storage, thread_id, _dataset, _mapping, fields = _scoped_analysis_dataset(tmp_path, allow_notes=True)
+    first = SimpleNamespace(
+        status="completed",
+        output=[
+            {"type": "reasoning", "encrypted_content": "SECRET_NOTE_REPLAY_STATE_8"},
+            analysis_tool_call(
+                "read_text_evidence",
+                {"text_field_ids": [fields["Journal"]], "context_field_ids": [], "filters": [], "order_by": "source"},
+                call_id="notes",
+            ),
+        ],
+    )
+    uncited = SimpleNamespace(
+        status="completed",
+        output=[
+            {"type": "reasoning", "encrypted_content": "SECRET_NOTE_REPLAY_STATE_8_AFTER_TOOL"},
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "Direct source teaching: Jacob teaches patience.", "annotations": []}],
+            },
+        ],
+    )
+    repaired = source_response(
+        "Direct source teaching: Jacob teaches patience.",
+        [{"type": "file_citation", "file_id": "file_jacob", "filename": "lesson.txt"}],
+    )
+    responses = SequenceResponses(first, uncited, repaired, terminal_response("A later turn is ordinary."))
+    service = ChatService(storage, SimpleNamespace(responses=responses))
+
+    answer = service.reply(thread_id, "Read my approved notes and relate them to Jacob.", include_approved_notes=True)
+
+    assert answer.citations[0].file_id == "file_jacob"
+    assert "waited for confirmation" in responses.calls[1]["input"][-1]["output"]
+    repair_input = responses.calls[2]["input"]
+    assert not any(item.get("type") in {"reasoning", "function_call", "function_call_output"} for item in repair_input)
+    persisted = json.dumps({
+        "thread": storage.thread_items(thread_id),
+        "replay": storage.replay_items(thread_id),
+        "metadata": storage.qualitative_metadata(thread_id),
+    })
+    assert "SECRET_NOTE_REPLAY_STATE_8" not in persisted
+    assert "waited for confirmation" not in persisted
+    assert all(item.get("type") not in {"reasoning", "function_call", "function_call_output"} for item in storage.replay_items(thread_id))
+
+    service.reply(thread_id, "What should I check next?")
+
+    future_input = responses.calls[3]["input"]
+    assert not any("SECRET_NOTE_REPLAY_STATE_8" in json.dumps(item) for item in future_input)
+    assert all(item.get("type") not in {"reasoning", "function_call", "function_call_output"} for item in future_input)
+    assert any(item.get("role") == "user" and item["content"][0]["text"] == "Read my approved notes and relate them to Jacob." for item in future_input)
+    assert any(item.get("type") == "message" and item.get("role") == "assistant" for item in future_input)
+
+
+def test_mixed_numeric_and_qualitative_turn_keeps_empirical_evidence_but_not_qualitative_replay_state(tmp_path):
+    storage, thread_id, _dataset, _mapping, fields = _scoped_analysis_dataset(tmp_path, allow_notes=True)
+    first = SimpleNamespace(
+        status="completed",
+        output=[
+            {"type": "reasoning", "encrypted_content": "SECRET_NOTE_REPLAY_STATE_8_MIXED"},
+            analysis_tool_call("summarize_results", {"filters": []}, call_id="summary"),
+            analysis_tool_call(
+                "read_text_evidence",
+                {"text_field_ids": [fields["Journal"]], "context_field_ids": [], "filters": [], "order_by": "source"},
+                call_id="notes",
+            ),
+        ],
+    )
+    continued = SimpleNamespace(
+        status="completed",
+        output=[
+            {"type": "reasoning", "encrypted_content": "SECRET_NOTE_REPLAY_STATE_8_MIXED_AFTER_TOOL"},
+            {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "The numeric result and notes both matter."}]},
+        ],
+    )
+    responses = SequenceResponses(first, continued, terminal_response("The next turn has no note access."))
+    service = ChatService(storage, SimpleNamespace(responses=responses))
+
+    service.reply(thread_id, "Use the numbers and my approved notes.", include_approved_notes=True)
+
+    assert len(storage.analysis_evidence(thread_id)) == 1
+    assert storage.qualitative_metadata(thread_id)[0]["returned_rows"] == 2
+    assert all(item.get("type") not in {"reasoning", "function_call", "function_call_output"} for item in storage.replay_items(thread_id))
+    assert "SECRET_NOTE_REPLAY_STATE_8_MIXED" not in json.dumps(storage.replay_items(thread_id))
+
+    service.reply(thread_id, "Continue without the notes.")
+
+    assert "waited for confirmation" not in json.dumps(responses.calls[2]["input"])
+    assert "SECRET_NOTE_REPLAY_STATE_8_MIXED" not in json.dumps(responses.calls[2]["input"])
+
+
+def test_qualitative_timestamp_repair_uses_only_visible_draft_state(tmp_path):
+    storage, thread_id, _dataset, _mapping, fields = _scoped_analysis_dataset(tmp_path, allow_notes=True)
+    citation = [{"type": "file_citation", "file_id": "file_jacob", "filename": "lesson.txt"}]
+    first = SimpleNamespace(
+        status="completed",
+        output=[
+            {"type": "reasoning", "encrypted_content": "SECRET_NOTE_REPLAY_TIMESTAMP_8"},
+            analysis_tool_call(
+                "read_text_evidence",
+                {"text_field_ids": [fields["Journal"]], "context_field_ids": [], "filters": [], "order_by": "source"},
+                call_id="notes",
+            ),
+        ],
+    )
+    draft = source_response("Direct source teaching: Jacob says this at 12:10–12:36.", citation)
+    draft.output.insert(0, {"type": "reasoning", "encrypted_content": "SECRET_NOTE_REPLAY_TIMESTAMP_8_AFTER_TOOL"})
+    draft.output[1]["results"][0]["text"] = "[609.0 --> 616.0] An unrelated passage."
+    repaired = source_response("Direct source teaching: Jacob says this at 12:10–12:36.", citation)
+    responses = SequenceResponses(first, draft, repaired)
+
+    answer = ChatService(storage, SimpleNamespace(responses=responses)).reply(
+        thread_id,
+        "Read my approved notes. Where exactly does Jacob say this? Give me the timestamp.",
+        include_approved_notes=True,
+    )
+
+    assert answer.text == "Direct source teaching: Jacob says this at 12:10–12:36."
+    repair = responses.calls[2]
+    assert repair["tool_choice"] == {"type": "file_search"}
+    assert not any(item.get("type") in {"reasoning", "function_call", "function_call_output"} for item in repair["input"])
+    assert "SECRET_NOTE_REPLAY_TIMESTAMP_8" not in json.dumps(repair)
+
+
+def test_later_qualitative_turn_requires_fresh_consent_and_never_resurrects_prior_exchange(tmp_path):
+    storage, thread_id, _dataset, _mapping, fields = _scoped_analysis_dataset(tmp_path, allow_notes=True)
+    call = lambda call_id: analysis_tool_call(
+        "read_text_evidence",
+        {"text_field_ids": [fields["Journal"]], "context_field_ids": [], "filters": [], "order_by": "source"},
+        call_id=call_id,
+    )
+    responses = SequenceResponses(
+        SimpleNamespace(status="completed", output=[{"type": "reasoning", "encrypted_content": "SECRET_NOTE_CONSENT_A"}, call("notes_a")]),
+        terminal_response("Turn A visible answer."),
+        SimpleNamespace(status="completed", output=[call("notes_b")]),
+        terminal_response("Turn B needs consent."),
+        SimpleNamespace(status="completed", output=[call("notes_c")]),
+        terminal_response("Turn C visible answer."),
+    )
+    service = ChatService(storage, SimpleNamespace(responses=responses))
+
+    service.reply(thread_id, "Read approved notes for turn A.", include_approved_notes=True)
+    service.reply(thread_id, "Read notes again for turn B.", include_approved_notes=False)
+    service.reply(thread_id, "Read newly approved notes for turn C.", include_approved_notes=True)
+
+    assert "waited for confirmation" in responses.calls[1]["input"][-1]["output"]
+    assert "waited for confirmation" not in json.dumps(responses.calls[2]["input"])
+    rejection = next(item for item in responses.calls[3]["input"] if item.get("type") == "function_call_output")
+    assert json.loads(rejection["output"])["reason"] == "qualitative_consent_required"
+    assert "waited for confirmation" in responses.calls[5]["input"][-1]["output"]
+    historic = json.dumps(storage.replay_items(thread_id))
+    assert "SECRET_NOTE_CONSENT_A" not in historic
+    assert "waited for confirmation" not in historic
+
+
 def test_selected_profile_context_is_marked_on_only_the_new_request(tmp_path):
     storage = Storage(tmp_path / "mentor.sqlite3")
     storage.initialize()

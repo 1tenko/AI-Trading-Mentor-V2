@@ -280,11 +280,11 @@ class ChatService:
         user_item, request, effective_depth = self._request(thread_id, question, evaluation)
         started_at = perf_counter()
         response = self.client.responses.create(**request)
-        response, leading_output, replay_leading_output, response_request, profile_update = self._local_tools_continued_response(
+        response, leading_output, replay_leading_output, response_request, profile_update, qualitative_exchange = self._local_tools_continued_response(
             thread_id, request, response, user_item["content"][0]["text"], include_approved_notes=include_approved_notes
         )
         response, evidence_output, draft_response = self._citation_repaired_response(
-            response_request, response, user_item["content"][0]["text"]
+            response_request, response, user_item["content"][0]["text"], qualitative_exchange=qualitative_exchange
         )
         return self._finalize(
             thread_id,
@@ -298,6 +298,7 @@ class ChatService:
             leading_output=leading_output,
             replay_leading_output=replay_leading_output,
             profile_update=profile_update,
+            qualitative_exchange=qualitative_exchange,
         )
 
     def stream_reply(
@@ -316,11 +317,11 @@ class ChatService:
                 if event.type == "response.output_text.delta":
                     yield StreamEvent("delta", event.delta)
                 elif event.type in {"response.completed", "response.incomplete"}:
-                    response, leading_output, replay_leading_output, response_request, profile_update = self._local_tools_continued_response(
+                    response, leading_output, replay_leading_output, response_request, profile_update, qualitative_exchange = self._local_tools_continued_response(
                         thread_id, request, event.response, user_item["content"][0]["text"], include_approved_notes=include_approved_notes
                     )
                     response, evidence_output, draft_response = self._citation_repaired_response(
-                        response_request, response, user_item["content"][0]["text"]
+                        response_request, response, user_item["content"][0]["text"], qualitative_exchange=qualitative_exchange
                     )
                     answer = self._finalize(
                         thread_id,
@@ -334,6 +335,7 @@ class ChatService:
                         leading_output=leading_output,
                         replay_leading_output=replay_leading_output,
                         profile_update=profile_update,
+                        qualitative_exchange=qualitative_exchange,
                     )
                     if answer.incomplete_reason:
                         yield StreamEvent(
@@ -356,7 +358,7 @@ class ChatService:
         yield StreamEvent("error", error="The mentor stream ended before returning a usable response. Try again.")
 
     def _citation_repaired_response(
-        self, request: dict, response: Any, question: str
+        self, request: dict, response: Any, question: str, *, qualitative_exchange: bool = False
     ) -> tuple[Any, list[dict], Any | None]:
         draft_output = [_as_dict(item) for item in response.output]
         draft = _answer(draft_output)
@@ -367,12 +369,13 @@ class ChatService:
         repair_instructions = f"{request['instructions']}\n\n{CITATION_REPAIR_INSTRUCTION}"
         if needs_timestamp_repair:
             repair_instructions = f"{repair_instructions}\n\n{EXACT_TIMESTAMP_REPAIR_INSTRUCTION}"
+        repair_history = _qualitative_historic_items(draft_output) if qualitative_exchange else draft_output
         repair_request = {
             **request,
             "instructions": repair_instructions,
             "input": [
                 *request["input"],
-                *(_input_item(item) for item in draft_output),
+                *(_input_item(item) for item in repair_history),
                 {
                     "role": "user",
                     "content": [{"type": "input_text", "text": "Please repair the citations now."}],
@@ -393,11 +396,11 @@ class ChatService:
         question: str,
         *,
         include_approved_notes: bool,
-    ) -> tuple[Any, list[dict], list[dict], dict, dict[str, str] | None]:
+    ) -> tuple[Any, list[dict], list[dict], dict, dict[str, str] | None, bool]:
         output = [_as_dict(item) for item in response.output]
         calls = [item for item in output if item.get("type") == "function_call"]
         if not calls:
-            return response, [], [], request, None
+            return response, [], [], request, None, False
         if any(not isinstance(call.get("call_id"), str) or not call["call_id"] for call in calls):
             LOGGER.warning("Local function call missing a usable call id")
             safe_output = [item for item in output if item.get("type") != "function_call"]
@@ -419,17 +422,17 @@ class ChatService:
                         ],
                     }
                 )
-            return _response_with_output(response, safe_output), [], [], request, None
+            return _response_with_output(response, safe_output), [], [], request, None, False
 
         names = {call.get("name") for call in calls}
         profile_calls = [call for call in calls if call.get("name") == PROFILE_TOOL_NAME]
         analysis_calls = [call for call in calls if call.get("name") in ANALYSIS_TOOL_NAMES]
         if len({call["call_id"] for call in calls}) != len(calls):
             results = [_profile_tool_rejection("duplicate_call_id") for _ in calls]
-            return (*self._standard_local_continuation(request, output, calls, results), None)
+            return (*self._standard_local_continuation(request, output, calls, results), None, False)
         if profile_calls and analysis_calls:
             results = [_profile_tool_rejection("mixed_local_tool_batch_not_supported") for _ in calls]
-            return (*self._standard_local_continuation(request, output, calls, results), None)
+            return (*self._standard_local_continuation(request, output, calls, results), None, False)
         if profile_calls:
             results = (
                 [self._execute_profile_tool(thread_id, question, profile_calls[0])]
@@ -439,11 +442,11 @@ class ChatService:
             if len(calls) == 1 and names != {PROFILE_TOOL_NAME}:
                 results = [_profile_tool_rejection("unsupported_tool")]
             continued = self._standard_local_continuation(request, output, calls, results)
-            return (*continued, _profile_update(results[0]) if len(results) == 1 else None)
+            return (*continued, _profile_update(results[0]) if len(results) == 1 else None, False)
         if len(analysis_calls) != len(calls):
             return (*self._standard_local_continuation(
                 request, output, calls, [_profile_tool_rejection("unsupported_tool") for _ in calls]
-            ), None)
+            ), None, False)
         if (
             len(calls) > MAX_ANALYSIS_CALLS
             or sum(call.get("name") == QUALITATIVE_TOOL_NAME for call in calls) > 1
@@ -451,13 +454,13 @@ class ChatService:
         ):
             return (*self._standard_local_continuation(
                 request, output, calls, [_profile_tool_rejection("analysis_batch_limit_exceeded") for _ in calls]
-            ), None)
+            ), None, False)
 
         scope = self._active_analysis_scope(thread_id)
         if scope is None:
             return (*self._standard_local_continuation(
                 request, output, calls, [_profile_tool_rejection("no_active_dataset") for _ in calls]
-            ), None)
+            ), None, False)
         dataset_id, mapping_version_id = scope
         deterministic: list[tuple[dict, dict]] = []
         qualitative: tuple[dict, Any] | None = None
@@ -534,16 +537,15 @@ class ChatService:
             )
         if qualitative is None:
             response = self.client.responses.create(**raw_continuation_request)
-            return response, leading_output, replay_leading_output, raw_continuation_request, None
+            return response, leading_output, replay_leading_output, raw_continuation_request, None, False
 
         qualitative_call, qualitative_evidence = qualitative
         safe_request = {
             **request,
-            "input": [
-                *request["input"],
-                *(_input_item(item) for item in output if item is not qualitative_call),
-                *tool_outputs,
-            ],
+            # The qualitative exchange has no valid replayable tool protocol once
+            # its ephemeral output is gone. Citation/timestamp repair therefore
+            # starts from durable history plus the visible draft answer only.
+            "input": [*request["input"]],
             "tools": _raw_file_search_tools(request["tools"]),
         }
         try:
@@ -556,7 +558,14 @@ class ChatService:
         except QualitativeTransportError:
             raise RuntimeError("The approved notes could not be disclosed safely. Try again.") from None
         self.storage.record_qualitative_metadata(thread_id, origin_turn_number, continuation.metadata)
-        return _response_with_output(continuation, list(continuation.output)), leading_output, replay_leading_output, safe_request, None
+        return (
+            _response_with_output(continuation, list(continuation.output)),
+            [item for item in output if item.get("type") == "file_search_call"],
+            [],
+            safe_request,
+            None,
+            True,
+        )
 
     def _standard_local_continuation(
         self, request: dict, output: list[dict], calls: list[dict], results: list[dict]
@@ -803,9 +812,12 @@ class ChatService:
         leading_output: list[dict] | None = None,
         replay_leading_output: list[dict] | None = None,
         profile_update: dict[str, str] | None = None,
+        qualitative_exchange: bool = False,
     ) -> Answer:
-        output = [*(leading_output or []), *(_as_dict(item) for item in response.output)]
-        replay_output = [*(replay_leading_output if replay_leading_output is not None else (leading_output or [])), *(_as_dict(item) for item in response.output)]
+        response_output = [_as_dict(item) for item in response.output]
+        historic_response_output = _qualitative_historic_items(response_output) if qualitative_exchange else response_output
+        output = [*(leading_output or []), *historic_response_output]
+        replay_output = [*(replay_leading_output if replay_leading_output is not None else (leading_output or [])), *historic_response_output]
         raw_positions = self.storage.append_thread_items(thread_id, [user_item, *output])
         compaction_index = next((index for index, item in enumerate(replay_output) if item.get("type") == "compaction"), None)
         if compaction_index is None:
@@ -1026,6 +1038,20 @@ def _response_with_output(response: Any, output: list[dict]) -> Any:
 def _input_item(item: dict) -> dict:
     """Keep full API output locally but omit fields the input endpoint rejects."""
     return {key: value for key, value in item.items() if key not in {"status", "created_by"}}
+
+
+def _qualitative_historic_items(items: list[dict]) -> list[dict]:
+    """Return the only response item eligible after a qualitative exchange.
+
+    This is origin-based: callers use it only for a turn known to have disclosed
+    qualitative evidence.  The visible terminal assistant message survives, but
+    every hidden item from that exchange (reasoning and local tool protocol) is
+    ephemeral and never enters a later Responses replay.
+    """
+    return [
+        item for item in items
+        if item.get("type") == "message" and item.get("role") == "assistant"
+    ]
 
 
 def _raw_file_search_tools(tools: list[dict]) -> list[dict]:

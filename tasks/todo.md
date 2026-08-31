@@ -1,6 +1,7 @@
 # Phase 5 Task List — Backtest / Empirical Data Analysis Foundation
 
-**Status:** 2026-08-31 amended Checkpoint B passed; Task 8 is next.
+**Status:** 2026-08-31 Task 8 passed deterministic verification and independent
+privacy/protocol review; Task 9 is next.
 Phase 4 passed and is recorded in [`docs/phase-4-acceptance.md`](../docs/phase-4-acceptance.md).
 
 ## dataset-foundation
@@ -245,24 +246,24 @@ generic local-function dispatcher, then add strict analysis functions,
 numeric/qualitative provenance instructions, and replay-safe evidence storage.
 
 **Acceptance criteria:**
-- [ ] Sol can request only approved inspect/summarize/group/compare/MFE-MAE/time
+- [x] Sol can request only approved inspect/summarize/group/compare/MFE-MAE/time
   operations plus `read_text_evidence` through an analysis batch capped at
   three calls (at most two aggregate and one text call) and one terminal continuation.
-- [ ] Existing profile mutation idempotence remains one call/continuation;
+- [x] Existing profile mutation idempotence remains one call/continuation;
   profile-plus-analysis mixed batches are safely rejected, while File Search and
   citation repair retain their existing behavior.
-- [ ] Arguments are locally validated against the active thread dataset.
-- [ ] Sol receives bounded results, not raw spreadsheets, and distinguishes
+- [x] Arguments are locally validated against the active thread dataset.
+- [x] Sol receives bounded results, not raw spreadsheets, and distinguishes
   deterministic user empirical evidence, disclosed user qualitative data, AI
   qualitative interpretation, Jacob teaching, hypotheses, and user decisions.
 
 **Verification:**
-- [ ] Chat fixtures prove multi-call dispatch/continuation, invalid/mixed-call
+- [x] Chat fixtures prove multi-call dispatch/continuation, invalid/mixed-call
   rejections, permission/scope failure for text requests, numeric/text budgets,
   replay evidence linkage without raw text, partial-text wording, no fabricated
   arithmetic, provenance separation, bounded sanitized payloads, and existing
   citation behavior.
-- [ ] No paid call is needed for deterministic tests.
+- [x] No paid call is needed for deterministic tests.
 
 **Dependencies:** Amended Checkpoint B
 **Files likely touched:** `src/mentor/chat_service.py`, `src/mentor/analysis.py`,
