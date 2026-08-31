@@ -3,6 +3,7 @@ import math
 from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -21,6 +22,7 @@ from mentor.analysis import (
     TextEvidenceUseGuard,
 )
 from mentor.datasets import MappingEntry, create_inspected_mapping_draft, import_local_dataset, inspect_local_dataset
+from mentor.datasets import continue_qualitative_model_transport
 from mentor.storage import ANALYSIS_EXCLUSION_LIMIT, Storage, validate_completed_evidence_envelope
 
 
@@ -33,6 +35,21 @@ def _confirmed_dataset(tmp_path: Path, contents: str, entries: list[MappingEntry
     draft = create_inspected_mapping_draft(storage, inspect_local_dataset(storage, dataset.id), entries)
     confirmed = storage.confirm_mapping_version(draft.id)
     return storage, dataset, confirmed
+
+
+def _qualitative_payload(evidence):
+    calls = []
+
+    class Responses:
+        def create(self, **request):
+            calls.append(request)
+            return SimpleNamespace(status="completed")
+
+    continue_qualitative_model_transport(
+        client=SimpleNamespace(responses=Responses()), request={"model": "fake", "input": []},
+        call_id="call_qualitative", evidence=evidence,
+    )
+    return json.loads(calls[0]["input"][-1]["output"])
 
 
 def test_text_evidence_requires_explicit_mapping_permission_and_consent(tmp_path):
@@ -76,7 +93,7 @@ def test_text_evidence_requires_explicit_mapping_permission_and_consent(tmp_path
         include_approved_notes=True,
         use_guard=TextEvidenceUseGuard(),
     )
-    payload = evidence.to_model_transport().function_output()
+    payload = _qualitative_payload(evidence)
 
     assert payload["provenance"] == "USER_SUPPLIED_QUALITATIVE_DATA"
     assert payload["matching_rows"] == 2
@@ -139,7 +156,7 @@ def test_text_evidence_short_note_row_bound_and_deterministic_completeness(tmp_p
         storage, dataset.id, mapping.id, text_field_ids=(journal_id,), order_by="timestamp",
         include_approved_notes=True, use_guard=TextEvidenceUseGuard(),
     )
-    payload = evidence.to_model_transport().function_output()
+    payload = _qualitative_payload(evidence)
 
     assert payload["matching_rows"] == count
     assert payload["usable_text_rows"] == count
@@ -167,7 +184,7 @@ def test_text_evidence_bounds_cells_total_characters_and_unavailable_context_wit
         storage, dataset.id, mapping.id, text_field_ids=(journal_id,), context_field_ids=(session_id,),
         include_approved_notes=True, use_guard=TextEvidenceUseGuard(),
     )
-    payload = evidence.to_model_transport().function_output()
+    payload = _qualitative_payload(evidence)
 
     assert payload["usable_text_rows"] == 21
     assert payload["returned_rows"] < 21
@@ -200,8 +217,8 @@ def test_text_evidence_revocation_requires_a_new_confirmed_mapping_and_consumes_
     evidence = read_text_evidence(
         storage, dataset.id, allowed.id, text_field_ids=(journal_id,), include_approved_notes=True, use_guard=guard
     )
-    assert evidence.to_model_transport().function_output()["returned_rows"] == 1
-    with pytest.raises(ValueError, match="one call per turn"):
+    assert _qualitative_payload(evidence)["returned_rows"] == 1
+    with pytest.raises(ValueError, match="expired"):
         read_text_evidence(
             storage, dataset.id, allowed.id, text_field_ids=(journal_id,), include_approved_notes=True, use_guard=guard
         )
@@ -246,7 +263,7 @@ def test_text_evidence_caps_the_entire_envelope_when_a_canonical_filter_value_is
         filters=(AnalysisFilter(session_id, "eq", long_value),),
         include_approved_notes=True, use_guard=TextEvidenceUseGuard(),
     )
-    payload = evidence.to_model_transport().function_output()
+    payload = _qualitative_payload(evidence)
 
     encoded = json.dumps(payload, separators=(",", ":"))
     assert payload["matching_rows"] == 0

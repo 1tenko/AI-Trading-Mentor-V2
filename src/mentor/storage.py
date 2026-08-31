@@ -19,7 +19,6 @@ from mentor.datasets import (
     EphemeralQualitativeEvidence,
     MappingEntry,
     QualitativeEvidenceMetadata,
-    QualitativeModelTransport,
     ThreadDatasetScope,
 )
 
@@ -2692,7 +2691,7 @@ def _persistent_json(value: object) -> str:
 
 def _contains_ephemeral_qualitative_evidence(value: object) -> bool:
     """Reject the typed capability, not text that happens to resemble it."""
-    if isinstance(value, (EphemeralQualitativeEvidence, QualitativeModelTransport)):
+    if isinstance(value, EphemeralQualitativeEvidence):
         return True
     if isinstance(value, Mapping):
         return any(_contains_ephemeral_qualitative_evidence(item) for item in value.values())

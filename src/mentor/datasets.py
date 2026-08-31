@@ -3,6 +3,7 @@
 import csv
 import hashlib
 import io
+import json
 import math
 import os
 import re
@@ -111,31 +112,69 @@ class EphemeralQualitativeEvidence:
     def to_persistable_metadata(self) -> QualitativeEvidenceMetadata:
         return self._metadata
 
-    def to_model_transport(self) -> "QualitativeModelTransport":
-        self._capability.consume_transport()
-        return QualitativeModelTransport(self)
-
-    def _function_output(self) -> dict[str, object]:
-        if not self._capability.active:
-            raise ValueError("qualitative disclosure capability is expired")
-        return self._metadata.to_dict() | {"items": self._items}
+    def _release(self) -> None:
+        self._items.clear()
+        self._capability.release()
 
 
-class QualitativeModelTransport:
-    """Immediate-only model transport for one ephemeral evidence object."""
+@dataclass(frozen=True, slots=True)
+class QualitativeTransportResult:
+    """Safe result of one qualitative disclosure; raw text never leaves transport."""
 
-    __slots__ = ("_evidence",)
+    status: str
+    metadata: QualitativeEvidenceMetadata
 
-    def __init__(self, evidence: EphemeralQualitativeEvidence) -> None:
-        self._evidence = evidence
+    def to_persistable_dict(self) -> dict[str, object]:
+        return {"status": self.status, "qualitative_metadata": self.metadata.to_dict()}
 
-    def __repr__(self) -> str:
-        return "<QualitativeModelTransport>"
 
-    __str__ = __repr__
+class QualitativeTransportError(RuntimeError):
+    """Safe terminal failure for the raw qualitative model-disclosure boundary."""
 
-    def function_output(self) -> dict[str, object]:
-        return self._evidence._function_output()
+
+def continue_qualitative_model_transport(
+    *,
+    client: Any,
+    request: Mapping[str, object],
+    call_id: str,
+    evidence: EphemeralQualitativeEvidence,
+    max_attempts: int = 1,
+) -> QualitativeTransportResult:
+    """Send one ephemeral qualitative tool output directly to a Responses continuation.
+
+    The raw payload is built and consumed only in this lexical scope.  No raw
+    function output is returned to normal application code.
+    """
+    if not isinstance(evidence, EphemeralQualitativeEvidence):
+        raise ValueError("qualitative transport requires ephemeral evidence")
+    if not isinstance(call_id, str) or not call_id:
+        raise ValueError("qualitative transport call id is required")
+    if not isinstance(request, Mapping) or not isinstance(request.get("input"), list):
+        raise ValueError("qualitative transport requires a Responses input list")
+    if type(max_attempts) is not int or not 1 <= max_attempts <= 2:
+        raise ValueError("qualitative transport attempts must be one or two")
+
+    evidence._capability.consume_transport()
+    try:
+        raw_output = json.dumps(evidence._metadata.to_dict() | {"items": evidence._items}, separators=(",", ":"))
+        continuation_request = dict(request)
+        continuation_request["input"] = [
+            *request["input"],
+            {"type": "function_call_output", "call_id": call_id, "output": raw_output},
+        ]
+        for attempt in range(max_attempts):
+            try:
+                response = client.responses.create(**continuation_request)
+                status = str(getattr(response, "status", "completed"))
+                return QualitativeTransportResult(status=status, metadata=evidence.to_persistable_metadata())
+            except TimeoutError:
+                if attempt + 1 == max_attempts:
+                    raise QualitativeTransportError("qualitative model transport timed out") from None
+            except Exception:
+                raise QualitativeTransportError("qualitative model transport failed") from None
+        raise AssertionError("unreachable")
+    finally:
+        evidence._release()
 _DATASET_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,79}")
 _CELL_REFERENCE_PATTERN = re.compile(r"([A-Z]+)([1-9][0-9]*)$")
 _IMPORT_LEASE_LOCK = threading.RLock()

@@ -20,6 +20,7 @@ from mentor.analysis import (
     read_text_evidence,
 )
 from mentor.datasets import (
+    continue_qualitative_model_transport,
     DatasetImportError,
     MappingEntry,
     MappingSuggestion,
@@ -29,7 +30,147 @@ from mentor.datasets import (
     mapping_suggestions,
     model_mapping_context,
 )
+from mentor.datasets import QualitativeTransportError
 from mentor.storage import Storage
+
+
+class _SentinelResponses:
+    """In-memory provider boundary used only to inspect immediate transport input."""
+
+    def __init__(self, *, failures: int = 0):
+        self.calls: list[dict[str, object]] = []
+        self.failures = failures
+
+    def create(self, **request):
+        self.calls.append(request)
+        if self.failures:
+            self.failures -= 1
+            raise TimeoutError("temporary provider failure")
+        return type("Response", (), {"status": "completed"})()
+
+
+def _qualitative_payload(evidence):
+    responses = _SentinelResponses()
+    continue_qualitative_model_transport(
+        client=type("Client", (), {"responses": responses})(),
+        request={"model": "fake", "input": []}, call_id="call_qualitative", evidence=evidence,
+    )
+    return json.loads(responses.calls[0]["input"][-1]["output"])
+
+
+def test_qualitative_model_transport_keeps_raw_payload_inside_immediate_client_call(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    source = tmp_path / "trades.csv"
+    note = "TRANSPORT-SENTINEL: market looked weak so I entered short."
+    source.write_text(f"Journal\n{note}\n", encoding="utf-8")
+    dataset = _importer(storage, tmp_path)(source).dataset
+    mapping = storage.confirm_mapping_version(create_inspected_mapping_draft(
+        storage,
+        inspect_local_dataset(storage, dataset.id),
+        [MappingEntry(0, analysis_label="Journal", mentor_access="allow_row_values_when_analysing_notes")],
+    ).id)
+    field_id = storage.mapping_entries(mapping.id)[0].field_id or ""
+    capability = QualitativeDisclosureCapability()
+    evidence = read_text_evidence(
+        storage, dataset.id, mapping.id, text_field_ids=(field_id,),
+        include_approved_notes=True, use_guard=capability,
+    )
+    responses = _SentinelResponses()
+
+    result = continue_qualitative_model_transport(
+        client=type("Client", (), {"responses": responses})(),
+        request={"model": "fake", "input": [{"role": "user", "content": "analyse notes"}]},
+        call_id="call_notes",
+        evidence=evidence,
+    )
+
+    assert result.status == "completed"
+    assert note not in repr(result)
+    assert note not in json.dumps(result.to_persistable_dict())
+    sent = json.loads(responses.calls[0]["input"][-1]["output"])
+    assert sent["items"][0]["text"][0]["value"] == note
+    assert capability.active is False
+    assert note not in json.dumps(evidence.to_persistable_metadata().to_dict())
+
+
+def test_qualitative_transport_retries_only_in_memory_and_releases_on_terminal_failure(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    source = tmp_path / "trades.csv"
+    note = "TRANSPORT-RETRY-SENTINEL"
+    source.write_text(f"Journal\n{note}\n", encoding="utf-8")
+    dataset = _importer(storage, tmp_path)(source).dataset
+    mapping = storage.confirm_mapping_version(create_inspected_mapping_draft(
+        storage,
+        inspect_local_dataset(storage, dataset.id),
+        [MappingEntry(0, analysis_label="Journal", mentor_access="allow_row_values_when_analysing_notes")],
+    ).id)
+    field_id = storage.mapping_entries(mapping.id)[0].field_id or ""
+    capability = QualitativeDisclosureCapability()
+    evidence = read_text_evidence(
+        storage, dataset.id, mapping.id, text_field_ids=(field_id,),
+        include_approved_notes=True, use_guard=capability,
+    )
+    responses = _SentinelResponses(failures=1)
+
+    result = continue_qualitative_model_transport(
+        client=type("Client", (), {"responses": responses})(),
+        request={"model": "fake", "input": []}, call_id="call_notes", evidence=evidence, max_attempts=2,
+    )
+
+    assert result.status == "completed"
+    assert len(responses.calls) == 2
+    assert all(note in call["input"][-1]["output"] for call in responses.calls)
+    assert note not in json.dumps(result.to_persistable_dict())
+    assert capability.active is False
+    with pytest.raises(ValueError, match="expired"):
+        continue_qualitative_model_transport(
+            client=type("Client", (), {"responses": responses})(), request={"model": "fake", "input": []},
+            call_id="call_notes", evidence=evidence,
+        )
+
+    fresh_capability = QualitativeDisclosureCapability()
+    fresh_evidence = read_text_evidence(
+        storage, dataset.id, mapping.id, text_field_ids=(field_id,),
+        include_approved_notes=True, use_guard=fresh_capability,
+    )
+    failing = _SentinelResponses(failures=1)
+    with pytest.raises(QualitativeTransportError) as error:
+        continue_qualitative_model_transport(
+            client=type("Client", (), {"responses": failing})(), request={"model": "fake", "input": []},
+            call_id="call_notes", evidence=fresh_evidence,
+        )
+    assert fresh_capability.active is False
+    assert note not in repr(fresh_evidence)
+    assert note not in str(error.value)
+
+
+def test_qualitative_transport_result_has_no_generic_raw_serialization_route(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    source = tmp_path / "trades.csv"
+    note = "TRANSPORT-SERIALIZATION-SENTINEL"
+    source.write_text(f"Journal\n{note}\n", encoding="utf-8")
+    dataset = _importer(storage, tmp_path)(source).dataset
+    mapping = storage.confirm_mapping_version(create_inspected_mapping_draft(
+        storage,
+        inspect_local_dataset(storage, dataset.id),
+        [MappingEntry(0, analysis_label="Journal", mentor_access="allow_row_values_when_analysing_notes")],
+    ).id)
+    field_id = storage.mapping_entries(mapping.id)[0].field_id or ""
+    evidence = read_text_evidence(
+        storage, dataset.id, mapping.id, text_field_ids=(field_id,), include_approved_notes=True,
+        use_guard=QualitativeDisclosureCapability(),
+    )
+    result = continue_qualitative_model_transport(
+        client=type("Client", (), {"responses": _SentinelResponses()})(),
+        request={"model": "fake", "input": []}, call_id="call_notes", evidence=evidence,
+    )
+
+    with pytest.raises(TypeError):
+        json.dumps(result)
+    assert note not in json.dumps(result.to_persistable_dict())
 
 
 def _dataset(storage: Storage):
@@ -278,7 +419,7 @@ def test_text_evidence_is_ephemeral_and_cannot_enter_analysis_persistence(tmp_pa
     )
     thread_id = storage.create_thread("Qualitative evidence")
 
-    assert evidence.to_model_transport().function_output()["items"][0]["text"][0]["value"] == note
+    assert _qualitative_payload(evidence)["items"][0]["text"][0]["value"] == note
     with pytest.raises(ValueError, match="ephemeral qualitative"):
         storage.record_analysis_evidence(
             thread_id=thread_id,
@@ -396,23 +537,22 @@ def test_qualitative_evidence_is_typed_ephemeral_and_only_metadata_persists(tmp_
     metadata = evidence.to_persistable_metadata()
     assert isinstance(metadata, QualitativeEvidenceMetadata)
     assert note not in json.dumps(metadata.to_dict())
-    transport = evidence.to_model_transport()
-    assert note not in repr(transport)
-    assert transport.function_output()["items"][0]["text"][0]["value"] == note
+    assert _qualitative_payload(evidence)["items"][0]["text"][0]["value"] == note
 
     for wrapped in (evidence, {"result": evidence}, [evidence], {"diagnostic": evidence}):
         with pytest.raises(ValueError, match="ephemeral qualitative"):
             storage.record_response_diagnostics(thread_id, "response-rejected", {"value": wrapped})
     with pytest.raises(ValueError, match="ephemeral qualitative"):
-        storage.append_replay_items(thread_id, [{"type": "function_call_output", "output": transport}])
+        storage.append_replay_items(thread_id, [{"type": "function_call_output", "output": evidence}])
 
     storage.record_response_diagnostics(thread_id, "response-safe", {"qualitative_metadata": metadata.to_dict()})
     storage.append_thread_items(thread_id, [{"role": "user", "content": [{"type": "input_text", "text": note}]}])
     capability.release()
     with pytest.raises(ValueError, match="expired"):
-        transport.function_output()
-    with pytest.raises(ValueError, match="expired"):
-        evidence.to_model_transport()
+        continue_qualitative_model_transport(
+            client=type("Client", (), {"responses": _SentinelResponses()})(),
+            request={"model": "fake", "input": []}, call_id="call_qualitative", evidence=evidence,
+        )
     with pytest.raises(ValueError, match="expired"):
         read_text_evidence(
             storage, dataset.id, mapping.id, text_field_ids=(field_id,),
