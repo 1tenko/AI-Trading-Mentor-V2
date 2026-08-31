@@ -9,10 +9,17 @@ const send = form.querySelector("button[type=submit]");
 const effort = document.querySelector("#reasoning-effort");
 const mode = document.querySelector("#reasoning-mode");
 const researchDepth = document.querySelector("#research-depth");
+const dataWorkspace = document.querySelector("#data-workspace");
+const dataStatus = document.querySelector("#data-status");
+const datasetSelect = document.querySelector("#dataset-select");
+const datasetInspection = document.querySelector("#dataset-inspection");
+const includeApprovedNotes = document.querySelector("#include-approved-notes");
+const dataScope = document.querySelector("#data-scope");
 const SETTINGS_KEY = "trading-mentor-evaluation-settings";
 const ACTIVE_THREAD_KEY = "trading-mentor-active-thread";
 const CONTINUE_PROMPT = "Continue the previous response from where it stopped. Do not repeat completed material.";
 let activeThreadId;
+let activeDatasetScope;
 
 function showEmpty() {
   messages.replaceChildren();
@@ -336,6 +343,8 @@ async function loadThread(threadId) {
   activeThreadId = thread.id;
   localStorage.setItem(ACTIVE_THREAD_KEY, String(thread.id));
   renderTimeline(thread.turns);
+  activeDatasetScope = thread.dataset_scope;
+  updateDatasetScope();
   status.textContent = `Conversation: ${thread.title}`;
 }
 
@@ -374,9 +383,183 @@ async function createThread(title = "New conversation") {
   if (!response.ok) throw new Error("Could not create a conversation.");
   const thread = await response.json();
   activeThreadId = thread.id;
+  activeDatasetScope = undefined;
+  updateDatasetScope();
   localStorage.setItem(ACTIVE_THREAD_KEY, String(thread.id));
   showEmpty();
   await loadThreads();
+}
+
+async function loadDatasets() {
+  const response = await fetch("/api/datasets");
+  if (!response.ok) throw new Error("Could not load local datasets.");
+  const data = await response.json();
+  const selected = datasetSelect.value;
+  datasetSelect.replaceChildren(new Option("Choose imported data", ""));
+  data.datasets.forEach((dataset) => datasetSelect.add(new Option(`${dataset.original_name} · ${dataset.source_row_count} rows`, dataset.id)));
+  if ([...datasetSelect.options].some((option) => option.value === selected)) datasetSelect.value = selected;
+}
+
+function updateDatasetScope() {
+  const scope = activeDatasetScope;
+  if (scope && [...datasetSelect.options].some((option) => option.value === scope.dataset_id)) {
+    datasetSelect.value = scope.dataset_id;
+  }
+  document.querySelector("#dataset-use").disabled = !activeThreadId || !datasetSelect.value;
+  document.querySelector("#dataset-clear").disabled = !activeThreadId || !scope;
+  includeApprovedNotes.disabled = !scope;
+  if (!scope) includeApprovedNotes.checked = false;
+  dataScope.textContent = scope ? `Data: ${scope.original_name}` : "No conversation data";
+  if (scope) dataStatus.textContent = `Using ${scope.original_name} in this conversation only.`;
+}
+
+async function inspectSelectedDataset() {
+  const datasetId = datasetSelect.value;
+  if (!datasetId) throw new Error("Choose a local dataset first.");
+  const response = await fetch(`/api/datasets/${encodeURIComponent(datasetId)}`);
+  if (!response.ok) throw new Error((await response.json()).error || "Could not inspect this dataset.");
+  const data = await response.json();
+  renderDatasetInspection(data);
+  dataStatus.textContent = `${data.dataset.original_name} is local. Confirm the mapping before using it in a conversation.`;
+}
+
+function renderDatasetInspection(data) {
+  datasetInspection.replaceChildren();
+  const intro = document.createElement("p");
+  intro.className = "data-inspection-intro";
+  intro.textContent = `${data.dataset.source_row_count} source rows. Headers and preview stay in this local browser workspace.`;
+  const table = document.createElement("table");
+  table.className = "data-mapping-table";
+  const head = document.createElement("thead");
+  head.innerHTML = "<tr><th>Column</th><th>Health</th><th>Meaning</th><th>Unit</th><th>Mentor access</th><th>Safe label</th><th>Share aggregate labels</th></tr>";
+  const body = document.createElement("tbody");
+  const suggestions = new Map(data.suggestions.map((suggestion) => [suggestion.column_ordinal, suggestion]));
+  const entries = new Map((data.entries || []).map((entry) => [entry.column_ordinal, entry]));
+  data.columns.forEach((column) => {
+    const current = entries.get(column.ordinal) || suggestions.get(column.ordinal) || {};
+    const row = document.createElement("tr");
+    row.dataset.ordinal = String(column.ordinal);
+    const role = selectControl([
+      ["", "Not used"], ["trade_return", "Trade return"], ["trade_outcome", "Outcome"], ["trade_timestamp", "Timestamp"], ["session", "Session"], ["direction", "Direction"], ["mfe", "MFE"], ["mae", "MAE"], ["instrument", "Instrument"], ["setup", "Setup"],
+    ], current.semantic_role || "", "mapping-role");
+    const unit = selectControl([["", "—"], ["R", "R"], ["currency", "Currency"], ["points", "Points"], ["percentage", "Percentage"]], current.unit || "", "mapping-unit");
+    const access = selectControl([["aggregates_only", "Aggregates only"], ["allow_row_values_when_analysing_notes", "Approved notes only"]], current.mentor_access || "aggregates_only", "mapping-access");
+    const label = document.createElement("input");
+    label.className = "mapping-label";
+    label.maxLength = 80;
+    label.placeholder = "Optional safe label";
+    label.value = current.analysis_label || "";
+    const modelDisclosure = document.createElement("input");
+    modelDisclosure.type = "checkbox";
+    modelDisclosure.className = "mapping-disclosure";
+    modelDisclosure.checked = Boolean(current.aggregate_labels_allowed);
+    modelDisclosure.disabled = !["categorical", "boolean"].includes(column.value_type);
+    modelDisclosure.setAttribute("aria-label", `Share aggregate labels for ${column.original_header}`);
+    row.append(
+      cell(column.original_header),
+      cell(`${column.valid_count} valid · ${column.blank_count} blank${column.invalid_count ? ` · ${column.invalid_count} invalid` : ""}`),
+      cell(role), cell(unit), cell(access), cell(label), cell(modelDisclosure),
+    );
+    body.append(row);
+  });
+  table.append(head, body);
+  const confirm = document.createElement("button");
+  confirm.type = "button";
+  confirm.textContent = data.mapping?.status === "confirmed" ? "Confirm new mapping version" : "Confirm mapping";
+  confirm.addEventListener("click", () => confirmDatasetMapping(data.dataset.id).catch((error) => { dataStatus.textContent = error.message; }));
+  datasetInspection.append(intro, table, confirm);
+  if (data.preview.length) datasetInspection.append(renderLocalPreview(data.preview));
+}
+
+function renderLocalPreview(preview) {
+  const section = document.createElement("section");
+  const heading = document.createElement("h3");
+  heading.textContent = "Local preview";
+  const table = document.createElement("table");
+  table.className = "data-mapping-table";
+  const headers = Object.keys(preview[0]);
+  const head = document.createElement("thead");
+  const headRow = document.createElement("tr");
+  headers.forEach((header) => headRow.append(cell(header)));
+  head.append(headRow);
+  const body = document.createElement("tbody");
+  preview.forEach((row) => {
+    const tr = document.createElement("tr");
+    headers.forEach((header) => tr.append(cell(row[header] || "")));
+    body.append(tr);
+  });
+  table.append(head, body);
+  section.append(heading, table);
+  return section;
+}
+
+function selectControl(options, value, className) {
+  const select = document.createElement("select");
+  select.className = className;
+  options.forEach(([optionValue, text]) => select.add(new Option(text, optionValue, false, optionValue === value)));
+  return select;
+}
+
+function cell(content) {
+  const element = document.createElement("td");
+  if (typeof content === "string") element.textContent = content;
+  else element.append(content);
+  return element;
+}
+
+async function confirmDatasetMapping(datasetId) {
+  const entries = [...datasetInspection.querySelectorAll("tr[data-ordinal]")].map((row) => ({
+    column_ordinal: Number(row.dataset.ordinal),
+    semantic_role: row.querySelector(".mapping-role").value || null,
+    unit: row.querySelector(".mapping-unit").value || null,
+    mentor_access: row.querySelector(".mapping-access").value,
+    analysis_label: row.querySelector(".mapping-label").value.trim() || null,
+    model_disclosure: row.querySelector(".mapping-disclosure").checked,
+  }));
+  const response = await fetch(`/api/datasets/${encodeURIComponent(datasetId)}/mapping`, {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ entries }),
+  });
+  if (!response.ok) throw new Error((await response.json()).error || "Could not confirm this mapping.");
+  dataStatus.textContent = "Mapping confirmed locally. You can now use this dataset in the current conversation.";
+  await loadDatasets();
+}
+
+async function useSelectedDataset() {
+  if (!activeThreadId) throw new Error("Open a conversation before selecting data.");
+  const datasetId = datasetSelect.value;
+  if (!datasetId) throw new Error("Choose a local dataset first.");
+  const response = await fetch(`/api/threads/${activeThreadId}/dataset`, {
+    method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ dataset_id: datasetId }),
+  });
+  if (!response.ok) throw new Error((await response.json()).error || "Could not select this dataset.");
+  activeDatasetScope = (await response.json()).dataset_scope;
+  updateDatasetScope();
+}
+
+async function clearDatasetScope() {
+  if (!activeThreadId) return;
+  const response = await fetch(`/api/threads/${activeThreadId}/dataset`, {
+    method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ dataset_id: null }),
+  });
+  if (!response.ok) throw new Error("Could not clear this conversation’s data.");
+  activeDatasetScope = undefined;
+  updateDatasetScope();
+  dataStatus.textContent = "Conversation data cleared. Other conversations were not changed.";
+}
+
+async function importDataset(event) {
+  event.preventDefault();
+  const file = document.querySelector("#dataset-file").files[0];
+  if (!file) throw new Error("Choose a CSV or XLSX file.");
+  dataStatus.textContent = "Importing locally…";
+  const response = await fetch("/api/datasets/import", {
+    method: "POST", headers: { "Content-Type": "application/octet-stream", "X-Dataset-Filename": file.name }, body: file,
+  });
+  if (!response.ok) throw new Error((await response.json()).error || "Could not import this dataset.");
+  const data = await response.json();
+  await loadDatasets();
+  datasetSelect.value = data.dataset.id;
+  await inspectSelectedDataset();
 }
 
 function parseEventBuffer(buffer, onEvent) {
@@ -390,8 +573,10 @@ async function sendMessage(text, showUser = true) {
   if (showUser) showMessage("Theo", text);
   status.textContent = "Thinking…";
   send.disabled = true;
+  const approvedNotesForTurn = includeApprovedNotes.checked;
+  includeApprovedNotes.checked = false;
   try {
-    const response = await fetch(`/api/threads/${activeThreadId}/messages`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ question: text, evaluation: evaluation() }) });
+    const response = await fetch(`/api/threads/${activeThreadId}/messages`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ question: text, evaluation: evaluation(), include_approved_notes: approvedNotesForTurn }) });
     if (!response.ok) {
       const data = await response.json();
       throw new Error(data.error || "The mentor is unavailable.");
@@ -452,6 +637,20 @@ async function sendMessage(text, showUser = true) {
 }
 
 document.querySelector("#new-thread").addEventListener("click", () => createThread().catch((error) => { status.textContent = error.message; }));
+document.querySelector("#data-toggle").addEventListener("click", () => {
+  dataWorkspace.hidden = !dataWorkspace.hidden;
+  document.querySelector("#data-toggle").setAttribute("aria-expanded", String(!dataWorkspace.hidden));
+  if (!dataWorkspace.hidden) loadDatasets().catch((error) => { dataStatus.textContent = error.message; });
+});
+document.querySelector("#data-close").addEventListener("click", () => {
+  dataWorkspace.hidden = true;
+  document.querySelector("#data-toggle").setAttribute("aria-expanded", "false");
+});
+document.querySelector("#dataset-upload-form").addEventListener("submit", (event) => importDataset(event).catch((error) => { dataStatus.textContent = error.message; }));
+document.querySelector("#dataset-inspect").addEventListener("click", () => inspectSelectedDataset().catch((error) => { dataStatus.textContent = error.message; }));
+document.querySelector("#dataset-use").addEventListener("click", () => useSelectedDataset().catch((error) => { dataStatus.textContent = error.message; }));
+document.querySelector("#dataset-clear").addEventListener("click", () => clearDatasetScope().catch((error) => { dataStatus.textContent = error.message; }));
+datasetSelect.addEventListener("change", updateDatasetScope);
 form.addEventListener("submit", async (event) => {
   event.preventDefault();
   const text = question.value.trim();
@@ -463,7 +662,8 @@ restoreEvaluation();
 effort.addEventListener("change", persistEvaluation);
 mode.addEventListener("change", persistEvaluation);
 researchDepth.addEventListener("change", persistEvaluation);
-loadThreads().then(async () => {
+updateDatasetScope();
+Promise.all([loadThreads(), loadDatasets()]).then(async ([,]) => {
   const savedThreadId = Number(localStorage.getItem(ACTIVE_THREAD_KEY));
   const firstThread = threads.querySelector(".thread");
   if (Number.isInteger(savedThreadId) && savedThreadId > 0) {
@@ -472,4 +672,4 @@ loadThreads().then(async () => {
   }
   else if (firstThread) firstThread.click();
   else showEmpty();
-}).catch(() => { status.textContent = "Could not load conversations."; });
+}).catch(() => { status.textContent = "Could not load conversations or local datasets."; });

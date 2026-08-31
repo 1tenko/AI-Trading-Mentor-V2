@@ -278,22 +278,22 @@ select/change/clear active dataset in chat; add the one-turn **Include approved
 notes in this answer** compose control.
 
 **Acceptance criteria:**
-- [ ] Upload -> preview -> mapping -> select is usable without a spreadsheet editor.
-- [ ] Active dataset is visible, persists per conversation, is never silently
+- [x] Upload -> preview -> mapping -> select is usable without a spreadsheet editor.
+- [x] Active dataset is visible, persists per conversation, is never silently
   inherited by a new thread, and historic evidence retains its original settings.
-- [ ] Text fields and optional structured context fields are visibly denied by
+- [x] Text fields and optional structured context fields are visibly denied by
   default; Theo can approve/revoke future row disclosure through a new mapping
   version. The loopback mapping UI may show Theo raw headers to select a column,
   but headers never reach Sol, replay/evidence payloads, logs, or non-loopback
   surfaces; the rest of the workbook remains undisclosed.
-- [ ] The compose control is clear, defaults off for every message, and shows
+- [x] The compose control is clear, defaults off for every message, and shows
   that it only permits already approved fields for that one response.
-- [ ] Accessible controls, errors, and existing chat/profile UI remain intact.
+- [x] Accessible controls, errors, and existing chat/profile UI remain intact.
 
 **Verification:**
-- [ ] Server/API and browser smoke cover import/mapping/access choice/one-turn
+- [x] Server/API and browser smoke cover import/mapping/access choice/one-turn
   consent/scope/clear/reload and user-visible text-disclosure state.
-- [ ] Console is clean; upload bytes travel only in the loopback upload request,
+- [x] Console is clean; upload bytes travel only in the loopback upload request,
   never to OpenAI, File Search/vector stores, logs, Git, or non-loopback endpoints.
 
 **Dependencies:** Tasks 3 and 8
@@ -303,10 +303,10 @@ notes in this answer** compose control.
 
 ### Checkpoint C: End-to-end local data flow
 
-- [ ] Tasks 8–9 focused suites and full pytest are green.
-- [ ] Browser flow shows visible thread-local scope, explicit text-disclosure
+- [x] Tasks 8–9 focused suites and full pytest are green.
+- [x] Browser flow shows visible thread-local scope, explicit text-disclosure
   state, and no unapproved raw-data network path.
-- [ ] Existing Phase 1–4 chat/profile/source behavior remains green.
+- [x] Existing Phase 1–4 chat/profile/source behavior remains green.
 
 ## phase5-evaluation
 

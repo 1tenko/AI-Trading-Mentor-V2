@@ -16,27 +16,30 @@ class FakeChatService:
 class StreamingFakeChatService:
     def __init__(self):
         self.evaluation = None
+        self.include_approved_notes = None
 
-    def stream_reply(self, thread_id, question, evaluation):
+    def stream_reply(self, thread_id, question, evaluation, *, include_approved_notes=False):
         self.evaluation = evaluation
+        self.include_approved_notes = include_approved_notes
         yield StreamEvent("delta", "A")
         yield StreamEvent("complete", answer=Answer(text="A", citations=[], evidence=[]))
 
 
 class FailingStreamingFakeChatService:
-    def stream_reply(self, thread_id, question, evaluation):
+    def stream_reply(self, thread_id, question, evaluation, *, include_approved_notes=False):
         yield StreamEvent("error", error="The mentor request failed. Try again.")
 
 
 class ExplodingStreamingFakeChatService:
-    def stream_reply(self, thread_id, question, evaluation):
+    def stream_reply(self, thread_id, question, evaluation, *, include_approved_notes=False):
         raise RuntimeError("simulated server failure")
 
 
-def request(server, method, path, body=None):
+def request(server, method, path, body=None, headers=None):
     connection = http.client.HTTPConnection(*server.server_address)
-    headers = {"Content-Type": "application/json"} if body is not None else {}
-    connection.request(method, path, body=body, headers=headers)
+    request_headers = {"Content-Type": "application/json"} if body is not None else {}
+    request_headers.update(headers or {})
+    connection.request(method, path, body=body, headers=request_headers)
     response = connection.getresponse()
     result = (response.status, dict(response.getheaders()), response.read())
     connection.close()
@@ -112,6 +115,7 @@ def test_server_streams_chat_events(tmp_path):
         assert chat_service.evaluation.reasoning_effort == "xhigh"
         assert chat_service.evaluation.reasoning_mode == "pro"
         assert chat_service.evaluation.research_depth == "deep"
+        assert chat_service.include_approved_notes is False
     finally:
         server.shutdown()
         worker.join()
@@ -265,6 +269,7 @@ def test_server_restores_only_safe_display_turns_and_permanently_deletes_one_thr
         assert payload == {
             "id": thread_id,
             "title": "Question",
+            "dataset_scope": None,
             "turns": [
                 {
                     "turn_number": 1,
@@ -604,6 +609,90 @@ def test_questionnaire_profile_page_and_local_batch_api_hide_internal_schema(tmp
         status, _, body = request(server, "GET", "/api/profile")
         assert status == 200
         assert json.loads(body)["current"][0]["questionnaire"] is True
+    finally:
+        server.shutdown()
+        worker.join()
+
+
+def test_data_workspace_loopback_api_imports_maps_and_scopes_one_thread(tmp_path):
+    class DatasetAwareChat:
+        def __init__(self):
+            self.include_approved_notes = None
+
+        def stream_reply(self, thread_id, question, evaluation, *, include_approved_notes=False):
+            self.include_approved_notes = include_approved_notes
+            yield StreamEvent("complete", answer=Answer(text="Local answer", citations=[], evidence=[]))
+
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    thread_id = storage.create_thread("Analysis")
+    chat = DatasetAwareChat()
+    server = create_server(storage, chat, port=0)
+    worker = threading.Thread(target=server.serve_forever)
+    worker.start()
+    try:
+        csv = b"Result,Outcome,Journal\n1,Win,Waited for confirmation\n-1,Loss,Entered early\n"
+        status, _, body = request(
+            server,
+            "POST",
+            "/api/datasets/import",
+            csv,
+            headers={"Content-Type": "application/octet-stream", "X-Dataset-Filename": "trades.csv"},
+        )
+        imported = json.loads(body)
+        assert status == 201
+        assert imported["dataset"]["original_name"] == "trades.csv"
+        dataset_id = imported["dataset"]["id"]
+        assert b"Waited for confirmation" not in body
+
+        status, _, body = request(server, "GET", f"/api/datasets/{dataset_id}")
+        inspection = json.loads(body)
+        assert status == 200
+        assert inspection["preview"][0]["Journal"] == "Waited for confirmation"
+        assert inspection["suggestions"][0] == {"column_ordinal": 0, "semantic_role": "trade_return", "unit": "R"}
+
+        mapping = {
+            "entries": [
+                {"column_ordinal": 0, "semantic_role": "trade_return", "unit": "R"},
+                {"column_ordinal": 1, "semantic_role": "trade_outcome", "analysis_label": "Outcome", "model_disclosure": True},
+                {"column_ordinal": 2, "analysis_label": "Journal", "mentor_access": "allow_row_values_when_analysing_notes"},
+            ]
+        }
+        status, _, body = request(server, "POST", f"/api/datasets/{dataset_id}/mapping", json.dumps(mapping).encode())
+        confirmed = json.loads(body)
+        assert status == 201
+        assert confirmed["mapping"]["status"] == "confirmed"
+        assert confirmed["entries"][2]["mentor_access"] == "allow_row_values_when_analysing_notes"
+        assert confirmed["entries"][1]["aggregate_labels_allowed"] is True
+
+        status, _, body = request(
+            server, "PUT", f"/api/threads/{thread_id}/dataset", json.dumps({"dataset_id": dataset_id}).encode()
+        )
+        assert status == 200
+        assert json.loads(body)["dataset_scope"]["original_name"] == "trades.csv"
+        status, _, body = request(server, "GET", f"/api/threads/{thread_id}")
+        assert status == 200
+        assert json.loads(body)["dataset_scope"]["mapping_status"] == "confirmed"
+        status, _, body = request(server, "POST", "/api/threads", b'{"title":"Separate"}')
+        assert status == 201
+        assert json.loads(body)["id"] != thread_id
+        status, _, body = request(server, "GET", "/api/threads/2")
+        assert status == 200
+        assert json.loads(body)["dataset_scope"] is None
+
+        status, _, _ = request(
+            server,
+            "POST",
+            f"/api/threads/{thread_id}/messages",
+            json.dumps({"question": "Use the approved notes.", "include_approved_notes": True}).encode(),
+        )
+        assert status == 200
+        assert chat.include_approved_notes is True
+
+        status, _, body = request(server, "PUT", f"/api/threads/{thread_id}/dataset", b'{"dataset_id":null}')
+        assert status == 200
+        assert json.loads(body)["dataset_scope"] is None
+        assert request(server, "GET", "/api/datasets")[0] == 200
     finally:
         server.shutdown()
         worker.join()

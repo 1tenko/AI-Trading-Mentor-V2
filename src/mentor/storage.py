@@ -2039,6 +2039,19 @@ class Storage:
             ).fetchone()
         return None if row is None else Dataset(*row)
 
+    def datasets(self) -> list[Dataset]:
+        """List local dataset metadata without reading any source rows."""
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT datasets.id, original_name, content_sha256, original_extension,
+                       byte_size, source_row_count, status, dataset_import_specs.id
+                FROM datasets JOIN dataset_import_specs ON dataset_import_specs.dataset_id = datasets.id
+                ORDER BY datasets.rowid DESC
+                """
+            ).fetchall()
+        return [Dataset(*row) for row in rows]
+
     def dataset_import_spec(self, dataset_id: str) -> DatasetImportSpec | None:
         with self._connect() as connection:
             row = connection.execute(

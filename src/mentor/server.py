@@ -3,6 +3,7 @@
 import json
 import logging
 import re
+import tempfile
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -10,6 +11,14 @@ from typing import Any
 from urllib.parse import unquote, urlparse
 
 from mentor.chat_service import Answer, EvaluationConfig, StreamEvent
+from mentor.datasets import (
+    MAX_DATASET_BYTES,
+    MappingEntry,
+    create_inspected_mapping_draft,
+    import_local_dataset,
+    inspect_local_dataset,
+    mapping_suggestions,
+)
 from mentor.profile import QUESTIONNAIRE_FIELDS, ProfileService, ProfileValidationError
 from mentor.storage import Storage
 
@@ -59,6 +68,9 @@ class _Handler(BaseHTTPRequestHandler):
                 {"threads": [thread.__dict__ for thread in self.storage.threads()]},
             )
             return
+        if path == "/api/datasets":
+            self._send_json(HTTPStatus.OK, {"datasets": [_dataset_json(dataset) for dataset in self.storage.datasets()]})
+            return
         if path == "/profile":
             self._send_bytes(HTTPStatus.OK, _static("profile.html"), "text/html; charset=utf-8")
             return
@@ -71,6 +83,10 @@ class _Handler(BaseHTTPRequestHandler):
         if path == "/api/profile/questionnaire":
             self._send_json(HTTPStatus.OK, _questionnaire_json(ProfileService(self.storage)))
             return
+        dataset_match = re.fullmatch(r"/api/datasets/([A-Za-z0-9_-]+)", path)
+        if dataset_match:
+            self._dataset_inspection(dataset_match.group(1))
+            return
         match = re.fullmatch(r"/api/threads/(\d+)", path)
         if match:
             thread = self.storage.thread(int(match.group(1)))
@@ -79,7 +95,12 @@ class _Handler(BaseHTTPRequestHandler):
                 return
             self._send_json(
                 HTTPStatus.OK,
-                {"id": thread.id, "title": thread.title, "turns": self.storage.display_turns(thread.id)},
+                {
+                    "id": thread.id,
+                    "title": thread.title,
+                    "turns": self.storage.display_turns(thread.id),
+                    "dataset_scope": _thread_dataset_scope_json(self.storage, thread.id),
+                },
             )
             return
         match = re.fullmatch(r"/api/sources/([^/]+)", path)
@@ -112,6 +133,9 @@ class _Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802
         path = urlparse(self.path).path
         try:
+            if path == "/api/datasets/import":
+                self._import_dataset()
+                return
             body = self._json_body()
             if path == "/api/threads":
                 title = _title(body.get("title"))
@@ -121,6 +145,10 @@ class _Handler(BaseHTTPRequestHandler):
             if path == "/api/profile/items":
                 item = _create_profile_item(ProfileService(self.storage), body)
                 self._send_json(HTTPStatus.CREATED, {"item": _profile_item_json(item)})
+                return
+            mapping_match = re.fullmatch(r"/api/datasets/([A-Za-z0-9_-]+)/mapping", path)
+            if mapping_match:
+                self._confirm_mapping(mapping_match.group(1), body)
                 return
             match = re.fullmatch(r"/api/threads/(\d+)/messages", path)
             if match:
@@ -132,7 +160,12 @@ class _Handler(BaseHTTPRequestHandler):
                     self._send_json(HTTPStatus.NOT_FOUND, {"error": "Conversation not found."})
                     return
                 if hasattr(self.chat_service, "stream_reply"):
-                    self._stream_answer(thread_id, question, _evaluation(body.get("evaluation")))
+                    self._stream_answer(
+                        thread_id,
+                        question,
+                        _evaluation(body.get("evaluation")),
+                        _include_approved_notes(body.get("include_approved_notes", False)),
+                    )
                 else:
                     self._send_json(HTTPStatus.OK, _answer_json(self.chat_service.reply(thread_id, question)))
                 return
@@ -168,7 +201,31 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.OK, {"item": _profile_item_json(result)})
 
     def do_PUT(self) -> None:  # noqa: N802
-        if urlparse(self.path).path != "/api/profile/questionnaire":
+        path = urlparse(self.path).path
+        scope_match = re.fullmatch(r"/api/threads/(\d+)/dataset", path)
+        if scope_match:
+            try:
+                body = self._json_body()
+                _only_fields(body, {"dataset_id"})
+                dataset_id = body.get("dataset_id")
+                if dataset_id is not None and not isinstance(dataset_id, str):
+                    raise ValueError("Dataset selection must be text or null.")
+                thread_id = int(scope_match.group(1))
+                if not self.storage.has_thread(thread_id):
+                    self._send_json(HTTPStatus.NOT_FOUND, {"error": "Conversation not found."})
+                    return
+                if dataset_id is not None:
+                    if self.storage.dataset(dataset_id) is None:
+                        raise ValueError("Dataset is unavailable.")
+                    if self.storage.confirmed_mapping_for_dataset(dataset_id) is None:
+                        raise ValueError("Confirm a dataset mapping before selecting it for this conversation.")
+                self.storage.set_thread_dataset_scope(thread_id, dataset_id)
+            except ValueError as error:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
+                return
+            self._send_json(HTTPStatus.OK, {"dataset_scope": _thread_dataset_scope_json(self.storage, thread_id)})
+            return
+        if path != "/api/profile/questionnaire":
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "Not found."})
             return
         try:
@@ -194,8 +251,72 @@ class _Handler(BaseHTTPRequestHandler):
             return
         self._send_bytes(HTTPStatus.OK, path.read_bytes(), "text/plain; charset=utf-8")
 
+    def _import_dataset(self) -> None:
+        filename = _upload_filename(self.headers.get("X-Dataset-Filename"))
+        content_length = self.headers.get("Content-Length")
+        if content_length is None or not content_length.isdigit():
+            raise ValueError("A dataset upload body is required.")
+        length = int(content_length)
+        if not 0 < length <= MAX_DATASET_BYTES:
+            raise ValueError("Dataset upload must be between 1 byte and 50 MiB.")
+        content_type = self.headers.get("Content-Type", "").split(";", 1)[0].strip().casefold()
+        if content_type != "application/octet-stream":
+            raise ValueError("Dataset uploads must use application/octet-stream.")
+        upload_root = self.storage.database_path.parent / "uploads"
+        upload_root.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix=".upload-", dir=upload_root) as temporary_directory:
+            source_path = Path(temporary_directory) / filename
+            remaining = length
+            with source_path.open("xb") as upload:
+                while remaining:
+                    chunk = self.rfile.read(min(65_536, remaining))
+                    if not chunk:
+                        raise ValueError("Dataset upload ended unexpectedly.")
+                    upload.write(chunk)
+                    remaining -= len(chunk)
+            imported = import_local_dataset(source_path, self.storage)
+        inspection = inspect_local_dataset(self.storage, imported.dataset.id)
+        self._send_json(
+            HTTPStatus.CREATED,
+            {
+                "dataset": _dataset_json(imported.dataset),
+                "inspection": _inspection_json(inspection, include_preview=False),
+                "suggestions": [suggestion.__dict__ for suggestion in mapping_suggestions(inspection)],
+            },
+        )
+
+    def _dataset_inspection(self, dataset_id: str) -> None:
+        if self.storage.dataset(dataset_id) is None:
+            self._send_json(HTTPStatus.NOT_FOUND, {"error": "Dataset not found."})
+            return
+        inspection = inspect_local_dataset(self.storage, dataset_id)
+        mapping = self.storage.confirmed_mapping_for_dataset(dataset_id)
+        self._send_json(
+            HTTPStatus.OK,
+            {
+                "dataset": _dataset_json(self.storage.dataset(dataset_id)),
+                **_inspection_json(inspection, include_preview=True),
+                "suggestions": [suggestion.__dict__ for suggestion in mapping_suggestions(inspection)],
+                "mapping": None if mapping is None else _mapping_json(mapping),
+                "entries": [] if mapping is None else [_mapping_entry_json(entry) for entry in self.storage.mapping_entries(mapping.id)],
+            },
+        )
+
+    def _confirm_mapping(self, dataset_id: str, body: dict) -> None:
+        _only_fields(body, {"entries"})
+        entries = body.get("entries")
+        if not isinstance(entries, list):
+            raise ValueError("Mapping entries must be a list.")
+        inspection = inspect_local_dataset(self.storage, dataset_id)
+        draft = create_inspected_mapping_draft(self.storage, inspection, [_mapping_entry_from_json(entry) for entry in entries])
+        mapping = self.storage.confirm_mapping_version(draft.id)
+        self._send_json(
+            HTTPStatus.CREATED,
+            {"mapping": _mapping_json(mapping), "entries": [_mapping_entry_json(entry) for entry in self.storage.mapping_entries(mapping.id)]},
+        )
+
     def _stream_answer(
-        self, thread_id: int, question: str, evaluation: EvaluationConfig
+        self, thread_id: int, question: str, evaluation: EvaluationConfig, include_approved_notes: bool
     ) -> None:
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
@@ -204,7 +325,9 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_header("X-Frame-Options", "DENY")
         self.end_headers()
         try:
-            for event in self.chat_service.stream_reply(thread_id, question, evaluation):
+            for event in self.chat_service.stream_reply(
+                thread_id, question, evaluation, include_approved_notes=include_approved_notes
+            ):
                 self._write_stream_event(event)
         except Exception as error:
             LOGGER.warning("Mentor SSE handler raised %s", type(error).__name__)
@@ -390,6 +513,115 @@ def _questionnaire_json(profile: ProfileService) -> dict[str, object]:
             for key, answer in answers.items()
         },
     }
+
+
+def _dataset_json(dataset: Any) -> dict[str, object]:
+    return {
+        "id": dataset.id,
+        "original_name": dataset.original_name,
+        "original_extension": dataset.original_extension,
+        "byte_size": dataset.byte_size,
+        "source_row_count": dataset.source_row_count,
+        "status": dataset.status,
+    }
+
+
+def _inspection_json(inspection: Any, *, include_preview: bool) -> dict[str, object]:
+    return {
+        "dataset_id": inspection.dataset_id,
+        "columns": [
+            {
+                "ordinal": column.ordinal,
+                "original_header": column.original_header,
+                "value_type": column.value_type,
+                "valid_count": column.valid_count,
+                "blank_count": column.blank_count,
+                "invalid_count": column.invalid_count,
+                "distinct_count": column.distinct_count,
+                "unavailable_reason": column.unavailable_reason,
+            }
+            for column in inspection.columns
+        ],
+        "preview": inspection.preview if include_preview else [],
+    }
+
+
+def _mapping_json(mapping: Any) -> dict[str, object]:
+    return {
+        "id": mapping.id,
+        "dataset_id": mapping.dataset_id,
+        "version": mapping.version,
+        "status": mapping.status,
+    }
+
+
+def _mapping_entry_json(entry: MappingEntry) -> dict[str, object]:
+    return {
+        "column_ordinal": entry.column_ordinal,
+        "semantic_role": entry.semantic_role,
+        "unit": entry.unit,
+        "analysis_label": entry.analysis_label,
+        "mentor_access": entry.mentor_access,
+        "aggregate_labels_allowed": entry.aggregate_labels_allowed,
+    }
+
+
+def _mapping_entry_from_json(value: object) -> MappingEntry:
+    if not isinstance(value, dict):
+        raise ValueError("Each mapping entry must be an object.")
+    _only_fields(
+        value,
+        {"column_ordinal", "semantic_role", "unit", "analysis_label", "mentor_access", "model_disclosure"},
+    )
+    ordinal = value.get("column_ordinal")
+    if not isinstance(ordinal, int) or ordinal < 0:
+        raise ValueError("Mapping column ordinal must be a non-negative integer.")
+    for field in ("semantic_role", "unit", "analysis_label", "mentor_access"):
+        if field in value and value[field] is not None and not isinstance(value[field], str):
+            raise ValueError(f"Mapping {field} must be text or null.")
+    disclosure = value.get("model_disclosure", False)
+    if not isinstance(disclosure, bool):
+        raise ValueError("Mapping model_disclosure must be true or false.")
+    return MappingEntry(
+        column_ordinal=ordinal,
+        semantic_role=value.get("semantic_role"),
+        unit=value.get("unit"),
+        analysis_label=value.get("analysis_label"),
+        mentor_access=value.get("mentor_access", "aggregates_only"),
+        model_disclosure=disclosure,
+    )
+
+
+def _thread_dataset_scope_json(storage: Storage, thread_id: int) -> dict[str, object] | None:
+    scope = storage.thread_dataset_scope(thread_id)
+    if scope is None or scope.dataset_id is None:
+        return None
+    dataset = storage.dataset(scope.dataset_id)
+    mapping = storage.confirmed_mapping_for_dataset(scope.dataset_id)
+    if dataset is None or mapping is None:
+        return None
+    return {
+        "dataset_id": dataset.id,
+        "original_name": dataset.original_name,
+        "mapping_version": mapping.version,
+        "mapping_status": mapping.status,
+    }
+
+
+def _upload_filename(value: object) -> str:
+    if not isinstance(value, str) or not value or len(value) > 120:
+        raise ValueError("Dataset filename is required and must be at most 120 characters.")
+    if value != value.strip() or "/" in value or "\\" in value or Path(value).name != value:
+        raise ValueError("Dataset filename is invalid.")
+    if Path(value).suffix.casefold() not in {".csv", ".xlsx"}:
+        raise ValueError("Only CSV or XLSX files are supported.")
+    return value
+
+
+def _include_approved_notes(value: object) -> bool:
+    if not isinstance(value, bool):
+        raise ValueError("Include approved notes must be true or false.")
+    return value
 
 
 def _profile_item_json(item: Any) -> dict[str, object]:
