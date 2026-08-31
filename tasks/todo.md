@@ -1,7 +1,6 @@
 # Phase 5 Task List — Backtest / Empirical Data Analysis Foundation
 
-**Status:** 2026-08-30 architecture-breaker amendment awaiting Theo review;
-implementation is stopped before Task 8.
+**Status:** 2026-08-31 amended Checkpoint B passed; Task 8 is next.
 Phase 4 passed and is recorded in [`docs/phase-4-acceptance.md`](../docs/phase-4-acceptance.md).
 
 ## dataset-foundation
@@ -230,11 +229,11 @@ approved controls.
 ### Amended Checkpoint B: Deterministic and qualitative evidence boundary
 
 - [x] Tasks 4–7B and full pytest are green.
-- [ ] Numeric evidence preserves N, exclusions, reproducibility, and
+- [x] Numeric evidence preserves N, exclusions, reproducibility, and
   `USER_EMPIRICAL_EVIDENCE`; grouped evidence is one validated partition.
 - [x] Text disclosure is explicit, local-default-denied, bounded, and
   complete-or-explicitly-partial; raw text never enters replay/persistence.
-- [ ] Independent deterministic/privacy review finds no P0/P1 evidence-boundary
+- [x] Independent deterministic/privacy review finds no P0/P1 evidence-boundary
   issue before Task 8 begins.
 
 ## empirical-mentor and data-workspace
