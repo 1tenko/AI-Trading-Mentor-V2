@@ -31,6 +31,7 @@ from mentor.datasets import (
     model_mapping_context,
 )
 from mentor.datasets import QualitativeTransportError
+from mentor.chat_service import ChatService, EvaluationConfig
 from mentor.storage import Storage
 
 
@@ -47,6 +48,39 @@ class _SentinelResponses:
             self.failures -= 1
             raise TimeoutError("temporary provider failure")
         return type("Response", (), {"status": "completed"})()
+
+
+class _SequenceResponses:
+    def __init__(self, *responses):
+        self.responses = list(responses)
+        self.calls: list[dict[str, object]] = []
+
+    def create(self, **request):
+        self.calls.append(request)
+        return self.responses.pop(0)
+
+
+def _source_response(text: str, annotations: list[dict[str, object]], *, passage: str = "[730.0 --> 756.0] Jacob's original words."):
+    return type("Response", (), {
+        "status": "completed",
+        "id": "response-qualitative",
+        "model": "gpt-5.6-sol",
+        "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+        "output": [
+            {
+                "type": "file_search_call",
+                "queries": ["Jacob source"],
+                "results": [{
+                    "file_id": "file_jacob", "filename": "lesson.txt", "text": passage,
+                    "attributes": {"year": "2026"},
+                }],
+            },
+            {
+                "type": "message", "role": "assistant",
+                "content": [{"type": "output_text", "text": text, "annotations": annotations}],
+            },
+        ],
+    })()
 
 
 def _qualitative_payload(evidence):
@@ -92,6 +126,228 @@ def test_qualitative_model_transport_keeps_raw_payload_inside_immediate_client_c
     assert sent["items"][0]["text"][0]["value"] == note
     assert capability.active is False
     assert note not in json.dumps(evidence.to_persistable_metadata().to_dict())
+
+
+def test_qualitative_transport_returns_safe_continuation_for_same_turn_citation_repair(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    storage.set_vector_store("vs_jacob")
+    source = tmp_path / "trades.csv"
+    note = "SECRET_NOTE_SENTINEL_REPAIR"
+    source.write_text(f"Journal\n{note}\n", encoding="utf-8")
+    dataset = _importer(storage, tmp_path)(source).dataset
+    mapping = storage.confirm_mapping_version(create_inspected_mapping_draft(
+        storage, inspect_local_dataset(storage, dataset.id),
+        [MappingEntry(0, analysis_label="Journal", mentor_access="allow_row_values_when_analysing_notes")],
+    ).id)
+    field_id = storage.mapping_entries(mapping.id)[0].field_id or ""
+    evidence = read_text_evidence(
+        storage, dataset.id, mapping.id, text_field_ids=(field_id,), include_approved_notes=True,
+        use_guard=QualitativeDisclosureCapability(),
+    )
+    draft = _source_response("Direct source teaching: Jacob teaches this.", [])
+    repaired = _source_response(
+        "Direct source teaching: Jacob teaches this.",
+        [{"type": "file_citation", "file_id": "file_jacob", "filename": "lesson.txt"}],
+    )
+    responses = _SequenceResponses(draft, repaired)
+
+    continuation = continue_qualitative_model_transport(
+        client=type("Client", (), {"responses": responses})(),
+        request={"model": "fake", "input": [], "instructions": "analyse", "tools": []},
+        call_id="call_notes", evidence=evidence,
+    )
+
+    assert note in responses.calls[0]["input"][-1]["output"]
+    assert note not in repr(continuation)
+    assert note not in json.dumps(continuation.to_persistable_dict())
+    service = ChatService(storage, type("Client", (), {"responses": responses})())
+    response, evidence_output, draft_response = service._citation_repaired_response(
+        {"model": "fake", "input": [], "instructions": "analyse", "tools": []},
+        continuation,
+        "What does Jacob teach?",
+    )
+    thread_id = storage.create_thread("Qualitative")
+    answer = service._finalize(
+        thread_id,
+        {"role": "user", "content": [{"type": "input_text", "text": "What does Jacob teach?"}]},
+        response, EvaluationConfig(), "normal", 0.0, evidence_output=evidence_output, draft_response=draft_response,
+    )
+
+    assert len(responses.calls) == 2
+    assert "Citation repair" in responses.calls[1]["instructions"]
+    assert answer.citations[0].file_id == "file_jacob"
+    persisted = json.dumps(
+        storage.thread_items(thread_id) + storage.replay_items(thread_id) + storage.response_diagnostics(thread_id)
+    )
+    assert note not in persisted
+
+
+def test_qualitative_transport_continuation_supports_same_turn_timestamp_repair_without_raw_replay(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    storage.set_vector_store("vs_jacob")
+    source = tmp_path / "trades.csv"
+    note = "SECRET_NOTE_SENTINEL_TIMESTAMP"
+    source.write_text(f"Journal\n{note}\n", encoding="utf-8")
+    dataset = _importer(storage, tmp_path)(source).dataset
+    mapping = storage.confirm_mapping_version(create_inspected_mapping_draft(
+        storage, inspect_local_dataset(storage, dataset.id),
+        [MappingEntry(0, analysis_label="Journal", mentor_access="allow_row_values_when_analysing_notes")],
+    ).id)
+    field_id = storage.mapping_entries(mapping.id)[0].field_id or ""
+    evidence = read_text_evidence(
+        storage, dataset.id, mapping.id, text_field_ids=(field_id,), include_approved_notes=True,
+        use_guard=QualitativeDisclosureCapability(),
+    )
+    citation = [{"type": "file_citation", "file_id": "file_jacob", "filename": "lesson.txt"}]
+    draft = _source_response(
+        "Direct source teaching: Jacob says this at 12:10–12:36.", citation,
+        passage="[609.0 --> 616.0] An unrelated passage.",
+    )
+    repaired = _source_response("Direct source teaching: Jacob says this at 12:10–12:36.", citation)
+    responses = _SequenceResponses(draft, repaired)
+
+    continuation = continue_qualitative_model_transport(
+        client=type("Client", (), {"responses": responses})(),
+        request={"model": "fake", "input": [], "instructions": "analyse", "tools": []},
+        call_id="call_notes", evidence=evidence,
+    )
+    service = ChatService(storage, type("Client", (), {"responses": responses})())
+    response, evidence_output, draft_response = service._citation_repaired_response(
+        {"model": "fake", "input": [], "instructions": "analyse", "tools": []},
+        continuation,
+        "Where exactly does Jacob say this? Give me the timestamp.",
+    )
+
+    assert response is repaired
+    assert draft_response is continuation
+    assert len(evidence_output) == 4
+    assert responses.calls[1]["tool_choice"] == {"type": "file_search"}
+    assert note not in json.dumps(responses.calls[1])
+    assert note not in json.dumps(continuation.to_persistable_dict())
+
+
+def test_qualitative_transport_no_repair_and_failed_repair_persist_no_raw_payload(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    storage.set_vector_store("vs_jacob")
+    source = tmp_path / "trades.csv"
+    note = "SECRET_NOTE_SENTINEL_REPAIR_FAILURE"
+    source.write_text(f"Journal\n{note}\n", encoding="utf-8")
+    dataset = _importer(storage, tmp_path)(source).dataset
+    mapping = storage.confirm_mapping_version(create_inspected_mapping_draft(
+        storage, inspect_local_dataset(storage, dataset.id),
+        [MappingEntry(0, analysis_label="Journal", mentor_access="allow_row_values_when_analysing_notes")],
+    ).id)
+    field_id = storage.mapping_entries(mapping.id)[0].field_id or ""
+    citation = [{"type": "file_citation", "file_id": "file_jacob", "filename": "lesson.txt"}]
+
+    no_repair_evidence = read_text_evidence(
+        storage, dataset.id, mapping.id, text_field_ids=(field_id,), include_approved_notes=True,
+        use_guard=QualitativeDisclosureCapability(),
+    )
+    no_repair_responses = _SequenceResponses(_source_response("Direct source teaching: Jacob teaches this.", citation))
+    no_repair = continue_qualitative_model_transport(
+        client=type("Client", (), {"responses": no_repair_responses})(),
+        request={"model": "fake", "input": [], "instructions": "analyse", "tools": []},
+        call_id="call_notes", evidence=no_repair_evidence,
+    )
+    service = ChatService(storage, type("Client", (), {"responses": no_repair_responses})())
+    response, _, draft_response = service._citation_repaired_response(
+        {"model": "fake", "input": [], "instructions": "analyse", "tools": []}, no_repair, "What does Jacob teach?"
+    )
+    assert response is no_repair
+    assert draft_response is None
+    assert len(no_repair_responses.calls) == 1
+
+    failure_evidence = read_text_evidence(
+        storage, dataset.id, mapping.id, text_field_ids=(field_id,), include_approved_notes=True,
+        use_guard=QualitativeDisclosureCapability(),
+    )
+    failed_repair = type("Response", (), {"status": "failed", "output": []})()
+    failure_responses = _SequenceResponses(_source_response("Direct source teaching: Jacob teaches this.", []), failed_repair)
+    continuation = continue_qualitative_model_transport(
+        client=type("Client", (), {"responses": failure_responses})(),
+        request={"model": "fake", "input": [], "instructions": "analyse", "tools": []},
+        call_id="call_notes", evidence=failure_evidence,
+    )
+    service = ChatService(storage, type("Client", (), {"responses": failure_responses})())
+    response, evidence_output, draft_response = service._citation_repaired_response(
+        {"model": "fake", "input": [], "instructions": "analyse", "tools": []}, continuation, "What does Jacob teach?"
+    )
+    thread_id = storage.create_thread("Failed repair")
+    service._finalize(
+        thread_id, {"role": "user", "content": [{"type": "input_text", "text": "What does Jacob teach?"}]},
+        response, EvaluationConfig(), "normal", 0.0, evidence_output=evidence_output, draft_response=draft_response,
+    )
+
+    assert response.status == "failed"
+    assert note not in json.dumps(failure_responses.calls[1])
+    persisted = json.dumps(storage.thread_items(thread_id) + storage.replay_items(thread_id) + storage.response_diagnostics(thread_id))
+    assert note not in persisted
+
+
+def test_qualitative_transport_rejects_returned_raw_tool_artifact_and_releases_capability(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    source = tmp_path / "trades.csv"
+    note = "SECRET_NOTE_SENTINEL_MALFORMED"
+    source.write_text(f"Journal\n{note}\n", encoding="utf-8")
+    dataset = _importer(storage, tmp_path)(source).dataset
+    mapping = storage.confirm_mapping_version(create_inspected_mapping_draft(
+        storage, inspect_local_dataset(storage, dataset.id),
+        [MappingEntry(0, analysis_label="Journal", mentor_access="allow_row_values_when_analysing_notes")],
+    ).id)
+    field_id = storage.mapping_entries(mapping.id)[0].field_id or ""
+    capability = QualitativeDisclosureCapability()
+    evidence = read_text_evidence(
+        storage, dataset.id, mapping.id, text_field_ids=(field_id,), include_approved_notes=True,
+        use_guard=capability,
+    )
+    malformed = type("Response", (), {
+        "status": "completed",
+        "output": [{"type": "function_call_output", "output": note}],
+    })()
+
+    with pytest.raises(QualitativeTransportError) as error:
+        continue_qualitative_model_transport(
+            client=type("Client", (), {"responses": _SequenceResponses(malformed)})(),
+            request={"model": "fake", "input": []}, call_id="call_notes", evidence=evidence,
+        )
+
+    assert note not in str(error.value)
+    assert capability.active is False
+
+
+def test_qualitative_transport_rejects_ephemeral_evidence_wrapped_in_model_output(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    source = tmp_path / "trades.csv"
+    source.write_text("Journal\nSECRET_NOTE_SENTINEL_WRAPPED\n", encoding="utf-8")
+    dataset = _importer(storage, tmp_path)(source).dataset
+    mapping = storage.confirm_mapping_version(create_inspected_mapping_draft(
+        storage, inspect_local_dataset(storage, dataset.id),
+        [MappingEntry(0, analysis_label="Journal", mentor_access="allow_row_values_when_analysing_notes")],
+    ).id)
+    field_id = storage.mapping_entries(mapping.id)[0].field_id or ""
+    capability = QualitativeDisclosureCapability()
+    evidence = read_text_evidence(
+        storage, dataset.id, mapping.id, text_field_ids=(field_id,), include_approved_notes=True,
+        use_guard=capability,
+    )
+    malformed = type("Response", (), {
+        "status": "completed",
+        "output": [{"type": "message", "content": [{"evidence": evidence}]}],
+    })()
+
+    with pytest.raises(QualitativeTransportError, match="unsafe"):
+        continue_qualitative_model_transport(
+            client=type("Client", (), {"responses": _SequenceResponses(malformed)})(),
+            request={"model": "fake", "input": []}, call_id="call_notes", evidence=evidence,
+        )
+
+    assert capability.active is False
 
 
 def test_qualitative_transport_retries_only_in_memory_and_releases_on_terminal_failure(tmp_path):

@@ -118,14 +118,22 @@ class EphemeralQualitativeEvidence:
 
 
 @dataclass(frozen=True, slots=True)
-class QualitativeTransportResult:
-    """Safe result of one qualitative disclosure; raw text never leaves transport."""
+class QualitativeContinuationResult:
+    """Safe model-output projection for same-turn processing after qualitative disclosure."""
 
+    output: tuple[dict[str, object], ...] = field(repr=False)
     status: str
     metadata: QualitativeEvidenceMetadata
+    id: str | None = None
+    model: str | None = None
+    usage: Mapping[str, object] | None = field(default=None, repr=False)
+    incomplete_details: Mapping[str, object] | None = field(default=None, repr=False)
 
     def to_persistable_dict(self) -> dict[str, object]:
         return {"status": self.status, "qualitative_metadata": self.metadata.to_dict()}
+
+
+QualitativeTransportResult = QualitativeContinuationResult
 
 
 class QualitativeTransportError(RuntimeError):
@@ -165,16 +173,81 @@ def continue_qualitative_model_transport(
         for attempt in range(max_attempts):
             try:
                 response = client.responses.create(**continuation_request)
-                status = str(getattr(response, "status", "completed"))
-                return QualitativeTransportResult(status=status, metadata=evidence.to_persistable_metadata())
+                return _qualitative_continuation_result(response, evidence.to_persistable_metadata())
             except TimeoutError:
                 if attempt + 1 == max_attempts:
                     raise QualitativeTransportError("qualitative model transport timed out") from None
+            except QualitativeTransportError:
+                raise
             except Exception:
                 raise QualitativeTransportError("qualitative model transport failed") from None
         raise AssertionError("unreachable")
     finally:
         evidence._release()
+
+
+def _qualitative_continuation_result(response: Any, metadata: QualitativeEvidenceMetadata) -> QualitativeContinuationResult:
+    """Project only model-produced fields needed by terminal/citation processing."""
+    output = tuple(_safe_qualitative_output_item(item) for item in getattr(response, "output", ()) or ())
+    return QualitativeContinuationResult(
+        output=output,
+        status=str(getattr(response, "status", "completed")),
+        metadata=metadata,
+        id=_safe_optional_string(getattr(response, "id", None)),
+        model=_safe_optional_string(getattr(response, "model", None)),
+        usage=_safe_usage(getattr(response, "usage", None)),
+        incomplete_details=_safe_incomplete_details(getattr(response, "incomplete_details", None)),
+    )
+
+
+def _safe_qualitative_output_item(item: Any) -> dict[str, object]:
+    if isinstance(item, dict):
+        safe = dict(item)
+    elif hasattr(item, "model_dump"):
+        safe = item.model_dump(mode="json")
+    else:
+        raise QualitativeTransportError("qualitative model response was malformed")
+    if (
+        not isinstance(safe, dict)
+        or safe.get("type") == "function_call_output"
+        or _contains_ephemeral_qualitative_evidence(safe)
+    ):
+        raise QualitativeTransportError("qualitative model response contained an unsafe tool artifact")
+    return safe
+
+
+def _safe_optional_string(value: object) -> str | None:
+    return value if isinstance(value, str) else None
+
+
+def _safe_usage(value: object) -> Mapping[str, object] | None:
+    if not isinstance(value, Mapping):
+        return None
+    allowed = {"input_tokens", "output_tokens", "total_tokens"}
+    details = {"input_tokens_details", "output_tokens_details"}
+    safe: dict[str, object] = {
+        key: item for key in allowed if isinstance((item := value.get(key)), int | float)
+    }
+    for key in details:
+        if isinstance((item := value.get(key)), Mapping):
+            safe[key] = {name: count for name, count in item.items() if isinstance(count, int | float)}
+    return safe
+
+
+def _safe_incomplete_details(value: object) -> Mapping[str, object] | None:
+    if not isinstance(value, Mapping):
+        return None
+    return {"reason": value["reason"]} if isinstance(value.get("reason"), str) else None
+
+
+def _contains_ephemeral_qualitative_evidence(value: object) -> bool:
+    if isinstance(value, EphemeralQualitativeEvidence):
+        return True
+    if isinstance(value, Mapping):
+        return any(_contains_ephemeral_qualitative_evidence(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_contains_ephemeral_qualitative_evidence(item) for item in value)
+    return False
 _DATASET_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,79}")
 _CELL_REFERENCE_PATTERN = re.compile(r"([A-Z]+)([1-9][0-9]*)$")
 _IMPORT_LEASE_LOCK = threading.RLock()
