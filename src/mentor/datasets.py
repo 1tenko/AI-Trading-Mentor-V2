@@ -209,8 +209,7 @@ def _safe_qualitative_output_item(item: Any) -> dict[str, object]:
         raise QualitativeTransportError("qualitative model response was malformed")
     if (
         not isinstance(safe, dict)
-        or safe.get("type") == "function_call_output"
-        or _contains_ephemeral_qualitative_evidence(safe)
+        or _contains_unsafe_qualitative_output(safe)
     ):
         raise QualitativeTransportError("qualitative model response contained an unsafe tool artifact")
     return safe
@@ -240,14 +239,19 @@ def _safe_incomplete_details(value: object) -> Mapping[str, object] | None:
     return {"reason": value["reason"]} if isinstance(value.get("reason"), str) else None
 
 
-def _contains_ephemeral_qualitative_evidence(value: object) -> bool:
+def _contains_unsafe_qualitative_output(value: object) -> bool:
+    """Reject only typed ephemeral data and forbidden Responses tool output."""
     if isinstance(value, EphemeralQualitativeEvidence):
         return True
     if isinstance(value, Mapping):
-        return any(_contains_ephemeral_qualitative_evidence(item) for item in value.values())
+        return value.get("type") == "function_call_output" or any(
+            _contains_unsafe_qualitative_output(item) for item in value.values()
+        )
     if isinstance(value, (list, tuple)):
-        return any(_contains_ephemeral_qualitative_evidence(item) for item in value)
+        return any(_contains_unsafe_qualitative_output(item) for item in value)
     return False
+
+
 _DATASET_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,79}")
 _CELL_REFERENCE_PATTERN = re.compile(r"([A-Z]+)([1-9][0-9]*)$")
 _IMPORT_LEASE_LOCK = threading.RLock()

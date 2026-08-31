@@ -60,6 +60,17 @@ class _SequenceResponses:
         return self.responses.pop(0)
 
 
+class _ProjectedOutputWrapper:
+    """Small SDK-like response item used to exercise the approved projection path."""
+
+    def __init__(self, payload):
+        self.payload = payload
+
+    def model_dump(self, *, mode):
+        assert mode == "json"
+        return self.payload
+
+
 def _source_response(text: str, annotations: list[dict[str, object]], *, passage: str = "[730.0 --> 756.0] Jacob's original words."):
     return type("Response", (), {
         "status": "completed",
@@ -317,6 +328,82 @@ def test_qualitative_transport_rejects_returned_raw_tool_artifact_and_releases_c
         )
 
     assert note not in str(error.value)
+    assert capability.active is False
+
+
+@pytest.mark.parametrize(
+    "malformed_item",
+    [
+        {"type": "function_call_output", "output": "SECRET_NOTE_SENTINEL_NESTED_FCO"},
+        {"type": "message", "content": {"tool": {"type": "function_call_output", "output": "SECRET_NOTE_SENTINEL_NESTED_FCO"}}},
+        {"type": "message", "content": {"a": {"b": {"c": {"type": "function_call_output", "output": "SECRET_NOTE_SENTINEL_NESTED_FCO"}}}}},
+        {"type": "message", "content": [{"type": "function_call_output", "output": "SECRET_NOTE_SENTINEL_NESTED_FCO"}]},
+        {"type": "message", "content": {"children": [{"type": "function_call_output", "output": "SECRET_NOTE_SENTINEL_NESTED_FCO"}]}},
+        {"type": "message", "content": ({"type": "function_call_output", "output": "SECRET_NOTE_SENTINEL_NESTED_FCO"},)},
+        _ProjectedOutputWrapper({"type": "message", "content": {"output": {"type": "function_call_output", "output": "SECRET_NOTE_SENTINEL_NESTED_FCO"}}}),
+    ],
+    ids=("top-level", "nested-dict", "deep-dict", "list", "list-in-dict", "tuple", "sdk-wrapper"),
+)
+def test_qualitative_transport_rejects_function_call_output_at_every_projected_depth(tmp_path, malformed_item):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    source = tmp_path / "trades.csv"
+    source.write_text("Journal\nSECRET_NOTE_SENTINEL_NESTED_FCO\n", encoding="utf-8")
+    dataset = _importer(storage, tmp_path)(source).dataset
+    mapping = storage.confirm_mapping_version(create_inspected_mapping_draft(
+        storage, inspect_local_dataset(storage, dataset.id),
+        [MappingEntry(0, analysis_label="Journal", mentor_access="allow_row_values_when_analysing_notes")],
+    ).id)
+    field_id = storage.mapping_entries(mapping.id)[0].field_id or ""
+    capability = QualitativeDisclosureCapability()
+    evidence = read_text_evidence(
+        storage, dataset.id, mapping.id, text_field_ids=(field_id,), include_approved_notes=True,
+        use_guard=capability,
+    )
+    malformed = type("Response", (), {"status": "completed", "output": [malformed_item]})()
+
+    with pytest.raises(QualitativeTransportError, match="unsafe tool artifact") as error:
+        continue_qualitative_model_transport(
+            client=type("Client", (), {"responses": _SequenceResponses(malformed)})(),
+            request={"model": "fake", "input": []}, call_id="call_notes", evidence=evidence,
+        )
+
+    assert "SECRET_NOTE_SENTINEL_NESTED_FCO" not in str(error.value)
+    assert capability.active is False
+    with pytest.raises(ValueError, match="expired"):
+        continue_qualitative_model_transport(
+            client=type("Client", (), {"responses": _SentinelResponses()})(),
+            request={"model": "fake", "input": []}, call_id="call_notes", evidence=evidence,
+        )
+
+
+def test_qualitative_transport_accepts_nested_assistant_and_reasoning_state(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    source = tmp_path / "trades.csv"
+    source.write_text("Journal\nSAFE_NESTED_CONTINUATION\n", encoding="utf-8")
+    dataset = _importer(storage, tmp_path)(source).dataset
+    mapping = storage.confirm_mapping_version(create_inspected_mapping_draft(
+        storage, inspect_local_dataset(storage, dataset.id),
+        [MappingEntry(0, analysis_label="Journal", mentor_access="allow_row_values_when_analysing_notes")],
+    ).id)
+    field_id = storage.mapping_entries(mapping.id)[0].field_id or ""
+    capability = QualitativeDisclosureCapability()
+    evidence = read_text_evidence(
+        storage, dataset.id, mapping.id, text_field_ids=(field_id,), include_approved_notes=True,
+        use_guard=capability,
+    )
+    safe = type("Response", (), {"status": "completed", "output": [
+        _ProjectedOutputWrapper({"type": "reasoning", "summary": [{"type": "summary_text", "text": "safe"}]}),
+        {"type": "message", "content": [{"type": "output_text", "text": "safe", "annotations": []}]},
+    ]})()
+
+    result = continue_qualitative_model_transport(
+        client=type("Client", (), {"responses": _SequenceResponses(safe)})(),
+        request={"model": "fake", "input": []}, call_id="call_notes", evidence=evidence,
+    )
+
+    assert [item["type"] for item in result.output] == ["reasoning", "message"]
     assert capability.active is False
 
 
