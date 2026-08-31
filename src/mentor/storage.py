@@ -2206,6 +2206,17 @@ class Storage:
             ).fetchone()
         return None if row is None else DatasetMappingVersion(*row)
 
+    def confirmed_mapping_for_dataset(self, dataset_id: str) -> DatasetMappingVersion | None:
+        """Return the latest immutable confirmed mapping for a local dataset scope."""
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT id, dataset_id, version, status, parent_mapping_version_id "
+                "FROM dataset_mapping_versions WHERE dataset_id = ? AND status = 'confirmed' "
+                "ORDER BY version DESC LIMIT 1",
+                (dataset_id,),
+            ).fetchone()
+        return None if row is None else DatasetMappingVersion(*row)
+
     def mapping_entries(self, mapping_version_id: int) -> list[MappingEntry]:
         with self._connect() as connection:
             rows = connection.execute(

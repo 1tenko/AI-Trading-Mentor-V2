@@ -17,7 +17,23 @@ from mentor.profile import (
     select_profile_context,
     strategy_profile_context,
 )
-from mentor.prompts import MENTOR_INSTRUCTIONS, PROFILE_TOOL_INSTRUCTIONS
+from mentor.analysis import (
+    AnalysisFilter,
+    analyze_mfe_mae,
+    analyze_over_time,
+    build_analysis_frame,
+    compare_groups,
+    group_results,
+    read_text_evidence,
+    summarize_results,
+)
+from mentor.datasets import (
+    QualitativeDisclosureCapability,
+    QualitativeTransportError,
+    continue_qualitative_model_transport,
+    model_mapping_context,
+)
+from mentor.prompts import ANALYSIS_TOOL_INSTRUCTIONS, MENTOR_INSTRUCTIONS, PROFILE_TOOL_INSTRUCTIONS
 from mentor.storage import Storage
 
 
@@ -106,6 +122,61 @@ EXPLICIT_PROFILE_FORGET = re.compile(r"\b(?:forget|archive|delete|remove)\b", re
 EXPLICIT_PROFILE_TARGET = re.compile(r"\bprofile\s+item\s*#?\s*(\d+)\b", re.IGNORECASE)
 PROFILE_TOOL_KEYS = frozenset({"operation", "category", "subject", "value", "kind", "provenance", "target_id"})
 PROFILE_WRITE_FIELDS = frozenset({"category", "subject", "value", "kind", "provenance"})
+ANALYSIS_TOOL_NAMES = frozenset({
+    "inspect_dataset", "summarize_results", "group_results", "compare_groups",
+    "analyze_mfe_mae", "analyze_over_time", "read_text_evidence",
+})
+QUALITATIVE_TOOL_NAME = "read_text_evidence"
+MAX_ANALYSIS_CALLS = 3
+MAX_DETERMINISTIC_ANALYSIS_CALLS = 2
+MAX_DETERMINISTIC_OUTPUT_CHARS = 8_000
+
+
+def _tool(name: str, description: str, properties: dict[str, object], required: list[str]) -> dict[str, object]:
+    return {
+        "type": "function",
+        "name": name,
+        "description": description,
+        "strict": True,
+        "parameters": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": properties,
+            "required": required,
+        },
+    }
+
+
+_FILTER_VALUE_SCHEMA = {
+    "anyOf": [
+        {"type": "string", "maxLength": 200},
+        {"type": "number"},
+        {"type": "boolean"},
+        {"type": "null"},
+        {"type": "array", "items": {"anyOf": [{"type": "string", "maxLength": 200}, {"type": "number"}, {"type": "boolean"}, {"type": "null"}]}, "maxItems": 20},
+    ],
+}
+_FILTER_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "field_id": {"type": "string", "minLength": 1, "maxLength": 120},
+        "operator": {"type": "string", "enum": ["eq", "neq", "in", "not_in", "is_blank", "not_blank", "gt", "gte", "lt", "lte", "between"]},
+        "value": _FILTER_VALUE_SCHEMA,
+    },
+    "required": ["field_id", "operator", "value"],
+}
+_FILTERS_SCHEMA = {"type": "array", "items": _FILTER_SCHEMA, "maxItems": 8}
+_FIELD_IDS_SCHEMA = {"type": "array", "items": {"type": "string", "minLength": 1, "maxLength": 120}, "maxItems": 3}
+ANALYSIS_TOOLS = [
+    _tool("inspect_dataset", "Inspect the active local dataset's safe mapping and row-health summary; never returns raw cells.", {}, []),
+    _tool("summarize_results", "Compute deterministic aggregate results for the active dataset.", {"filters": _FILTERS_SCHEMA}, ["filters"]),
+    _tool("group_results", "Compute deterministic aggregate results by one or two approved fields.", {"group_field_ids": {**_FIELD_IDS_SCHEMA, "minItems": 1, "maxItems": 2}, "filters": _FILTERS_SCHEMA}, ["group_field_ids", "filters"]),
+    _tool("compare_groups", "Compare two distinct values in one approved group field.", {"field_id": {"type": "string", "minLength": 1, "maxLength": 120}, "value_a": _FILTER_VALUE_SCHEMA, "value_b": _FILTER_VALUE_SCHEMA, "filters": _FILTERS_SCHEMA}, ["field_id", "value_a", "value_b", "filters"]),
+    _tool("analyze_mfe_mae", "Compute deterministic MFE and MAE aggregates when mapped.", {"filters": _FILTERS_SCHEMA}, ["filters"]),
+    _tool("analyze_over_time", "Compute deterministic chronological aggregates for the active dataset.", {"mode": {"type": "string", "enum": ["month", "halves", "rolling"]}, "window_size": {"type": ["integer", "null"], "minimum": 1, "maximum": 250}, "filters": _FILTERS_SCHEMA}, ["mode", "window_size", "filters"]),
+    _tool("read_text_evidence", "Read one bounded, explicitly approved local note sample for this turn only.", {"text_field_ids": {**_FIELD_IDS_SCHEMA, "minItems": 1}, "context_field_ids": _FIELD_IDS_SCHEMA, "filters": _FILTERS_SCHEMA, "order_by": {"type": "string", "enum": ["source", "timestamp"]}}, ["text_field_ids", "context_field_ids", "filters", "order_by"]),
+]
 
 
 @dataclass(frozen=True)
@@ -203,12 +274,14 @@ class ChatService:
         thread_id: int,
         question: str,
         evaluation: EvaluationConfig = DEFAULT_EVALUATION_CONFIG,
+        *,
+        include_approved_notes: bool = False,
     ) -> Answer:
         user_item, request, effective_depth = self._request(thread_id, question, evaluation)
         started_at = perf_counter()
         response = self.client.responses.create(**request)
-        response, leading_output, response_request, profile_update = self._profile_continued_response(
-            thread_id, request, response, user_item["content"][0]["text"]
+        response, leading_output, replay_leading_output, response_request, profile_update = self._local_tools_continued_response(
+            thread_id, request, response, user_item["content"][0]["text"], include_approved_notes=include_approved_notes
         )
         response, evidence_output, draft_response = self._citation_repaired_response(
             response_request, response, user_item["content"][0]["text"]
@@ -223,6 +296,7 @@ class ChatService:
             evidence_output=[*leading_output, *evidence_output],
             draft_response=draft_response,
             leading_output=leading_output,
+            replay_leading_output=replay_leading_output,
             profile_update=profile_update,
         )
 
@@ -231,6 +305,8 @@ class ChatService:
         thread_id: int,
         question: str,
         evaluation: EvaluationConfig = DEFAULT_EVALUATION_CONFIG,
+        *,
+        include_approved_notes: bool = False,
     ):
         user_item, request, effective_depth = self._request(thread_id, question, evaluation)
         started_at = perf_counter()
@@ -240,8 +316,8 @@ class ChatService:
                 if event.type == "response.output_text.delta":
                     yield StreamEvent("delta", event.delta)
                 elif event.type in {"response.completed", "response.incomplete"}:
-                    response, leading_output, response_request, profile_update = self._profile_continued_response(
-                        thread_id, request, event.response, user_item["content"][0]["text"]
+                    response, leading_output, replay_leading_output, response_request, profile_update = self._local_tools_continued_response(
+                        thread_id, request, event.response, user_item["content"][0]["text"], include_approved_notes=include_approved_notes
                     )
                     response, evidence_output, draft_response = self._citation_repaired_response(
                         response_request, response, user_item["content"][0]["text"]
@@ -256,6 +332,7 @@ class ChatService:
                         evidence_output=[*leading_output, *evidence_output],
                         draft_response=draft_response,
                         leading_output=leading_output,
+                        replay_leading_output=replay_leading_output,
                         profile_update=profile_update,
                     )
                     if answer.incomplete_reason:
@@ -308,16 +385,27 @@ class ChatService:
         repaired = self.client.responses.create(**repair_request)
         return repaired, [*draft_output, *(_as_dict(item) for item in repaired.output)], response
 
-    def _profile_continued_response(
-        self, thread_id: int, request: dict, response: Any, question: str
-    ) -> tuple[Any, list[dict], dict, dict[str, str] | None]:
+    def _local_tools_continued_response(
+        self,
+        thread_id: int,
+        request: dict,
+        response: Any,
+        question: str,
+        *,
+        include_approved_notes: bool,
+    ) -> tuple[Any, list[dict], list[dict], dict, dict[str, str] | None]:
         output = [_as_dict(item) for item in response.output]
         calls = [item for item in output if item.get("type") == "function_call"]
         if not calls:
-            return response, [], request, None
+            return response, [], [], request, None
         if any(not isinstance(call.get("call_id"), str) or not call["call_id"] for call in calls):
-            LOGGER.warning("Profile function call missing a usable call id")
+            LOGGER.warning("Local function call missing a usable call id")
             safe_output = [item for item in output if item.get("type") != "function_call"]
+            failure_text = (
+                "I could not update that profile item. Please try again."
+                if all(call.get("name") == PROFILE_TOOL_NAME for call in calls)
+                else "I could not complete that local request. Please try again."
+            )
             if not any(item.get("type") == "message" and item.get("role") == "assistant" for item in safe_output):
                 safe_output.append(
                     {
@@ -326,26 +414,90 @@ class ChatService:
                         "content": [
                             {
                                 "type": "output_text",
-                                "text": "I could not update that profile item. Please try again.",
+                                "text": failure_text,
                             }
                         ],
                     }
                 )
-            return _response_with_output(response, safe_output), [], request, None
-        if len(calls) > 1:
-            results = [_profile_tool_rejection("multiple_function_calls") for _ in calls]
-        else:
-            call = calls[0]
-            results = [
-                self._execute_profile_tool(thread_id, question, call)
-                if call.get("name") == PROFILE_TOOL_NAME
-                else _profile_tool_rejection("unsupported_tool")
-            ]
+            return _response_with_output(response, safe_output), [], [], request, None
+
+        names = {call.get("name") for call in calls}
+        profile_calls = [call for call in calls if call.get("name") == PROFILE_TOOL_NAME]
+        analysis_calls = [call for call in calls if call.get("name") in ANALYSIS_TOOL_NAMES]
+        if len({call["call_id"] for call in calls}) != len(calls):
+            results = [_profile_tool_rejection("duplicate_call_id") for _ in calls]
+            return (*self._standard_local_continuation(request, output, calls, results), None)
+        if profile_calls and analysis_calls:
+            results = [_profile_tool_rejection("mixed_local_tool_batch_not_supported") for _ in calls]
+            return (*self._standard_local_continuation(request, output, calls, results), None)
+        if profile_calls:
+            results = (
+                [self._execute_profile_tool(thread_id, question, profile_calls[0])]
+                if len(calls) == 1
+                else [_profile_tool_rejection("multiple_function_calls") for _ in calls]
+            )
+            if len(calls) == 1 and names != {PROFILE_TOOL_NAME}:
+                results = [_profile_tool_rejection("unsupported_tool")]
+            continued = self._standard_local_continuation(request, output, calls, results)
+            return (*continued, _profile_update(results[0]) if len(results) == 1 else None)
+        if len(analysis_calls) != len(calls):
+            return (*self._standard_local_continuation(
+                request, output, calls, [_profile_tool_rejection("unsupported_tool") for _ in calls]
+            ), None)
+        if (
+            len(calls) > MAX_ANALYSIS_CALLS
+            or sum(call.get("name") == QUALITATIVE_TOOL_NAME for call in calls) > 1
+            or sum(call.get("name") != QUALITATIVE_TOOL_NAME for call in calls) > MAX_DETERMINISTIC_ANALYSIS_CALLS
+        ):
+            return (*self._standard_local_continuation(
+                request, output, calls, [_profile_tool_rejection("analysis_batch_limit_exceeded") for _ in calls]
+            ), None)
+
+        scope = self._active_analysis_scope(thread_id)
+        if scope is None:
+            return (*self._standard_local_continuation(
+                request, output, calls, [_profile_tool_rejection("no_active_dataset") for _ in calls]
+            ), None)
+        dataset_id, mapping_version_id = scope
+        deterministic: list[tuple[dict, dict]] = []
+        qualitative: tuple[dict, Any] | None = None
+        rejection_results: dict[str, dict] = {}
+        deterministic_size = 0
+        capability = QualitativeDisclosureCapability() if include_approved_notes else None
+        for call in calls:
+            try:
+                if call["name"] == QUALITATIVE_TOOL_NAME:
+                    if capability is None:
+                        raise _LocalToolRejected("qualitative_consent_required")
+                    evidence = self._execute_qualitative_tool(
+                        dataset_id, mapping_version_id, call, capability
+                    )
+                    qualitative = (call, evidence)
+                else:
+                    result = self._execute_analysis_tool(dataset_id, mapping_version_id, call)
+                    encoded_size = len(json.dumps(result, separators=(",", ":"), allow_nan=False))
+                    if deterministic_size + encoded_size > MAX_DETERMINISTIC_OUTPUT_CHARS:
+                        raise _LocalToolRejected("deterministic_result_budget_exceeded")
+                    deterministic_size += encoded_size
+                    deterministic.append((call, result))
+            except _LocalToolRejected as error:
+                rejection_results[call["call_id"]] = _profile_tool_rejection(error.reason)
+            except (ValueError, TypeError, json.JSONDecodeError):
+                rejection_results[call["call_id"]] = _profile_tool_rejection("invalid_analysis_arguments")
+
         tool_outputs = [
-            {"type": "function_call_output", "call_id": call["call_id"], "output": json.dumps(result)}
-            for call, result in zip(calls, results, strict=True)
+            {
+                "type": "function_call_output",
+                "call_id": call["call_id"],
+                "output": json.dumps(
+                    next((result for candidate, result in deterministic if candidate is call), rejection_results.get(call["call_id"], _profile_tool_rejection("invalid_analysis_arguments"))),
+                    separators=(",", ":"),
+                ),
+            }
+            for call in calls
+            if call.get("name") != QUALITATIVE_TOOL_NAME or call["call_id"] in rejection_results
         ]
-        continuation_request = {
+        raw_continuation_request = {
             **request,
             "input": [
                 *request["input"],
@@ -354,11 +506,132 @@ class ChatService:
             ],
             "tools": _raw_file_search_tools(request["tools"]),
         }
-        return (
-            self.client.responses.create(**continuation_request),
-            [*output, *tool_outputs],
-            continuation_request,
-            _profile_update(results[0]) if len(results) == 1 else None,
+        leading_output = [*output, *tool_outputs]
+        replay_leading_output = [
+            item for item in leading_output
+            if not (item.get("type") == "function_call" and item.get("name") == QUALITATIVE_TOOL_NAME)
+        ]
+        origin_turn_number = len(self.storage.display_turns(thread_id)) + 1
+        for call, result in deterministic:
+            if call["call_id"] in rejection_results:
+                continue
+            if result.get("operation") == "inspect_dataset":
+                continue
+            evidence = self.storage.record_analysis_evidence(
+                thread_id=thread_id,
+                origin_turn_number=origin_turn_number,
+                display_turn_number=origin_turn_number,
+                dataset_id=dataset_id,
+                mapping_version_id=mapping_version_id,
+                operation=str(result["operation"]),
+                schema_version=str(result["schema_version"]),
+                arguments={"dataset_id": dataset_id},
+                result=result,
+            )
+            self.storage.record_analysis_tool_output(
+                thread_id, call["call_id"], evidence.id, result,
+                arguments={"dataset_id": dataset_id, "mapping_version_id": mapping_version_id, "operation": result["operation"]},
+            )
+        if qualitative is None:
+            response = self.client.responses.create(**raw_continuation_request)
+            return response, leading_output, replay_leading_output, raw_continuation_request, None
+
+        qualitative_call, qualitative_evidence = qualitative
+        safe_request = {
+            **request,
+            "input": [
+                *request["input"],
+                *(_input_item(item) for item in output if item is not qualitative_call),
+                *tool_outputs,
+            ],
+            "tools": _raw_file_search_tools(request["tools"]),
+        }
+        try:
+            continuation = continue_qualitative_model_transport(
+                client=self.client,
+                request=raw_continuation_request,
+                call_id=qualitative_call["call_id"],
+                evidence=qualitative_evidence,
+            )
+        except QualitativeTransportError:
+            raise RuntimeError("The approved notes could not be disclosed safely. Try again.") from None
+        self.storage.record_qualitative_metadata(thread_id, origin_turn_number, continuation.metadata)
+        return _response_with_output(continuation, list(continuation.output)), leading_output, replay_leading_output, safe_request, None
+
+    def _standard_local_continuation(
+        self, request: dict, output: list[dict], calls: list[dict], results: list[dict]
+    ) -> tuple[Any, list[dict], list[dict], dict]:
+        tool_outputs = [
+            {"type": "function_call_output", "call_id": call["call_id"], "output": json.dumps(result)}
+            for call, result in zip(calls, results, strict=True)
+        ]
+        continuation_request = {
+            **request,
+            "input": [*request["input"], *(_input_item(item) for item in output), *tool_outputs],
+            "tools": _raw_file_search_tools(request["tools"]),
+        }
+        leading_output = [*output, *tool_outputs]
+        return self.client.responses.create(**continuation_request), leading_output, leading_output, continuation_request
+
+    def _active_analysis_scope(self, thread_id: int) -> tuple[str, int] | None:
+        scope = self.storage.thread_dataset_scope(thread_id)
+        if scope is None or scope.dataset_id is None:
+            return None
+        mapping = self.storage.confirmed_mapping_for_dataset(scope.dataset_id)
+        return None if mapping is None else (scope.dataset_id, mapping.id)
+
+    def _execute_analysis_tool(self, dataset_id: str, mapping_version_id: int, call: dict) -> dict:
+        arguments = _analysis_arguments(call)
+        name = call["name"]
+        if name == "inspect_dataset":
+            if arguments:
+                raise _LocalToolRejected("invalid_analysis_arguments")
+            return _inspect_dataset_payload(self.storage, dataset_id, mapping_version_id)
+        filters = _analysis_filters(arguments.pop("filters"))
+        if name == "summarize_results":
+            _require_exact_keys(arguments, set())
+            return summarize_results(build_analysis_frame(self.storage, dataset_id, mapping_version_id, required_roles=_analysis_roles(self.storage, mapping_version_id), filters=filters))
+        if name == "group_results":
+            group_field_ids = arguments.pop("group_field_ids", None)
+            _require_exact_keys(arguments, set())
+            return group_results(build_analysis_frame(self.storage, dataset_id, mapping_version_id, required_roles=_analysis_roles(self.storage, mapping_version_id), filters=filters), group_field_ids)
+        if name == "compare_groups":
+            field_id, value_a, value_b = arguments.pop("field_id", None), arguments.pop("value_a", None), arguments.pop("value_b", None)
+            _require_exact_keys(arguments, set())
+            return compare_groups(build_analysis_frame(self.storage, dataset_id, mapping_version_id, required_roles=_analysis_roles(self.storage, mapping_version_id), filters=filters), field_id, value_a, value_b)
+        if name == "analyze_mfe_mae":
+            _require_exact_keys(arguments, set())
+            mfe_roles = tuple(role for role in ("mfe", "mae") if role in _mapping_roles(self.storage, mapping_version_id))
+            if not mfe_roles:
+                raise _LocalToolRejected("required_metric_unavailable")
+            return analyze_mfe_mae(build_analysis_frame(self.storage, dataset_id, mapping_version_id, required_roles=mfe_roles, filters=filters))
+        if name == "analyze_over_time":
+            mode, window_size = arguments.pop("mode", None), arguments.pop("window_size", None)
+            _require_exact_keys(arguments, set())
+            available_roles = _mapping_roles(self.storage, mapping_version_id)
+            if "trade_timestamp" not in available_roles:
+                raise _LocalToolRejected("required_metric_unavailable")
+            temporal_roles = tuple(role for role in ("trade_return", "trade_outcome", "trade_timestamp") if role in available_roles)
+            return analyze_over_time(build_analysis_frame(self.storage, dataset_id, mapping_version_id, required_roles=temporal_roles, filters=filters, order_by="timestamp"), mode=mode, window_size=window_size)
+        raise _LocalToolRejected("unsupported_tool")
+
+    def _execute_qualitative_tool(
+        self, dataset_id: str, mapping_version_id: int, call: dict, capability: QualitativeDisclosureCapability
+    ) -> Any:
+        arguments = _analysis_arguments(call)
+        text_field_ids = arguments.pop("text_field_ids", None)
+        context_field_ids = arguments.pop("context_field_ids", None)
+        order_by = arguments.pop("order_by", None)
+        filters = _analysis_filters(arguments.pop("filters"))
+        _require_exact_keys(arguments, set())
+        return read_text_evidence(
+            self.storage, dataset_id, mapping_version_id,
+            text_field_ids=text_field_ids,
+            context_field_ids=context_field_ids,
+            filters=filters,
+            order_by=order_by,
+            include_approved_notes=True,
+            use_guard=capability,
         )
 
     def _execute_profile_tool(self, thread_id: int, question: str, call: dict) -> dict:
@@ -487,17 +760,29 @@ class ChatService:
                 "max_num_results": FILE_SEARCH_RESULT_BUDGETS[effective_depth],
             }
         ]
+        analysis_context = ""
+        analysis_tools: list[dict] = []
+        scope = self._active_analysis_scope(thread_id)
+        if scope is not None:
+            dataset_id, mapping_version_id = scope
+            analysis_context = (
+                "\n\nLocal Backtest Dataset — server-owned user empirical context, not source evidence:\n"
+                f"dataset_id={dataset_id}; mapping_version_id={mapping_version_id}; "
+                f"fields={json.dumps(model_mapping_context(self.storage, mapping_version_id), separators=(',', ':'))}\n"
+                "Use only the available local analysis tools for this dataset. Field identifiers are opaque; never request headers, paths, rows, SQL, Python, or unlisted fields."
+            )
+            analysis_tools = ANALYSIS_TOOLS
         return user_item, {
             "model": self.model,
             "instructions": (
                 f"{MENTOR_INSTRUCTIONS}\n\n{PROFILE_TOOL_INSTRUCTIONS}\n\n"
-                f"{_research_instruction(effective_depth)}{profile_context}"
+                f"{ANALYSIS_TOOL_INSTRUCTIONS}\n\n{_research_instruction(effective_depth)}{profile_context}{analysis_context}"
             ),
             "input": [
                 *(_input_item(item) for item in replay_items),
                 user_item,
             ],
-            "tools": [*source_tools, PROFILE_TOOL],
+            "tools": [*source_tools, PROFILE_TOOL, *analysis_tools],
             "include": ["reasoning.encrypted_content", "file_search_call.results"],
             "reasoning": evaluation.request_value(),
             "context_management": [{"type": "compaction", "compact_threshold": COMPACTION_TOKEN_THRESHOLD}],
@@ -516,17 +801,22 @@ class ChatService:
         evidence_output: list[dict] | None = None,
         draft_response: Any | None = None,
         leading_output: list[dict] | None = None,
+        replay_leading_output: list[dict] | None = None,
         profile_update: dict[str, str] | None = None,
     ) -> Answer:
         output = [*(leading_output or []), *(_as_dict(item) for item in response.output)]
+        replay_output = [*(replay_leading_output if replay_leading_output is not None else (leading_output or [])), *(_as_dict(item) for item in response.output)]
         raw_positions = self.storage.append_thread_items(thread_id, [user_item, *output])
-        compaction_index = next((index for index, item in enumerate(output) if item.get("type") == "compaction"), None)
+        compaction_index = next((index for index, item in enumerate(replay_output) if item.get("type") == "compaction"), None)
         if compaction_index is None:
-            self.storage.append_replay_items(thread_id, [user_item, *output])
+            if replay_output != output:
+                self.storage.replace_replay_items(thread_id, [user_item, *replay_output])
+            else:
+                self.storage.append_replay_items(thread_id, [user_item, *replay_output])
         else:
             self.storage.replace_replay_items(
                 thread_id,
-                output[compaction_index:],
+                replay_output[compaction_index:],
             )
         answer = _answer(
             output,
@@ -596,6 +886,72 @@ def _question(question: str) -> str:
     if len(question) > 8_000:
         raise ValueError("Question is too long.")
     return question
+
+
+class _LocalToolRejected(ValueError):
+    def __init__(self, reason: str):
+        self.reason = reason
+        super().__init__(reason)
+
+
+def _analysis_arguments(call: dict) -> dict[str, object]:
+    try:
+        arguments = json.loads(call.get("arguments", ""))
+    except json.JSONDecodeError as error:
+        raise _LocalToolRejected("invalid_analysis_arguments") from error
+    if not isinstance(arguments, dict):
+        raise _LocalToolRejected("invalid_analysis_arguments")
+    return dict(arguments)
+
+
+def _analysis_filters(value: object) -> tuple[AnalysisFilter, ...]:
+    if not isinstance(value, list) or len(value) > 8:
+        raise _LocalToolRejected("invalid_analysis_arguments")
+    filters: list[AnalysisFilter] = []
+    for item in value:
+        if not isinstance(item, dict) or set(item) != {"field_id", "operator", "value"}:
+            raise _LocalToolRejected("invalid_analysis_arguments")
+        if not isinstance(item["field_id"], str) or not isinstance(item["operator"], str):
+            raise _LocalToolRejected("invalid_analysis_arguments")
+        filters.append(AnalysisFilter(item["field_id"], item["operator"], item["value"]))
+    return tuple(filters)
+
+
+def _require_exact_keys(arguments: dict[str, object], expected: set[str]) -> None:
+    if set(arguments) != expected:
+        raise _LocalToolRejected("invalid_analysis_arguments")
+
+
+def _mapping_roles(storage: Storage, mapping_version_id: int) -> set[str]:
+    return {entry.semantic_role for entry in storage.mapping_entries(mapping_version_id) if entry.semantic_role is not None}
+
+
+def _analysis_roles(storage: Storage, mapping_version_id: int) -> tuple[str, ...]:
+    roles = tuple(role for role in ("trade_return", "trade_outcome") if role in _mapping_roles(storage, mapping_version_id))
+    if not roles:
+        raise _LocalToolRejected("required_metric_unavailable")
+    return roles
+
+
+def _inspect_dataset_payload(storage: Storage, dataset_id: str, mapping_version_id: int) -> dict[str, object]:
+    dataset = storage.dataset(dataset_id)
+    mapping = storage.mapping_version(mapping_version_id)
+    if dataset is None or mapping is None or mapping.status != "confirmed" or mapping.dataset_id != dataset_id:
+        raise _LocalToolRejected("no_active_dataset")
+    fields = model_mapping_context(storage, mapping_version_id)
+    return {
+        "provenance": "USER_EMPIRICAL_EVIDENCE",
+        "operation": "inspect_dataset",
+        "dataset_id": dataset_id,
+        "mapping_version_id": mapping_version_id,
+        "source_rows": dataset.source_row_count,
+        "fields": fields,
+        "available_operations": [
+            "summarize_results", "group_results", "compare_groups", "analyze_mfe_mae",
+            "analyze_over_time", "read_text_evidence",
+        ],
+        "limitations": ["schema_and_mapping_only_no_raw_cells"],
+    }
 
 
 def _is_strategy_design_question(question: str) -> bool:

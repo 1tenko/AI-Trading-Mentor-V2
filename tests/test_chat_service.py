@@ -13,6 +13,7 @@ from mentor.chat_service import (
     _profile_context_mode,
 )
 from mentor.prompts import MENTOR_INSTRUCTIONS, PROFILE_TOOL_INSTRUCTIONS
+from mentor.datasets import MappingEntry, create_inspected_mapping_draft, import_local_dataset, inspect_local_dataset
 from mentor.profile import ProfileService
 from mentor.storage import Storage
 
@@ -99,6 +100,208 @@ def profile_forget_arguments(*, operation, target_id):
         "provenance": None,
         "target_id": target_id,
     }
+
+
+def _scoped_analysis_dataset(tmp_path, *, allow_notes=False):
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    storage.set_vector_store("vs_jacob")
+    source = tmp_path / "trades.csv"
+    source.write_text(
+        "Result,Outcome,Session,Journal\n1,Win,London,waited for confirmation\n-1,Loss,New York,entered early\n",
+        encoding="utf-8",
+    )
+    dataset = import_local_dataset(source, storage, dataset_id_factory=lambda: "chat-analysis").dataset
+    draft = create_inspected_mapping_draft(
+        storage,
+        inspect_local_dataset(storage, dataset.id),
+        [
+            MappingEntry(0, semantic_role="trade_return", unit="R"),
+            MappingEntry(1, semantic_role="trade_outcome"),
+            MappingEntry(2, analysis_label="Session", model_disclosure=True),
+            MappingEntry(
+                3,
+                analysis_label="Journal",
+                mentor_access="allow_row_values_when_analysing_notes" if allow_notes else "aggregates_only",
+            ),
+        ],
+    )
+    mapping = storage.confirm_mapping_version(draft.id)
+    thread_id = storage.create_thread("Analysis")
+    storage.set_thread_dataset_scope(thread_id, dataset.id)
+    fields = {entry.analysis_label or entry.semantic_role: entry.field_id for entry in storage.mapping_entries(mapping.id)}
+    return storage, thread_id, dataset, mapping, fields
+
+
+def analysis_tool_call(name, arguments, *, call_id="call_analysis"):
+    return {
+        "type": "function_call",
+        "call_id": call_id,
+        "name": name,
+        "arguments": json.dumps(arguments),
+    }
+
+
+def terminal_response(text="The local evidence is bounded."):
+    return SimpleNamespace(
+        status="completed",
+        output=[{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": text}]}],
+    )
+
+
+def test_analysis_batch_runs_locally_and_persists_bounded_empirical_evidence(tmp_path):
+    storage, thread_id, dataset, mapping, fields = _scoped_analysis_dataset(tmp_path)
+    first = SimpleNamespace(
+        status="completed",
+        output=[
+            analysis_tool_call("summarize_results", {"filters": []}, call_id="summary"),
+            analysis_tool_call("group_results", {"group_field_ids": [fields["Session"]], "filters": []}, call_id="groups"),
+        ],
+    )
+    responses = SequenceResponses(first, terminal_response())
+
+    answer = ChatService(storage, SimpleNamespace(responses=responses)).reply(thread_id, "How did this dataset perform by session?")
+
+    assert answer.text == "The local evidence is bounded."
+    assert len(responses.calls) == 2
+    outputs = [item for item in responses.calls[1]["input"] if item.get("type") == "function_call_output"]
+    assert len(outputs) == 2
+    assert all(json.loads(item["output"])["provenance"] == "USER_EMPIRICAL_EVIDENCE" for item in outputs)
+    assert len(storage.analysis_evidence(thread_id)) == 2
+    assert len(storage.analysis_tool_outputs(thread_id)) == 2
+    assert all("Journal" not in item["output"] for item in outputs)
+    assert all(tool.get("name") != "summarize_results" for tool in responses.calls[1]["tools"])
+
+
+def test_mixed_profile_and_analysis_batch_is_rejected_without_mutation_or_analysis(tmp_path):
+    storage, thread_id, _dataset, _mapping, _fields = _scoped_analysis_dataset(tmp_path)
+    first = SimpleNamespace(
+        status="completed",
+        output=[
+            profile_tool_call(arguments=profile_write_arguments()).output[0],
+            analysis_tool_call("summarize_results", {"filters": []}, call_id="summary"),
+        ],
+    )
+    responses = SequenceResponses(first, terminal_response("Separate those actions."))
+
+    ChatService(storage, SimpleNamespace(responses=responses)).reply(thread_id, "Remember that I trade ES and summarize my data.")
+
+    outputs = [item for item in responses.calls[1]["input"] if item.get("type") == "function_call_output"]
+    assert all(json.loads(item["output"])["reason"] == "mixed_local_tool_batch_not_supported" for item in outputs)
+    assert storage.current_confirmed_profile_items() == []
+    assert storage.analysis_evidence(thread_id) == []
+
+
+def test_qualitative_tool_needs_current_turn_server_consent_and_never_replays_notes(tmp_path):
+    storage, thread_id, _dataset, _mapping, fields = _scoped_analysis_dataset(tmp_path, allow_notes=True)
+    first = SimpleNamespace(
+        status="completed",
+        output=[analysis_tool_call("read_text_evidence", {"text_field_ids": [fields["Journal"]], "context_field_ids": [], "filters": [], "order_by": "source"}, call_id="notes")],
+    )
+    responses = SequenceResponses(first, terminal_response("The disclosed notes suggest checking entry timing."))
+
+    ChatService(storage, SimpleNamespace(responses=responses)).reply(
+        thread_id, "Read my approved notes.", include_approved_notes=False
+    )
+
+    output = next(item for item in responses.calls[1]["input"] if item.get("type") == "function_call_output")
+    assert json.loads(output["output"])["reason"] == "qualitative_consent_required"
+    assert "waited for confirmation" not in json.dumps(storage.thread_items(thread_id))
+
+
+def test_approved_qualitative_notes_use_only_the_ephemeral_transport_and_persist_safe_metadata(tmp_path):
+    storage, thread_id, _dataset, _mapping, fields = _scoped_analysis_dataset(tmp_path, allow_notes=True)
+    first = SimpleNamespace(
+        status="completed",
+        output=[analysis_tool_call("read_text_evidence", {"text_field_ids": [fields["Journal"]], "context_field_ids": [], "filters": [], "order_by": "source"}, call_id="notes")],
+    )
+    responses = SequenceResponses(first, terminal_response("The notes show a possible entry-timing pattern."))
+
+    answer = ChatService(storage, SimpleNamespace(responses=responses)).reply(
+        thread_id, "Read my approved notes.", include_approved_notes=True
+    )
+
+    assert answer.text == "The notes show a possible entry-timing pattern."
+    assert "waited for confirmation" in responses.calls[1]["input"][-1]["output"]
+    persisted = json.dumps({
+        "thread": storage.thread_items(thread_id),
+        "replay": storage.replay_items(thread_id),
+        "metadata": storage.qualitative_metadata(thread_id),
+        "diagnostics": storage.response_diagnostics(thread_id),
+    })
+    assert "waited for confirmation" not in persisted
+    assert "entered early" not in persisted
+    assert all(item.get("name") != "read_text_evidence" for item in storage.replay_items(thread_id))
+    assert storage.qualitative_metadata(thread_id)[0]["returned_rows"] == 2
+
+
+def test_analysis_batch_limit_and_wrong_thread_scope_are_rejected_locally(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    storage.set_vector_store("vs_jacob")
+    thread_id = storage.create_thread("No scope")
+    no_scope = SequenceResponses(
+        SimpleNamespace(status="completed", output=[analysis_tool_call("summarize_results", {"filters": []})]),
+        terminal_response(),
+    )
+    ChatService(storage, SimpleNamespace(responses=no_scope)).reply(thread_id, "Summarize my data.")
+    output = next(item for item in no_scope.calls[1]["input"] if item.get("type") == "function_call_output")
+    assert json.loads(output["output"])["reason"] == "no_active_dataset"
+
+    scoped, scoped_thread, _dataset, _mapping, _fields = _scoped_analysis_dataset(tmp_path / "scoped")
+    over_limit = SequenceResponses(
+        SimpleNamespace(
+            status="completed",
+            output=[analysis_tool_call("summarize_results", {"filters": []}, call_id=f"call_{index}") for index in range(4)],
+        ),
+        terminal_response(),
+    )
+    ChatService(scoped, SimpleNamespace(responses=over_limit)).reply(scoped_thread, "Run every analysis.")
+    outputs = [json.loads(item["output"]) for item in over_limit.calls[1]["input"] if item.get("type") == "function_call_output"]
+    assert len(outputs) == 4
+    assert all(output["reason"] == "analysis_batch_limit_exceeded" for output in outputs)
+    assert scoped.analysis_evidence(scoped_thread) == []
+
+
+def test_inspect_dataset_exposes_only_safe_mapping_contract(tmp_path):
+    storage, thread_id, _dataset, _mapping, _fields = _scoped_analysis_dataset(tmp_path)
+    responses = SequenceResponses(
+        SimpleNamespace(status="completed", output=[analysis_tool_call("inspect_dataset", {}, call_id="inspect")]),
+        terminal_response(),
+    )
+
+    ChatService(storage, SimpleNamespace(responses=responses)).reply(thread_id, "What local analysis is available?")
+
+    output = next(item for item in responses.calls[1]["input"] if item.get("type") == "function_call_output")
+    payload = json.loads(output["output"])
+    assert payload["operation"] == "inspect_dataset"
+    assert payload["source_rows"] == 2
+    assert "waited for confirmation" not in json.dumps(payload)
+    assert storage.analysis_evidence(thread_id) == []
+
+
+def test_qualitative_citation_repair_uses_safe_replay_without_redisclosing_notes(tmp_path):
+    storage, thread_id, _dataset, _mapping, fields = _scoped_analysis_dataset(tmp_path, allow_notes=True)
+    first = SimpleNamespace(
+        status="completed",
+        output=[analysis_tool_call("read_text_evidence", {"text_field_ids": [fields["Journal"]], "context_field_ids": [], "filters": [], "order_by": "source"}, call_id="notes")],
+    )
+    uncited = source_response("Direct source teaching: Jacob teaches patience.", [])
+    repaired = source_response(
+        "Direct source teaching: Jacob teaches patience.",
+        [{"type": "file_citation", "file_id": "file_jacob", "filename": "lesson.txt"}],
+    )
+    responses = SequenceResponses(first, uncited, repaired)
+
+    answer = ChatService(storage, SimpleNamespace(responses=responses)).reply(
+        thread_id, "Read my approved notes and relate them to Jacob.", include_approved_notes=True
+    )
+
+    assert len(responses.calls) == 3
+    assert answer.citations[0].file_id == "file_jacob"
+    assert "waited for confirmation" not in json.dumps(responses.calls[2]["input"])
+    assert all(tool.get("type") != "function" for tool in responses.calls[2]["tools"])
 
 
 def test_selected_profile_context_is_marked_on_only_the_new_request(tmp_path):

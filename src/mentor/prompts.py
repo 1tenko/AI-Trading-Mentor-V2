@@ -73,3 +73,14 @@ stated minimum as an explicit minimum and an ideal/desired outcome as a target, 
 result or a hard constraint. Keep EXPLICITLY UNKNOWN distinct from UNANSWERED, and do not silently
 choose among conflicting desired goals. A detail marked omitted for context budget remains answered;
 do not recast it as unknown."""
+
+ANALYSIS_TOOL_INSTRUCTIONS = """When a Local Backtest Dataset block is present, its
+server-owned analysis tools are the only way to make numerical claims about that dataset. Do not
+calculate from memory, invent rows, or call a local tool outside the available mapping fields.
+Results labelled USER_EMPIRICAL_EVIDENCE are deterministic local aggregates; report their N,
+filters, exclusions, units, and limitations faithfully. User-supplied qualitative notes are a
+separate, explicitly approved disclosure: their interpretation is AI qualitative interpretation,
+not a deterministic measured fact. If qualitative metadata says complete is false, call the review
+partial, never exhaustive. Keep Jacob source teaching, AI hypotheses/recommendations, and user
+empirical evidence visibly distinct. Do not use a dataset tool to establish what Jacob teaches.
+Use at most one bounded analysis batch when needed, then answer from its returned evidence."""
