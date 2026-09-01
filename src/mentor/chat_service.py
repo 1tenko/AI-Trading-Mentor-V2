@@ -128,9 +128,9 @@ ANALYSIS_TOOL_NAMES = frozenset({
     "analyze_mfe_mae", "analyze_over_time", "read_text_evidence",
 })
 QUALITATIVE_TOOL_NAME = "read_text_evidence"
-MAX_ANALYSIS_CALLS = 3
-MAX_DETERMINISTIC_ANALYSIS_CALLS = 2
-MAX_DETERMINISTIC_OUTPUT_CHARS = 8_000
+MAX_ANALYSIS_CALLS = 7
+MAX_DETERMINISTIC_ANALYSIS_CALLS = 6
+MAX_DETERMINISTIC_OUTPUT_CHARS = 32_000
 
 
 def _tool(name: str, description: str, properties: dict[str, object], required: list[str]) -> dict[str, object]:
@@ -243,6 +243,11 @@ class ResponseDiagnostics:
     estimated_text_cost_usd: float | None
     known_file_search_call_cost_usd: float
     native_compaction_applied: bool
+    analysis_calls: dict[str, int]
+    analysis_operations: list[str]
+    deterministic_result_chars: int
+    qualitative_calls: int
+    analysis_batch_status: str
 
 
 @dataclass(frozen=True)
@@ -277,6 +282,7 @@ class ChatService:
         evaluation: EvaluationConfig = DEFAULT_EVALUATION_CONFIG,
         *,
         include_approved_notes: bool = False,
+        dataset_attachment_id: str | None = None,
     ) -> Answer:
         user_item, request, effective_depth = self._request(thread_id, question, evaluation)
         started_at = perf_counter()
@@ -300,6 +306,7 @@ class ChatService:
             replay_leading_output=replay_leading_output,
             profile_update=profile_update,
             qualitative_exchange=qualitative_exchange,
+            dataset_attachment_id=dataset_attachment_id,
         )
 
     def stream_reply(
@@ -310,6 +317,7 @@ class ChatService:
         *,
         include_approved_notes: bool = False,
         qualitative_consent_prompt: bool = True,
+        dataset_attachment_id: str | None = None,
     ):
         user_item, request, effective_depth = self._request(thread_id, question, evaluation)
         started_at = perf_counter()
@@ -343,6 +351,7 @@ class ChatService:
                         replay_leading_output=replay_leading_output,
                         profile_update=profile_update,
                         qualitative_exchange=qualitative_exchange,
+                        dataset_attachment_id=dataset_attachment_id,
                     )
                     if answer.incomplete_reason:
                         yield StreamEvent(
@@ -458,15 +467,6 @@ class ChatService:
             return (*self._standard_local_continuation(
                 request, output, calls, [_profile_tool_rejection("unsupported_tool") for _ in calls]
             ), None, False)
-        if (
-            len(calls) > MAX_ANALYSIS_CALLS
-            or sum(call.get("name") == QUALITATIVE_TOOL_NAME for call in calls) > 1
-            or sum(call.get("name") != QUALITATIVE_TOOL_NAME for call in calls) > MAX_DETERMINISTIC_ANALYSIS_CALLS
-        ):
-            return (*self._standard_local_continuation(
-                request, output, calls, [_profile_tool_rejection("analysis_batch_limit_exceeded") for _ in calls]
-            ), None, False)
-
         scope = self._active_analysis_scope(thread_id)
         if scope is None:
             return (*self._standard_local_continuation(
@@ -487,9 +487,16 @@ class ChatService:
         rejection_results: dict[str, dict] = {}
         deterministic_size = 0
         capability = QualitativeDisclosureCapability() if include_approved_notes else None
-        for call in calls:
+        deterministic_calls = 0
+        qualitative_calls = 0
+        for index, call in enumerate(calls, start=1):
             try:
+                if index > MAX_ANALYSIS_CALLS:
+                    raise _LocalToolRejected("analysis_call_limit_exceeded")
                 if call["name"] == QUALITATIVE_TOOL_NAME:
+                    qualitative_calls += 1
+                    if qualitative_calls > 1:
+                        raise _LocalToolRejected("analysis_call_limit_exceeded")
                     if capability is None:
                         self._validate_qualitative_tool(dataset_id, mapping_version_id, call)
                         raise _LocalToolRejected("qualitative_consent_required")
@@ -498,6 +505,9 @@ class ChatService:
                     )
                     qualitative = (call, evidence)
                 else:
+                    deterministic_calls += 1
+                    if deterministic_calls > MAX_DETERMINISTIC_ANALYSIS_CALLS:
+                        raise _LocalToolRejected("analysis_call_limit_exceeded")
                     result = self._execute_analysis_tool(dataset_id, mapping_version_id, call)
                     encoded_size = len(json.dumps(result, separators=(",", ":"), allow_nan=False))
                     if deterministic_size + encoded_size > MAX_DETERMINISTIC_OUTPUT_CHARS:
@@ -852,11 +862,16 @@ class ChatService:
         replay_leading_output: list[dict] | None = None,
         profile_update: dict[str, str] | None = None,
         qualitative_exchange: bool = False,
+        dataset_attachment_id: str | None = None,
     ) -> Answer:
         response_output = [_as_dict(item) for item in response.output]
         historic_response_output = _qualitative_historic_items(response_output) if qualitative_exchange else response_output
         output = [*(leading_output or []), *historic_response_output]
         replay_output = [*(replay_leading_output if replay_leading_output is not None else (leading_output or [])), *historic_response_output]
+        if dataset_attachment_id is not None:
+            scope = self.storage.thread_dataset_scope(thread_id)
+            if scope is None or scope.dataset_id != dataset_attachment_id:
+                raise ValueError("The attached backtest is not active for this conversation.")
         raw_positions = self.storage.append_thread_items(thread_id, [user_item, *output])
         compaction_index = next((index for index, item in enumerate(replay_output) if item.get("type") == "compaction"), None)
         if compaction_index is None:
@@ -924,6 +939,7 @@ class ChatService:
             status=diagnostics.status,
             incomplete_reason=answer.incomplete_reason,
             profile_update=profile_update,
+            dataset_attachment_id=dataset_attachment_id,
             raw_start_position=None if raw_positions is None else raw_positions[0],
             raw_end_position=None if raw_positions is None else raw_positions[1],
         )
@@ -1215,6 +1231,7 @@ def _diagnostics(
     output_tokens = _usage_total(responses, "output_tokens")
     response_model = str(_field(response, "model") or model)
     file_search_calls, file_search_queries = _file_search_details(output)
+    analysis = _analysis_tool_details(output)
     estimate = _estimate_text_cost(
         response_model, input_tokens, cached_input_tokens, cache_write_tokens or 0, output_tokens
     )
@@ -1241,7 +1258,51 @@ def _diagnostics(
         estimated_text_cost_usd=estimate,
         known_file_search_call_cost_usd=round(file_search_calls * FILE_SEARCH_CALL_COST_USD, 6),
         native_compaction_applied=native_compaction_applied,
+        analysis_calls=analysis["calls"],
+        analysis_operations=analysis["operations"],
+        deterministic_result_chars=analysis["deterministic_result_chars"],
+        qualitative_calls=analysis["qualitative_calls"],
+        analysis_batch_status=analysis["status"],
     )
+
+
+def _analysis_tool_details(output: list[dict]) -> dict[str, object]:
+    calls = [item for item in output if item.get("type") == "function_call" and item.get("name") in ANALYSIS_TOOL_NAMES]
+    if not calls:
+        return {
+            "calls": {"requested": 0, "executed": 0, "rejected": 0},
+            "operations": [],
+            "deterministic_result_chars": 0,
+            "qualitative_calls": 0,
+            "status": "not_requested",
+        }
+    outputs = {
+        item.get("call_id"): item.get("output")
+        for item in output
+        if item.get("type") == "function_call_output" and isinstance(item.get("call_id"), str)
+    }
+    executed = 0
+    rejected = 0
+    deterministic_result_chars = 0
+    for call in calls:
+        encoded = outputs.get(call.get("call_id"))
+        try:
+            result = json.loads(encoded) if isinstance(encoded, str) else None
+        except json.JSONDecodeError:
+            result = None
+        if isinstance(result, dict) and result.get("provenance") == "USER_EMPIRICAL_EVIDENCE":
+            executed += 1
+            if call.get("name") != QUALITATIVE_TOOL_NAME:
+                deterministic_result_chars += len(encoded)
+        elif isinstance(result, dict) and result.get("status") == "rejected":
+            rejected += 1
+    return {
+        "calls": {"requested": len(calls), "executed": executed, "rejected": rejected},
+        "operations": list(dict.fromkeys(str(call["name"]) for call in calls)),
+        "deterministic_result_chars": deterministic_result_chars,
+        "qualitative_calls": sum(call.get("name") == QUALITATIVE_TOOL_NAME for call in calls),
+        "status": "complete" if rejected == 0 else "partial" if executed else "rejected",
+    }
 
 
 def _usage_total(responses: list[Any], field: str, parent: str | None = None) -> int | None:

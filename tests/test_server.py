@@ -366,9 +366,37 @@ def test_attachment_ui_keeps_a_replacement_needing_input_distinct_from_the_old_s
         status, _, script = request(server, "GET", "/app.js")
         assert status == 200
         assert b"let pendingAttachment;" in script
-        assert b"pendingAttachment = { threadId, dataset: data.dataset };" in script
+        assert b"pendingAttachment = { threadId, dataset: data.dataset, previousDatasetId };" in script
         assert b"Resolve or remove the spreadsheet that needs attention before sending a message." in script
         assert b"async function removeAttachment()" in script
+        assert b"let pendingMessageAttachment;" in script
+        assert b"attachment_dataset_id" in script
+        assert b"attachmentChip.hidden = true;" in script
+        assert b"function restorePendingMessageAttachment(attachment)" in script
+        assert b"restorePendingMessageAttachment(attachment);" in script
+        assert b"function completePendingMessageAttachment(attachment)" in script
+    finally:
+        server.shutdown()
+        worker.join()
+
+
+def test_message_attachment_must_match_the_active_thread_dataset_scope(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    thread_id = storage.create_thread("Analysis")
+    server = create_server(storage, StreamingFakeChatService(), port=0)
+    worker = threading.Thread(target=server.serve_forever)
+    worker.start()
+    try:
+        status, _, body = request(
+            server,
+            "POST",
+            f"/api/threads/{thread_id}/messages",
+            json.dumps({"question": "Analyze this backtest.", "attachment_dataset_id": "not-active"}).encode(),
+        )
+
+        assert status == 400
+        assert json.loads(body)["error"] == "The attached backtest is not active for this conversation."
     finally:
         server.shutdown()
         worker.join()

@@ -164,6 +164,13 @@ class _Handler(BaseHTTPRequestHandler):
                 if not self.storage.has_thread(thread_id):
                     self._send_json(HTTPStatus.NOT_FOUND, {"error": "Conversation not found."})
                     return
+                dataset_attachment_id = body.get("attachment_dataset_id")
+                if dataset_attachment_id is not None:
+                    if not isinstance(dataset_attachment_id, str):
+                        raise ValueError("The attached backtest is not active for this conversation.")
+                    scope = self.storage.thread_dataset_scope(thread_id)
+                    if scope is None or scope.dataset_id != dataset_attachment_id:
+                        raise ValueError("The attached backtest is not active for this conversation.")
                 if hasattr(self.chat_service, "stream_reply"):
                     self._stream_answer(
                         thread_id,
@@ -171,9 +178,11 @@ class _Handler(BaseHTTPRequestHandler):
                         _evaluation(body.get("evaluation")),
                         _include_approved_notes(body.get("include_approved_notes", False)),
                         offer_qualitative_consent=not _numbers_only(body.get("numbers_only", False)),
+                        dataset_attachment_id=dataset_attachment_id,
                     )
                 else:
-                    self._send_json(HTTPStatus.OK, _answer_json(self.chat_service.reply(thread_id, question)))
+                    arguments = {} if dataset_attachment_id is None else {"dataset_attachment_id": dataset_attachment_id}
+                    self._send_json(HTTPStatus.OK, _answer_json(self.chat_service.reply(thread_id, question, **arguments)))
                 return
         except ValueError as error:
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
@@ -375,7 +384,7 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _stream_answer(
         self, thread_id: int, question: str, evaluation: EvaluationConfig, include_approved_notes: bool,
-        *, offer_qualitative_consent: bool = True,
+        *, offer_qualitative_consent: bool = True, dataset_attachment_id: str | None = None,
     ) -> None:
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
@@ -387,6 +396,8 @@ class _Handler(BaseHTTPRequestHandler):
             arguments = {"include_approved_notes": include_approved_notes}
             if not offer_qualitative_consent:
                 arguments["qualitative_consent_prompt"] = False
+            if dataset_attachment_id is not None:
+                arguments["dataset_attachment_id"] = dataset_attachment_id
             for event in self.chat_service.stream_reply(thread_id, question, evaluation, **arguments):
                 self._write_stream_event(event)
         except Exception as error:

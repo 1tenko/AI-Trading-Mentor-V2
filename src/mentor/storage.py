@@ -440,6 +440,13 @@ class Storage:
                     raw_end_position INTEGER,
                     PRIMARY KEY(thread_id, turn_number)
                 );
+                CREATE TABLE IF NOT EXISTS thread_turn_dataset_attachments (
+                    thread_id INTEGER NOT NULL REFERENCES threads(id),
+                    turn_number INTEGER NOT NULL,
+                    dataset_id TEXT NOT NULL REFERENCES datasets(id),
+                    PRIMARY KEY(thread_id, turn_number),
+                    FOREIGN KEY(thread_id, turn_number) REFERENCES display_turns(thread_id, turn_number)
+                );
                 CREATE TABLE IF NOT EXISTS trader_profile_items (
                     id INTEGER PRIMARY KEY,
                     category TEXT NOT NULL CHECK(category IN (
@@ -1629,6 +1636,7 @@ class Storage:
         status: str,
         incomplete_reason: str | None,
         profile_update: dict[str, str] | None = None,
+        dataset_attachment_id: str | None = None,
         raw_start_position: int | None = None,
         raw_end_position: int | None = None,
     ) -> None:
@@ -1641,6 +1649,11 @@ class Storage:
                 "SELECT COALESCE(MAX(turn_number), 0) FROM display_turns WHERE thread_id = ?",
                 (thread_id,),
             ).fetchone()
+            turn_number = int(row[0]) + 1
+            if dataset_attachment_id is not None and connection.execute(
+                "SELECT 1 FROM datasets WHERE id = ?", (dataset_attachment_id,)
+            ).fetchone() is None:
+                raise ValueError("turn attachment dataset is unavailable")
             connection.execute(
                 """
                 INSERT INTO display_turns(
@@ -1651,7 +1664,7 @@ class Storage:
                 """,
                 (
                     thread_id,
-                    int(row[0]) + 1,
+                    turn_number,
                     user_text,
                     answer_markdown,
                     citations_json,
@@ -1665,15 +1678,26 @@ class Storage:
                     raw_end_position,
                 ),
             )
+            if dataset_attachment_id is not None:
+                connection.execute(
+                    "INSERT INTO thread_turn_dataset_attachments(thread_id, turn_number, dataset_id) VALUES (?, ?, ?)",
+                    (thread_id, turn_number, dataset_attachment_id),
+                )
 
     def display_turns(self, thread_id: int) -> list[dict]:
         with self._connect() as connection:
             rows = connection.execute(
                 """
-                SELECT turn_number, user_text, answer_markdown, citations_json,
-                       evidence_json, diagnostic_json, profile_update_json, response_id, status,
-                       incomplete_reason
-                FROM display_turns WHERE thread_id = ? ORDER BY turn_number
+                SELECT display_turns.turn_number, display_turns.user_text, display_turns.answer_markdown, display_turns.citations_json,
+                       display_turns.evidence_json, display_turns.diagnostic_json, display_turns.profile_update_json, display_turns.response_id, display_turns.status,
+                       display_turns.incomplete_reason, thread_turn_dataset_attachments.dataset_id,
+                       datasets.original_name, datasets.source_row_count
+                FROM display_turns
+                LEFT JOIN thread_turn_dataset_attachments
+                  ON thread_turn_dataset_attachments.thread_id = display_turns.thread_id
+                 AND thread_turn_dataset_attachments.turn_number = display_turns.turn_number
+                LEFT JOIN datasets ON datasets.id = thread_turn_dataset_attachments.dataset_id
+                WHERE display_turns.thread_id = ? ORDER BY display_turns.turn_number
                 """,
                 (thread_id,),
             ).fetchall()
@@ -1689,6 +1713,7 @@ class Storage:
                 "status": row[8],
                 "incomplete_reason": row[9],
                 **({"profile_update": json.loads(row[6])} if row[6] is not None else {}),
+                **({"attachment": {"dataset_id": row[10], "original_name": row[11], "source_row_count": row[12]}} if row[10] is not None else {}),
             }
             for row in rows
         ]
@@ -2126,10 +2151,11 @@ class Storage:
                     """
                     SELECT 1 FROM dataset_mapping_versions WHERE dataset_id = ?
                     UNION ALL SELECT 1 FROM thread_dataset_scopes WHERE dataset_id = ?
+                    UNION ALL SELECT 1 FROM thread_turn_dataset_attachments WHERE dataset_id = ?
                     UNION ALL SELECT 1 FROM analysis_evidence WHERE dataset_id = ?
                     LIMIT 1
-                    """,
-                    (dataset_id, dataset_id, dataset_id),
+                """,
+                    (dataset_id, dataset_id, dataset_id, dataset_id),
                 ).fetchone()
                 if referenced is not None:
                     raise ValueError("dataset is no longer an interrupted import")
@@ -2569,6 +2595,7 @@ class Storage:
             connection.execute("DELETE FROM analysis_evidence WHERE thread_id = ?", (thread_id,))
             connection.execute("DELETE FROM qualitative_evidence_metadata WHERE thread_id = ?", (thread_id,))
             connection.execute("DELETE FROM thread_dataset_scopes WHERE thread_id = ?", (thread_id,))
+            connection.execute("DELETE FROM thread_turn_dataset_attachments WHERE thread_id = ?", (thread_id,))
             connection.execute("DELETE FROM display_turns WHERE thread_id = ?", (thread_id,))
             connection.execute("DELETE FROM response_diagnostics WHERE thread_id = ?", (thread_id,))
             connection.execute("DELETE FROM thread_replay_items WHERE thread_id = ?", (thread_id,))

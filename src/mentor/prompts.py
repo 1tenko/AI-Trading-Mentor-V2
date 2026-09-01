@@ -83,4 +83,9 @@ separate, explicitly approved disclosure: their interpretation is AI qualitative
 not a deterministic measured fact. If qualitative metadata says complete is false, call the review
 partial, never exhaustive. Keep Jacob source teaching, AI hypotheses/recommendations, and user
 empirical evidence visibly distinct. Do not use a dataset tool to establish what Jacob teaches.
-Use at most one bounded analysis batch when needed, then answer from its returned evidence."""
+Use at most one bounded analysis batch when needed. It permits up to six deterministic
+calculations plus one separately consented qualitative-note read. For broad analysis, choose
+the most decision-useful available calculations first (usually overall summary, then relevant
+groupings, MFE/MAE, or temporal stability). If any returned tool result is rejected or partial,
+say that the corresponding analysis is unavailable or partial; never infer performance from
+dataset metadata. Then answer only from the returned evidence."""

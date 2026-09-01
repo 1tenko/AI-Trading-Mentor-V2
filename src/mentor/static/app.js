@@ -28,11 +28,13 @@ const CONTINUE_PROMPT = "Continue the previous response from where it stopped. D
 let activeThreadId;
 let activeDatasetScope;
 let pendingAttachment;
+let pendingMessageAttachment;
 let pendingQualitativeQuestion;
 let conversationLoadToken = 0;
 
 function clearPendingChatInteraction() {
   pendingAttachment = undefined;
+  pendingMessageAttachment = undefined;
   pendingQualitativeQuestion = undefined;
   attachmentClarifications.replaceChildren();
   attachmentClarifications.hidden = true;
@@ -48,7 +50,7 @@ function showEmpty() {
   messages.append(empty);
 }
 
-function showMessage(label, text) {
+function showMessage(label, text, attachment = undefined) {
   messages.querySelector(".empty")?.remove();
   const message = document.createElement("section");
   message.className = `message message--${label.toLowerCase()}`;
@@ -59,7 +61,9 @@ function showMessage(label, text) {
   content.className = label === "Mentor" ? "message-content markdown" : "message-content";
   if (label === "Mentor") renderMarkdown(content, text);
   else content.textContent = text;
-  message.append(heading, content);
+  message.append(heading);
+  if (attachment) message.append(renderMessageAttachment(attachment));
+  message.append(content);
   messages.append(message);
   return { message, heading, content };
 }
@@ -224,6 +228,8 @@ function showDiagnostics(diagnostics) {
   const searches = Number.isFinite(diagnostics.file_search_calls)
     ? `${diagnostics.file_search_calls} calls · ${diagnostics.file_search_queries?.length ?? 0} queries · ${diagnostics.returned_evidence_count ?? 0} results · ${diagnostics.cited_evidence_count ?? 0} cited`
     : "Unavailable";
+  const analysisCalls = diagnostics.analysis_calls || { requested: 0, executed: 0, rejected: 0 };
+  const analysisContext = `${(diagnostics.deterministic_result_chars || 0).toLocaleString()} / 32,000 chars`;
   const rows = [
     ["Model", diagnostics.model || "Unavailable"],
     ["Reasoning", diagnostics.reasoning_effort && diagnostics.reasoning_mode ? `${diagnostics.reasoning_effort} / ${diagnostics.reasoning_mode}` : "Unavailable"],
@@ -237,6 +243,11 @@ function showDiagnostics(diagnostics) {
     ["Cache write", diagnostics.cache_write_tokens == null ? "Unavailable" : diagnostics.cache_write_tokens.toLocaleString()],
     ["File Search calls", `${diagnostics.file_search_calls || 0} · ${diagnostics.known_file_search_call_cost_usd == null ? "cost unavailable" : `$${diagnostics.known_file_search_call_cost_usd.toFixed(4)} known call cost`}`],
     ["File Search/platform cost", diagnostics.file_search_cost_status || "Unknown"],
+    ["Analysis calls", `${analysisCalls.requested} requested · ${analysisCalls.executed} executed · ${analysisCalls.rejected} rejected`],
+    ["Analysis operations", diagnostics.analysis_operations?.join(", ") || "None"],
+    ["Deterministic result context", analysisContext],
+    ["Qualitative calls", String(diagnostics.qualitative_calls || 0)],
+    ["Analysis batch", diagnostics.analysis_batch_status || "Not requested"],
   ];
   rows.push(["Native compaction", diagnostics.native_compaction_applied
     ? "Applied for future model replay; included in this response usage."
@@ -276,6 +287,28 @@ function showProfileUpdate(update) {
     block.textContent = update.kind === "saved" ? "Saved to Trader Profile." : "Removed from Trader Profile.";
   }
   messages.append(block);
+}
+
+function renderMessageAttachment(attachment) {
+  const card = document.createElement("section");
+  card.className = "message-attachment";
+  const name = document.createElement("strong");
+  name.textContent = attachment.original_name;
+  const meta = document.createElement("small");
+  meta.textContent = `${attachment.source_row_count} rows`;
+  card.append(name, meta);
+  return card;
+}
+
+function restorePendingMessageAttachment(attachment) {
+  if (!attachment || attachment.threadId !== activeThreadId) return;
+  pendingMessageAttachment = attachment;
+  showAttachmentState(attachment.dataset, "Ready");
+}
+
+function completePendingMessageAttachment(attachment) {
+  if (pendingMessageAttachment === attachment) pendingMessageAttachment = undefined;
+  attachmentChip.hidden = true;
 }
 
 function showIncomplete(answer, mentor) {
@@ -385,7 +418,7 @@ function renderTimeline(turns) {
     return;
   }
   turns.forEach((turn) => {
-    showMessage("Theo", turn.user_text);
+    showMessage("Theo", turn.user_text, turn.attachment);
     if (!turn.answer_markdown && !turn.incomplete_reason) return;
     const mentor = showMessage("Mentor", turn.answer_markdown || "");
     showProfileUpdate(turn.profile_update);
@@ -441,11 +474,7 @@ function updateDatasetScope() {
   document.querySelector("#dataset-use").disabled = !activeThreadId || !datasetSelect.value;
   document.querySelector("#dataset-clear").disabled = !activeThreadId || !scope;
   dataScope.textContent = scope ? scope.original_name : "";
-  attachmentChip.hidden = !scope;
-  if (scope) {
-    attachmentName.textContent = scope.original_name;
-    attachmentMeta.textContent = `${scope.source_row_count ?? ""} rows · Ready`.trim();
-  }
+  attachmentChip.hidden = true;
   if (scope) dataStatus.textContent = `Using ${scope.original_name} in this conversation only.`;
 }
 
@@ -584,6 +613,20 @@ async function clearDatasetScope() {
 }
 
 async function removeAttachment() {
+  if (pendingMessageAttachment?.threadId === activeThreadId) {
+    const response = await fetch(`/api/threads/${activeThreadId}/dataset`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ dataset_id: pendingMessageAttachment.previousDatasetId }),
+    });
+    if (!response.ok) throw new Error("Could not remove this pending spreadsheet.");
+    activeDatasetScope = (await response.json()).dataset_scope;
+    pendingMessageAttachment = undefined;
+    attachmentFile.value = "";
+    attachmentChip.hidden = true;
+    updateDatasetScope();
+    return;
+  }
   if (pendingAttachment?.threadId === activeThreadId) {
     pendingAttachment = undefined;
     attachmentClarifications.hidden = true;
@@ -693,9 +736,12 @@ async function resolveAttachmentMapping(data, form, threadId) {
   if (!scope.ok) throw new Error("Could not use this backtest in the conversation.");
   if (activeThreadId !== threadId) return;
   activeDatasetScope = (await scope.json()).dataset_scope;
+  const previousDatasetId = pendingAttachment?.threadId === threadId ? pendingAttachment.previousDatasetId : null;
   pendingAttachment = undefined;
   attachmentClarifications.hidden = true;
   updateDatasetScope();
+  pendingMessageAttachment = { threadId, dataset: data.dataset, previousDatasetId };
+  showAttachmentState(data.dataset, "Ready");
 }
 
 async function attachDataset() {
@@ -703,6 +749,7 @@ async function attachDataset() {
   if (!file) return;
   if (!activeThreadId) await createThread("New conversation");
   const threadId = activeThreadId;
+  const previousDatasetId = activeDatasetScope?.dataset_id ?? null;
   attachmentClarifications.hidden = true;
   let replace = false;
   if (activeDatasetScope) {
@@ -722,23 +769,25 @@ async function attachDataset() {
   const data = await response.json();
   if (activeThreadId !== threadId) return;
   if (response.status === 422 && data.state === "needs_input") {
-    pendingAttachment = { threadId, dataset: data.dataset };
+    pendingAttachment = { threadId, dataset: data.dataset, previousDatasetId };
     showAttachmentState(data.dataset, "Needs input");
     showMappingClarifications(data, threadId);
     return;
   }
   if (response.status === 422 && data.state === "error") {
-    pendingAttachment = { threadId, dataset: data.dataset };
+    pendingAttachment = { threadId, dataset: data.dataset, previousDatasetId };
     showAttachmentIssue(data);
     return;
   }
   if (!response.ok) throw new Error("I couldn't import this backtest.");
   activeDatasetScope = data.dataset_scope;
+  pendingMessageAttachment = { threadId, dataset: data.dataset, previousDatasetId };
   updateDatasetScope();
+  showAttachmentState(data.dataset, "Ready");
   attachmentFile.value = "";
 }
 
-function showNotesConsent(questionText, threadId) {
+function showNotesConsent(questionText, threadId, attachment) {
   if (activeThreadId !== threadId) return;
   pendingQualitativeQuestion = questionText;
   notesConsent.replaceChildren();
@@ -751,7 +800,7 @@ function showNotesConsent(questionText, threadId) {
   include.addEventListener("click", () => {
     if (activeThreadId !== threadId) return;
     notesConsent.hidden = true;
-    sendMessage(questionText, false, true);
+    sendMessage(questionText, false, true, false, attachment);
   });
   const numbersOnly = document.createElement("button");
   numbersOnly.type = "button";
@@ -759,7 +808,7 @@ function showNotesConsent(questionText, threadId) {
   numbersOnly.addEventListener("click", () => {
     if (activeThreadId !== threadId) return;
     notesConsent.hidden = true;
-    sendMessage(questionText, false, false, true);
+    sendMessage(questionText, false, false, true, attachment);
   });
   const choose = document.createElement("button");
   choose.type = "button";
@@ -774,18 +823,24 @@ function parseEventBuffer(buffer, onEvent) {
   return events.at(-1);
 }
 
-async function sendMessage(text, showUser = true, includeApprovedNotes = false, numbersOnly = false) {
+async function sendMessage(text, showUser = true, includeApprovedNotes = false, numbersOnly = false, sentAttachment = undefined) {
   if (pendingAttachment?.threadId === activeThreadId) {
     status.textContent = "Resolve or remove the spreadsheet that needs attention before sending a message.";
     return;
   }
   if (!activeThreadId) await createThread(conversationTitle(text));
   const threadId = activeThreadId;
-  if (showUser) showMessage("Theo", text);
+  const attachment = sentAttachment || (pendingMessageAttachment?.threadId === threadId ? pendingMessageAttachment : undefined);
+  if (showUser) {
+    showMessage("Theo", text, attachment?.dataset);
+    if (attachment) {
+      attachmentChip.hidden = true;
+    }
+  }
   status.textContent = "Thinking…";
   send.disabled = true;
   try {
-    const response = await fetch(`/api/threads/${threadId}/messages`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ question: text, evaluation: evaluation(), include_approved_notes: includeApprovedNotes, numbers_only: numbersOnly }) });
+    const response = await fetch(`/api/threads/${threadId}/messages`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ question: text, evaluation: evaluation(), include_approved_notes: includeApprovedNotes, numbers_only: numbersOnly, attachment_dataset_id: attachment?.dataset.id ?? null }) });
     if (!response.ok) {
       const data = await response.json();
       throw new Error(data.error || "The mentor is unavailable.");
@@ -808,6 +863,7 @@ async function sendMessage(text, showUser = true, includeApprovedNotes = false, 
           }
           if (event.type === "complete" || event.type === "incomplete") {
             terminal = true;
+            completePendingMessageAttachment(attachment);
             renderMarkdown(mentor.content, event.answer.text);
             showProfileUpdate(event.answer.profile_update);
             showEvidence(event.answer.evidence, event.answer.citations);
@@ -816,26 +872,30 @@ async function sendMessage(text, showUser = true, includeApprovedNotes = false, 
           }
           if (event.type === "error") {
             terminal = true;
+            restorePendingMessageAttachment(attachment);
             showStreamError(mentor, event.error || "The mentor request failed. Try again.", text);
           }
           if (event.type === "consent_required") {
             terminal = true;
             mentor.message.remove();
-            showNotesConsent(text, threadId);
+            showNotesConsent(text, threadId, attachment);
           }
         });
       }
       if (!terminal) {
+        restorePendingMessageAttachment(attachment);
         showStreamError(mentor, "The mentor stream ended before returning a usable response. Try again.", text);
         status.textContent = "Mentor unavailable. You can retry.";
         return;
       }
       if (mentor.heading.textContent === "Mentor — unavailable") {
+        restorePendingMessageAttachment(attachment);
         status.textContent = "Mentor unavailable. You can retry.";
         return;
       }
     } else {
       const answer = await response.json();
+      completePendingMessageAttachment(attachment);
       const mentor = showMessage("Mentor", answer.text);
       showProfileUpdate(answer.profile_update);
       showEvidence(answer.evidence, answer.citations);
@@ -845,6 +905,7 @@ async function sendMessage(text, showUser = true, includeApprovedNotes = false, 
     await loadThreads();
     status.textContent = "";
   } catch (error) {
+    restorePendingMessageAttachment(attachment);
     status.textContent = error.message;
   } finally {
     send.disabled = false;

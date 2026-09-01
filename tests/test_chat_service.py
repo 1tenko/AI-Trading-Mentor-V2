@@ -253,15 +253,43 @@ def test_analysis_batch_limit_and_wrong_thread_scope_are_rejected_locally(tmp_pa
     over_limit = SequenceResponses(
         SimpleNamespace(
             status="completed",
-            output=[analysis_tool_call("summarize_results", {"filters": []}, call_id=f"call_{index}") for index in range(4)],
+            output=[analysis_tool_call("summarize_results", {"filters": []}, call_id=f"call_{index}") for index in range(7)],
         ),
         terminal_response(),
     )
-    ChatService(scoped, SimpleNamespace(responses=over_limit)).reply(scoped_thread, "Run every analysis.")
+    answer = ChatService(scoped, SimpleNamespace(responses=over_limit)).reply(scoped_thread, "Analyze this backtest and tell me what stands out.")
     outputs = [json.loads(item["output"]) for item in over_limit.calls[1]["input"] if item.get("type") == "function_call_output"]
-    assert len(outputs) == 4
-    assert all(output["reason"] == "analysis_batch_limit_exceeded" for output in outputs)
-    assert scoped.analysis_evidence(scoped_thread) == []
+    assert len(outputs) == 7
+    assert all(output["provenance"] == "USER_EMPIRICAL_EVIDENCE" for output in outputs[:6])
+    assert outputs[6]["reason"] == "analysis_call_limit_exceeded"
+    assert len(scoped.analysis_evidence(scoped_thread)) == 6
+    assert answer.diagnostics.analysis_calls == {"requested": 7, "executed": 6, "rejected": 1}
+    assert answer.diagnostics.analysis_batch_status == "partial"
+    assert 0 < answer.diagnostics.deterministic_result_chars <= 32_000
+
+
+def test_dataset_attachment_is_persisted_with_only_its_sent_user_turn(tmp_path):
+    storage, thread_id, dataset, _mapping, _fields = _scoped_analysis_dataset(tmp_path)
+    responses = SequenceResponses(terminal_response("The deterministic summary is ready."))
+
+    ChatService(storage, SimpleNamespace(responses=responses)).reply(
+        thread_id,
+        "Analyze this backtest and tell me what stands out.",
+        dataset_attachment_id=dataset.id,
+    )
+
+    turns = storage.display_turns(thread_id)
+    assert turns[0]["attachment"] == {
+        "dataset_id": dataset.id,
+        "original_name": "trades.csv",
+        "source_row_count": 2,
+    }
+    assert storage.thread_dataset_scope(thread_id).dataset_id == dataset.id
+    storage.initialize()
+    assert storage.display_turns(thread_id)[0]["attachment"] == turns[0]["attachment"]
+    other_thread = storage.create_thread("Separate")
+    assert storage.display_turns(other_thread) == []
+    assert storage.thread_dataset_scope(other_thread) is None
 
 
 def test_inspect_dataset_exposes_only_safe_mapping_contract(tmp_path):
@@ -1396,6 +1424,11 @@ def test_reply_persists_continuation_state_and_extracts_evidence(tmp_path):
                 "estimated_text_cost_usd": None,
                 "known_file_search_call_cost_usd": 0.0025,
                 "native_compaction_applied": False,
+                "analysis_calls": {"requested": 0, "executed": 0, "rejected": 0},
+                "analysis_operations": [],
+                "deterministic_result_chars": 0,
+                "qualitative_calls": 0,
+                "analysis_batch_status": "not_requested",
             },
             "response_id": storage.response_diagnostics(thread_id)[0]["response_id"],
             "status": "completed",
