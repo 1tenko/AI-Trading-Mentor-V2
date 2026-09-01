@@ -308,6 +308,32 @@ notes in this answer** compose control.
   state, and no unapproved raw-data network path.
 - [x] Existing Phase 1–4 chat/profile/source behavior remains green.
 
+### Task 9UX: Chat-first attachment redesign
+
+**Description:** Replace normal Data administration with a local attachment
+flow while preserving the accepted Phase 5 engine and privacy contracts.
+
+**Acceptance criteria:**
+- [ ] A compact composer attachment control imports and automatically scopes a
+  strictly safe auto-mapped CSV/XLSX to the current thread; a new thread has no
+  inherited attachment.
+- [ ] Ambiguous fields receive a compact local clarification, and a second
+  attachment asks to replace the current one; no raw header is a chat/model
+  message.
+- [ ] Normal UI has no Data mode, mapping grid, permanent note checkbox, or
+  permanent no-data banner; advanced mapping remains reachable from the chip.
+- [ ] Qualitative access remains fresh-turn, server-enforced, and is requested
+  only just in time; numeric analysis does not request it.
+- [ ] Theo's Trading Mentor is the normal identity with a dark-by-default,
+  keyboard-accessible, responsive theme and compact settings menu.
+
+**Verification:**
+- [ ] Focused server/dataset/UI tests cover auto-map, scope, ambiguity,
+  replacement, fresh consent and advanced-settings reachability.
+- [ ] Browser desktop/mobile/keyboard/console checks prove a normal chat-first
+  interaction, dark default, and persisted appearance choice.
+- [ ] Full pytest and independent design/code/UX review pass.
+
 ## phase5-evaluation
 
 ### Task 10: Run Phase 5 acceptance evaluation and stop for Theo

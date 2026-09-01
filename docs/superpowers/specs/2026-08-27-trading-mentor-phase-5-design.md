@@ -598,3 +598,94 @@ thread; and Theo passes the human quality gate.
   endpoint shape and keep 50 MiB/250,000 rows unless fixtures prove a safe need
   to adjust.
 - Apply the established Phase 4 visual pattern rather than redesigning chat.
+
+## 2026-09-01 Chat-First UX Amendment
+
+### Objective and boundaries
+
+The normal Phase 5 interaction is chat-first: in an existing conversation Theo
+chooses **+**, attaches a CSV/XLSX locally, and asks a normal question. The
+product identity is **Theo's Trading Mentor**; Jacob remains the active
+methodology corpus, not the product's permanent UI identity. This amendment
+does not alter deterministic calculation, immutable datasets/mappings,
+thread-owned evidence, source authority, raw-data privacy, or the one-active-
+dataset-per-thread boundary. Phase 6 multi-library/project scope remains
+deferred.
+
+### Normal attachment flow
+
+`POST /api/threads/{thread_id}/attachments` is the loopback-only binary upload
+boundary. It validates/imports locally exactly as the existing importer does,
+then attempts the strict policy below. A safely mapped dataset is confirmed and
+selected only for that thread, returning a small attachment state (`importing`,
+`needs_input`, `ready`, or `error`) with filename and row count only. A new
+thread has no attachment. If a thread already has an attachment, the browser
+asks to replace it before importing; Phase 5 never analyses two datasets in a
+single thread. Matching immutable content may reuse an existing local Dataset
+and compatible confirmed mapping rather than duplicating it.
+
+The normal composer contains a keyboard-accessible **+** file input and an
+attachment chip. It has no normal Data button, no scope text in the permanent
+header, no mapping grid, and no permanent notes checkbox. The old inspection
+and mapping controls remain reachable only from the attachment chip's
+**Data settings** action. They are an advanced correction/debug surface, not a
+normal prerequisite.
+
+### Deterministic safe auto-mapping
+
+Auto-confirmation creates the same immutable confirmed mapping version as
+manual confirmation, with source `deterministic_auto`. It is permitted only
+when every mapping decision is exact and unambiguous:
+
+- exact controlled aliases `result_r`, `mfe_r`, and `mae_r` map to their
+  corresponding R-unit semantic roles;
+- exact controlled aliases `entry_timestamp`, `instrument`, `session`,
+  `direction`, `outcome`, and `setup` map to their equivalent semantic roles;
+- known safe categorical/boolean analysis labels (for example `quarter`,
+  `smt`, `setup`, `rule_adherence`, and `mistake_tag`) use a deterministic
+  controlled label and may expose aggregate labels only within the existing
+  cardinality/length limits;
+- known note aliases (`trade_notes`, `notes`, `journal`, `post_trade_review`,
+  `reason_for_entry`, `what_went_wrong`) receive a controlled local label but
+  retain aggregate-only/row-disclosure-denied defaults.
+
+`Result`, `PnL`, unqualified `MFE`/`MAE`, and generic date/time headers are not
+safe return/unit/time auto-maps. They remain unresolved. Arbitrary headers are
+not projected to Sol merely because they are short: only the controlled labels
+above are model-visible. The implementation may reuse a compatible confirmed
+mapping for an identical immutable dataset; it must not claim manual approval.
+
+### Ambiguity and qualitative consent
+
+An unresolved normal attachment returns only a compact local clarification
+card for the ambiguous fields. For example, `PnL` asks whether it is R,
+dollars, points, percentage, or something else. It never opens the advanced
+mapping table automatically. The selected answer creates a fresh immutable
+mapping version and resumes the attachment flow.
+
+Raw note values remain denied by default. Numeric questions receive no consent
+prompt. When a qualitative tool request is rejected solely because current-turn
+consent is absent, the server emits a safe consent-required terminal state; the
+browser shows an inline card and may resubmit the same already-visible question
+with a fresh server-owned consent value. It must not duplicate the visible user
+message, persist raw text, reuse prior consent, or let Sol grant consent.
+Existing mapping permissions remain required. Multiple candidate note fields
+are presented as simple local field choices, never as database terminology.
+
+### Visual, accessibility, and verification contract
+
+The normal chat surface has a minimal header, a compact menu for Trader
+Profile/model settings/Appearance, a familiar attachment composer, concise
+empty state, and a dark theme by default. CSS variables own dark/light/system
+theme tokens; the preference persists locally. Dark mode must remain readable,
+keyboard-accessible, responsive at 320/768/1024/1440px, and keep advanced
+tables horizontally scrollable only when explicitly opened.
+
+Implementation is sliced as: (1) attachment/auto-map server contract and
+tests, (2) chat-first composer/attachment UI, (3) just-in-time consent and
+advanced settings relocation, (4) theme/header/accessibility/browser checks.
+Automated coverage proves attachment auto-scope, no new-thread inheritance,
+second-attachment replacement, ambiguity isolation, fresh consent, advanced
+settings reachability, and absence of normal administration controls. Theo's
+human gate remains open after implementation; Phase 5 is not passed by this
+amendment.

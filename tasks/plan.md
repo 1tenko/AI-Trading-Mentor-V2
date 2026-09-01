@@ -37,6 +37,21 @@ numeric evidence; the other establishes text privacy and completeness before
 any model-facing tool exists. Work stays on `feature/phase-5-backtest-analysis`;
 pushes happen at sensible completed milestones. No merge to main is implied.
 
+## 2026-09-01 Chat-First UX amendment workstream
+
+The accepted Task 9 backend remains intact. Its normal Data workspace is
+replaced by an attachment-first surface; advanced correction stays reachable
+from an attachment chip. Build order is deliberately vertical:
+
+1. strict local auto-map/attachment API and ambiguity contract;
+2. compact composer/chip/automatic thread scope and replacement confirmation;
+3. just-in-time pre-turn notes consent plus advanced-settings relocation;
+4. minimal header, dark/light/system theme, responsive/accessibility checks.
+
+No raw upload becomes a chat attachment or model input. Safe auto-confirmation
+is restricted to the controlled policy in the Phase 5 design amendment; all
+other mappings remain local UI clarification or advanced settings.
+
 ## Decisions carried into implementation
 
 - pandas plus openpyxl; no DuckDB or Polars in v1.
