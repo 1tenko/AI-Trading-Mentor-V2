@@ -622,7 +622,7 @@ def summarize_results(
     metrics["excluded_rows"] = frame.excluded_rows
 
     if has_outcome:
-        metrics.update(_outcome_metrics(frame.data["trade_outcome"].tolist(), frame.outcome_sequence))
+        metrics.update(_outcome_metrics(frame.filtered_data["trade_outcome"].tolist(), frame.outcome_sequence))
     if has_return and returns:
         metrics.update(_return_metrics(returns, frame, has_outcome))
     if frame.return_unit == "R" and has_return and returns:
@@ -770,13 +770,18 @@ def analyze_over_time(
     })
 
 
-def analyze_mfe_mae(frame: AnalysisFrame) -> dict[str, object]:
+def analyze_mfe_mae(frame: AnalysisFrame, *, mae_frame: AnalysisFrame | None = None) -> dict[str, object]:
     """Return only unit-confirmed MFE/MAE aggregates from a validated frame."""
     if not isinstance(frame, AnalysisFrame):
         raise ValueError("MFE/MAE analysis requires a validated analysis frame")
+    if mae_frame is not None and (
+        not isinstance(mae_frame, AnalysisFrame)
+        or (frame.dataset_id, frame.mapping_version_id, frame.filter_descriptors) != (mae_frame.dataset_id, mae_frame.mapping_version_id, mae_frame.filter_descriptors)
+    ):
+        raise ValueError("MFE and MAE analysis frames must share one dataset, mapping, and filter set")
     metadata = _result_metadata(frame, "analyze_mfe_mae")
     mfe = _mfe_mae_payload(frame, "mfe")
-    mae = _mfe_mae_payload(frame, "mae")
+    mae = _mfe_mae_payload(mae_frame or frame, "mae")
     return _finalize_evidence({
         **metadata,
         "mfe": mfe,
@@ -1038,7 +1043,7 @@ def _mfe_mae_payload(frame: AnalysisFrame, role: Literal["mfe", "mae"]) -> dict[
     if field is None or field.unit is None:
         return {"available": False, "reason": "missing_confirmed_mapping"}
     state_column = _state_column(field)
-    data = frame.data
+    data = frame.filtered_data if frame.required_roles == (role,) else frame.data
     valid = data.loc[data[state_column] == "valid", field.column_name].astype(float)
     exclusions = [
         {"reason": reason, "count": int((data[state_column] == reason).sum())}

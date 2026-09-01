@@ -317,8 +317,20 @@ class _Handler(BaseHTTPRequestHandler):
                 },
             )
             return
-        draft = create_inspected_mapping_draft(self.storage, inspection, auto_mapping.entries)
-        mapping = self.storage.confirm_mapping_version(draft.id)
+        try:
+            draft = create_inspected_mapping_draft(self.storage, inspection, auto_mapping.entries)
+            mapping = self.storage.confirm_mapping_version(draft.id)
+        except ValueError:
+            self._send_json(
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                {
+                    "state": "error",
+                    "dataset": _dataset_json(imported.dataset),
+                    "dataset_scope": _thread_dataset_scope_json(self.storage, thread_id),
+                    "message": "I couldn't confidently interpret one of the spreadsheet columns.",
+                },
+            )
+            return
         self.storage.set_thread_dataset_scope(thread_id, imported.dataset.id)
         self._send_json(
             HTTPStatus.CREATED,

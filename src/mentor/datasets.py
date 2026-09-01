@@ -440,6 +440,12 @@ _SAFE_AUTO_ROLES = {
     "outcome": ("trade_outcome", None),
     "setup": ("setup", None),
 }
+_NUMERIC_INTENDED_HEADER_KEYS = _NUMERIC_HEADER_KEYS | frozenset(
+    key for key, (role, _) in _SAFE_AUTO_ROLES.items() if role in _UNIT_ROLES
+)
+_NUMERIC_AUTO_HEADER_KEYS = frozenset(key for key, (role, _) in _SAFE_AUTO_ROLES.items() if role in _UNIT_ROLES)
+_LEGACY_NUMERIC_HEADER_KEYS = _NUMERIC_HEADER_KEYS - _NUMERIC_AUTO_HEADER_KEYS
+_NUMERIC_INTENT_MINIMUM_VALID_RATIO = 0.90
 _SAFE_AUTO_LABELS = {
     "quarter": "Quarter",
     "smt": "SMT",
@@ -517,6 +523,9 @@ def safe_auto_mapping(inspection: DatasetInspection) -> AutoMappingResult:
         role_and_unit = _SAFE_AUTO_ROLES.get(key)
         if role_and_unit is not None:
             role, unit = role_and_unit
+            if role in _UNIT_ROLES and column.value_type != "number":
+                ambiguities.append({"column_ordinal": column.ordinal, "header": column.original_header, "role": role})
+                continue
             if role not in mapped_roles:
                 entries.append(MappingEntry(column.ordinal, semantic_role=role, unit=unit, source="deterministic_auto"))
                 mapped_roles.add(role)
@@ -747,7 +756,13 @@ def _inspect_column(
     if _HEADER_ALIASES.get(_header_key(header), (None,))[0] == "trade_outcome":
         return _outcome_column_inspection(ordinal, header, text, blank_count)
     numeric_count = sum(_parse_number(value) is not None for value in text)
-    if numeric_count and (numeric_count == len(text) or _header_key(header) in _NUMERIC_HEADER_KEYS):
+    numeric_ratio = numeric_count / len(text)
+    if numeric_count and (
+        numeric_count == len(text)
+        or _header_key(header) in _LEGACY_NUMERIC_HEADER_KEYS
+        or (_header_key(header) in _NUMERIC_AUTO_HEADER_KEYS and len(text) <= 2)
+        or (_header_key(header) in _NUMERIC_INTENDED_HEADER_KEYS and numeric_ratio >= _NUMERIC_INTENT_MINIMUM_VALID_RATIO)
+    ):
         invalid_count = len(text) - numeric_count
         return DatasetColumnInspection(
             ordinal,

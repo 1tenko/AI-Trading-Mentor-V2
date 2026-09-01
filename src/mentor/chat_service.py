@@ -634,7 +634,13 @@ class ChatService:
             mfe_roles = tuple(role for role in ("mfe", "mae") if role in _mapping_roles(self.storage, mapping_version_id))
             if not mfe_roles:
                 raise _LocalToolRejected("required_metric_unavailable")
-            return analyze_mfe_mae(build_analysis_frame(self.storage, dataset_id, mapping_version_id, required_roles=mfe_roles, filters=filters))
+            primary_role = "mfe" if "mfe" in mfe_roles else "mae"
+            mfe_frame = build_analysis_frame(self.storage, dataset_id, mapping_version_id, required_roles=(primary_role,), filters=filters)
+            mae_frame = (
+                build_analysis_frame(self.storage, dataset_id, mapping_version_id, required_roles=("mae",), filters=filters)
+                if primary_role == "mfe" and "mae" in mfe_roles else None
+            )
+            return analyze_mfe_mae(mfe_frame, mae_frame=mae_frame)
         if name == "analyze_over_time":
             mode, window_size = arguments.pop("mode", None), arguments.pop("window_size", None)
             _require_exact_keys(arguments, set())

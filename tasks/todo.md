@@ -1,7 +1,8 @@
 # Phase 5 Task List — Backtest / Empirical Data Analysis Foundation
 
-**Status:** 2026-09-01 Chat-first Task 9UX implementation passed deterministic,
-browser, and independent review; Task 10 is Theo's human quality gate.
+**Status:** 2026-09-01 Chat-first Task 9UX implementation, including the
+mixed-quality numeric attachment regression, passed deterministic, browser, and
+independent review; Task 10 is Theo's human quality gate.
 Phase 4 passed and is recorded in [`docs/phase-4-acceptance.md`](../docs/phase-4-acceptance.md).
 
 ## dataset-foundation

@@ -655,6 +655,86 @@ def test_local_inspection_keeps_blank_and_invalid_numeric_cells_in_health(tmp_pa
     assert column.unavailable_reason == "invalid_values_excluded"
 
 
+def test_safe_auto_mapping_accepts_exact_r_headers_with_mostly_valid_numeric_cells(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    source = tmp_path / "phase5_mock_backtest.csv"
+    result_values = ["2"] * 95 + ["2.75"] + ["-0.75"] * 59 + ["0"] * 2 + ["two R", "?", "error"]
+    mfe_values = ["3"] * 157 + ["", "", "error"]
+    mae_values = ["-1"] * 158 + ["", "error"]
+    outcomes = ["Win"] * 96 + ["Loss"] * 59 + ["BE"] * 5
+    source.write_text(
+        "Result_R,MFE_R,MAE_R,Outcome\n"
+        + "".join(f"{result},{mfe},{mae},{outcome}\n" for result, mfe, mae, outcome in zip(result_values, mfe_values, mae_values, outcomes, strict=True)),
+        encoding="utf-8",
+    )
+    dataset = _importer(storage, tmp_path)(source).dataset
+
+    inspection = inspect_local_dataset(storage, dataset.id)
+    auto_mapping = safe_auto_mapping(inspection)
+
+    assert [(column.original_header, column.value_type, column.valid_count, column.blank_count, column.invalid_count) for column in inspection.columns] == [
+        ("Result_R", "number", 157, 0, 3),
+        ("MFE_R", "number", 157, 2, 1),
+        ("MAE_R", "number", 158, 1, 1),
+        ("Outcome", "categorical", 160, 0, 0),
+    ]
+    assert auto_mapping.ambiguities == []
+    assert {(entry.semantic_role, entry.unit) for entry in auto_mapping.entries} == {
+        ("trade_return", "R"), ("mfe", "R"), ("mae", "R"), ("trade_outcome", None)
+    }
+    confirmed = storage.confirm_mapping_version(create_inspected_mapping_draft(storage, inspection, auto_mapping.entries).id)
+    assert {entry.semantic_role for entry in storage.mapping_entries(confirmed.id)} == {"trade_return", "mfe", "mae", "trade_outcome"}
+
+
+def test_safe_auto_mapping_refuses_exact_r_header_with_contradictory_values(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    source = tmp_path / "contradictory.csv"
+    source.write_text("Result_R,Notes\ngreat,one\nbad,two\nmaybe,three\nyes,four\nno,five\n1,six\n", encoding="utf-8")
+    dataset = _importer(storage, tmp_path)(source).dataset
+
+    inspection = inspect_local_dataset(storage, dataset.id)
+    auto_mapping = safe_auto_mapping(inspection)
+
+    assert inspection.columns[0].value_type == "categorical"
+    assert not any(entry.semantic_role == "trade_return" for entry in auto_mapping.entries)
+    assert auto_mapping.ambiguities == [{"column_ordinal": 0, "header": "Result_R", "role": "trade_return"}]
+
+
+def test_safe_auto_mapping_requires_ninety_percent_valid_values_for_exact_r_headers(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    accepted = tmp_path / "accepted.csv"
+    accepted.write_text("Result_R\n" + "".join(f"{value}\n" for value in [*range(9), "bad"]), encoding="utf-8")
+    rejected = tmp_path / "rejected.csv"
+    rejected.write_text("Result_R\n" + "".join(f"{value}\n" for value in [*range(8), "bad", "error"]), encoding="utf-8")
+
+    accepted_dataset = _importer(storage, tmp_path)(accepted).dataset
+    rejected_storage = Storage(tmp_path / "rejected" / "mentor.sqlite3")
+    rejected_storage.initialize()
+    rejected_dataset = _importer(rejected_storage, tmp_path / "rejected")(rejected).dataset
+    accepted_inspection = inspect_local_dataset(storage, accepted_dataset.id)
+    rejected_inspection = inspect_local_dataset(rejected_storage, rejected_dataset.id)
+
+    assert (accepted_inspection.columns[0].value_type, accepted_inspection.columns[0].valid_count, accepted_inspection.columns[0].invalid_count) == ("number", 9, 1)
+    assert {(entry.semantic_role, entry.unit) for entry in safe_auto_mapping(accepted_inspection).entries} == {("trade_return", "R")}
+    assert rejected_inspection.columns[0].value_type == "categorical"
+    assert safe_auto_mapping(rejected_inspection).ambiguities == [{"column_ordinal": 0, "header": "Result_R", "role": "trade_return"}]
+
+
+def test_small_mixed_notes_column_never_becomes_numeric(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    source = tmp_path / "notes.csv"
+    source.write_text("Notes\n1\nword\n", encoding="utf-8")
+    dataset = _importer(storage, tmp_path)(source).dataset
+
+    column = inspect_local_dataset(storage, dataset.id).columns[0]
+
+    assert (column.value_type, column.valid_count, column.invalid_count) == ("categorical", 2, 0)
+
+
 def test_local_inspection_uses_controlled_outcome_normalization(tmp_path):
     storage = Storage(tmp_path / "mentor.sqlite3")
     storage.initialize()

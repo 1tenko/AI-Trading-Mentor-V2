@@ -21,7 +21,7 @@ from mentor.analysis import (
     summarize_results,
     TextEvidenceUseGuard,
 )
-from mentor.datasets import MappingEntry, create_inspected_mapping_draft, import_local_dataset, inspect_local_dataset
+from mentor.datasets import MappingEntry, create_inspected_mapping_draft, import_local_dataset, inspect_local_dataset, safe_auto_mapping
 from mentor.datasets import continue_qualitative_model_transport
 from mentor.storage import ANALYSIS_EXCLUSION_LIMIT, Storage, validate_completed_evidence_envelope
 
@@ -454,6 +454,51 @@ def test_summarize_results_calculates_r_metrics_in_source_order_and_returns_a_re
     assert "do-not-disclose" not in json.dumps(result)
 
 
+def test_mixed_quality_r_returns_keep_outcome_counts_separate_from_return_exclusions(tmp_path):
+    result_values = ["2"] * 95 + ["2.75"] + ["-0.75"] * 59 + ["0"] * 2 + ["two R", "?", "error"]
+    outcomes = ["Win"] * 96 + ["Loss"] * 59 + ["BE"] * 5
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    source = tmp_path / "phase5_mock_backtest.csv"
+    source.write_text(
+        "Result_R,Outcome\n" + "".join(f"{result},{outcome}\n" for result, outcome in zip(result_values, outcomes, strict=True)),
+        encoding="utf-8",
+    )
+    dataset = import_local_dataset(source, storage, dataset_id_factory=lambda: "dataset-mixed-quality").dataset
+    mapping = storage.confirm_mapping_version(create_inspected_mapping_draft(
+        storage, inspect_local_dataset(storage, dataset.id), safe_auto_mapping(inspect_local_dataset(storage, dataset.id)).entries
+    ).id)
+
+    result = summarize_results(build_analysis_frame(
+        storage, dataset.id, mapping.id, required_roles=("trade_return", "trade_outcome")
+    ))
+
+    assert result["counts"] == {"source_rows": 160, "filtered_rows": 160, "valid_rows": 157, "excluded_rows": 3}
+    assert result["metrics"]["wins"] == 96
+    assert result["metrics"]["losses"] == 59
+    assert result["metrics"]["breakevens"] == 5
+    assert result["metrics"]["win_rate"] == pytest.approx(0.60)
+    assert result["metrics"]["mean_return"] == pytest.approx(0.945859872611465)
+    assert result["exclusions"] == [{"kind": "required_role_diagnostic", "role": "trade_return", "reason": "invalid", "count": 3}]
+
+
+def test_mfe_mae_report_each_field_validity_without_cross_excluding_the_other_field(tmp_path):
+    storage, dataset, mapping = _confirmed_dataset(
+        tmp_path,
+        "MFE,MAE\n2,-1\nbad,-2\n,?\n3,\n",
+        [MappingEntry(0, semantic_role="mfe", unit="R"), MappingEntry(1, semantic_role="mae", unit="R")],
+    )
+
+    mfe_frame = build_analysis_frame(storage, dataset.id, mapping.id, required_roles=("mfe",))
+    mae_frame = build_analysis_frame(storage, dataset.id, mapping.id, required_roles=("mae",))
+    result = analyze_mfe_mae(mfe_frame, mae_frame=mae_frame)
+
+    assert result["mfe"]["counts"] == {"source_rows": 4, "filtered_rows": 4, "valid_rows": 2, "excluded_rows": 2}
+    assert result["mfe"]["exclusions"] == [{"reason": "blank", "count": 1}, {"reason": "invalid", "count": 1}]
+    assert result["mae"]["counts"] == {"source_rows": 4, "filtered_rows": 4, "valid_rows": 2, "excluded_rows": 2}
+    assert result["mae"]["exclusions"] == [{"reason": "blank", "count": 1}, {"reason": "invalid", "count": 1}]
+
+
 def test_summarize_results_preserves_non_r_returns_and_marks_missing_capabilities_unavailable(tmp_path):
     storage, dataset, mapping = _confirmed_dataset(
         tmp_path,
@@ -581,9 +626,9 @@ def test_summarize_results_treats_invalid_required_returns_as_ordered_streak_bre
     assert frame.outcome_sequence == ("win", None, "win")
     assert result["counts"] == {"source_rows": 3, "filtered_rows": 3, "valid_rows": 2, "excluded_rows": 1}
     assert result["metrics"]["wins"] == 2
-    assert result["metrics"]["losses"] == 0
-    assert result["metrics"]["wins"] + result["metrics"]["losses"] + result["metrics"]["breakevens"] == 2
-    assert result["metrics"]["win_rate"] == 1.0
+    assert result["metrics"]["losses"] == 1
+    assert result["metrics"]["wins"] + result["metrics"]["losses"] + result["metrics"]["breakevens"] == 3
+    assert result["metrics"]["win_rate"] == pytest.approx(2 / 3)
     assert result["metrics"]["max_consecutive_wins"] == 1
     assert result["exclusions"] == [{"kind": "required_role_diagnostic", "role": "trade_return", "reason": "invalid", "count": 1}]
 
@@ -602,9 +647,9 @@ def test_summarize_results_uses_a_neutral_breaker_for_invalid_required_return_wi
 
     assert frame.outcome_sequence == ("loss", None, "loss")
     assert result["counts"] == {"source_rows": 3, "filtered_rows": 3, "valid_rows": 2, "excluded_rows": 1}
-    assert result["metrics"]["wins"] == 0
+    assert result["metrics"]["wins"] == 1
     assert result["metrics"]["losses"] == 2
-    assert result["metrics"]["loss_rate"] == 1.0
+    assert result["metrics"]["loss_rate"] == pytest.approx(2 / 3)
     assert result["metrics"]["max_consecutive_losses"] == 1
 
 

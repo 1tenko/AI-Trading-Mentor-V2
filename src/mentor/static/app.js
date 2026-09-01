@@ -27,10 +27,12 @@ const THEME_KEY = "trading-mentor-theme";
 const CONTINUE_PROMPT = "Continue the previous response from where it stopped. Do not repeat completed material.";
 let activeThreadId;
 let activeDatasetScope;
+let pendingAttachment;
 let pendingQualitativeQuestion;
 let conversationLoadToken = 0;
 
 function clearPendingChatInteraction() {
+  pendingAttachment = undefined;
   pendingQualitativeQuestion = undefined;
   attachmentClarifications.replaceChildren();
   attachmentClarifications.hidden = true;
@@ -581,6 +583,18 @@ async function clearDatasetScope() {
   dataStatus.textContent = "Conversation data cleared. Other conversations were not changed.";
 }
 
+async function removeAttachment() {
+  if (pendingAttachment?.threadId === activeThreadId) {
+    pendingAttachment = undefined;
+    attachmentClarifications.hidden = true;
+    attachmentFile.value = "";
+    if (activeDatasetScope) updateDatasetScope();
+    else attachmentChip.hidden = true;
+    return;
+  }
+  await clearDatasetScope();
+}
+
 async function importDataset(event) {
   event.preventDefault();
   const file = document.querySelector("#dataset-file").files[0];
@@ -600,6 +614,28 @@ function showAttachmentState(dataset, state) {
   attachmentChip.hidden = false;
   attachmentName.textContent = dataset.original_name;
   attachmentMeta.textContent = `${dataset.source_row_count} rows · ${state}`;
+}
+
+function showAttachmentIssue(data) {
+  showAttachmentState(data.dataset, "Needs attention");
+  attachmentClarifications.replaceChildren();
+  attachmentClarifications.hidden = false;
+  const text = document.createElement("p");
+  text.textContent = data.message || "I couldn't prepare this spreadsheet. Try again or review the issue.";
+  const review = document.createElement("button");
+  review.type = "button";
+  review.textContent = "Review issue";
+  review.addEventListener("click", async () => {
+    await loadDatasets();
+    datasetSelect.value = data.dataset.id;
+    await inspectSelectedDataset();
+    if (dataWorkspace.hidden) openDataSettings();
+  });
+  const remove = document.createElement("button");
+  remove.type = "button";
+  remove.textContent = "Remove";
+  remove.addEventListener("click", () => removeAttachment().catch((error) => { status.textContent = error.message; }));
+  attachmentClarifications.append(text, review, remove);
 }
 
 function showMappingClarifications(data, threadId) {
@@ -657,6 +693,7 @@ async function resolveAttachmentMapping(data, form, threadId) {
   if (!scope.ok) throw new Error("Could not use this backtest in the conversation.");
   if (activeThreadId !== threadId) return;
   activeDatasetScope = (await scope.json()).dataset_scope;
+  pendingAttachment = undefined;
   attachmentClarifications.hidden = true;
   updateDatasetScope();
 }
@@ -685,12 +722,17 @@ async function attachDataset() {
   const data = await response.json();
   if (activeThreadId !== threadId) return;
   if (response.status === 422 && data.state === "needs_input") {
-    if (activeDatasetScope) updateDatasetScope();
-    else showAttachmentState(data.dataset, "Needs input");
+    pendingAttachment = { threadId, dataset: data.dataset };
+    showAttachmentState(data.dataset, "Needs input");
     showMappingClarifications(data, threadId);
     return;
   }
-  if (!response.ok) throw new Error(data.error || "Could not import this backtest.");
+  if (response.status === 422 && data.state === "error") {
+    pendingAttachment = { threadId, dataset: data.dataset };
+    showAttachmentIssue(data);
+    return;
+  }
+  if (!response.ok) throw new Error("I couldn't import this backtest.");
   activeDatasetScope = data.dataset_scope;
   updateDatasetScope();
   attachmentFile.value = "";
@@ -733,6 +775,10 @@ function parseEventBuffer(buffer, onEvent) {
 }
 
 async function sendMessage(text, showUser = true, includeApprovedNotes = false, numbersOnly = false) {
+  if (pendingAttachment?.threadId === activeThreadId) {
+    status.textContent = "Resolve or remove the spreadsheet that needs attention before sending a message.";
+    return;
+  }
   if (!activeThreadId) await createThread(conversationTitle(text));
   const threadId = activeThreadId;
   if (showUser) showMessage("Theo", text);
@@ -816,8 +862,14 @@ document.querySelector("#data-close").addEventListener("click", () => {
   dataWorkspace.hidden = true;
 });
 document.querySelector("#attachment-trigger").addEventListener("click", () => attachmentFile.click());
-attachmentFile.addEventListener("change", () => attachDataset().catch((error) => { status.textContent = error.message; updateDatasetScope(); }));
-document.querySelector("#remove-attachment").addEventListener("click", () => clearDatasetScope().catch((error) => { status.textContent = error.message; }));
+attachmentFile.addEventListener("change", () => attachDataset().catch(() => {
+  if (activeDatasetScope) updateDatasetScope();
+  else showAttachmentIssue({
+    dataset: { original_name: attachmentFile.files[0]?.name || "Spreadsheet", source_row_count: "" },
+    message: "I couldn't prepare this spreadsheet. Try again or review the issue.",
+  });
+}));
+document.querySelector("#remove-attachment").addEventListener("click", () => removeAttachment().catch((error) => { status.textContent = error.message; }));
 document.querySelector("#dataset-upload-form").addEventListener("submit", (event) => importDataset(event).catch((error) => { dataStatus.textContent = error.message; }));
 document.querySelector("#dataset-inspect").addEventListener("click", () => inspectSelectedDataset().catch((error) => { dataStatus.textContent = error.message; }));
 document.querySelector("#dataset-use").addEventListener("click", () => useSelectedDataset().catch((error) => { dataStatus.textContent = error.message; }));
@@ -827,6 +879,10 @@ form.addEventListener("submit", async (event) => {
   event.preventDefault();
   const text = question.value.trim();
   if (!text) return;
+  if (pendingAttachment?.threadId === activeThreadId) {
+    status.textContent = "Resolve or remove the spreadsheet that needs attention before sending a message.";
+    return;
+  }
   question.value = "";
   await sendMessage(text);
 });

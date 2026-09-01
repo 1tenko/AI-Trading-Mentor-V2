@@ -1,7 +1,11 @@
 import http.client
+from io import BytesIO
 import json
 import threading
 
+from openpyxl import Workbook
+
+import mentor.server as server_module
 from mentor.chat_service import Answer, StreamEvent
 from mentor.profile import ProfileService
 from mentor.server import create_server
@@ -44,6 +48,23 @@ def request(server, method, path, body=None, headers=None):
     result = (response.status, dict(response.getheaders()), response.read())
     connection.close()
     return result
+
+
+def _mixed_quality_backtest_xlsx() -> bytes:
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Trades"
+    sheet.append(["Result_R", "MFE_R", "MAE_R", "Outcome"])
+    result_values = [2] * 95 + [2.75] + [-0.75] * 59 + [0] * 2 + ["two R", "?", "error"]
+    mfe_values = [3] * 157 + [None, None, "error"]
+    mae_values = [-1] * 158 + [None, "error"]
+    outcomes = ["Win"] * 96 + ["Loss"] * 59 + ["BE"] * 5
+    for row in zip(result_values, mfe_values, mae_values, outcomes, strict=True):
+        sheet.append(row)
+    output = BytesIO()
+    workbook.save(output)
+    workbook.close()
+    return output.getvalue()
 
 
 def test_server_binds_loopback_and_only_serves_registered_sources(tmp_path):
@@ -330,6 +351,24 @@ def test_server_keeps_profile_acknowledgement_safe_and_historical_only(tmp_path)
         assert "ES" not in json.dumps(profile_update)
         assert "tool_call" not in json.dumps(profile_update)
         assert storage.current_confirmed_profile_items() == []
+    finally:
+        server.shutdown()
+        worker.join()
+
+
+def test_attachment_ui_keeps_a_replacement_needing_input_distinct_from_the_old_scope(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    server = create_server(storage, FakeChatService(), port=0)
+    worker = threading.Thread(target=server.serve_forever)
+    worker.start()
+    try:
+        status, _, script = request(server, "GET", "/app.js")
+        assert status == 200
+        assert b"let pendingAttachment;" in script
+        assert b"pendingAttachment = { threadId, dataset: data.dataset };" in script
+        assert b"Resolve or remove the spreadsheet that needs attention before sending a message." in script
+        assert b"async function removeAttachment()" in script
     finally:
         server.shutdown()
         worker.join()
@@ -737,6 +776,69 @@ def test_chat_attachment_auto_confirms_only_safe_mapping_and_scopes_its_thread(t
         )
         assert status == 409
         assert json.loads(body)["state"] == "replace_required"
+    finally:
+        server.shutdown()
+        worker.join()
+
+
+def test_chat_attachment_auto_maps_mixed_quality_exact_r_columns_and_keeps_scope_ready(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    thread_id = storage.create_thread("Analysis")
+    server = create_server(storage, StreamingFakeChatService(), port=0)
+    worker = threading.Thread(target=server.serve_forever)
+    worker.start()
+    try:
+        status, _, body = request(
+            server,
+            "POST",
+            f"/api/threads/{thread_id}/attachments",
+            _mixed_quality_backtest_xlsx(),
+            headers={"Content-Type": "application/octet-stream", "X-Dataset-Filename": "phase5_mock_backtest.xlsx"},
+        )
+        attached = json.loads(body)
+
+        assert status == 201
+        assert attached["state"] == "ready"
+        assert attached["dataset_scope"]["original_name"] == "phase5_mock_backtest.xlsx"
+        assert "semantic role is incompatible" not in body.decode()
+        entries = {entry.semantic_role: entry for entry in storage.mapping_entries(attached["mapping"]["id"]) if entry.semantic_role}
+        assert {(role, entry.unit, entry.value_type, entry.valid_count, entry.blank_count, entry.invalid_count) for role, entry in entries.items()} == {
+            ("trade_return", "R", "number", 157, 0, 3),
+            ("mfe", "R", "number", 157, 2, 1),
+            ("mae", "R", "number", 158, 1, 1),
+            ("trade_outcome", None, "categorical", 160, 0, 0),
+        }
+        assert storage.thread_dataset_scope(thread_id).dataset_id == attached["dataset"]["id"]
+    finally:
+        server.shutdown()
+        worker.join()
+
+
+def test_chat_attachment_keeps_recoverable_mapping_failure_visible_without_internal_error(tmp_path, monkeypatch):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    thread_id = storage.create_thread("Analysis")
+    server = create_server(storage, StreamingFakeChatService(), port=0)
+    worker = threading.Thread(target=server.serve_forever)
+    worker.start()
+    monkeypatch.setattr(server_module, "create_inspected_mapping_draft", lambda *args: (_ for _ in ()).throw(ValueError("semantic role is incompatible with the inspected column type")))
+    try:
+        status, _, body = request(
+            server,
+            "POST",
+            f"/api/threads/{thread_id}/attachments",
+            b"Result_R,Outcome\n1,Win\n",
+            headers={"Content-Type": "application/octet-stream", "X-Dataset-Filename": "recoverable.csv"},
+        )
+        payload = json.loads(body)
+
+        assert status == 422
+        assert payload["state"] == "error"
+        assert payload["dataset"]["original_name"] == "recoverable.csv"
+        assert payload["message"] == "I couldn't confidently interpret one of the spreadsheet columns."
+        assert "semantic role is incompatible" not in body.decode()
+        assert storage.thread_dataset_scope(thread_id) is None
     finally:
         server.shutdown()
         worker.join()
