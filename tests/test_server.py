@@ -217,6 +217,8 @@ def test_server_serves_the_persistent_chat_controls(tmp_path):
         assert b"Profile update needs confirmation" in script
         assert b"Review in Trader Profile" in script
         assert b"profile_update" in script
+        assert b"clearPendingChatInteraction" in script
+        assert b"if (activeThreadId !== threadId) return;" in script
         status, _, stylesheet = request(server, "GET", "/app.css")
         assert b".markdown-table-scroll" in stylesheet
         assert b"overflow-wrap: normal" in stylesheet
@@ -693,6 +695,82 @@ def test_data_workspace_loopback_api_imports_maps_and_scopes_one_thread(tmp_path
         assert status == 200
         assert json.loads(body)["dataset_scope"] is None
         assert request(server, "GET", "/api/datasets")[0] == 200
+    finally:
+        server.shutdown()
+        worker.join()
+
+
+def test_chat_attachment_auto_confirms_only_safe_mapping_and_scopes_its_thread(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    thread_id = storage.create_thread("Analysis")
+    server = create_server(storage, StreamingFakeChatService(), port=0)
+    worker = threading.Thread(target=server.serve_forever)
+    worker.start()
+    try:
+        csv = (
+            b"Result_R,MFE_R,MAE_R,Entry_Timestamp,Instrument,Session,Direction,Outcome,Setup,Quarter,Notes\n"
+            b"1,2,-1,2026-01-02T09:30:00,ES,NYAM,Long,Win,Reversal,Q1,Waited for confirmation\n"
+        )
+        status, _, body = request(
+            server,
+            "POST",
+            f"/api/threads/{thread_id}/attachments",
+            csv,
+            headers={"Content-Type": "application/octet-stream", "X-Dataset-Filename": "gxt_backtest.csv"},
+        )
+        attached = json.loads(body)
+        assert status == 201
+        assert attached["state"] == "ready"
+        assert attached["dataset_scope"]["original_name"] == "gxt_backtest.csv"
+        assert attached["mapping"]["status"] == "confirmed"
+        assert {entry.source for entry in storage.mapping_entries(attached["mapping"]["id"])} == {"deterministic_auto"}
+        assert next(entry for entry in storage.mapping_entries(attached["mapping"]["id"]) if entry.analysis_label == "Trade notes").mentor_access == "aggregates_only"
+        assert all("Notes" not in value for value in body.decode().splitlines())
+
+        status, _, body = request(
+            server,
+            "POST",
+            f"/api/threads/{thread_id}/attachments",
+            csv,
+            headers={"Content-Type": "application/octet-stream", "X-Dataset-Filename": "other.csv"},
+        )
+        assert status == 409
+        assert json.loads(body)["state"] == "replace_required"
+    finally:
+        server.shutdown()
+        worker.join()
+
+
+def test_chat_attachment_keeps_ambiguous_pnl_local_and_unscoped(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    thread_id = storage.create_thread("Analysis")
+    server = create_server(storage, StreamingFakeChatService(), port=0)
+    worker = threading.Thread(target=server.serve_forever)
+    worker.start()
+    try:
+        safe_csv = b"Result_R,Session\n1,NYAM\n"
+        assert request(
+            server,
+            "POST",
+            f"/api/threads/{thread_id}/attachments",
+            safe_csv,
+            headers={"Content-Type": "application/octet-stream", "X-Dataset-Filename": "current.csv"},
+        )[0] == 201
+        status, _, body = request(
+            server,
+            "POST",
+            f"/api/threads/{thread_id}/attachments",
+            b"PnL,Session\n10,NYAM\n",
+            headers={"Content-Type": "application/octet-stream", "X-Dataset-Filename": "ambiguous.csv", "X-Replace-Attachment": "true"},
+        )
+        attached = json.loads(body)
+        assert status == 422
+        assert attached["state"] == "needs_input"
+        assert attached["dataset_scope"]["original_name"] == "current.csv"
+        assert attached["clarifications"] == [{"column_ordinal": 0, "header": "PnL", "role": "trade_return"}]
+        assert storage.thread_dataset_scope(thread_id).dataset_id == attached["dataset_scope"]["dataset_id"]
     finally:
         server.shutdown()
         worker.join()

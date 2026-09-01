@@ -2528,7 +2528,7 @@ class Storage:
             source = values.get("source")
             if (role in _UNIT_ROLES and (not isinstance(unit, str) or unit not in _UNITS)) or (
                 role not in _UNIT_ROLES and values.get("unit") is not None
-            ) or not isinstance(source, str) or source not in {"manual", "alias"}:
+            ) or not isinstance(source, str) or source not in {"manual", "alias", "deterministic_auto"}:
                 raise ValueError("mapping semantic metadata is invalid")
             label = values.get("analysis_label")
             if label is not None and (

@@ -29,6 +29,7 @@ from mentor.datasets import (
     import_local_dataset,
     mapping_suggestions,
     model_mapping_context,
+    safe_auto_mapping,
 )
 from mentor.datasets import QualitativeTransportError
 from mentor.chat_service import ChatService, EvaluationConfig

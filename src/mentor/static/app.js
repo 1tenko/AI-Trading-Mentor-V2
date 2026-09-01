@@ -13,19 +13,36 @@ const dataWorkspace = document.querySelector("#data-workspace");
 const dataStatus = document.querySelector("#data-status");
 const datasetSelect = document.querySelector("#dataset-select");
 const datasetInspection = document.querySelector("#dataset-inspection");
-const includeApprovedNotes = document.querySelector("#include-approved-notes");
 const dataScope = document.querySelector("#data-scope");
+const attachmentFile = document.querySelector("#attachment-file");
+const attachmentChip = document.querySelector("#attachment-chip");
+const attachmentName = document.querySelector("#attachment-name");
+const attachmentMeta = document.querySelector("#attachment-meta");
+const attachmentClarifications = document.querySelector("#attachment-clarifications");
+const notesConsent = document.querySelector("#notes-consent");
+const theme = document.querySelector("#theme");
 const SETTINGS_KEY = "trading-mentor-evaluation-settings";
 const ACTIVE_THREAD_KEY = "trading-mentor-active-thread";
+const THEME_KEY = "trading-mentor-theme";
 const CONTINUE_PROMPT = "Continue the previous response from where it stopped. Do not repeat completed material.";
 let activeThreadId;
 let activeDatasetScope;
+let pendingQualitativeQuestion;
+let conversationLoadToken = 0;
+
+function clearPendingChatInteraction() {
+  pendingQualitativeQuestion = undefined;
+  attachmentClarifications.replaceChildren();
+  attachmentClarifications.hidden = true;
+  notesConsent.replaceChildren();
+  notesConsent.hidden = true;
+}
 
 function showEmpty() {
   messages.replaceChildren();
   const empty = document.createElement("p");
   empty.className = "empty";
-  empty.textContent = "Ask a question to start a private, source-grounded conversation.";
+  empty.textContent = "How can I help with your trading today?";
   messages.append(empty);
 }
 
@@ -301,6 +318,14 @@ function persistEvaluation() {
   localStorage.setItem(SETTINGS_KEY, JSON.stringify(evaluation()));
 }
 
+function applyTheme(preference) {
+  const selected = ["dark", "light", "system"].includes(preference) ? preference : "dark";
+  const resolved = selected === "system" && window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : selected;
+  document.documentElement.dataset.theme = resolved;
+  theme.value = selected;
+  localStorage.setItem(THEME_KEY, selected);
+}
+
 function conversationTitle(text) {
   const compact = text.replace(/\s+/g, " ").trim();
   return compact.length > 56 ? `${compact.slice(0, 55)}…` : compact || "New conversation";
@@ -337,9 +362,12 @@ async function loadThreads() {
 }
 
 async function loadThread(threadId) {
+  clearPendingChatInteraction();
+  const requestToken = ++conversationLoadToken;
   const response = await fetch(`/api/threads/${threadId}`);
   if (!response.ok) throw new Error("Could not restore this conversation.");
   const thread = await response.json();
+  if (requestToken !== conversationLoadToken) return;
   activeThreadId = thread.id;
   localStorage.setItem(ACTIVE_THREAD_KEY, String(thread.id));
   renderTimeline(thread.turns);
@@ -370,6 +398,7 @@ async function deleteThread(thread) {
   const response = await fetch(`/api/threads/${thread.id}`, { method: "DELETE" });
   if (!response.ok) throw new Error("Could not delete this conversation.");
   if (activeThreadId === thread.id) {
+    clearPendingChatInteraction();
     activeThreadId = undefined;
     localStorage.removeItem(ACTIVE_THREAD_KEY);
     showEmpty();
@@ -379,6 +408,8 @@ async function deleteThread(thread) {
 }
 
 async function createThread(title = "New conversation") {
+  clearPendingChatInteraction();
+  conversationLoadToken += 1;
   const response = await fetch("/api/threads", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ title }) });
   if (!response.ok) throw new Error("Could not create a conversation.");
   const thread = await response.json();
@@ -407,9 +438,12 @@ function updateDatasetScope() {
   }
   document.querySelector("#dataset-use").disabled = !activeThreadId || !datasetSelect.value;
   document.querySelector("#dataset-clear").disabled = !activeThreadId || !scope;
-  includeApprovedNotes.disabled = !scope;
-  if (!scope) includeApprovedNotes.checked = false;
-  dataScope.textContent = scope ? `Data: ${scope.original_name}` : "No conversation data";
+  dataScope.textContent = scope ? scope.original_name : "";
+  attachmentChip.hidden = !scope;
+  if (scope) {
+    attachmentName.textContent = scope.original_name;
+    attachmentMeta.textContent = `${scope.source_row_count ?? ""} rows · Ready`.trim();
+  }
   if (scope) dataStatus.textContent = `Using ${scope.original_name} in this conversation only.`;
 }
 
@@ -562,21 +596,150 @@ async function importDataset(event) {
   await inspectSelectedDataset();
 }
 
+function showAttachmentState(dataset, state) {
+  attachmentChip.hidden = false;
+  attachmentName.textContent = dataset.original_name;
+  attachmentMeta.textContent = `${dataset.source_row_count} rows · ${state}`;
+}
+
+function showMappingClarifications(data, threadId) {
+  attachmentClarifications.replaceChildren();
+  attachmentClarifications.hidden = false;
+  const text = document.createElement("p");
+  text.textContent = `${data.dataset.original_name}: I can read this spreadsheet, but need one detail before I calculate returns.`;
+  const form = document.createElement("form");
+  data.clarifications.forEach((item) => {
+    const label = document.createElement("label");
+    label.textContent = `What does the ${item.header} column represent?`;
+    const select = selectControl(
+      item.role === "trade_timestamp"
+        ? [["trade_timestamp", "Trade date/time"], ["", "Do not use it"]]
+        : [["R", "R multiple"], ["currency", "Dollars"], ["points", "Points"], ["percentage", "Percentage"], ["", "Do not use it"]],
+      "",
+      "attachment-clarification",
+    );
+    select.dataset.ordinal = String(item.column_ordinal);
+    select.dataset.role = item.role;
+    label.append(select);
+    form.append(label);
+  });
+  const continueButton = document.createElement("button");
+  continueButton.type = "submit";
+  continueButton.textContent = "Continue";
+  form.append(continueButton);
+  form.addEventListener("submit", (event) => {
+    event.preventDefault();
+    resolveAttachmentMapping(data, form, threadId).catch((error) => { status.textContent = error.message; });
+  });
+  attachmentClarifications.append(text, form);
+}
+
+async function resolveAttachmentMapping(data, form, threadId) {
+  if (activeThreadId !== threadId) return;
+  const entries = [...data.entries];
+  form.querySelectorAll(".attachment-clarification").forEach((select) => {
+    if (!select.value) return;
+    entries.push({
+      column_ordinal: Number(select.dataset.ordinal),
+      semantic_role: select.dataset.role,
+      unit: select.dataset.role === "trade_timestamp" ? null : select.value,
+      source: "manual",
+    });
+  });
+  const response = await fetch(`/api/datasets/${encodeURIComponent(data.dataset.id)}/mapping`, {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ entries }),
+  });
+  if (!response.ok) throw new Error((await response.json()).error || "Could not confirm this mapping.");
+  if (activeThreadId !== threadId) return;
+  const scope = await fetch(`/api/threads/${threadId}/dataset`, {
+    method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ dataset_id: data.dataset.id }),
+  });
+  if (!scope.ok) throw new Error("Could not use this backtest in the conversation.");
+  if (activeThreadId !== threadId) return;
+  activeDatasetScope = (await scope.json()).dataset_scope;
+  attachmentClarifications.hidden = true;
+  updateDatasetScope();
+}
+
+async function attachDataset() {
+  const file = attachmentFile.files[0];
+  if (!file) return;
+  if (!activeThreadId) await createThread("New conversation");
+  const threadId = activeThreadId;
+  attachmentClarifications.hidden = true;
+  let replace = false;
+  if (activeDatasetScope) {
+    replace = window.confirm("Replace the current backtest with this one for this conversation?");
+    if (!replace) { updateDatasetScope(); return; }
+  }
+  if (!activeDatasetScope) showAttachmentState({ original_name: file.name, source_row_count: "" }, "Importing");
+  const response = await fetch(`/api/threads/${threadId}/attachments`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/octet-stream",
+      "X-Dataset-Filename": file.name,
+      ...(replace ? { "X-Replace-Attachment": "true" } : {}),
+    },
+    body: file,
+  });
+  const data = await response.json();
+  if (activeThreadId !== threadId) return;
+  if (response.status === 422 && data.state === "needs_input") {
+    if (activeDatasetScope) updateDatasetScope();
+    else showAttachmentState(data.dataset, "Needs input");
+    showMappingClarifications(data, threadId);
+    return;
+  }
+  if (!response.ok) throw new Error(data.error || "Could not import this backtest.");
+  activeDatasetScope = data.dataset_scope;
+  updateDatasetScope();
+  attachmentFile.value = "";
+}
+
+function showNotesConsent(questionText, threadId) {
+  if (activeThreadId !== threadId) return;
+  pendingQualitativeQuestion = questionText;
+  notesConsent.replaceChildren();
+  notesConsent.hidden = false;
+  const message = document.createElement("p");
+  message.textContent = "This spreadsheet contains written trade notes. Reading approved notes will send those values to the AI for this answer; the spreadsheet stays local.";
+  const include = document.createElement("button");
+  include.type = "button";
+  include.textContent = "Include trade notes";
+  include.addEventListener("click", () => {
+    if (activeThreadId !== threadId) return;
+    notesConsent.hidden = true;
+    sendMessage(questionText, false, true);
+  });
+  const numbersOnly = document.createElement("button");
+  numbersOnly.type = "button";
+  numbersOnly.textContent = "Numbers only";
+  numbersOnly.addEventListener("click", () => {
+    if (activeThreadId !== threadId) return;
+    notesConsent.hidden = true;
+    sendMessage(questionText, false, false, true);
+  });
+  const choose = document.createElement("button");
+  choose.type = "button";
+  choose.textContent = "Choose fields";
+  choose.addEventListener("click", () => openDataSettings());
+  notesConsent.append(message, include, numbersOnly, choose);
+}
+
 function parseEventBuffer(buffer, onEvent) {
   const events = buffer.split("\n\n");
   events.slice(0, -1).forEach((event) => onEvent(JSON.parse(event.slice(5))));
   return events.at(-1);
 }
 
-async function sendMessage(text, showUser = true) {
+async function sendMessage(text, showUser = true, includeApprovedNotes = false, numbersOnly = false) {
   if (!activeThreadId) await createThread(conversationTitle(text));
+  const threadId = activeThreadId;
   if (showUser) showMessage("Theo", text);
   status.textContent = "Thinking…";
   send.disabled = true;
-  const approvedNotesForTurn = includeApprovedNotes.checked;
-  includeApprovedNotes.checked = false;
   try {
-    const response = await fetch(`/api/threads/${activeThreadId}/messages`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ question: text, evaluation: evaluation(), include_approved_notes: approvedNotesForTurn }) });
+    const response = await fetch(`/api/threads/${threadId}/messages`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ question: text, evaluation: evaluation(), include_approved_notes: includeApprovedNotes, numbers_only: numbersOnly }) });
     if (!response.ok) {
       const data = await response.json();
       throw new Error(data.error || "The mentor is unavailable.");
@@ -592,6 +755,7 @@ async function sendMessage(text, showUser = true) {
         const chunk = await reader.read();
         if (chunk.done) break;
         buffer = parseEventBuffer(buffer + decoder.decode(chunk.value, { stream: true }), (event) => {
+          if (activeThreadId !== threadId) return;
           if (event.type === "delta") {
             answerText += event.text;
             renderMarkdown(mentor.content, answerText);
@@ -607,6 +771,11 @@ async function sendMessage(text, showUser = true) {
           if (event.type === "error") {
             terminal = true;
             showStreamError(mentor, event.error || "The mentor request failed. Try again.", text);
+          }
+          if (event.type === "consent_required") {
+            terminal = true;
+            mentor.message.remove();
+            showNotesConsent(text, threadId);
           }
         });
       }
@@ -636,16 +805,19 @@ async function sendMessage(text, showUser = true) {
   }
 }
 
-document.querySelector("#new-thread").addEventListener("click", () => createThread().catch((error) => { status.textContent = error.message; }));
-document.querySelector("#data-toggle").addEventListener("click", () => {
+function openDataSettings() {
   dataWorkspace.hidden = !dataWorkspace.hidden;
-  document.querySelector("#data-toggle").setAttribute("aria-expanded", String(!dataWorkspace.hidden));
   if (!dataWorkspace.hidden) loadDatasets().catch((error) => { dataStatus.textContent = error.message; });
-});
+}
+
+document.querySelector("#new-thread").addEventListener("click", () => createThread().catch((error) => { status.textContent = error.message; }));
+document.querySelector("#data-settings").addEventListener("click", openDataSettings);
 document.querySelector("#data-close").addEventListener("click", () => {
   dataWorkspace.hidden = true;
-  document.querySelector("#data-toggle").setAttribute("aria-expanded", "false");
 });
+document.querySelector("#attachment-trigger").addEventListener("click", () => attachmentFile.click());
+attachmentFile.addEventListener("change", () => attachDataset().catch((error) => { status.textContent = error.message; updateDatasetScope(); }));
+document.querySelector("#remove-attachment").addEventListener("click", () => clearDatasetScope().catch((error) => { status.textContent = error.message; }));
 document.querySelector("#dataset-upload-form").addEventListener("submit", (event) => importDataset(event).catch((error) => { dataStatus.textContent = error.message; }));
 document.querySelector("#dataset-inspect").addEventListener("click", () => inspectSelectedDataset().catch((error) => { dataStatus.textContent = error.message; }));
 document.querySelector("#dataset-use").addEventListener("click", () => useSelectedDataset().catch((error) => { dataStatus.textContent = error.message; }));
@@ -659,9 +831,11 @@ form.addEventListener("submit", async (event) => {
   await sendMessage(text);
 });
 restoreEvaluation();
+applyTheme(localStorage.getItem(THEME_KEY) || "dark");
 effort.addEventListener("change", persistEvaluation);
 mode.addEventListener("change", persistEvaluation);
 researchDepth.addEventListener("change", persistEvaluation);
+theme.addEventListener("change", () => applyTheme(theme.value));
 updateDatasetScope();
 Promise.all([loadThreads(), loadDatasets()]).then(async ([,]) => {
   const savedThreadId = Number(localStorage.getItem(ACTIVE_THREAD_KEY));

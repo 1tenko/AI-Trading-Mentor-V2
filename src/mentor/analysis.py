@@ -459,6 +459,42 @@ def _field_ids_are_bounded(field_ids: Sequence[str], limit: int, *, required: bo
     )
 
 
+def validate_text_evidence_request(
+    storage: "Storage", dataset_id: str, mapping_version_id: int, *, text_field_ids: Sequence[str],
+    context_field_ids: Sequence[str] = (), filters: Sequence[AnalysisFilter] = (),
+    order_by: Literal["source", "timestamp"] = "source",
+) -> None:
+    """Check qualitative eligibility locally without reading a note value."""
+    if (
+        not _field_ids_are_bounded(text_field_ids, _TEXT_FIELD_LIMIT)
+        or not _field_ids_are_bounded(context_field_ids, _TEXT_FIELD_LIMIT, required=False)
+        or set(text_field_ids) & set(context_field_ids)
+    ):
+        raise ValueError("text and context fields must be unique bounded field IDs")
+    dataset = storage.dataset(dataset_id)
+    mapping = storage.mapping_version(mapping_version_id)
+    if dataset is None or mapping is None or mapping.status != "confirmed" or mapping.dataset_id != dataset_id:
+        raise ValueError("text evidence requires a confirmed mapping for the dataset")
+    entries = {entry.field_id: entry for entry in storage.mapping_entries(mapping_version_id) if entry.field_id}
+    selected_ids = (*text_field_ids, *context_field_ids)
+    if any(field_id not in entries for field_id in selected_ids):
+        raise ValueError("text evidence field is unsupported")
+    if any(entries[field_id].mentor_access != "allow_row_values_when_analysing_notes" for field_id in selected_ids):
+        raise ValueError("text evidence field is not approved")
+    if any(entries[field_id].value_type != "categorical" for field_id in text_field_ids):
+        raise ValueError("text evidence fields must be mapped text")
+    fields = {field.field_id: field for field in (_field(entry) for entry in entries.values())}
+    for filter_ in filters:
+        _validate_filter(filter_, fields)
+    timestamp_id = next((entry.field_id for entry in entries.values() if entry.semantic_role == "trade_timestamp"), None)
+    if order_by not in _ORDER_MODES:
+        raise ValueError("text evidence order is unsupported")
+    if order_by == "timestamp" and (
+        timestamp_id is None or entries[timestamp_id].mentor_access != "allow_row_values_when_analysing_notes"
+    ):
+        raise ValueError("timestamp order requires an approved timestamp field")
+
+
 def _safe_text_field(entry: "MappingEntry") -> dict[str, str]:
     return {"field_id": entry.field_id or "", "label": entry.analysis_label or entry.semantic_role or entry.field_id or ""}
 

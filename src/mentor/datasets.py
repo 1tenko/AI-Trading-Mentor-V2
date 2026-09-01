@@ -351,6 +351,14 @@ class MappingSuggestion:
 
 
 @dataclass(frozen=True)
+class AutoMappingResult:
+    """Strict local-only mappings safe to confirm without asking the user."""
+
+    entries: list[MappingEntry]
+    ambiguities: list[dict[str, object]]
+
+
+@dataclass(frozen=True)
 class AnalysisEvidence:
     id: int
     thread_id: int
@@ -421,6 +429,43 @@ _OUTCOME_VALUES = {
     "be": "breakeven",
 }
 
+_SAFE_AUTO_ROLES = {
+    "resultr": ("trade_return", "R"),
+    "mfer": ("mfe", "R"),
+    "maer": ("mae", "R"),
+    "entrytimestamp": ("trade_timestamp", None),
+    "instrument": ("instrument", None),
+    "session": ("session", None),
+    "direction": ("direction", None),
+    "outcome": ("trade_outcome", None),
+    "setup": ("setup", None),
+}
+_SAFE_AUTO_LABELS = {
+    "quarter": "Quarter",
+    "smt": "SMT",
+    "setup": "Setup",
+    "ruleadherence": "Rule adherence",
+    "mistaketag": "Mistake tag",
+}
+_SAFE_NOTE_FIELDS = {
+    "tradenotes": "Trade notes",
+    "notes": "Trade notes",
+    "journal": "Journal",
+    "posttradereview": "Post-trade review",
+    "reasonforentry": "Reason for entry",
+    "whatwentwrong": "What went wrong",
+}
+_AMBIGUOUS_AUTO_ROLES = {
+    "pnl": "trade_return",
+    "result": "trade_return",
+    "mfe": "mfe",
+    "mae": "mae",
+    "date": "trade_timestamp",
+    "time": "trade_timestamp",
+    "timestamp": "trade_timestamp",
+    "datetime": "trade_timestamp",
+}
+
 
 def inspect_local_dataset(storage: "Storage", dataset_id: str, *, preview_rows: int = MAX_INSPECTION_PREVIEW_ROWS) -> DatasetInspection:
     """Read one immutable local original for a bounded, local-only inspection."""
@@ -459,6 +504,39 @@ def mapping_suggestions(inspection: DatasetInspection) -> list[MappingSuggestion
     ]
 
 
+def safe_auto_mapping(inspection: DatasetInspection) -> AutoMappingResult:
+    """Return only mappings whose header and unit meanings are exact and safe."""
+    entries: list[MappingEntry] = []
+    ambiguities: list[dict[str, object]] = []
+    mapped_roles: set[str] = set()
+    for column in inspection.columns:
+        key = _header_key(column.original_header)
+        if key in _AMBIGUOUS_AUTO_ROLES:
+            ambiguities.append({"column_ordinal": column.ordinal, "header": column.original_header, "role": _AMBIGUOUS_AUTO_ROLES[key]})
+            continue
+        role_and_unit = _SAFE_AUTO_ROLES.get(key)
+        if role_and_unit is not None:
+            role, unit = role_and_unit
+            if role not in mapped_roles:
+                entries.append(MappingEntry(column.ordinal, semantic_role=role, unit=unit, source="deterministic_auto"))
+                mapped_roles.add(role)
+            continue
+        label = _SAFE_AUTO_LABELS.get(key)
+        if label is not None and column.value_type in {"categorical", "boolean"}:
+            entries.append(MappingEntry(column.ordinal, analysis_label=label, source="deterministic_auto", model_disclosure=True))
+            continue
+        note_label = _SAFE_NOTE_FIELDS.get(key)
+        if note_label is not None:
+            entries.append(
+                MappingEntry(
+                    column.ordinal,
+                    analysis_label=note_label,
+                    source="deterministic_auto",
+                )
+            )
+    return AutoMappingResult(entries, ambiguities)
+
+
 def create_inspected_mapping_draft(
     storage: "Storage", inspection: DatasetInspection, entries: list[MappingEntry]
 ) -> DatasetMappingVersion:
@@ -494,8 +572,8 @@ def create_inspected_mapping_draft(
                 raise ValueError("return, MFE, and MAE mappings require a declared unit")
         elif entry.unit is not None:
             raise ValueError("only return, MFE, and MAE mappings may declare a unit")
-        if entry.source not in {"manual", "alias"}:
-            raise ValueError("mapping source must be manual or alias")
+        if entry.source not in {"manual", "alias", "deterministic_auto"}:
+            raise ValueError("mapping source must be manual, alias, or deterministic_auto")
         label = _analysis_label(entry.analysis_label)
         if entry.model_disclosure:
             if label is None:

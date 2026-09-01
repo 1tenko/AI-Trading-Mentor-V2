@@ -1669,6 +1669,66 @@ def test_stream_reply_relays_deltas_then_persists_completed_response(tmp_path):
     assert responses.calls[0]["stream"] is True
 
 
+def test_streaming_qualitative_request_without_consent_pauses_before_persisting_turn(tmp_path):
+    storage, thread_id, _dataset, _mapping, fields = _scoped_analysis_dataset(tmp_path, allow_notes=True)
+    response = SimpleNamespace(
+        status="completed",
+        output=[analysis_tool_call("read_text_evidence", {"text_field_ids": [fields["Journal"]], "context_field_ids": [], "filters": [], "order_by": "source"}, call_id="notes")],
+    )
+    responses = FakeResponses([SimpleNamespace(type="response.completed", response=response)])
+
+    events = list(ChatService(storage, SimpleNamespace(responses=responses)).stream_reply(thread_id, "Read my notes."))
+
+    assert [event.type for event in events] == ["consent_required"]
+    assert storage.display_turns(thread_id) == []
+    assert len(responses.calls) == 1
+
+
+def test_streaming_invalid_qualitative_request_does_not_offer_consent(tmp_path):
+    storage, thread_id, _dataset, _mapping, fields = _scoped_analysis_dataset(tmp_path, allow_notes=False)
+    response = SimpleNamespace(
+        status="completed",
+        output=[analysis_tool_call("read_text_evidence", {"text_field_ids": [fields["Journal"]], "context_field_ids": [], "filters": [], "order_by": "source"}, call_id="notes")],
+    )
+    responses = SequenceResponses(
+        [SimpleNamespace(type="response.completed", response=response)],
+        terminal_response("That written field is not approved for row-level analysis."),
+    )
+
+    events = list(ChatService(storage, SimpleNamespace(responses=responses)).stream_reply(thread_id, "Read my notes."))
+
+    assert [event.type for event in events] == ["complete"]
+    output = next(item for item in responses.calls[1]["input"] if item.get("type") == "function_call_output")
+    assert json.loads(output["output"])["reason"] == "invalid_analysis_arguments"
+
+
+def test_streaming_incompatible_qualitative_filter_does_not_offer_consent(tmp_path):
+    storage, thread_id, _dataset, _mapping, fields = _scoped_analysis_dataset(tmp_path, allow_notes=True)
+    response = SimpleNamespace(
+        status="completed",
+        output=[analysis_tool_call(
+            "read_text_evidence",
+            {
+                "text_field_ids": [fields["Journal"]],
+                "context_field_ids": [],
+                "filters": [{"field_id": fields["Journal"], "operator": "gt", "value": "early"}],
+                "order_by": "source",
+            },
+            call_id="notes",
+        )],
+    )
+    responses = SequenceResponses(
+        [SimpleNamespace(type="response.completed", response=response)],
+        terminal_response("That qualitative filter is not supported."),
+    )
+
+    events = list(ChatService(storage, SimpleNamespace(responses=responses)).stream_reply(thread_id, "Read my notes."))
+
+    assert [event.type for event in events] == ["complete"]
+    output = next(item for item in responses.calls[1]["input"] if item.get("type") == "function_call_output")
+    assert json.loads(output["output"])["reason"] == "invalid_analysis_arguments"
+
+
 def test_stream_reply_marks_an_output_limit_response_incomplete_and_records_diagnostics(tmp_path):
     storage = Storage(tmp_path / "mentor.sqlite3")
     storage.initialize()

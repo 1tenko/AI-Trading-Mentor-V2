@@ -26,6 +26,7 @@ from mentor.analysis import (
     group_results,
     read_text_evidence,
     summarize_results,
+    validate_text_evidence_request,
 )
 from mentor.datasets import (
     QualitativeDisclosureCapability,
@@ -308,6 +309,7 @@ class ChatService:
         evaluation: EvaluationConfig = DEFAULT_EVALUATION_CONFIG,
         *,
         include_approved_notes: bool = False,
+        qualitative_consent_prompt: bool = True,
     ):
         user_item, request, effective_depth = self._request(thread_id, question, evaluation)
         started_at = perf_counter()
@@ -318,7 +320,12 @@ class ChatService:
                     yield StreamEvent("delta", event.delta)
                 elif event.type in {"response.completed", "response.incomplete"}:
                     response, leading_output, replay_leading_output, response_request, profile_update, qualitative_exchange = self._local_tools_continued_response(
-                        thread_id, request, event.response, user_item["content"][0]["text"], include_approved_notes=include_approved_notes
+                        thread_id,
+                        request,
+                        event.response,
+                        user_item["content"][0]["text"],
+                        include_approved_notes=include_approved_notes,
+                        pause_for_qualitative_consent=qualitative_consent_prompt,
                     )
                     response, evidence_output, draft_response = self._citation_repaired_response(
                         response_request, response, user_item["content"][0]["text"], qualitative_exchange=qualitative_exchange
@@ -350,6 +357,9 @@ class ChatService:
                     LOGGER.warning("OpenAI stream ended with %s", event.type)
                     yield StreamEvent("error", error="The mentor request failed. Try again.")
                     return
+        except _QualitativeConsentRequired:
+            yield StreamEvent("consent_required")
+            return
         except Exception as error:
             LOGGER.warning("OpenAI stream raised %s", type(error).__name__)
             yield StreamEvent("error", error="The mentor request failed. Try again.")
@@ -396,6 +406,7 @@ class ChatService:
         question: str,
         *,
         include_approved_notes: bool,
+        pause_for_qualitative_consent: bool = False,
     ) -> tuple[Any, list[dict], list[dict], dict, dict[str, str] | None, bool]:
         output = [_as_dict(item) for item in response.output]
         calls = [item for item in output if item.get("type") == "function_call"]
@@ -462,6 +473,15 @@ class ChatService:
                 request, output, calls, [_profile_tool_rejection("no_active_dataset") for _ in calls]
             ), None, False)
         dataset_id, mapping_version_id = scope
+        if pause_for_qualitative_consent and not include_approved_notes and any(
+            call["name"] == QUALITATIVE_TOOL_NAME for call in calls
+        ):
+            try:
+                self._validate_qualitative_tool(dataset_id, mapping_version_id, next(call for call in calls if call["name"] == QUALITATIVE_TOOL_NAME))
+            except (ValueError, TypeError, json.JSONDecodeError):
+                pass
+            else:
+                raise _QualitativeConsentRequired()
         deterministic: list[tuple[dict, dict]] = []
         qualitative: tuple[dict, Any] | None = None
         rejection_results: dict[str, dict] = {}
@@ -471,6 +491,7 @@ class ChatService:
             try:
                 if call["name"] == QUALITATIVE_TOOL_NAME:
                     if capability is None:
+                        self._validate_qualitative_tool(dataset_id, mapping_version_id, call)
                         raise _LocalToolRejected("qualitative_consent_required")
                     evidence = self._execute_qualitative_tool(
                         dataset_id, mapping_version_id, call, capability
@@ -641,6 +662,18 @@ class ChatService:
             order_by=order_by,
             include_approved_notes=True,
             use_guard=capability,
+        )
+
+    def _validate_qualitative_tool(self, dataset_id: str, mapping_version_id: int, call: dict) -> None:
+        arguments = _analysis_arguments(call)
+        text_field_ids = arguments.pop("text_field_ids", None)
+        context_field_ids = arguments.pop("context_field_ids", None)
+        order_by = arguments.pop("order_by", None)
+        filters = _analysis_filters(arguments.pop("filters"))
+        _require_exact_keys(arguments, set())
+        validate_text_evidence_request(
+            self.storage, dataset_id, mapping_version_id,
+            text_field_ids=text_field_ids, context_field_ids=context_field_ids, filters=filters, order_by=order_by,
         )
 
     def _execute_profile_tool(self, thread_id: int, question: str, call: dict) -> dict:
@@ -904,6 +937,10 @@ class _LocalToolRejected(ValueError):
     def __init__(self, reason: str):
         self.reason = reason
         super().__init__(reason)
+
+
+class _QualitativeConsentRequired(Exception):
+    """A stream can safely pause before a raw qualitative disclosure."""
 
 
 def _analysis_arguments(call: dict) -> dict[str, object]:

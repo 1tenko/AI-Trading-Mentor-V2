@@ -52,6 +52,9 @@ No raw upload becomes a chat attachment or model input. Safe auto-confirmation
 is restricted to the controlled policy in the Phase 5 design amendment; all
 other mappings remain local UI clarification or advanced settings.
 
+**Implementation status:** Complete and pushed after deterministic, browser, and
+independent review. Task 10 remains the explicit Theo human quality gate.
+
 ## Decisions carried into implementation
 
 - pandas plus openpyxl; no DuckDB or Polars in v1.

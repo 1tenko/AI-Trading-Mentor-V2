@@ -18,6 +18,7 @@ from mentor.datasets import (
     import_local_dataset,
     inspect_local_dataset,
     mapping_suggestions,
+    safe_auto_mapping,
 )
 from mentor.profile import QUESTIONNAIRE_FIELDS, ProfileService, ProfileValidationError
 from mentor.storage import Storage
@@ -136,6 +137,10 @@ class _Handler(BaseHTTPRequestHandler):
             if path == "/api/datasets/import":
                 self._import_dataset()
                 return
+            attachment_match = re.fullmatch(r"/api/threads/(\d+)/attachments", path)
+            if attachment_match:
+                self._attach_dataset(int(attachment_match.group(1)))
+                return
             body = self._json_body()
             if path == "/api/threads":
                 title = _title(body.get("title"))
@@ -165,6 +170,7 @@ class _Handler(BaseHTTPRequestHandler):
                         question,
                         _evaluation(body.get("evaluation")),
                         _include_approved_notes(body.get("include_approved_notes", False)),
+                        offer_qualitative_consent=not _numbers_only(body.get("numbers_only", False)),
                     )
                 else:
                     self._send_json(HTTPStatus.OK, _answer_json(self.chat_service.reply(thread_id, question)))
@@ -252,6 +258,18 @@ class _Handler(BaseHTTPRequestHandler):
         self._send_bytes(HTTPStatus.OK, path.read_bytes(), "text/plain; charset=utf-8")
 
     def _import_dataset(self) -> None:
+        imported = self._receive_dataset_upload()
+        inspection = inspect_local_dataset(self.storage, imported.dataset.id)
+        self._send_json(
+            HTTPStatus.CREATED,
+            {
+                "dataset": _dataset_json(imported.dataset),
+                "inspection": _inspection_json(inspection, include_preview=False),
+                "suggestions": [suggestion.__dict__ for suggestion in mapping_suggestions(inspection)],
+            },
+        )
+
+    def _receive_dataset_upload(self):
         filename = _upload_filename(self.headers.get("X-Dataset-Filename"))
         content_length = self.headers.get("Content-Length")
         if content_length is None or not content_length.isdigit():
@@ -275,13 +293,41 @@ class _Handler(BaseHTTPRequestHandler):
                     upload.write(chunk)
                     remaining -= len(chunk)
             imported = import_local_dataset(source_path, self.storage)
+        return imported
+
+    def _attach_dataset(self, thread_id: int) -> None:
+        if not self.storage.has_thread(thread_id):
+            self._send_json(HTTPStatus.NOT_FOUND, {"error": "Conversation not found."})
+            return
+        if self.storage.thread_dataset_scope(thread_id) is not None and self.headers.get("X-Replace-Attachment") != "true":
+            self._send_json(HTTPStatus.CONFLICT, {"state": "replace_required", "error": "Replace the current backtest for this conversation?"})
+            return
+        imported = self._receive_dataset_upload()
         inspection = inspect_local_dataset(self.storage, imported.dataset.id)
+        auto_mapping = safe_auto_mapping(inspection)
+        if auto_mapping.ambiguities:
+            self._send_json(
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                {
+                    "state": "needs_input",
+                    "dataset": _dataset_json(imported.dataset),
+                    "dataset_scope": _thread_dataset_scope_json(self.storage, thread_id),
+                    "entries": [_mapping_entry_json(entry) for entry in auto_mapping.entries],
+                    "clarifications": auto_mapping.ambiguities,
+                },
+            )
+            return
+        draft = create_inspected_mapping_draft(self.storage, inspection, auto_mapping.entries)
+        mapping = self.storage.confirm_mapping_version(draft.id)
+        self.storage.set_thread_dataset_scope(thread_id, imported.dataset.id)
         self._send_json(
             HTTPStatus.CREATED,
             {
+                "state": "ready",
                 "dataset": _dataset_json(imported.dataset),
-                "inspection": _inspection_json(inspection, include_preview=False),
-                "suggestions": [suggestion.__dict__ for suggestion in mapping_suggestions(inspection)],
+                "dataset_scope": _thread_dataset_scope_json(self.storage, thread_id),
+                "mapping": _mapping_json(mapping),
+                "entries": [_mapping_entry_json(entry) for entry in self.storage.mapping_entries(mapping.id)],
             },
         )
 
@@ -316,7 +362,8 @@ class _Handler(BaseHTTPRequestHandler):
         )
 
     def _stream_answer(
-        self, thread_id: int, question: str, evaluation: EvaluationConfig, include_approved_notes: bool
+        self, thread_id: int, question: str, evaluation: EvaluationConfig, include_approved_notes: bool,
+        *, offer_qualitative_consent: bool = True,
     ) -> None:
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
@@ -325,9 +372,10 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_header("X-Frame-Options", "DENY")
         self.end_headers()
         try:
-            for event in self.chat_service.stream_reply(
-                thread_id, question, evaluation, include_approved_notes=include_approved_notes
-            ):
+            arguments = {"include_approved_notes": include_approved_notes}
+            if not offer_qualitative_consent:
+                arguments["qualitative_consent_prompt"] = False
+            for event in self.chat_service.stream_reply(thread_id, question, evaluation, **arguments):
                 self._write_stream_event(event)
         except Exception as error:
             LOGGER.warning("Mentor SSE handler raised %s", type(error).__name__)
@@ -563,6 +611,7 @@ def _mapping_entry_json(entry: MappingEntry) -> dict[str, object]:
         "analysis_label": entry.analysis_label,
         "mentor_access": entry.mentor_access,
         "aggregate_labels_allowed": entry.aggregate_labels_allowed,
+        "source": entry.source,
     }
 
 
@@ -571,12 +620,12 @@ def _mapping_entry_from_json(value: object) -> MappingEntry:
         raise ValueError("Each mapping entry must be an object.")
     _only_fields(
         value,
-        {"column_ordinal", "semantic_role", "unit", "analysis_label", "mentor_access", "model_disclosure"},
+        {"column_ordinal", "semantic_role", "unit", "analysis_label", "mentor_access", "model_disclosure", "source"},
     )
     ordinal = value.get("column_ordinal")
     if not isinstance(ordinal, int) or ordinal < 0:
         raise ValueError("Mapping column ordinal must be a non-negative integer.")
-    for field in ("semantic_role", "unit", "analysis_label", "mentor_access"):
+    for field in ("semantic_role", "unit", "analysis_label", "mentor_access", "source"):
         if field in value and value[field] is not None and not isinstance(value[field], str):
             raise ValueError(f"Mapping {field} must be text or null.")
     disclosure = value.get("model_disclosure", False)
@@ -589,6 +638,7 @@ def _mapping_entry_from_json(value: object) -> MappingEntry:
         analysis_label=value.get("analysis_label"),
         mentor_access=value.get("mentor_access", "aggregates_only"),
         model_disclosure=disclosure,
+        source=value.get("source", "manual"),
     )
 
 
@@ -603,6 +653,7 @@ def _thread_dataset_scope_json(storage: Storage, thread_id: int) -> dict[str, ob
     return {
         "dataset_id": dataset.id,
         "original_name": dataset.original_name,
+        "source_row_count": dataset.source_row_count,
         "mapping_version": mapping.version,
         "mapping_status": mapping.status,
     }
@@ -621,6 +672,12 @@ def _upload_filename(value: object) -> str:
 def _include_approved_notes(value: object) -> bool:
     if not isinstance(value, bool):
         raise ValueError("Include approved notes must be true or false.")
+    return value
+
+
+def _numbers_only(value: object) -> bool:
+    if not isinstance(value, bool):
+        raise ValueError("Numbers-only mode must be true or false.")
     return value
 
 

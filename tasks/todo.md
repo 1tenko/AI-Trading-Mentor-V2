@@ -1,7 +1,7 @@
 # Phase 5 Task List — Backtest / Empirical Data Analysis Foundation
 
-**Status:** 2026-08-31 Task 8 passed deterministic verification and independent
-privacy/protocol review; Task 9 is next.
+**Status:** 2026-09-01 Chat-first Task 9UX implementation passed deterministic,
+browser, and independent review; Task 10 is Theo's human quality gate.
 Phase 4 passed and is recorded in [`docs/phase-4-acceptance.md`](../docs/phase-4-acceptance.md).
 
 ## dataset-foundation
@@ -314,25 +314,25 @@ notes in this answer** compose control.
 flow while preserving the accepted Phase 5 engine and privacy contracts.
 
 **Acceptance criteria:**
-- [ ] A compact composer attachment control imports and automatically scopes a
+- [x] A compact composer attachment control imports and automatically scopes a
   strictly safe auto-mapped CSV/XLSX to the current thread; a new thread has no
   inherited attachment.
-- [ ] Ambiguous fields receive a compact local clarification, and a second
+- [x] Ambiguous fields receive a compact local clarification, and a second
   attachment asks to replace the current one; no raw header is a chat/model
   message.
-- [ ] Normal UI has no Data mode, mapping grid, permanent note checkbox, or
+- [x] Normal UI has no Data mode, mapping grid, permanent note checkbox, or
   permanent no-data banner; advanced mapping remains reachable from the chip.
-- [ ] Qualitative access remains fresh-turn, server-enforced, and is requested
+- [x] Qualitative access remains fresh-turn, server-enforced, and is requested
   only just in time; numeric analysis does not request it.
-- [ ] Theo's Trading Mentor is the normal identity with a dark-by-default,
+- [x] Theo's Trading Mentor is the normal identity with a dark-by-default,
   keyboard-accessible, responsive theme and compact settings menu.
 
 **Verification:**
-- [ ] Focused server/dataset/UI tests cover auto-map, scope, ambiguity,
+- [x] Focused server/dataset/UI tests cover auto-map, scope, ambiguity,
   replacement, fresh consent and advanced-settings reachability.
-- [ ] Browser desktop/mobile/keyboard/console checks prove a normal chat-first
+- [x] Browser desktop/mobile/keyboard/console checks prove a normal chat-first
   interaction, dark default, and persisted appearance choice.
-- [ ] Full pytest and independent design/code/UX review pass.
+- [x] Full pytest and independent design/code/UX review pass.
 
 ## phase5-evaluation
 
