@@ -36,6 +36,7 @@ from mentor.datasets import (
     continue_qualitative_model_transport,
     ensure_current_auto_mapping,
     model_mapping_context,
+    safe_provider_error_details,
 )
 from mentor.prompts import ANALYSIS_TOOL_INSTRUCTIONS, MENTOR_INSTRUCTIONS, PROFILE_TOOL_INSTRUCTIONS
 from mentor.storage import Storage
@@ -280,6 +281,7 @@ class StreamEvent:
     incomplete_reason: str | None = None
     error: str = ""
     error_classification: str = ""
+    qualitative_field_count: int = 0
 
 
 class ChatService:
@@ -287,6 +289,13 @@ class ChatService:
         self.storage = storage
         self.client = client
         self.model = model
+
+    def _responses_create(self, request: dict, stage: str, *, stream: bool = False) -> Any:
+        try:
+            return self.client.responses.create(**request, **({"stream": True} if stream else {}))
+        except Exception as error:
+            _log_safe_responses_error(stage, error)
+            raise _ResponsesRequestError(stage, error) from None
 
     def reply(
         self,
@@ -299,7 +308,7 @@ class ChatService:
     ) -> Answer:
         user_item, request, effective_depth, prior_empirical_evidence_reused, auto_mapping_policy_upgraded = self._request(thread_id, question, evaluation)
         started_at = perf_counter()
-        response = self.client.responses.create(**request)
+        response = self._responses_create(request, "initial_response")
         response, leading_output, replay_leading_output, response_request, profile_update, qualitative_exchange = self._local_tools_continued_response(
             thread_id, request, response, user_item["content"][0]["text"], include_approved_notes=include_approved_notes
         )
@@ -334,10 +343,10 @@ class ChatService:
         qualitative_consent_prompt: bool = True,
         dataset_attachment_id: str | None = None,
     ):
-        user_item, request, effective_depth, prior_empirical_evidence_reused, auto_mapping_policy_upgraded = self._request(thread_id, question, evaluation)
-        started_at = perf_counter()
         try:
-            stream = self.client.responses.create(**request, stream=True)
+            user_item, request, effective_depth, prior_empirical_evidence_reused, auto_mapping_policy_upgraded = self._request(thread_id, question, evaluation)
+            started_at = perf_counter()
+            stream = self._responses_create(request, "initial_stream", stream=True)
             for event in stream:
                 if event.type == "response.output_text.delta":
                     yield StreamEvent("delta", event.delta)
@@ -385,8 +394,15 @@ class ChatService:
                         "error", error="The mentor request failed. Try again.", error_classification="responses_continuation_error"
                     )
                     return
-        except _QualitativeConsentRequired:
-            yield StreamEvent("consent_required")
+        except _QualitativeConsentRequired as consent:
+            yield StreamEvent("consent_required", qualitative_field_count=consent.field_count)
+            return
+        except _ResponsesRequestError as error:
+            yield StreamEvent(
+                "error",
+                error="The mentor request failed. Try again.",
+                error_classification="qualitative_continuation_error" if error.stage == "qualitative_continuation" else "responses_continuation_error",
+            )
             return
         except Exception as error:
             LOGGER.warning("OpenAI stream raised %s", type(error).__name__)
@@ -425,7 +441,7 @@ class ChatService:
         }
         if needs_timestamp_repair:
             repair_request["tool_choice"] = {"type": "file_search"}
-        repaired = self.client.responses.create(**repair_request)
+        repaired = self._responses_create(repair_request, "citation_repair")
         return repaired, [*draft_output, *(_as_dict(item) for item in repaired.output)], response
 
     def _local_tools_continued_response(
@@ -502,7 +518,14 @@ class ChatService:
             except (ValueError, TypeError, json.JSONDecodeError):
                 pass
             else:
-                raise _QualitativeConsentRequired()
+                raise _QualitativeConsentRequired(
+                    sum(
+                        entry.semantic_role is None
+                        and entry.value_type == "categorical"
+                        and entry.mentor_access == "allow_row_values_when_analysing_notes"
+                        for entry in self.storage.mapping_entries(mapping_version_id)
+                    )
+                )
         deterministic: list[tuple[dict, dict]] = []
         qualitative: tuple[dict, Any] | None = None
         rejection_results: dict[str, dict] = {}
@@ -562,10 +585,13 @@ class ChatService:
             "tools": _raw_file_search_tools(request["tools"]),
         }
         leading_output = [*output, *tool_outputs]
+        qualitative_call_ids = {
+            call["call_id"] for call in calls if call.get("name") == QUALITATIVE_TOOL_NAME
+        }
         replay_leading_output = [
-            item for item in leading_output
-            if not (item.get("type") == "function_call" and item.get("name") == QUALITATIVE_TOOL_NAME)
+            item for item in leading_output if item.get("call_id") not in qualitative_call_ids
         ]
+        _validate_replay_protocol(leading_output, replay=False)
         origin_turn_number = len(self.storage.display_turns(thread_id)) + 1
         for call, result in deterministic:
             if call["call_id"] in rejection_results:
@@ -588,7 +614,7 @@ class ChatService:
                 arguments={"dataset_id": dataset_id, "mapping_version_id": mapping_version_id, "operation": result["operation"]},
             )
         if qualitative is None:
-            response = self.client.responses.create(**raw_continuation_request)
+            response = self._responses_create(raw_continuation_request, "local_tool_continuation")
             return response, leading_output, replay_leading_output, raw_continuation_request, None, False
 
         qualitative_call, qualitative_evidence = qualitative
@@ -607,8 +633,8 @@ class ChatService:
                 call_id=qualitative_call["call_id"],
                 evidence=qualitative_evidence,
             )
-        except QualitativeTransportError:
-            raise RuntimeError("The approved notes could not be disclosed safely. Try again.") from None
+        except QualitativeTransportError as error:
+            raise _ResponsesRequestError("qualitative_continuation", error) from None
         self.storage.record_qualitative_metadata(thread_id, origin_turn_number, continuation.metadata)
         return (
             _response_with_output(continuation, list(continuation.output)),
@@ -632,7 +658,8 @@ class ChatService:
             "tools": _raw_file_search_tools(request["tools"]),
         }
         leading_output = [*output, *tool_outputs]
-        return self.client.responses.create(**continuation_request), leading_output, leading_output, continuation_request
+        _validate_replay_protocol(leading_output, replay=False)
+        return self._responses_create(continuation_request, "local_tool_continuation"), leading_output, leading_output, continuation_request
 
     def _active_analysis_scope(self, thread_id: int) -> AnalysisScope | None:
         scope = self.storage.thread_dataset_scope(thread_id)
@@ -809,6 +836,7 @@ class ChatService:
         replay_items, prior_empirical_evidence_reused = _dataset_bound_empirical_replay(
             self.storage, thread_id, self.storage.replay_items(thread_id), scope
         )
+        _validate_replay_protocol(replay_items)
         confirmed_profile = self.storage.current_confirmed_profile_items()
         profile_context = ""
         context_mode = _profile_context_mode(question)
@@ -893,6 +921,7 @@ class ChatService:
         historic_response_output = _qualitative_historic_items(response_output) if qualitative_exchange else response_output
         output = [*(leading_output or []), *historic_response_output]
         replay_output = [*(replay_leading_output if replay_leading_output is not None else (leading_output or [])), *historic_response_output]
+        _validate_replay_protocol(replay_output)
         if dataset_attachment_id is not None:
             scope = self.storage.thread_dataset_scope(thread_id)
             if scope is None or scope.dataset_id != dataset_attachment_id:
@@ -990,6 +1019,21 @@ class _LocalToolRejected(ValueError):
 
 class _QualitativeConsentRequired(Exception):
     """A stream can safely pause before a raw qualitative disclosure."""
+
+    def __init__(self, field_count: int = 1):
+        self.field_count = field_count
+
+
+class _ReplayProtocolError(ValueError):
+    """Persisted local tool replay does not form a valid Responses protocol."""
+
+
+class _ResponsesRequestError(RuntimeError):
+    """A provider request failed after safe diagnostic metadata was logged."""
+
+    def __init__(self, stage: str, cause: Exception):
+        super().__init__(str(cause))
+        self.stage = stage
 
 
 def _analysis_arguments(call: dict) -> dict[str, object]:
@@ -1126,6 +1170,38 @@ def _input_item(item: dict) -> dict:
     return {key: value for key, value in item.items() if key not in {"status", "created_by"}}
 
 
+def _validate_replay_protocol(items: list[dict], *, replay: bool = True) -> None:
+    """Reject malformed local tool replay without inspecting user-provided values."""
+    calls: dict[str, str] = {}
+    outputs: set[str] = set()
+    for item in items:
+        item_type = item.get("type")
+        if item_type == "function_call":
+            call_id = item.get("call_id")
+            name = item.get("name")
+            if not isinstance(call_id, str) or not call_id or not isinstance(name, str) or not name:
+                raise _ReplayProtocolError("malformed_local_call")
+            if call_id in calls:
+                raise _ReplayProtocolError("duplicate_local_call")
+            calls[call_id] = name
+        elif item_type == "function_call_output":
+            call_id = item.get("call_id")
+            if not isinstance(call_id, str) or not call_id:
+                raise _ReplayProtocolError("malformed_local_output")
+            if call_id in outputs:
+                raise _ReplayProtocolError("duplicate_local_output")
+            if call_id not in calls:
+                raise _ReplayProtocolError("orphan_local_output")
+            outputs.add(call_id)
+    if replay and QUALITATIVE_TOOL_NAME in calls.values():
+        raise _ReplayProtocolError("qualitative_call_in_replay")
+    missing_outputs = set(calls) - outputs
+    if replay and missing_outputs:
+        raise _ReplayProtocolError("unanswered_local_call")
+    if not replay and any(calls[call_id] != QUALITATIVE_TOOL_NAME for call_id in missing_outputs):
+        raise _ReplayProtocolError("unanswered_local_call")
+
+
 def _dataset_bound_empirical_replay(
     storage: Storage, thread_id: int, replay_items: list[dict], scope: AnalysisScope | None
 ) -> tuple[list[dict], bool]:
@@ -1191,11 +1267,24 @@ def _profile_tool_rejection(reason: str) -> dict[str, str]:
 
 
 def _safe_error_classification(error: Exception) -> str:
+    if isinstance(error, _ReplayProtocolError):
+        return "invalid_tool_protocol"
     if isinstance(error, sqlite3.Error):
         return "local_persistence_error"
     if isinstance(error, (ValueError, TypeError, json.JSONDecodeError)):
         return "local_tool_validation"
     return "stream_error"
+
+
+def _log_safe_responses_error(stage: str, error: Exception) -> None:
+    """Log protocol-safe provider metadata, never prompt or tool payloads."""
+    status, error_type, code, param, request_id = safe_provider_error_details(error)
+    LOGGER.warning(
+        "Responses request failed stage=%s class=%s status=%s type=%s code=%s param=%s request_id=%s",
+        stage,
+        type(error).__name__,
+        status, error_type, code, param, request_id,
+    )
 
 
 def _profile_update(result: dict) -> dict[str, str] | None:

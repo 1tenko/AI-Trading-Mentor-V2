@@ -417,6 +417,184 @@ def test_qualitative_tool_needs_current_turn_server_consent_and_never_replays_no
     assert "waited for confirmation" not in json.dumps(storage.thread_items(thread_id))
 
 
+def test_rejected_qualitative_call_leaves_neither_call_nor_output_in_future_replay(tmp_path):
+    storage, thread_id, _dataset, _mapping, fields = _scoped_analysis_dataset(tmp_path, allow_notes=True)
+    first = SimpleNamespace(
+        status="completed",
+        output=[analysis_tool_call(
+            "read_text_evidence",
+            {"text_field_ids": [fields["Journal"]], "context_field_ids": [], "filters": [], "order_by": "source"},
+            call_id="notes",
+        )],
+    )
+    responses = SequenceResponses(first, terminal_response("Numbers only."), terminal_response("The next turn is valid."))
+    service = ChatService(storage, SimpleNamespace(responses=responses))
+
+    service.reply(thread_id, "Read my notes.", include_approved_notes=False)
+
+    assert not any(item.get("call_id") == "notes" for item in storage.replay_items(thread_id))
+    service.reply(thread_id, "Continue without notes.")
+    assert not any(item.get("call_id") == "notes" for item in responses.calls[2]["input"])
+
+
+def test_orphaned_local_tool_output_is_rejected_before_any_responses_request(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    storage.set_vector_store("vs_jacob")
+    thread_id = storage.create_thread("Protocol")
+    storage.replace_replay_items(thread_id, [{
+        "type": "function_call_output",
+        "call_id": "orphan",
+        "output": json.dumps({"status": "rejected", "reason": "qualitative_consent_required"}),
+    }])
+    responses = FakeResponses([SimpleNamespace(type="response.completed", response=terminal_response())])
+
+    events = list(ChatService(storage, SimpleNamespace(responses=responses)).stream_reply(thread_id, "Continue."))
+
+    assert [event.type for event in events] == ["error"]
+    assert events[0].error_classification == "invalid_tool_protocol"
+    assert responses.calls == []
+
+
+@pytest.mark.parametrize("tool_name", ["summarize_results", "read_text_evidence"])
+def test_unanswered_local_call_is_rejected_before_any_responses_request(tmp_path, tool_name):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    storage.set_vector_store("vs_jacob")
+    thread_id = storage.create_thread("Protocol")
+    storage.replace_replay_items(thread_id, [{
+        "type": "function_call",
+        "call_id": "unanswered",
+        "name": tool_name,
+        "arguments": "{}",
+    }])
+    responses = FakeResponses([SimpleNamespace(type="response.completed", response=terminal_response())])
+
+    events = list(ChatService(storage, SimpleNamespace(responses=responses)).stream_reply(thread_id, "Continue."))
+
+    assert [event.type for event in events] == ["error"]
+    assert events[0].error_classification == "invalid_tool_protocol"
+    assert responses.calls == []
+
+
+def test_streaming_provider_failure_logs_only_safe_error_metadata(tmp_path, caplog):
+    class ProviderError(Exception):
+        status_code = 400
+        type = "invalid_request_error"
+        code = "invalid_tool_protocol"
+        param = "input"
+        request_id = "req_safe_123"
+
+    class RaisingResponses:
+        def __init__(self):
+            self.calls = []
+
+        def create(self, **request):
+            self.calls.append(request)
+            raise ProviderError("RAW_NOTE_SENTINEL_MUST_NOT_LOG")
+
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    storage.set_vector_store("vs_jacob")
+    thread_id = storage.create_thread("Provider failure")
+    responses = RaisingResponses()
+    caplog.set_level("WARNING", logger="mentor.chat_service")
+
+    events = list(ChatService(storage, SimpleNamespace(responses=responses)).stream_reply(
+        thread_id, "RAW_NOTE_SENTINEL_MUST_NOT_LOG"
+    ))
+
+    assert [event.type for event in events] == ["error"]
+    assert events[0].error_classification == "responses_continuation_error"
+    assert "stage=initial_stream" in caplog.text
+    assert "class=ProviderError" in caplog.text
+    assert "status=400" in caplog.text
+    assert "type=invalid_request_error" in caplog.text
+    assert "code=invalid_tool_protocol" in caplog.text
+    assert "param=input" in caplog.text
+    assert "request_id=req_safe_123" in caplog.text
+    assert "RAW_NOTE_SENTINEL_MUST_NOT_LOG" not in caplog.text
+
+
+def test_streaming_provider_error_metadata_rejects_untrusted_attribute_text(tmp_path, caplog):
+    class ProviderError(Exception):
+        status_code = 400
+        type = "RAW_NOTE_SENTINEL_TYPE"
+        code = "RAW_NOTE_SENTINEL_CODE"
+        param = "RAW_NOTE_SENTINEL_PARAM"
+        request_id = "RAW_NOTE_SENTINEL_REQUEST_ID"
+
+    class RaisingResponses:
+        def create(self, **request):
+            raise ProviderError("RAW_NOTE_SENTINEL_MESSAGE")
+
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    storage.set_vector_store("vs_jacob")
+    thread_id = storage.create_thread("Provider failure")
+    caplog.set_level("WARNING", logger="mentor.chat_service")
+
+    list(ChatService(storage, SimpleNamespace(responses=RaisingResponses())).stream_reply(thread_id, "Question"))
+
+    assert "type=None" in caplog.text
+    assert "code=None" in caplog.text
+    assert "param=None" in caplog.text
+    assert "request_id=None" in caplog.text
+    assert "RAW_NOTE_SENTINEL" not in caplog.text
+
+
+def test_streaming_provider_error_metadata_rejects_non_string_attributes(tmp_path, caplog):
+    class ProviderError(Exception):
+        status_code = 400
+        type = []
+        code = {}
+        param = ()
+        request_id = []
+
+    class RaisingResponses:
+        def create(self, **request):
+            raise ProviderError("provider failure")
+
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    storage.set_vector_store("vs_jacob")
+    thread_id = storage.create_thread("Provider failure")
+    caplog.set_level("WARNING", logger="mentor.chat_service")
+
+    events = list(ChatService(storage, SimpleNamespace(responses=RaisingResponses())).stream_reply(thread_id, "Question"))
+
+    assert [event.type for event in events] == ["error"]
+    assert "type=None" in caplog.text
+    assert "code=None" in caplog.text
+    assert "param=None" in caplog.text
+    assert "request_id=None" in caplog.text
+
+
+def test_qualitative_transport_failure_stays_in_the_safe_stream_error_path(tmp_path, monkeypatch):
+    storage, thread_id, _dataset, _mapping, fields = _scoped_analysis_dataset(tmp_path, allow_notes=True)
+    initial = SimpleNamespace(
+        status="completed",
+        output=[analysis_tool_call(
+            "read_text_evidence",
+            {"text_field_ids": [fields["Journal"]], "context_field_ids": [], "filters": [], "order_by": "source"},
+            call_id="notes",
+        )],
+    )
+    responses = FakeResponses([SimpleNamespace(type="response.completed", response=initial)])
+
+    def fail_transport(**_kwargs):
+        from mentor.datasets import QualitativeTransportError
+        raise QualitativeTransportError("qualitative model transport failed")
+
+    monkeypatch.setattr("mentor.chat_service.continue_qualitative_model_transport", fail_transport)
+    events = list(ChatService(storage, SimpleNamespace(responses=responses)).stream_reply(
+        thread_id, "Read my notes.", include_approved_notes=True
+    ))
+
+    assert [event.type for event in events] == ["error"]
+    assert events[0].error_classification == "qualitative_continuation_error"
+
+
 def test_approved_qualitative_notes_use_only_the_ephemeral_transport_and_persist_safe_metadata(tmp_path):
     storage, thread_id, _dataset, _mapping, fields = _scoped_analysis_dataset(tmp_path, allow_notes=True)
     first = SimpleNamespace(
@@ -1920,6 +2098,42 @@ def test_streaming_qualitative_request_without_consent_pauses_before_persisting_
     responses = FakeResponses([SimpleNamespace(type="response.completed", response=response)])
 
     events = list(ChatService(storage, SimpleNamespace(responses=responses)).stream_reply(thread_id, "Read my notes."))
+
+    assert [event.type for event in events] == ["consent_required"]
+    assert storage.display_turns(thread_id) == []
+    assert len(responses.calls) == 1
+
+
+def test_streaming_exact_auto_mapped_notes_pause_for_consent_without_manual_mapping(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    storage.set_vector_store("vs_jacob")
+    source = tmp_path / "phase5_mock_backtest.csv"
+    source.write_text(
+        "Result_R,Outcome,Trade_Notes\n1,Win,waited for confirmation\n-1,Loss,entered early\n",
+        encoding="utf-8",
+    )
+    dataset = import_local_dataset(source, storage, dataset_id_factory=lambda: "auto-notes").dataset
+    inspection = inspect_local_dataset(storage, dataset.id)
+    mapping = storage.confirm_mapping_version(
+        create_inspected_mapping_draft(storage, inspection, safe_auto_mapping(inspection).entries).id
+    )
+    thread_id = storage.create_thread("Analysis")
+    storage.set_thread_dataset_scope(thread_id, dataset.id)
+    notes = next(entry for entry in storage.mapping_entries(mapping.id) if entry.analysis_label == "Trade notes")
+    response = SimpleNamespace(
+        status="completed",
+        output=[analysis_tool_call(
+            "read_text_evidence",
+            {"text_field_ids": [notes.field_id], "context_field_ids": [], "filters": [], "order_by": "source"},
+            call_id="notes",
+        )],
+    )
+    responses = SequenceResponses([SimpleNamespace(type="response.completed", response=response)], terminal_response())
+
+    events = list(ChatService(storage, SimpleNamespace(responses=responses)).stream_reply(
+        thread_id, "Read my trade notes and tell me what recurring mistakes or behavioral patterns you notice."
+    ))
 
     assert [event.type for event in events] == ["consent_required"]
     assert storage.display_turns(thread_id) == []

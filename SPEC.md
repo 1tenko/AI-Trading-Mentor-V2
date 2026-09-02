@@ -116,7 +116,13 @@ before the next phase starts:
 4. Trader profile and editable memory — passed.
 5. Backtest and empirical data analysis foundation — current design/planning
    phase; structured import and deterministic analysis only.
-6. Strategy Projects plus source/research scope.
+6. Strategy Projects plus source/research scope. The future GxT project must
+   support multiple independently attributable mentor libraries (for example,
+   Garrett, Afyz, Erik, and later approved GxT mentors) teaching one strategy;
+   Jacob must remain independently switchable off. The mentor must preserve
+   per-mentor provenance and disagreements, while the later research supervisor
+   guides concept learning through hypothesis, operational definition, data
+   collection, deterministic analysis, falsification, and the next experiment.
 7. Scientific strategy-development supervisor.
 8. Mindset and development sources and coaching.
 9. Evals, hardening, and productization.

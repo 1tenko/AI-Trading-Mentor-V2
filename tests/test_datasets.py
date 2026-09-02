@@ -18,6 +18,7 @@ from mentor.analysis import (
     TextEvidenceUseGuard,
     qualitative_evidence_audit_metadata,
     read_text_evidence,
+    validate_text_evidence_request,
 )
 from mentor.datasets import (
     AUTO_MAPPING_POLICY_VERSION,
@@ -713,6 +714,63 @@ def test_safe_auto_mapping_allows_bounded_standard_trading_group_labels(tmp_path
     assert all(entries[name].value_type in {"categorical", "boolean"} for name in entries)
 
 
+def test_safe_auto_mapping_marks_exact_note_aliases_eligible_for_one_turn_consent(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    source = tmp_path / "trades.csv"
+    source.write_text("Result_R,Outcome,Trade_Notes\n1,Win,waited for confirmation\n", encoding="utf-8")
+    dataset = _importer(storage, tmp_path)(source).dataset
+    inspection = inspect_local_dataset(storage, dataset.id)
+
+    mapping = storage.confirm_mapping_version(
+        create_inspected_mapping_draft(storage, inspection, safe_auto_mapping(inspection).entries).id
+    )
+    notes = next(entry for entry in storage.mapping_entries(mapping.id) if entry.analysis_label == "Trade notes")
+
+    assert mapping.auto_mapping_policy_version == 3
+    assert notes.mentor_access == "allow_row_values_when_analysing_notes"
+    validate_text_evidence_request(
+        storage,
+        dataset.id,
+        mapping.id,
+        text_field_ids=(notes.field_id or "",),
+        context_field_ids=(),
+        filters=(),
+        order_by="source",
+    )
+
+
+def test_qualitative_review_reports_the_100_of_156_partial_boundary(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    source = tmp_path / "phase5_mock_backtest.csv"
+    source.write_text(
+        "Trade_Notes\n" + "\n".join(f"synthetic note {number}" for number in range(156)) + "\n",
+        encoding="utf-8",
+    )
+    dataset = _importer(storage, tmp_path)(source).dataset
+    inspection = inspect_local_dataset(storage, dataset.id)
+    mapping = storage.confirm_mapping_version(
+        create_inspected_mapping_draft(storage, inspection, safe_auto_mapping(inspection).entries).id
+    )
+    note_field_id = storage.mapping_entries(mapping.id)[0].field_id or ""
+
+    evidence = read_text_evidence(
+        storage,
+        dataset.id,
+        mapping.id,
+        text_field_ids=(note_field_id,),
+        include_approved_notes=True,
+        use_guard=QualitativeDisclosureCapability(),
+    )
+    metadata = evidence.to_persistable_metadata().to_dict()
+
+    assert metadata["usable_text_rows"] == 156
+    assert metadata["returned_rows"] == 100
+    assert metadata["omitted_rows"] == 56
+    assert metadata["complete"] is False
+
+
 def test_stale_deterministic_auto_mapping_gets_one_safe_successor_and_resets_model_replay(tmp_path):
     storage = Storage(tmp_path / "mentor.sqlite3")
     storage.initialize()
@@ -748,6 +806,40 @@ def test_stale_deterministic_auto_mapping_gets_one_safe_successor_and_resets_mod
     assert storage.mapping_entries(legacy.id)[2].aggregate_labels_allowed is False
     assert storage.replay_items(thread_id) == []
     assert ensure_current_auto_mapping(storage, dataset.id) == (upgraded, False)
+
+
+def test_policy_two_auto_note_mapping_gets_one_immutable_policy_three_successor(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    source = tmp_path / "trades.csv"
+    source.write_text("Result_R,Outcome,Trade_Notes\n1,Win,synthetic note\n", encoding="utf-8")
+    dataset = _importer(storage, tmp_path)(source).dataset
+    inspection = inspect_local_dataset(storage, dataset.id)
+    legacy_entries = [
+        replace(entry, mentor_access="aggregates_only") if entry.analysis_label == "Trade notes" else entry
+        for entry in safe_auto_mapping(inspection).entries
+    ]
+    legacy = storage.confirm_mapping_version(
+        create_inspected_mapping_draft(
+            storage,
+            inspection,
+            legacy_entries,
+            auto_mapping_policy_version=2,
+        ).id
+    )
+
+    successor, changed = ensure_current_auto_mapping(storage, dataset.id)
+    old_notes = next(entry for entry in storage.mapping_entries(legacy.id) if entry.analysis_label == "Trade notes")
+    new_notes = next(entry for entry in storage.mapping_entries(successor.id) if entry.analysis_label == "Trade notes")
+    repeated, changed_again = ensure_current_auto_mapping(storage, dataset.id)
+
+    assert changed is True
+    assert successor.id != legacy.id
+    assert successor.auto_mapping_policy_version == 3
+    assert old_notes.mentor_access == "aggregates_only"
+    assert new_notes.mentor_access == "allow_row_values_when_analysing_notes"
+    assert repeated.id == successor.id
+    assert changed_again is False
 
 
 def test_auto_mapping_upgrade_preserves_manual_entries_and_note_access(tmp_path):

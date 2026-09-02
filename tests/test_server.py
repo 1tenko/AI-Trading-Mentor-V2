@@ -247,6 +247,9 @@ def test_server_serves_the_persistent_chat_controls(tmp_path):
         assert b"overflow-wrap: normal" in stylesheet
         assert b".markdown-table-scroll { margin: 1rem 0; max-width: 100%; overflow-x: auto; width: 100%; }" in stylesheet
         assert b"#threads { min-width: 0;" in stylesheet
+        assert b"--tm-quote-text" in stylesheet
+        assert b"--tm-quote-border" in stylesheet
+        assert b".markdown blockquote { border-left: 3px solid var(--tm-quote-border); color: var(--tm-quote-text);" in stylesheet
     finally:
         server.shutdown()
         worker.join()
@@ -795,9 +798,9 @@ def test_chat_attachment_auto_confirms_only_safe_mapping_and_scopes_its_thread(t
         assert attached["state"] == "ready"
         assert attached["dataset_scope"]["original_name"] == "gxt_backtest.csv"
         assert attached["mapping"]["status"] == "confirmed"
-        assert storage.mapping_version(attached["mapping"]["id"]).auto_mapping_policy_version == 2
+        assert storage.mapping_version(attached["mapping"]["id"]).auto_mapping_policy_version == 3
         assert {entry.source for entry in storage.mapping_entries(attached["mapping"]["id"])} == {"deterministic_auto"}
-        assert next(entry for entry in storage.mapping_entries(attached["mapping"]["id"]) if entry.analysis_label == "Trade notes").mentor_access == "aggregates_only"
+        assert next(entry for entry in storage.mapping_entries(attached["mapping"]["id"]) if entry.analysis_label == "Trade notes").mentor_access == "allow_row_values_when_analysing_notes"
         assert all("Notes" not in value for value in body.decode().splitlines())
 
         status, _, body = request(

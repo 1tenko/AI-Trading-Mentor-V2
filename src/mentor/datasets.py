@@ -4,6 +4,7 @@ import csv
 import hashlib
 import io
 import json
+import logging
 import math
 import os
 import re
@@ -26,6 +27,9 @@ if TYPE_CHECKING:
     from mentor.storage import Storage
 
 
+LOGGER = logging.getLogger(__name__)
+
+
 MAX_DATASET_BYTES = 50 * 1024 * 1024
 MAX_DATASET_ROWS = 250_000
 MAX_DATASET_COLUMNS = 100
@@ -38,8 +42,19 @@ MAX_INSPECTION_PREVIEW_ROWS = 20
 MAX_INSPECTION_CELL_CHARS = 200
 MAX_MODEL_GROUP_LABELS = 20
 MAX_MODEL_GROUP_LABEL_CHARS = 80
-AUTO_MAPPING_POLICY_VERSION = 2
+AUTO_MAPPING_POLICY_VERSION = 3
 MENTOR_ACCESS_POLICIES = frozenset({"aggregates_only", "allow_row_values_when_analysing_notes"})
+_SAFE_PROVIDER_ERROR_TYPES = frozenset({
+    "authentication_error", "invalid_request_error", "not_found_error",
+    "permission_error", "rate_limit_error", "server_error",
+})
+_SAFE_PROVIDER_ERROR_CODES = frozenset({
+    "invalid_request", "invalid_tool_protocol", "invalid_value", "rate_limit_exceeded", "unsupported_parameter",
+})
+_SAFE_PROVIDER_ERROR_PARAMS = frozenset({
+    "input", "max_output_tokens", "model", "previous_response_id", "reasoning", "tool_choice", "tools",
+})
+_SAFE_REQUEST_ID = re.compile(r"req_[A-Za-z0-9_-]{1,128}$")
 
 
 class QualitativeDisclosureCapability:
@@ -141,6 +156,33 @@ class QualitativeTransportError(RuntimeError):
     """Safe terminal failure for the raw qualitative model-disclosure boundary."""
 
 
+def safe_provider_error_details(error: Exception) -> tuple[int | None, str | None, str | None, str | None, str | None]:
+    """Return only allowlisted provider metadata; error attributes are untrusted input."""
+    response = getattr(error, "response", None)
+    status = getattr(error, "status_code", None) or getattr(response, "status_code", None)
+    error_type = getattr(error, "type", None)
+    code = getattr(error, "code", None)
+    param = getattr(error, "param", None)
+    request_id = getattr(error, "request_id", None) or getattr(response, "request_id", None)
+    return (
+        status if isinstance(status, int) and 100 <= status <= 599 else None,
+        error_type if isinstance(error_type, str) and error_type in _SAFE_PROVIDER_ERROR_TYPES else None,
+        code if isinstance(code, str) and code in _SAFE_PROVIDER_ERROR_CODES else None,
+        param if isinstance(param, str) and param in _SAFE_PROVIDER_ERROR_PARAMS else None,
+        request_id if isinstance(request_id, str) and _SAFE_REQUEST_ID.fullmatch(request_id) else None,
+    )
+
+
+def _log_safe_qualitative_transport_error(error: Exception) -> None:
+    """Log provider metadata without ever formatting the raw qualitative request."""
+    status, error_type, code, param, request_id = safe_provider_error_details(error)
+    LOGGER.warning(
+        "Responses request failed stage=qualitative_continuation class=%s status=%s type=%s code=%s param=%s request_id=%s",
+        type(error).__name__,
+        status, error_type, code, param, request_id,
+    )
+
+
 def continue_qualitative_model_transport(
     *,
     client: Any,
@@ -180,7 +222,8 @@ def continue_qualitative_model_transport(
                     raise QualitativeTransportError("qualitative model transport timed out") from None
             except QualitativeTransportError:
                 raise
-            except Exception:
+            except Exception as error:
+                _log_safe_qualitative_transport_error(error)
                 raise QualitativeTransportError("qualitative model transport failed") from None
         raise AssertionError("unreachable")
     finally:
@@ -571,6 +614,7 @@ def safe_auto_mapping(inspection: DatasetInspection) -> AutoMappingResult:
                     column.ordinal,
                     analysis_label=note_label,
                     source="deterministic_auto",
+                    mentor_access="allow_row_values_when_analysing_notes",
                 )
             )
     return AutoMappingResult(entries, ambiguities)
