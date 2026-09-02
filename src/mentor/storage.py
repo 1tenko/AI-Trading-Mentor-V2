@@ -544,6 +544,7 @@ class Storage:
                     version INTEGER NOT NULL CHECK(version >= 1),
                     status TEXT NOT NULL CHECK(status IN ('draft', 'confirmed')),
                     parent_mapping_version_id INTEGER REFERENCES dataset_mapping_versions(id),
+                    auto_mapping_policy_version INTEGER CHECK(auto_mapping_policy_version >= 1),
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     confirmed_at TEXT,
                     UNIQUE(dataset_id, version)
@@ -846,6 +847,11 @@ class Storage:
                     "ALTER TABLE dataset_mapping_versions "
                     "ADD COLUMN parent_mapping_version_id INTEGER REFERENCES dataset_mapping_versions(id)"
                 )
+            if "auto_mapping_policy_version" not in mapping_version_columns:
+                connection.execute(
+                    "ALTER TABLE dataset_mapping_versions ADD COLUMN auto_mapping_policy_version INTEGER "
+                    "CHECK(auto_mapping_policy_version >= 1)"
+                )
             mapping_entry_columns = {
                 row[1] for row in connection.execute("PRAGMA table_info(dataset_mapping_entries)")
             }
@@ -911,6 +917,7 @@ class Storage:
                     OLD.status = 'draft' AND NEW.status = 'confirmed'
                     AND OLD.dataset_id = NEW.dataset_id AND OLD.version = NEW.version
                     AND OLD.parent_mapping_version_id IS NEW.parent_mapping_version_id
+                    AND OLD.auto_mapping_policy_version IS NEW.auto_mapping_policy_version
                     AND OLD.parent_mapping_version_id IS NOT NULL
                     AND OLD.created_at = NEW.created_at AND OLD.confirmed_at IS NULL
                     AND NEW.confirmed_at IS NOT NULL
@@ -2205,8 +2212,13 @@ class Storage:
             )
 
     def create_mapping_draft(
-        self, dataset_id: str, entries: list[MappingEntry | Mapping[str, Any]]
+        self, dataset_id: str, entries: list[MappingEntry | Mapping[str, Any]], *,
+        auto_mapping_policy_version: int | None = None,
     ) -> DatasetMappingVersion:
+        if auto_mapping_policy_version is not None and (
+            type(auto_mapping_policy_version) is not int or auto_mapping_policy_version < 1
+        ):
+            raise ValueError("auto-mapping policy version is invalid")
         self._validate_inspected_mapping_entries(dataset_id, entries)
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -2215,19 +2227,19 @@ class Storage:
                 (dataset_id,),
             ).fetchone()
             cursor = connection.execute(
-                "INSERT INTO dataset_mapping_versions(dataset_id, version, status, parent_mapping_version_id) "
-                "VALUES (?, ?, 'draft', NULL)",
-                (dataset_id, int(row[0])),
+                "INSERT INTO dataset_mapping_versions(dataset_id, version, status, parent_mapping_version_id, auto_mapping_policy_version) "
+                "VALUES (?, ?, 'draft', NULL, ?)",
+                (dataset_id, int(row[0]), auto_mapping_policy_version),
             )
             self._insert_mapping_entries(connection, int(cursor.lastrowid), entries)
-            return DatasetMappingVersion(int(cursor.lastrowid), dataset_id, int(row[0]), "draft", None)
+            return DatasetMappingVersion(int(cursor.lastrowid), dataset_id, int(row[0]), "draft", None, auto_mapping_policy_version)
 
     def confirm_mapping_version(self, draft_mapping_version_id: int) -> DatasetMappingVersion:
         """Copy a draft into a separate immutable confirmed snapshot."""
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             draft = connection.execute(
-                "SELECT dataset_id, status FROM dataset_mapping_versions WHERE id = ?", (draft_mapping_version_id,)
+                "SELECT dataset_id, status, auto_mapping_policy_version FROM dataset_mapping_versions WHERE id = ?", (draft_mapping_version_id,)
             ).fetchone()
             if draft is None or draft[1] != "draft":
                 raise ValueError("only a draft mapping version can be confirmed")
@@ -2251,9 +2263,9 @@ class Storage:
                 (draft[0],),
             ).fetchone()
             cursor = connection.execute(
-                "INSERT INTO dataset_mapping_versions(dataset_id, version, status, parent_mapping_version_id) "
-                "VALUES (?, ?, 'draft', ?)",
-                (draft[0], int(next_version[0]), draft_mapping_version_id),
+                "INSERT INTO dataset_mapping_versions(dataset_id, version, status, parent_mapping_version_id, auto_mapping_policy_version) "
+                "VALUES (?, ?, 'draft', ?, ?)",
+                (draft[0], int(next_version[0]), draft_mapping_version_id, draft[2]),
             )
             confirmed_id = int(cursor.lastrowid)
             self._insert_mapping_entries(
@@ -2268,13 +2280,67 @@ class Storage:
             if had_confirmed_mapping:
                 self._reset_replay_for_dataset_scope(connection, str(draft[0]))
             return DatasetMappingVersion(
-                confirmed_id, str(draft[0]), int(next_version[0]), "confirmed", draft_mapping_version_id
+                confirmed_id, str(draft[0]), int(next_version[0]), "confirmed", draft_mapping_version_id, draft[2]
             )
+
+    def create_deterministic_auto_successor(
+        self, source_mapping_version_id: int, policy_version: int, entries: list[MappingEntry]
+    ) -> tuple[DatasetMappingVersion, bool]:
+        """Atomically create one successor only while the inspected mapping remains current."""
+        if type(policy_version) is not int or policy_version < 1:
+            raise ValueError("auto-mapping policy version is invalid")
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            source = connection.execute(
+                "SELECT dataset_id, auto_mapping_policy_version FROM dataset_mapping_versions "
+                "WHERE id = ? AND status = 'confirmed'",
+                (source_mapping_version_id,),
+            ).fetchone()
+            if source is None:
+                raise ValueError("source mapping is unavailable")
+            latest = connection.execute(
+                "SELECT id, dataset_id, version, status, parent_mapping_version_id, auto_mapping_policy_version "
+                "FROM dataset_mapping_versions WHERE dataset_id = ? AND status = 'confirmed' ORDER BY version DESC LIMIT 1",
+                (source[0],),
+            ).fetchone()
+            if latest is None:
+                raise ValueError("dataset mapping is unavailable")
+            current = DatasetMappingVersion(*latest)
+            if current.id != source_mapping_version_id or (
+                current.auto_mapping_policy_version is not None and current.auto_mapping_policy_version >= policy_version
+            ):
+                return current, False
+            self._validate_inspected_mapping_entries(str(source[0]), entries)
+            draft_version = connection.execute(
+                "SELECT COALESCE(MAX(version), 0) + 1 FROM dataset_mapping_versions WHERE dataset_id = ?",
+                (source[0],),
+            ).fetchone()
+            draft = connection.execute(
+                "INSERT INTO dataset_mapping_versions(dataset_id, version, status, parent_mapping_version_id, auto_mapping_policy_version) "
+                "VALUES (?, ?, 'draft', NULL, ?)",
+                (source[0], int(draft_version[0]), policy_version),
+            )
+            draft_id = int(draft.lastrowid)
+            self._insert_mapping_entries(connection, draft_id, entries)
+            confirmed_version = int(draft_version[0]) + 1
+            confirmed = connection.execute(
+                "INSERT INTO dataset_mapping_versions(dataset_id, version, status, parent_mapping_version_id, auto_mapping_policy_version) "
+                "VALUES (?, ?, 'draft', ?, ?)",
+                (source[0], confirmed_version, draft_id, policy_version),
+            )
+            confirmed_id = int(confirmed.lastrowid)
+            self._insert_mapping_entries(connection, confirmed_id, entries)
+            connection.execute(
+                "UPDATE dataset_mapping_versions SET status = 'confirmed', confirmed_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (confirmed_id,),
+            )
+            self._reset_replay_for_dataset_scope(connection, str(source[0]))
+            return DatasetMappingVersion(confirmed_id, str(source[0]), confirmed_version, "confirmed", draft_id, policy_version), True
 
     def mapping_version(self, mapping_version_id: int) -> DatasetMappingVersion | None:
         with self._connect() as connection:
             row = connection.execute(
-                "SELECT id, dataset_id, version, status, parent_mapping_version_id "
+                "SELECT id, dataset_id, version, status, parent_mapping_version_id, auto_mapping_policy_version "
                 "FROM dataset_mapping_versions WHERE id = ?",
                 (mapping_version_id,),
             ).fetchone()
@@ -2284,7 +2350,7 @@ class Storage:
         """Return the latest immutable confirmed mapping for a local dataset scope."""
         with self._connect() as connection:
             row = connection.execute(
-                "SELECT id, dataset_id, version, status, parent_mapping_version_id "
+                "SELECT id, dataset_id, version, status, parent_mapping_version_id, auto_mapping_policy_version "
                 "FROM dataset_mapping_versions WHERE dataset_id = ? AND status = 'confirmed' "
                 "ORDER BY version DESC LIMIT 1",
                 (dataset_id,),

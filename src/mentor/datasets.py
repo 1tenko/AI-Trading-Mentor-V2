@@ -38,6 +38,7 @@ MAX_INSPECTION_PREVIEW_ROWS = 20
 MAX_INSPECTION_CELL_CHARS = 200
 MAX_MODEL_GROUP_LABELS = 20
 MAX_MODEL_GROUP_LABEL_CHARS = 80
+AUTO_MAPPING_POLICY_VERSION = 2
 MENTOR_ACCESS_POLICIES = frozenset({"aggregates_only", "allow_row_values_when_analysing_notes"})
 
 
@@ -297,6 +298,7 @@ class DatasetMappingVersion:
     version: int
     status: str
     parent_mapping_version_id: int | None
+    auto_mapping_policy_version: int | None = None
 
 
 @dataclass(frozen=True)
@@ -575,9 +577,24 @@ def safe_auto_mapping(inspection: DatasetInspection) -> AutoMappingResult:
 
 
 def create_inspected_mapping_draft(
-    storage: "Storage", inspection: DatasetInspection, entries: list[MappingEntry]
+    storage: "Storage", inspection: DatasetInspection, entries: list[MappingEntry], *,
+    auto_mapping_policy_version: int | None = None,
 ) -> DatasetMappingVersion:
     """Persist a local draft with the inspection health snapshot, never active semantics."""
+    prepared = _prepare_inspected_mapping_entries(storage, inspection, entries)
+    if auto_mapping_policy_version is None and any(entry.source == "deterministic_auto" for entry in prepared):
+        auto_mapping_policy_version = AUTO_MAPPING_POLICY_VERSION
+    return storage.create_mapping_draft(
+        inspection.dataset_id,
+        prepared,
+        auto_mapping_policy_version=auto_mapping_policy_version,
+    )
+
+
+def _prepare_inspected_mapping_entries(
+    storage: "Storage", inspection: DatasetInspection, entries: list[MappingEntry]
+) -> list[MappingEntry]:
+    """Rebuild entries from immutable local inspection before they can be persisted."""
     verified = inspect_local_dataset(storage, inspection.dataset_id)
     if inspection != verified:
         raise ValueError("mapping requires a current local inspection")
@@ -643,7 +660,58 @@ def create_inspected_mapping_draft(
                 ambiguous_date_count=column.ambiguous_date_count,
             )
         )
-    return storage.create_mapping_draft(inspection.dataset_id, prepared)
+    return prepared
+
+
+def ensure_current_auto_mapping(storage: "Storage", dataset_id: str) -> tuple[DatasetMappingVersion, bool]:
+    """Safely advance stale deterministic mapping entries without changing user-owned ones."""
+    mapping = storage.confirmed_mapping_for_dataset(dataset_id)
+    if mapping is None:
+        raise ValueError("dataset mapping is unavailable")
+    existing = storage.mapping_entries(mapping.id)
+    if not any(entry.source == "deterministic_auto" for entry in existing):
+        return mapping, False
+    recorded_policy = mapping.auto_mapping_policy_version or 1
+    if recorded_policy >= AUTO_MAPPING_POLICY_VERSION:
+        return mapping, False
+    inspection = inspect_local_dataset(storage, dataset_id)
+    candidate = safe_auto_mapping(inspection)
+    if candidate.ambiguities:
+        return mapping, False
+    candidates = {entry.column_ordinal: entry for entry in candidate.entries}
+    refreshed = [
+        candidates.get(entry.column_ordinal, _persisted_mapping_entry(entry))
+        if entry.source == "deterministic_auto" else _persisted_mapping_entry(entry)
+        for entry in existing
+    ]
+    prepared = _prepare_inspected_mapping_entries(storage, inspection, refreshed)
+    if _mapping_configuration_signatures(existing) == _mapping_configuration_signatures(prepared):
+        return mapping, False
+    return storage.create_deterministic_auto_successor(
+        mapping.id,
+        AUTO_MAPPING_POLICY_VERSION,
+        prepared,
+    )
+
+
+def _persisted_mapping_entry(entry: MappingEntry) -> MappingEntry:
+    return MappingEntry(
+        column_ordinal=entry.column_ordinal,
+        semantic_role=entry.semantic_role,
+        unit=entry.unit,
+        analysis_label=entry.analysis_label,
+        source=entry.source,
+        model_disclosure=entry.aggregate_labels_allowed,
+        mentor_access=entry.mentor_access,
+    )
+
+
+def _mapping_configuration_signatures(entries: Iterable[MappingEntry]) -> tuple[tuple[object, ...], ...]:
+    return tuple(
+        (entry.column_ordinal, entry.semantic_role, entry.unit, entry.analysis_label,
+         entry.source, entry.aggregate_labels_allowed or entry.model_disclosure, entry.mentor_access)
+        for entry in entries
+    )
 
 
 def model_mapping_context(storage: "Storage", mapping_version_id: int) -> list[dict[str, object]]:

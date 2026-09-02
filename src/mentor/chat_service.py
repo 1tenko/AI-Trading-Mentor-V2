@@ -34,6 +34,7 @@ from mentor.datasets import (
     QualitativeDisclosureCapability,
     QualitativeTransportError,
     continue_qualitative_model_transport,
+    ensure_current_auto_mapping,
     model_mapping_context,
 )
 from mentor.prompts import ANALYSIS_TOOL_INSTRUCTIONS, MENTOR_INSTRUCTIONS, PROFILE_TOOL_INSTRUCTIONS
@@ -251,6 +252,14 @@ class ResponseDiagnostics:
     qualitative_calls: int
     analysis_batch_status: str
     prior_empirical_evidence_reused: bool
+    auto_mapping_policy_upgraded: bool
+
+
+@dataclass(frozen=True)
+class AnalysisScope:
+    dataset_id: str
+    mapping_version_id: int
+    auto_mapping_policy_upgraded: bool
 
 
 @dataclass(frozen=True)
@@ -288,7 +297,7 @@ class ChatService:
         include_approved_notes: bool = False,
         dataset_attachment_id: str | None = None,
     ) -> Answer:
-        user_item, request, effective_depth, prior_empirical_evidence_reused = self._request(thread_id, question, evaluation)
+        user_item, request, effective_depth, prior_empirical_evidence_reused, auto_mapping_policy_upgraded = self._request(thread_id, question, evaluation)
         started_at = perf_counter()
         response = self.client.responses.create(**request)
         response, leading_output, replay_leading_output, response_request, profile_update, qualitative_exchange = self._local_tools_continued_response(
@@ -312,6 +321,7 @@ class ChatService:
             qualitative_exchange=qualitative_exchange,
             dataset_attachment_id=dataset_attachment_id,
             prior_empirical_evidence_reused=prior_empirical_evidence_reused,
+            auto_mapping_policy_upgraded=auto_mapping_policy_upgraded,
         )
 
     def stream_reply(
@@ -324,7 +334,7 @@ class ChatService:
         qualitative_consent_prompt: bool = True,
         dataset_attachment_id: str | None = None,
     ):
-        user_item, request, effective_depth, prior_empirical_evidence_reused = self._request(thread_id, question, evaluation)
+        user_item, request, effective_depth, prior_empirical_evidence_reused, auto_mapping_policy_upgraded = self._request(thread_id, question, evaluation)
         started_at = perf_counter()
         try:
             stream = self.client.responses.create(**request, stream=True)
@@ -358,6 +368,7 @@ class ChatService:
                         qualitative_exchange=qualitative_exchange,
                         dataset_attachment_id=dataset_attachment_id,
                         prior_empirical_evidence_reused=prior_empirical_evidence_reused,
+                        auto_mapping_policy_upgraded=auto_mapping_policy_upgraded,
                     )
                     if answer.incomplete_reason:
                         yield StreamEvent(
@@ -482,7 +493,7 @@ class ChatService:
             return (*self._standard_local_continuation(
                 request, output, calls, [_profile_tool_rejection("no_active_dataset") for _ in calls]
             ), None, False)
-        dataset_id, mapping_version_id = scope
+        dataset_id, mapping_version_id = scope.dataset_id, scope.mapping_version_id
         if pause_for_qualitative_consent and not include_approved_notes and any(
             call["name"] == QUALITATIVE_TOOL_NAME for call in calls
         ):
@@ -623,12 +634,12 @@ class ChatService:
         leading_output = [*output, *tool_outputs]
         return self.client.responses.create(**continuation_request), leading_output, leading_output, continuation_request
 
-    def _active_analysis_scope(self, thread_id: int) -> tuple[str, int] | None:
+    def _active_analysis_scope(self, thread_id: int) -> AnalysisScope | None:
         scope = self.storage.thread_dataset_scope(thread_id)
         if scope is None or scope.dataset_id is None:
             return None
-        mapping = self.storage.confirmed_mapping_for_dataset(scope.dataset_id)
-        return None if mapping is None else (scope.dataset_id, mapping.id)
+        mapping, upgraded = ensure_current_auto_mapping(self.storage, scope.dataset_id)
+        return AnalysisScope(scope.dataset_id, mapping.id, upgraded)
 
     def _execute_analysis_tool(self, dataset_id: str, mapping_version_id: int, call: dict) -> dict:
         arguments = _analysis_arguments(call)
@@ -787,7 +798,7 @@ class ChatService:
 
     def _request(
         self, thread_id: int, question: str, evaluation: EvaluationConfig
-    ) -> tuple[dict, dict, str, bool]:
+    ) -> tuple[dict, dict, str, bool, bool]:
         question = _question(question)
         vector_store_id = self.storage.vector_store_id()
         if vector_store_id is None:
@@ -834,12 +845,12 @@ class ChatService:
         analysis_context = ""
         analysis_tools: list[dict] = []
         if scope is not None:
-            dataset_id, mapping_version_id = scope
+            dataset_id, mapping_version_id = scope.dataset_id, scope.mapping_version_id
             analysis_context = (
                 "\n\nLocal Backtest Dataset — server-owned user empirical context, not source evidence:\n"
                 f"dataset_id={dataset_id}; mapping_version_id={mapping_version_id}; "
                 f"fields={json.dumps(model_mapping_context(self.storage, mapping_version_id), separators=(',', ':'))}\n"
-                "Use only the available local analysis tools for this dataset. Field identifiers are opaque; never request headers, paths, rows, SQL, Python, or unlisted fields. Earlier chat text may describe a replaced dataset; it is not empirical evidence for this scope."
+                "Use only the available local analysis tools for this dataset. Field identifiers are opaque; never request headers, paths, rows, SQL, Python, or unlisted fields. These mapping details are internal tool context: never mention mapping versions, field IDs, semantic roles, or access flags in a normal answer. Explain any unavailable analysis in plain language. Earlier chat text may describe a replaced dataset; it is not empirical evidence for this scope."
             )
             analysis_tools = ANALYSIS_TOOLS
         return user_item, {
@@ -858,7 +869,7 @@ class ChatService:
             "context_management": [{"type": "compaction", "compact_threshold": COMPACTION_TOKEN_THRESHOLD}],
             "max_output_tokens": MAX_OUTPUT_TOKENS,
             "store": False,
-        }, effective_depth, prior_empirical_evidence_reused
+        }, effective_depth, prior_empirical_evidence_reused, bool(scope and scope.auto_mapping_policy_upgraded)
 
     def _finalize(
         self,
@@ -876,6 +887,7 @@ class ChatService:
         qualitative_exchange: bool = False,
         dataset_attachment_id: str | None = None,
         prior_empirical_evidence_reused: bool = False,
+        auto_mapping_policy_upgraded: bool = False,
     ) -> Answer:
         response_output = [_as_dict(item) for item in response.output]
         historic_response_output = _qualitative_historic_items(response_output) if qualitative_exchange else response_output
@@ -930,6 +942,7 @@ class ChatService:
             native_compaction_applied=compaction_index is not None,
             draft_response=draft_response,
             prior_empirical_evidence_reused=prior_empirical_evidence_reused,
+            auto_mapping_policy_upgraded=auto_mapping_policy_upgraded,
         )
         self.storage.record_response_diagnostics(
             thread_id, diagnostics.response_id, diagnostics.__dict__
@@ -1114,7 +1127,7 @@ def _input_item(item: dict) -> dict:
 
 
 def _dataset_bound_empirical_replay(
-    storage: Storage, thread_id: int, replay_items: list[dict], scope: tuple[str, int] | None
+    storage: Storage, thread_id: int, replay_items: list[dict], scope: AnalysisScope | None
 ) -> tuple[list[dict], bool]:
     """Keep only persisted empirical tool outputs that match the active immutable scope."""
     persisted = {
@@ -1135,8 +1148,8 @@ def _dataset_bound_empirical_replay(
             continue
         current = (
             scope is not None
-            and result.get("dataset_id") == scope[0]
-            and result.get("mapping_version_id") == scope[1]
+            and result.get("dataset_id") == scope.dataset_id
+            and result.get("mapping_version_id") == scope.mapping_version_id
             and result.get("schema_version") == ANALYSIS_SCHEMA_VERSION
             and json.dumps(result, separators=(",", ":"), allow_nan=False) in persisted
         )
@@ -1288,6 +1301,7 @@ def _diagnostics(
     native_compaction_applied: bool,
     draft_response: Any | None = None,
     prior_empirical_evidence_reused: bool = False,
+    auto_mapping_policy_upgraded: bool = False,
 ) -> ResponseDiagnostics:
     responses = [response] if draft_response is None else [draft_response, response]
     input_tokens = _usage_total(responses, "input_tokens")
@@ -1329,6 +1343,7 @@ def _diagnostics(
         qualitative_calls=analysis["qualitative_calls"],
         analysis_batch_status=analysis["status"],
         prior_empirical_evidence_reused=prior_empirical_evidence_reused,
+        auto_mapping_policy_upgraded=auto_mapping_policy_upgraded,
     )
 
 

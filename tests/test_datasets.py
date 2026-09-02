@@ -20,6 +20,7 @@ from mentor.analysis import (
     read_text_evidence,
 )
 from mentor.datasets import (
+    AUTO_MAPPING_POLICY_VERSION,
     continue_qualitative_model_transport,
     DatasetImportError,
     MappingEntry,
@@ -27,6 +28,7 @@ from mentor.datasets import (
     create_inspected_mapping_draft,
     inspect_local_dataset,
     import_local_dataset,
+    ensure_current_auto_mapping,
     mapping_suggestions,
     model_mapping_context,
     safe_auto_mapping,
@@ -709,6 +711,99 @@ def test_safe_auto_mapping_allows_bounded_standard_trading_group_labels(tmp_path
         "Session", "Direction", "Instrument", "Setup", "Quarter", "SMT", "Rule adherence", "Mistake tag"
     }
     assert all(entries[name].value_type in {"categorical", "boolean"} for name in entries)
+
+
+def test_stale_deterministic_auto_mapping_gets_one_safe_successor_and_resets_model_replay(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    source = tmp_path / "trades.csv"
+    source.write_text(
+        "Result_R,Outcome,Session,Setup\n"
+        "2,Win,London,Reversal\n"
+        "-1,Loss,New York,Continuation\n",
+        encoding="utf-8",
+    )
+    dataset = _importer(storage, tmp_path)(source).dataset
+    inspection = inspect_local_dataset(storage, dataset.id)
+    legacy_entries = [
+        replace(entry, analysis_label=None, model_disclosure=False)
+        if entry.semantic_role in {"session", "setup"} else entry
+        for entry in safe_auto_mapping(inspection).entries
+    ]
+    legacy = storage.confirm_mapping_version(create_inspected_mapping_draft(
+        storage, inspection, legacy_entries, auto_mapping_policy_version=1
+    ).id)
+    thread_id = storage.create_thread("Existing attachment")
+    storage.set_thread_dataset_scope(thread_id, dataset.id)
+    storage.replace_replay_items(thread_id, [{"type": "message", "role": "assistant", "content": "Old empirical result."}])
+
+    upgraded, changed = ensure_current_auto_mapping(storage, dataset.id)
+
+    assert changed is True
+    assert upgraded.id != legacy.id
+    assert upgraded.auto_mapping_policy_version == AUTO_MAPPING_POLICY_VERSION
+    entries = {entry.semantic_role: entry for entry in storage.mapping_entries(upgraded.id)}
+    assert entries["session"].aggregate_labels_allowed is True
+    assert entries["setup"].aggregate_labels_allowed is True
+    assert storage.mapping_entries(legacy.id)[2].aggregate_labels_allowed is False
+    assert storage.replay_items(thread_id) == []
+    assert ensure_current_auto_mapping(storage, dataset.id) == (upgraded, False)
+
+
+def test_auto_mapping_upgrade_preserves_manual_entries_and_note_access(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    source = tmp_path / "trades.csv"
+    source.write_text(
+        "Result_R,Outcome,Session,Setup,Journal\n"
+        "2,Win,London,Reversal,waited for confirmation\n"
+        "-1,Loss,New York,Continuation,entered early\n",
+        encoding="utf-8",
+    )
+    dataset = _importer(storage, tmp_path)(source).dataset
+    inspection = inspect_local_dataset(storage, dataset.id)
+    legacy_entries = []
+    for entry in safe_auto_mapping(inspection).entries:
+        if entry.semantic_role == "session":
+            legacy_entries.append(MappingEntry(2, semantic_role="session", source="manual"))
+        elif entry.semantic_role == "setup":
+            legacy_entries.append(replace(entry, analysis_label=None, model_disclosure=False))
+        elif entry.analysis_label == "Journal":
+            legacy_entries.append(replace(entry, source="manual", mentor_access="allow_row_values_when_analysing_notes"))
+        else:
+            legacy_entries.append(entry)
+    legacy = storage.confirm_mapping_version(create_inspected_mapping_draft(
+        storage, inspection, legacy_entries, auto_mapping_policy_version=1
+    ).id)
+
+    upgraded, changed = ensure_current_auto_mapping(storage, dataset.id)
+
+    assert changed is True
+    assert upgraded.id != legacy.id
+    entries = {entry.semantic_role or entry.analysis_label: entry for entry in storage.mapping_entries(upgraded.id)}
+    assert entries["session"].source == "manual"
+    assert entries["session"].aggregate_labels_allowed is False
+    assert entries["setup"].source == "deterministic_auto"
+    assert entries["setup"].aggregate_labels_allowed is True
+    assert entries["Journal"].source == "manual"
+    assert entries["Journal"].mentor_access == "allow_row_values_when_analysing_notes"
+
+
+def test_current_auto_mapping_policy_is_a_noop_for_newly_attached_dataset(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    source = tmp_path / "trades.csv"
+    source.write_text("Result_R,Outcome,Session\n1,Win,London\n", encoding="utf-8")
+    dataset = _importer(storage, tmp_path)(source).dataset
+    inspection = inspect_local_dataset(storage, dataset.id)
+    mapping = storage.confirm_mapping_version(create_inspected_mapping_draft(
+        storage, inspection, safe_auto_mapping(inspection).entries
+    ).id)
+
+    current, changed = ensure_current_auto_mapping(storage, dataset.id)
+
+    assert mapping.auto_mapping_policy_version == AUTO_MAPPING_POLICY_VERSION
+    assert (current, changed) == (mapping, False)
 
 
 def test_safe_auto_mapping_keeps_high_cardinality_generic_label_non_groupable(tmp_path):

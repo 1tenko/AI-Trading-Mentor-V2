@@ -1,4 +1,5 @@
 import json
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -240,6 +241,46 @@ def test_exact_session_and_setup_prompt_runs_grouping_after_safe_auto_mapping(tm
     assert answer.text == "The groups are descriptive; the small cells need cautious interpretation."
     assert result["operation"] == "group_results"
     assert result["grouping"]["field_ids"] == [fields["Session"], fields["Setup"]]
+
+
+def test_existing_session_setup_mapping_upgrades_before_the_exact_grouping_prompt(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    storage.set_vector_store("vs_jacob")
+    source = tmp_path / "trades.csv"
+    source.write_text(
+        "Result_R,Outcome,Session,Setup\n2,Win,London,Reversal\n-1,Loss,New York,Continuation\n",
+        encoding="utf-8",
+    )
+    dataset = import_local_dataset(source, storage, dataset_id_factory=lambda: "legacy-session-setup").dataset
+    inspection = inspect_local_dataset(storage, dataset.id)
+    legacy_entries = [
+        replace(entry, analysis_label=None, model_disclosure=False)
+        if entry.semantic_role in {"session", "setup"} else entry
+        for entry in safe_auto_mapping(inspection).entries
+    ]
+    legacy = storage.confirm_mapping_version(create_inspected_mapping_draft(
+        storage, inspection, legacy_entries, auto_mapping_policy_version=1
+    ).id)
+    thread_id = storage.create_thread("Existing Session setup")
+    storage.set_thread_dataset_scope(thread_id, dataset.id)
+    fields = {entry.semantic_role: entry.field_id for entry in storage.mapping_entries(legacy.id)}
+    prompt = "Now break down performance by session and by setup. Show N, win rate, expectancy, and exclusions for each."
+    responses = SequenceResponses(
+        SimpleNamespace(status="completed", output=[analysis_tool_call(
+            "group_results", {"group_field_ids": [fields["session"], fields["setup"]], "filters": []}, call_id="session-setup"
+        )]),
+        terminal_response("The groups are descriptive."),
+    )
+
+    answer = ChatService(storage, SimpleNamespace(responses=responses)).reply(thread_id, prompt)
+
+    current = storage.confirmed_mapping_for_dataset(dataset.id)
+    assert answer.diagnostics.auto_mapping_policy_upgraded is True
+    assert current is not None and current.id != legacy.id
+    assert all(entry.aggregate_labels_allowed for entry in storage.mapping_entries(current.id) if entry.semantic_role in {"session", "setup"})
+    assert json.loads(next(item for item in responses.calls[1]["input"] if item.get("type") == "function_call_output")["output"])["operation"] == "group_results"
+    assert "never mention mapping versions" in responses.calls[0]["instructions"]
 
 
 def test_invalid_analysis_tool_arguments_return_a_structured_rejection_and_continue(tmp_path):
@@ -1596,6 +1637,7 @@ def test_reply_persists_continuation_state_and_extracts_evidence(tmp_path):
                 "qualitative_calls": 0,
                 "analysis_batch_status": "not_requested",
                 "prior_empirical_evidence_reused": False,
+                "auto_mapping_policy_upgraded": False,
             },
             "response_id": storage.response_diagnostics(thread_id)[0]["response_id"],
             "status": "completed",

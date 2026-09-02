@@ -245,6 +245,7 @@ function showDiagnostics(diagnostics) {
     ["File Search/platform cost", diagnostics.file_search_cost_status || "Unknown"],
     ["Analysis calls", `${analysisCalls.requested} requested · ${analysisCalls.executed} executed · ${analysisCalls.rejected} rejected`],
     ["Prior empirical evidence reused", diagnostics.prior_empirical_evidence_reused ? "Yes — retained deterministic evidence matches the active dataset and mapping." : "No"],
+    ["Dataset mapping", diagnostics.auto_mapping_policy_upgraded ? "Auto-upgraded for the current analysis policy." : "Current"],
     ["Analysis operations", diagnostics.analysis_operations?.join(", ") || "None"],
     ["Deterministic result context", analysisContext],
     ["Qualitative calls", String(diagnostics.qualitative_calls || 0)],

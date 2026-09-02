@@ -795,6 +795,7 @@ def test_chat_attachment_auto_confirms_only_safe_mapping_and_scopes_its_thread(t
         assert attached["state"] == "ready"
         assert attached["dataset_scope"]["original_name"] == "gxt_backtest.csv"
         assert attached["mapping"]["status"] == "confirmed"
+        assert storage.mapping_version(attached["mapping"]["id"]).auto_mapping_policy_version == 2
         assert {entry.source for entry in storage.mapping_entries(attached["mapping"]["id"])} == {"deterministic_auto"}
         assert next(entry for entry in storage.mapping_entries(attached["mapping"]["id"]) if entry.analysis_label == "Trade notes").mentor_access == "aggregates_only"
         assert all("Notes" not in value for value in body.decode().splitlines())
