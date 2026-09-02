@@ -12,8 +12,8 @@ from mentor.chat_service import (
     _effective_research_depth,
     _profile_context_mode,
 )
-from mentor.prompts import MENTOR_INSTRUCTIONS, PROFILE_TOOL_INSTRUCTIONS
-from mentor.datasets import MappingEntry, create_inspected_mapping_draft, import_local_dataset, inspect_local_dataset
+from mentor.prompts import ANALYSIS_TOOL_INSTRUCTIONS, MENTOR_INSTRUCTIONS, PROFILE_TOOL_INSTRUCTIONS
+from mentor.datasets import MappingEntry, create_inspected_mapping_draft, import_local_dataset, inspect_local_dataset, safe_auto_mapping
 from mentor.profile import ProfileService
 from mentor.storage import Storage
 
@@ -172,6 +172,172 @@ def test_analysis_batch_runs_locally_and_persists_bounded_empirical_evidence(tmp
     assert len(storage.analysis_tool_outputs(thread_id)) == 2
     assert all("Journal" not in item["output"] for item in outputs)
     assert all(tool.get("name") != "summarize_results" for tool in responses.calls[1]["tools"])
+
+
+def test_exact_smt_critical_prompt_persists_a_boolean_comparison_and_completes(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    storage.set_vector_store("vs_jacob")
+    source = tmp_path / "trades.csv"
+    source.write_text(
+        "Result_R,Outcome,SMT\n2,Win,true\n-1,Loss,true\n1,Win,false\n-1,Loss,false\n",
+        encoding="utf-8",
+    )
+    dataset = import_local_dataset(source, storage, dataset_id_factory=lambda: "smt-critical").dataset
+    inspection = inspect_local_dataset(storage, dataset.id)
+    mapping = storage.confirm_mapping_version(create_inspected_mapping_draft(storage, inspection, safe_auto_mapping(inspection).entries).id)
+    thread_id = storage.create_thread("SMT critical test")
+    storage.set_thread_dataset_scope(thread_id, dataset.id)
+    smt_field_id = next(entry.field_id for entry in storage.mapping_entries(mapping.id) if entry.analysis_label == "SMT")
+    prompt = (
+        "You said SMT looks like the strongest consistency filter. Critically test that conclusion. "
+        "Compare SMT vs non-SMT overall, not just by quarter, and tell me how strong the evidence actually is. "
+        "Try to disprove the idea rather than confirm it."
+    )
+    responses = SequenceResponses(
+        SimpleNamespace(status="completed", output=[analysis_tool_call(
+            "compare_groups", {"field_id": smt_field_id, "value_a": True, "value_b": False, "filters": []}, call_id="smt"
+        )]),
+        terminal_response("The comparison is descriptive and needs further testing."),
+    )
+
+    answer = ChatService(storage, SimpleNamespace(responses=responses)).reply(thread_id, prompt)
+
+    output = next(item for item in responses.calls[1]["input"] if item.get("type") == "function_call_output")
+    comparison = json.loads(output["output"])["comparison"]
+    assert answer.text == "The comparison is descriptive and needs further testing."
+    assert comparison["a"]["value"] is True and comparison["b"]["value"] is False
+    assert len(storage.analysis_evidence(thread_id)) == 1
+    assert prompt in responses.calls[0]["input"][-1]["content"][0]["text"]
+
+
+def test_exact_session_and_setup_prompt_runs_grouping_after_safe_auto_mapping(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    storage.set_vector_store("vs_jacob")
+    source = tmp_path / "trades.csv"
+    source.write_text(
+        "Result_R,Outcome,Session,Setup\n2,Win,London,Reversal\n-1,Loss,London,Continuation\n1,Win,New York,Reversal\n",
+        encoding="utf-8",
+    )
+    dataset = import_local_dataset(source, storage, dataset_id_factory=lambda: "session-setup").dataset
+    inspection = inspect_local_dataset(storage, dataset.id)
+    mapping = storage.confirm_mapping_version(create_inspected_mapping_draft(storage, inspection, safe_auto_mapping(inspection).entries).id)
+    thread_id = storage.create_thread("Session setup")
+    storage.set_thread_dataset_scope(thread_id, dataset.id)
+    fields = {entry.analysis_label: entry.field_id for entry in storage.mapping_entries(mapping.id)}
+    prompt = "Now break down performance by session and by setup. Show N, win rate, expectancy, and exclusions for each. Which differences look meaningful and which are too small to trust?"
+    responses = SequenceResponses(
+        SimpleNamespace(status="completed", output=[analysis_tool_call(
+            "group_results", {"group_field_ids": [fields["Session"], fields["Setup"]], "filters": []}, call_id="session-setup"
+        )]),
+        terminal_response("The groups are descriptive; the small cells need cautious interpretation."),
+    )
+
+    answer = ChatService(storage, SimpleNamespace(responses=responses)).reply(thread_id, prompt)
+
+    result = json.loads(next(item for item in responses.calls[1]["input"] if item.get("type") == "function_call_output")["output"])
+    assert answer.text == "The groups are descriptive; the small cells need cautious interpretation."
+    assert result["operation"] == "group_results"
+    assert result["grouping"]["field_ids"] == [fields["Session"], fields["Setup"]]
+
+
+def test_invalid_analysis_tool_arguments_return_a_structured_rejection_and_continue(tmp_path):
+    storage, thread_id, _dataset, _mapping, fields = _scoped_analysis_dataset(tmp_path)
+    responses = SequenceResponses(
+        SimpleNamespace(status="completed", output=[analysis_tool_call(
+            "compare_groups", {"field_id": fields["Session"], "value_a": "London", "value_b": "Atlantis", "filters": []}
+        )]),
+        terminal_response("I could not compare that unavailable group."),
+    )
+
+    answer = ChatService(storage, SimpleNamespace(responses=responses)).reply(
+        thread_id, "Compare performance by session, including Atlantis."
+    )
+
+    output = next(item for item in responses.calls[1]["input"] if item.get("type") == "function_call_output")
+    assert answer.text == "I could not compare that unavailable group."
+    assert json.loads(output["output"]) == {"status": "rejected", "reason": "invalid_analysis_arguments"}
+
+
+def test_prior_dataset_bound_empirical_evidence_is_marked_as_reused(tmp_path):
+    storage, thread_id, _dataset, _mapping, _fields = _scoped_analysis_dataset(tmp_path)
+    responses = SequenceResponses(
+        SimpleNamespace(status="completed", output=[analysis_tool_call("summarize_results", {"filters": []}, call_id="summary")]),
+        terminal_response("First deterministic summary."),
+        terminal_response("The prior deterministic summary still applies."),
+    )
+    service = ChatService(storage, SimpleNamespace(responses=responses))
+
+    service.reply(thread_id, "Analyze this backtest and tell me what stands out.")
+    answer = service.reply(
+        thread_id,
+        "What are my overall win rate and expectancy? Also tell me exactly how many trades were usable for each calculation, what was excluded, and why.",
+    )
+
+    assert answer.diagnostics.analysis_calls == {"requested": 0, "executed": 0, "rejected": 0}
+    assert answer.diagnostics.prior_empirical_evidence_reused is True
+    assert any(item.get("type") == "function_call_output" for item in responses.calls[2]["input"])
+
+
+def test_replaced_dataset_cannot_replay_stale_empirical_evidence(tmp_path):
+    storage, thread_id, _dataset, _mapping, _fields = _scoped_analysis_dataset(tmp_path)
+    responses = SequenceResponses(
+        SimpleNamespace(status="completed", output=[analysis_tool_call("summarize_results", {"filters": []}, call_id="summary")]),
+        terminal_response("First deterministic summary."),
+        terminal_response("The replacement needs fresh analysis."),
+    )
+    service = ChatService(storage, SimpleNamespace(responses=responses))
+    service.reply(thread_id, "Analyze this backtest and tell me what stands out.")
+
+    source = tmp_path / "replacement.csv"
+    source.write_text("Result,Outcome,Session\n2,Win,Asia\n", encoding="utf-8")
+    replacement = import_local_dataset(source, storage, dataset_id_factory=lambda: "replacement-analysis").dataset
+    replacement_mapping = storage.confirm_mapping_version(create_inspected_mapping_draft(
+        storage,
+        inspect_local_dataset(storage, replacement.id),
+        [
+            MappingEntry(0, semantic_role="trade_return", unit="R"),
+            MappingEntry(1, semantic_role="trade_outcome"),
+            MappingEntry(2, analysis_label="Session", model_disclosure=True),
+        ],
+    ).id)
+    storage.set_thread_dataset_scope(thread_id, replacement.id)
+    assert storage.replay_items(thread_id) == []
+
+    answer = service.reply(thread_id, "What are my overall win rate and expectancy?")
+
+    assert answer.diagnostics.prior_empirical_evidence_reused is False
+    assert all(item.get("type") != "function_call_output" for item in responses.calls[2]["input"])
+    assert "First deterministic summary." not in json.dumps(responses.calls[2]["input"])
+    assert "replaced dataset; it is not empirical evidence" in responses.calls[2]["instructions"]
+    assert replacement_mapping.dataset_id == replacement.id
+
+
+@pytest.mark.parametrize("prompt", [
+    "Now break down performance by session and by setup. Show N, win rate, expectancy, and exclusions for each. Which differences look meaningful and which are too small to trust?",
+    "I noticed Medium-adherence early entries performed badly. Should I just add a rule saying I never take those trades anymore?",
+    "Did this edge stay stable through time, or were most of the profits concentrated in one part of the backtest? Analyze the performance chronologically.",
+])
+def test_remaining_human_gate_prompts_receive_the_empirical_policy(tmp_path, prompt):
+    storage, thread_id, _dataset, _mapping, _fields = _scoped_analysis_dataset(tmp_path)
+    responses = SequenceResponses(terminal_response("Use deterministic evidence before deciding."))
+
+    ChatService(storage, SimpleNamespace(responses=responses)).reply(thread_id, prompt)
+
+    assert responses.calls[0]["input"][-1]["content"][0]["text"] == prompt
+    assert "User empirical evidence" in responses.calls[0]["instructions"]
+    assert "candidate hypothesis" in responses.calls[0]["instructions"]
+
+
+def test_empirical_provenance_and_post_hoc_guidance_are_explicit_in_the_prompt_policy():
+    assert "Reserve Source synthesis" in MENTOR_INSTRUCTIONS
+    assert "User empirical evidence" in MENTOR_INSTRUCTIONS
+    assert "AI interpretation" in MENTOR_INSTRUCTIONS
+    assert "AI research hypothesis" in MENTOR_INSTRUCTIONS
+    assert "AI recommendation" in MENTOR_INSTRUCTIONS
+    assert "candidate hypothesis" in ANALYSIS_TOOL_INSTRUCTIONS
+    assert "unseen/out-of-sample confirmation" in ANALYSIS_TOOL_INSTRUCTIONS
 
 
 def test_mixed_profile_and_analysis_batch_is_rejected_without_mutation_or_analysis(tmp_path):
@@ -1429,6 +1595,7 @@ def test_reply_persists_continuation_state_and_extracts_evidence(tmp_path):
                 "deterministic_result_chars": 0,
                 "qualitative_calls": 0,
                 "analysis_batch_status": "not_requested",
+                "prior_empirical_evidence_reused": False,
             },
             "response_id": storage.response_diagnostics(thread_id)[0]["response_id"],
             "status": "completed",
@@ -1822,6 +1989,7 @@ def test_stream_reply_reports_a_failed_response_without_persisting_a_turn(tmp_pa
     assert [(event.type, event.error) for event in events] == [
         ("error", "The mentor request failed. Try again."),
     ]
+    assert events[0].error_classification == "responses_continuation_error"
     assert storage.thread_items(thread_id) == []
     assert storage.display_turns(thread_id) == []
 

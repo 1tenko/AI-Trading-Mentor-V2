@@ -687,6 +687,66 @@ def test_safe_auto_mapping_accepts_exact_r_headers_with_mostly_valid_numeric_cel
     assert {entry.semantic_role for entry in storage.mapping_entries(confirmed.id)} == {"trade_return", "mfe", "mae", "trade_outcome"}
 
 
+def test_safe_auto_mapping_allows_bounded_standard_trading_group_labels(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    source = tmp_path / "trades.csv"
+    source.write_text(
+        "Session,Direction,Instrument,Setup,Quarter,SMT,Rule_Adherence,Mistake_Tag\n"
+        "London,Long,ES,Reversal,Q1,true,High,None\n"
+        "New York,Short,NQ,Continuation,Q2,false,Medium,Early entry\n",
+        encoding="utf-8",
+    )
+    dataset = _importer(storage, tmp_path)(source).dataset
+
+    draft = create_inspected_mapping_draft(
+        storage, inspection := inspect_local_dataset(storage, dataset.id), safe_auto_mapping(inspection).entries
+    )
+    confirmed = storage.confirm_mapping_version(draft.id)
+    entries = {entry.analysis_label or entry.semantic_role: entry for entry in storage.mapping_entries(confirmed.id)}
+
+    assert {name for name, entry in entries.items() if entry.aggregate_labels_allowed} == {
+        "Session", "Direction", "Instrument", "Setup", "Quarter", "SMT", "Rule adherence", "Mistake tag"
+    }
+    assert all(entries[name].value_type in {"categorical", "boolean"} for name in entries)
+
+
+def test_safe_auto_mapping_keeps_high_cardinality_generic_label_non_groupable(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    source = tmp_path / "trades.csv"
+    source.write_text(
+        "Quarter\n" + "".join(f"Q{number}\n" for number in range(1, 22)), encoding="utf-8"
+    )
+    dataset = _importer(storage, tmp_path)(source).dataset
+
+    entry = safe_auto_mapping(inspect_local_dataset(storage, dataset.id)).entries[0]
+
+    assert entry.analysis_label == "Quarter"
+    assert entry.model_disclosure is False
+
+
+def test_confirming_replacement_mapping_resets_only_model_replay(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    dataset = _dataset(storage)
+    initial = storage.confirm_mapping_version(storage.create_mapping_draft(
+        dataset.id, [{"column_ordinal": 0, "semantic_role": "trade_return", "unit": "R", "source": "manual"}]
+    ).id)
+    thread_id = storage.create_thread("Replay boundary")
+    storage.set_thread_dataset_scope(thread_id, dataset.id)
+    storage.append_thread_items(thread_id, [{"type": "message", "role": "assistant", "content": "Old empirical conclusion."}])
+    storage.replace_replay_items(thread_id, [{"type": "message", "role": "assistant", "content": "Old empirical conclusion."}])
+
+    replacement = storage.confirm_mapping_version(storage.create_mapping_draft(
+        dataset.id, [{"column_ordinal": 0, "semantic_role": "trade_return", "unit": "R", "source": "manual"}]
+    ).id)
+
+    assert replacement.version == initial.version + 2
+    assert storage.replay_items(thread_id) == []
+    assert storage.thread_items(thread_id) == [{"type": "message", "role": "assistant", "content": "Old empirical conclusion."}]
+
+
 def test_safe_auto_mapping_refuses_exact_r_header_with_contradictory_values(tmp_path):
     storage = Storage(tmp_path / "mentor.sqlite3")
     storage.initialize()

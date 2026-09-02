@@ -1214,7 +1214,17 @@ class Storage:
                         OR length(json_extract(filter_.value, '$.canonical_id')) != 12
                         OR json_extract(filter_.value, '$.canonical_id') GLOB '*[^0-9a-f]*'
                   )
-                  OR (SELECT COUNT(*) FROM json_each(NEW.result_json, '$.metric_definitions')) != 5
+                  OR (
+                      json_extract(NEW.result_json, '$.operation') = 'compare_groups'
+                      AND (
+                          (SELECT COUNT(*) FROM json_each(NEW.result_json, '$.metric_definitions')) != 6
+                          OR json_extract(NEW.result_json, '$.metric_definitions.comparison_delta') != 'A - B for numeric metrics available on both sides'
+                      )
+                  )
+                  OR (
+                      json_extract(NEW.result_json, '$.operation') != 'compare_groups'
+                      AND (SELECT COUNT(*) FROM json_each(NEW.result_json, '$.metric_definitions')) != 5
+                  )
                   OR json_extract(NEW.result_json, '$.metric_definitions.outcome_rate_denominator') != 'wins + losses + breakevens'
                   OR json_extract(NEW.result_json, '$.metric_definitions.win_rate_interval') != 'Wilson 95% interval'
                   OR json_extract(NEW.result_json, '$.metric_definitions.quantile_method') != 'linear'
@@ -1299,7 +1309,17 @@ class Storage:
                         OR length(json_extract(filter_.value, '$.canonical_id')) != 12
                         OR json_extract(filter_.value, '$.canonical_id') GLOB '*[^0-9a-f]*'
                   )
-                  OR (SELECT COUNT(*) FROM json_each(NEW.output_json, '$.metric_definitions')) != 5
+                  OR (
+                      json_extract(NEW.output_json, '$.operation') = 'compare_groups'
+                      AND (
+                          (SELECT COUNT(*) FROM json_each(NEW.output_json, '$.metric_definitions')) != 6
+                          OR json_extract(NEW.output_json, '$.metric_definitions.comparison_delta') != 'A - B for numeric metrics available on both sides'
+                      )
+                  )
+                  OR (
+                      json_extract(NEW.output_json, '$.operation') != 'compare_groups'
+                      AND (SELECT COUNT(*) FROM json_each(NEW.output_json, '$.metric_definitions')) != 5
+                  )
                   OR json_extract(NEW.output_json, '$.metric_definitions.outcome_rate_denominator') != 'wins + losses + breakevens'
                   OR json_extract(NEW.output_json, '$.metric_definitions.win_rate_interval') != 'Wilson 95% interval'
                   OR json_extract(NEW.output_json, '$.metric_definitions.quantile_method') != 'linear'
@@ -1549,13 +1569,22 @@ class Storage:
                 "SELECT item_json FROM thread_replay_items WHERE thread_id = ? ORDER BY position",
                 (thread_id,),
             ).fetchall()
-        return self.thread_items(thread_id) if not rows else [json.loads(row[0]) for row in rows]
+        if not rows:
+            return self.thread_items(thread_id)
+        return [
+            item for row in rows
+            if (item := json.loads(row[0])).get("type") != "local_replay_boundary"
+        ]
 
     def replace_replay_items(self, thread_id: int, items: list[dict]) -> None:
         """Atomically replace only the server-owned model replay state."""
         item_json = [_persistent_json(item) for item in items]
         with self._connect() as connection:
             connection.execute("DELETE FROM thread_replay_items WHERE thread_id = ?", (thread_id,))
+            if not item_json:
+                # This marker distinguishes an intentional model-context reset
+                # from legacy conversations that have not yet received replay state.
+                item_json = [_persistent_json({"type": "local_replay_boundary"})]
             connection.executemany(
                 "INSERT INTO thread_replay_items(thread_id, position, item_json) VALUES (?, ?, ?)",
                 [(thread_id, position, value) for position, value in enumerate(item_json)],
@@ -2213,6 +2242,10 @@ class Storage:
                 )
             ]
             self._validate_inspected_mapping_entries(str(draft[0]), draft_entries)
+            had_confirmed_mapping = connection.execute(
+                "SELECT 1 FROM dataset_mapping_versions WHERE dataset_id = ? AND status = 'confirmed' LIMIT 1",
+                (draft[0],),
+            ).fetchone() is not None
             next_version = connection.execute(
                 "SELECT COALESCE(MAX(version), 0) + 1 FROM dataset_mapping_versions WHERE dataset_id = ?",
                 (draft[0],),
@@ -2232,6 +2265,8 @@ class Storage:
                 "UPDATE dataset_mapping_versions SET status = 'confirmed', confirmed_at = CURRENT_TIMESTAMP WHERE id = ?",
                 (confirmed_id,),
             )
+            if had_confirmed_mapping:
+                self._reset_replay_for_dataset_scope(connection, str(draft[0]))
             return DatasetMappingVersion(
                 confirmed_id, str(draft[0]), int(next_version[0]), "confirmed", draft_mapping_version_id
             )
@@ -2269,11 +2304,31 @@ class Storage:
 
     def set_thread_dataset_scope(self, thread_id: int, dataset_id: str | None) -> None:
         with self._connect() as connection:
+            current = connection.execute(
+                "SELECT dataset_id FROM thread_dataset_scopes WHERE thread_id = ?", (thread_id,)
+            ).fetchone()
+            if current is not None and current[0] != dataset_id:
+                self._reset_thread_replay(connection, thread_id)
             connection.execute(
                 "INSERT INTO thread_dataset_scopes(thread_id, dataset_id) VALUES (?, ?) "
                 "ON CONFLICT(thread_id) DO UPDATE SET dataset_id = excluded.dataset_id, selected_at = CURRENT_TIMESTAMP",
                 (thread_id, dataset_id),
             )
+
+    @staticmethod
+    def _reset_thread_replay(connection: sqlite3.Connection, thread_id: int) -> None:
+        """Drop model replay only; display history remains available to Theo."""
+        connection.execute("DELETE FROM thread_replay_items WHERE thread_id = ?", (thread_id,))
+        connection.execute(
+            "INSERT INTO thread_replay_items(thread_id, position, item_json) VALUES (?, 0, ?)",
+            (thread_id, _persistent_json({"type": "local_replay_boundary"})),
+        )
+
+    def _reset_replay_for_dataset_scope(self, connection: sqlite3.Connection, dataset_id: str) -> None:
+        for row in connection.execute(
+            "SELECT thread_id FROM thread_dataset_scopes WHERE dataset_id = ?", (dataset_id,)
+        ):
+            self._reset_thread_replay(connection, int(row[0]))
 
     def thread_dataset_scope(self, thread_id: int) -> ThreadDatasetScope | None:
         with self._connect() as connection:

@@ -42,6 +42,7 @@ _TEXT_FIELD_LIMIT = 3
 _TEXT_ROW_LIMIT = 100
 _TEXT_CELL_LIMIT = 1_200
 _TEXT_CHARACTER_LIMIT = 24_000
+ANALYSIS_SCHEMA_VERSION = "1.0"
 _GROUP_METRICS = (
     "wins", "losses", "breakevens", "win_rate", "loss_rate", "wilson_95_lower", "wilson_95_upper",
     "total_return", "mean_return", "median_return", "mean_winning_return", "mean_losing_return",
@@ -797,7 +798,7 @@ def _result_metadata(frame: AnalysisFrame, operation: str) -> dict[str, object]:
         "dataset_sha256": frame.dataset_sha256,
         "mapping_version_id": frame.mapping_version_id,
         "operation": operation,
-        "schema_version": "1.0",
+        "schema_version": ANALYSIS_SCHEMA_VERSION,
         "filters": [_filter_payload(item) for item in frame.filter_descriptors],
         "metric_definitions": {
             "outcome_rate_denominator": "wins + losses + breakevens",

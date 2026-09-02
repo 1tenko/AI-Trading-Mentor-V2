@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import json
 import logging
 import re
+import sqlite3
 from time import perf_counter
 from typing import Any
 from types import SimpleNamespace
@@ -18,6 +19,7 @@ from mentor.profile import (
     strategy_profile_context,
 )
 from mentor.analysis import (
+    ANALYSIS_SCHEMA_VERSION,
     AnalysisFilter,
     analyze_mfe_mae,
     analyze_over_time,
@@ -248,6 +250,7 @@ class ResponseDiagnostics:
     deterministic_result_chars: int
     qualitative_calls: int
     analysis_batch_status: str
+    prior_empirical_evidence_reused: bool
 
 
 @dataclass(frozen=True)
@@ -267,6 +270,7 @@ class StreamEvent:
     answer: Answer | None = None
     incomplete_reason: str | None = None
     error: str = ""
+    error_classification: str = ""
 
 
 class ChatService:
@@ -284,7 +288,7 @@ class ChatService:
         include_approved_notes: bool = False,
         dataset_attachment_id: str | None = None,
     ) -> Answer:
-        user_item, request, effective_depth = self._request(thread_id, question, evaluation)
+        user_item, request, effective_depth, prior_empirical_evidence_reused = self._request(thread_id, question, evaluation)
         started_at = perf_counter()
         response = self.client.responses.create(**request)
         response, leading_output, replay_leading_output, response_request, profile_update, qualitative_exchange = self._local_tools_continued_response(
@@ -307,6 +311,7 @@ class ChatService:
             profile_update=profile_update,
             qualitative_exchange=qualitative_exchange,
             dataset_attachment_id=dataset_attachment_id,
+            prior_empirical_evidence_reused=prior_empirical_evidence_reused,
         )
 
     def stream_reply(
@@ -319,7 +324,7 @@ class ChatService:
         qualitative_consent_prompt: bool = True,
         dataset_attachment_id: str | None = None,
     ):
-        user_item, request, effective_depth = self._request(thread_id, question, evaluation)
+        user_item, request, effective_depth, prior_empirical_evidence_reused = self._request(thread_id, question, evaluation)
         started_at = perf_counter()
         try:
             stream = self.client.responses.create(**request, stream=True)
@@ -352,6 +357,7 @@ class ChatService:
                         profile_update=profile_update,
                         qualitative_exchange=qualitative_exchange,
                         dataset_attachment_id=dataset_attachment_id,
+                        prior_empirical_evidence_reused=prior_empirical_evidence_reused,
                     )
                     if answer.incomplete_reason:
                         yield StreamEvent(
@@ -364,14 +370,18 @@ class ChatService:
                     return
                 elif event.type in {"response.failed", "response.cancelled", "error"}:
                     LOGGER.warning("OpenAI stream ended with %s", event.type)
-                    yield StreamEvent("error", error="The mentor request failed. Try again.")
+                    yield StreamEvent(
+                        "error", error="The mentor request failed. Try again.", error_classification="responses_continuation_error"
+                    )
                     return
         except _QualitativeConsentRequired:
             yield StreamEvent("consent_required")
             return
         except Exception as error:
             LOGGER.warning("OpenAI stream raised %s", type(error).__name__)
-            yield StreamEvent("error", error="The mentor request failed. Try again.")
+            yield StreamEvent(
+                "error", error="The mentor request failed. Try again.", error_classification=_safe_error_classification(error)
+            )
             return
         LOGGER.warning("OpenAI stream ended without a terminal response event")
         yield StreamEvent("error", error="The mentor stream ended before returning a usable response. Try again.")
@@ -777,14 +787,17 @@ class ChatService:
 
     def _request(
         self, thread_id: int, question: str, evaluation: EvaluationConfig
-    ) -> tuple[dict, dict, str]:
+    ) -> tuple[dict, dict, str, bool]:
         question = _question(question)
         vector_store_id = self.storage.vector_store_id()
         if vector_store_id is None:
             raise RuntimeError("Import the Jacob transcripts before starting a chat.")
         user_item = {"role": "user", "content": [{"type": "input_text", "text": question}]}
         effective_depth = _effective_research_depth(question, evaluation.research_depth)
-        replay_items = self.storage.replay_items(thread_id)
+        scope = self._active_analysis_scope(thread_id)
+        replay_items, prior_empirical_evidence_reused = _dataset_bound_empirical_replay(
+            self.storage, thread_id, self.storage.replay_items(thread_id), scope
+        )
         confirmed_profile = self.storage.current_confirmed_profile_items()
         profile_context = ""
         context_mode = _profile_context_mode(question)
@@ -820,14 +833,13 @@ class ChatService:
         ]
         analysis_context = ""
         analysis_tools: list[dict] = []
-        scope = self._active_analysis_scope(thread_id)
         if scope is not None:
             dataset_id, mapping_version_id = scope
             analysis_context = (
                 "\n\nLocal Backtest Dataset — server-owned user empirical context, not source evidence:\n"
                 f"dataset_id={dataset_id}; mapping_version_id={mapping_version_id}; "
                 f"fields={json.dumps(model_mapping_context(self.storage, mapping_version_id), separators=(',', ':'))}\n"
-                "Use only the available local analysis tools for this dataset. Field identifiers are opaque; never request headers, paths, rows, SQL, Python, or unlisted fields."
+                "Use only the available local analysis tools for this dataset. Field identifiers are opaque; never request headers, paths, rows, SQL, Python, or unlisted fields. Earlier chat text may describe a replaced dataset; it is not empirical evidence for this scope."
             )
             analysis_tools = ANALYSIS_TOOLS
         return user_item, {
@@ -846,7 +858,7 @@ class ChatService:
             "context_management": [{"type": "compaction", "compact_threshold": COMPACTION_TOKEN_THRESHOLD}],
             "max_output_tokens": MAX_OUTPUT_TOKENS,
             "store": False,
-        }, effective_depth
+        }, effective_depth, prior_empirical_evidence_reused
 
     def _finalize(
         self,
@@ -863,6 +875,7 @@ class ChatService:
         profile_update: dict[str, str] | None = None,
         qualitative_exchange: bool = False,
         dataset_attachment_id: str | None = None,
+        prior_empirical_evidence_reused: bool = False,
     ) -> Answer:
         response_output = [_as_dict(item) for item in response.output]
         historic_response_output = _qualitative_historic_items(response_output) if qualitative_exchange else response_output
@@ -916,6 +929,7 @@ class ChatService:
             started_at,
             native_compaction_applied=compaction_index is not None,
             draft_response=draft_response,
+            prior_empirical_evidence_reused=prior_empirical_evidence_reused,
         )
         self.storage.record_response_diagnostics(
             thread_id, diagnostics.response_id, diagnostics.__dict__
@@ -1099,6 +1113,48 @@ def _input_item(item: dict) -> dict:
     return {key: value for key, value in item.items() if key not in {"status", "created_by"}}
 
 
+def _dataset_bound_empirical_replay(
+    storage: Storage, thread_id: int, replay_items: list[dict], scope: tuple[str, int] | None
+) -> tuple[list[dict], bool]:
+    """Keep only persisted empirical tool outputs that match the active immutable scope."""
+    persisted = {
+        json.dumps(item["output"], separators=(",", ":"), allow_nan=False)
+        for item in storage.analysis_tool_outputs(thread_id)
+    }
+    stale_call_ids: set[str] = set()
+    reused = False
+    for item in replay_items:
+        if item.get("type") != "function_call_output" or not isinstance(item.get("call_id"), str):
+            continue
+        encoded = item.get("output")
+        try:
+            result = json.loads(encoded) if isinstance(encoded, str) else None
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(result, dict) or result.get("provenance") != "USER_EMPIRICAL_EVIDENCE":
+            continue
+        current = (
+            scope is not None
+            and result.get("dataset_id") == scope[0]
+            and result.get("mapping_version_id") == scope[1]
+            and result.get("schema_version") == ANALYSIS_SCHEMA_VERSION
+            and json.dumps(result, separators=(",", ":"), allow_nan=False) in persisted
+        )
+        if current:
+            reused = True
+        else:
+            stale_call_ids.add(item["call_id"])
+    if not stale_call_ids:
+        return replay_items, reused
+    return [
+        item for item in replay_items
+        if not (
+            item.get("call_id") in stale_call_ids
+            and (item.get("type") == "function_call_output" or item.get("name") in ANALYSIS_TOOL_NAMES)
+        )
+    ], reused
+
+
 def _qualitative_historic_items(items: list[dict]) -> list[dict]:
     """Return the only response item eligible after a qualitative exchange.
 
@@ -1119,6 +1175,14 @@ def _raw_file_search_tools(tools: list[dict]) -> list[dict]:
 
 def _profile_tool_rejection(reason: str) -> dict[str, str]:
     return {"status": "rejected", "reason": reason}
+
+
+def _safe_error_classification(error: Exception) -> str:
+    if isinstance(error, sqlite3.Error):
+        return "local_persistence_error"
+    if isinstance(error, (ValueError, TypeError, json.JSONDecodeError)):
+        return "local_tool_validation"
+    return "stream_error"
 
 
 def _profile_update(result: dict) -> dict[str, str] | None:
@@ -1223,6 +1287,7 @@ def _diagnostics(
     started_at: float,
     native_compaction_applied: bool,
     draft_response: Any | None = None,
+    prior_empirical_evidence_reused: bool = False,
 ) -> ResponseDiagnostics:
     responses = [response] if draft_response is None else [draft_response, response]
     input_tokens = _usage_total(responses, "input_tokens")
@@ -1263,6 +1328,7 @@ def _diagnostics(
         deterministic_result_chars=analysis["deterministic_result_chars"],
         qualitative_calls=analysis["qualitative_calls"],
         analysis_batch_status=analysis["status"],
+        prior_empirical_evidence_reused=prior_empirical_evidence_reused,
     )
 
 

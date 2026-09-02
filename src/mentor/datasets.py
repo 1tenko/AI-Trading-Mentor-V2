@@ -440,6 +440,12 @@ _SAFE_AUTO_ROLES = {
     "outcome": ("trade_outcome", None),
     "setup": ("setup", None),
 }
+_SAFE_AUTO_ROLE_LABELS = {
+    "instrument": "Instrument",
+    "session": "Session",
+    "direction": "Direction",
+    "setup": "Setup",
+}
 _NUMERIC_INTENDED_HEADER_KEYS = _NUMERIC_HEADER_KEYS | frozenset(
     key for key, (role, _) in _SAFE_AUTO_ROLES.items() if role in _UNIT_ROLES
 )
@@ -449,10 +455,18 @@ _NUMERIC_INTENT_MINIMUM_VALID_RATIO = 0.90
 _SAFE_AUTO_LABELS = {
     "quarter": "Quarter",
     "smt": "SMT",
-    "setup": "Setup",
     "ruleadherence": "Rule adherence",
     "mistaketag": "Mistake tag",
 }
+
+
+def _safe_aggregate_label_disclosure(column: DatasetColumnInspection) -> bool:
+    """Return whether this categorical field may expose bounded group labels."""
+    return (
+        column.value_type in {"categorical", "boolean"}
+        and column.distinct_count <= MAX_MODEL_GROUP_LABELS
+        and column.max_label_length <= MAX_MODEL_GROUP_LABEL_CHARS
+    )
 _SAFE_NOTE_FIELDS = {
     "tradenotes": "Trade notes",
     "notes": "Trade notes",
@@ -527,12 +541,26 @@ def safe_auto_mapping(inspection: DatasetInspection) -> AutoMappingResult:
                 ambiguities.append({"column_ordinal": column.ordinal, "header": column.original_header, "role": role})
                 continue
             if role not in mapped_roles:
-                entries.append(MappingEntry(column.ordinal, semantic_role=role, unit=unit, source="deterministic_auto"))
+                label = _SAFE_AUTO_ROLE_LABELS.get(role)
+                disclose = label is not None and _safe_aggregate_label_disclosure(column)
+                entries.append(MappingEntry(
+                    column.ordinal,
+                    semantic_role=role,
+                    unit=unit,
+                    analysis_label=label if disclose else None,
+                    source="deterministic_auto",
+                    model_disclosure=disclose,
+                ))
                 mapped_roles.add(role)
             continue
         label = _SAFE_AUTO_LABELS.get(key)
         if label is not None and column.value_type in {"categorical", "boolean"}:
-            entries.append(MappingEntry(column.ordinal, analysis_label=label, source="deterministic_auto", model_disclosure=True))
+            entries.append(MappingEntry(
+                column.ordinal,
+                analysis_label=label,
+                source="deterministic_auto",
+                model_disclosure=_safe_aggregate_label_disclosure(column),
+            ))
             continue
         note_label = _SAFE_NOTE_FIELDS.get(key)
         if note_label is not None:

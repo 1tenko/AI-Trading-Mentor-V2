@@ -402,7 +402,9 @@ class _Handler(BaseHTTPRequestHandler):
                 self._write_stream_event(event)
         except Exception as error:
             LOGGER.warning("Mentor SSE handler raised %s", type(error).__name__)
-            self._write_stream_event(StreamEvent("error", error="The mentor request failed. Try again."))
+            self._write_stream_event(
+                StreamEvent("error", error="The mentor request failed. Try again.", error_classification="server_error")
+            )
 
     def _write_stream_event(self, event: Any) -> None:
         body = {"type": event.type, "text": event.text}
@@ -412,6 +414,8 @@ class _Handler(BaseHTTPRequestHandler):
             body["incomplete_reason"] = event.incomplete_reason
         if event.error:
             body["error"] = event.error
+        if event.error_classification:
+            body["error_classification"] = event.error_classification
         self.wfile.write(f"data: {json.dumps(body)}\n\n".encode())
         self.wfile.flush()
 

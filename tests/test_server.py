@@ -31,7 +31,7 @@ class StreamingFakeChatService:
 
 class FailingStreamingFakeChatService:
     def stream_reply(self, thread_id, question, evaluation, *, include_approved_notes=False):
-        yield StreamEvent("error", error="The mentor request failed. Try again.")
+        yield StreamEvent("error", error="The mentor request failed. Try again.", error_classification="responses_continuation_error")
 
 
 class ExplodingStreamingFakeChatService:
@@ -154,6 +154,7 @@ def test_server_streams_a_recoverable_error_event(tmp_path):
         assert status == 200
         assert b'"type": "error"' in body
         assert b"The mentor request failed. Try again." in body
+        assert b'"error_classification": "responses_continuation_error"' in body
     finally:
         server.shutdown()
         worker.join()
@@ -170,6 +171,7 @@ def test_server_recovers_an_unexpected_streaming_exception(tmp_path):
         status, _, body = request(server, "POST", f"/api/threads/{thread_id}/messages", b'{"question":"Hello"}')
         assert status == 200
         assert b'"type": "error"' in body
+        assert b'"error_classification": "server_error"' in body
     finally:
         server.shutdown()
         worker.join()
@@ -375,6 +377,8 @@ def test_attachment_ui_keeps_a_replacement_needing_input_distinct_from_the_old_s
         assert b"function restorePendingMessageAttachment(attachment)" in script
         assert b"restorePendingMessageAttachment(attachment);" in script
         assert b"function completePendingMessageAttachment(attachment)" in script
+        assert b"Prior empirical evidence reused" in script
+        assert b"Error classification: ${errorClassification}" in script
     finally:
         server.shutdown()
         worker.join()

@@ -244,6 +244,7 @@ function showDiagnostics(diagnostics) {
     ["File Search calls", `${diagnostics.file_search_calls || 0} · ${diagnostics.known_file_search_call_cost_usd == null ? "cost unavailable" : `$${diagnostics.known_file_search_call_cost_usd.toFixed(4)} known call cost`}`],
     ["File Search/platform cost", diagnostics.file_search_cost_status || "Unknown"],
     ["Analysis calls", `${analysisCalls.requested} requested · ${analysisCalls.executed} executed · ${analysisCalls.rejected} rejected`],
+    ["Prior empirical evidence reused", diagnostics.prior_empirical_evidence_reused ? "Yes — retained deterministic evidence matches the active dataset and mapping." : "No"],
     ["Analysis operations", diagnostics.analysis_operations?.join(", ") || "None"],
     ["Deterministic result context", analysisContext],
     ["Qualitative calls", String(diagnostics.qualitative_calls || 0)],
@@ -325,7 +326,7 @@ function showIncomplete(answer, mentor) {
   messages.append(block);
 }
 
-function showStreamError(mentor, message, retryText) {
+function showStreamError(mentor, message, retryText, errorClassification = "") {
   mentor.heading.textContent = "Mentor — unavailable";
   mentor.content.classList.remove("markdown");
   mentor.content.replaceChildren(document.createTextNode(message));
@@ -334,6 +335,17 @@ function showStreamError(mentor, message, retryText) {
   retry.textContent = "Retry";
   retry.addEventListener("click", () => sendMessage(retryText, false));
   mentor.content.append(document.createElement("br"), retry);
+  if (errorClassification) {
+    const diagnostics = document.createElement("details");
+    diagnostics.className = "diagnostics";
+    const summary = document.createElement("summary");
+    summary.textContent = "Evaluation diagnostics";
+    const detail = document.createElement("div");
+    detail.className = "diagnostics-content";
+    detail.textContent = `Error classification: ${errorClassification}`;
+    diagnostics.append(summary, detail);
+    mentor.content.append(diagnostics);
+  }
 }
 
 function evaluation() {
@@ -873,7 +885,7 @@ async function sendMessage(text, showUser = true, includeApprovedNotes = false, 
           if (event.type === "error") {
             terminal = true;
             restorePendingMessageAttachment(attachment);
-            showStreamError(mentor, event.error || "The mentor request failed. Try again.", text);
+            showStreamError(mentor, event.error || "The mentor request failed. Try again.", text, event.error_classification);
           }
           if (event.type === "consent_required") {
             terminal = true;
