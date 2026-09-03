@@ -32,6 +32,7 @@ from mentor.analysis import (
 )
 from mentor.datasets import (
     QualitativeDisclosureCapability,
+    QualitativeEvidenceMetadata,
     QualitativeTransportError,
     continue_qualitative_model_transport,
     ensure_current_auto_mapping,
@@ -251,6 +252,7 @@ class ResponseDiagnostics:
     analysis_operations: list[str]
     deterministic_result_chars: int
     qualitative_calls: int
+    qualitative_review: dict[str, int | bool] | None
     analysis_batch_status: str
     prior_empirical_evidence_reused: bool
     auto_mapping_policy_upgraded: bool
@@ -310,7 +312,7 @@ class ChatService:
         user_item, request, effective_depth, prior_empirical_evidence_reused, auto_mapping_policy_upgraded = self._request(thread_id, question, evaluation)
         started_at = perf_counter()
         response = self._responses_create(request, "initial_response")
-        response, leading_output, replay_leading_output, response_request, profile_update, qualitative_exchange = self._local_tools_continued_response(
+        response, leading_output, replay_leading_output, response_request, profile_update, qualitative_exchange, qualitative_review = self._local_tools_continued_response(
             thread_id, request, response, user_item["content"][0]["text"], include_approved_notes=include_approved_notes
         )
         response, evidence_output, draft_response = self._citation_repaired_response(
@@ -329,6 +331,7 @@ class ChatService:
             replay_leading_output=replay_leading_output,
             profile_update=profile_update,
             qualitative_exchange=qualitative_exchange,
+            qualitative_review=qualitative_review,
             dataset_attachment_id=dataset_attachment_id,
             prior_empirical_evidence_reused=prior_empirical_evidence_reused,
             auto_mapping_policy_upgraded=auto_mapping_policy_upgraded,
@@ -352,7 +355,7 @@ class ChatService:
                 if event.type == "response.output_text.delta":
                     yield StreamEvent("delta", event.delta)
                 elif event.type in {"response.completed", "response.incomplete"}:
-                    response, leading_output, replay_leading_output, response_request, profile_update, qualitative_exchange = self._local_tools_continued_response(
+                    response, leading_output, replay_leading_output, response_request, profile_update, qualitative_exchange, qualitative_review = self._local_tools_continued_response(
                         thread_id,
                         request,
                         event.response,
@@ -376,6 +379,7 @@ class ChatService:
                         replay_leading_output=replay_leading_output,
                         profile_update=profile_update,
                         qualitative_exchange=qualitative_exchange,
+                        qualitative_review=qualitative_review,
                         dataset_attachment_id=dataset_attachment_id,
                         prior_empirical_evidence_reused=prior_empirical_evidence_reused,
                         auto_mapping_policy_upgraded=auto_mapping_policy_upgraded,
@@ -458,11 +462,11 @@ class ChatService:
         *,
         include_approved_notes: bool,
         pause_for_qualitative_consent: bool = False,
-    ) -> tuple[Any, list[dict], list[dict], dict, dict[str, str] | None, bool]:
+    ) -> tuple[Any, list[dict], list[dict], dict, dict[str, str] | None, bool, dict[str, int | bool] | None]:
         output = [_as_dict(item) for item in response.output]
         calls = [item for item in output if item.get("type") == "function_call"]
         if not calls:
-            return response, [], [], request, None, False
+            return response, [], [], request, None, False, None
         if any(not isinstance(call.get("call_id"), str) or not call["call_id"] for call in calls):
             LOGGER.warning("Local function call missing a usable call id")
             safe_output = [item for item in output if item.get("type") != "function_call"]
@@ -484,17 +488,17 @@ class ChatService:
                         ],
                     }
                 )
-            return _response_with_output(response, safe_output), [], [], request, None, False
+            return _response_with_output(response, safe_output), [], [], request, None, False, None
 
         names = {call.get("name") for call in calls}
         profile_calls = [call for call in calls if call.get("name") == PROFILE_TOOL_NAME]
         analysis_calls = [call for call in calls if call.get("name") in ANALYSIS_TOOL_NAMES]
         if len({call["call_id"] for call in calls}) != len(calls):
             results = [_profile_tool_rejection("duplicate_call_id") for _ in calls]
-            return (*self._standard_local_continuation(request, output, calls, results), None, False)
+            return (*self._standard_local_continuation(request, output, calls, results), None, False, None)
         if profile_calls and analysis_calls:
             results = [_profile_tool_rejection("mixed_local_tool_batch_not_supported") for _ in calls]
-            return (*self._standard_local_continuation(request, output, calls, results), None, False)
+            return (*self._standard_local_continuation(request, output, calls, results), None, False, None)
         if profile_calls:
             results = (
                 [self._execute_profile_tool(thread_id, question, profile_calls[0])]
@@ -504,16 +508,16 @@ class ChatService:
             if len(calls) == 1 and names != {PROFILE_TOOL_NAME}:
                 results = [_profile_tool_rejection("unsupported_tool")]
             continued = self._standard_local_continuation(request, output, calls, results)
-            return (*continued, _profile_update(results[0]) if len(results) == 1 else None, False)
+            return (*continued, _profile_update(results[0]) if len(results) == 1 else None, False, None)
         if len(analysis_calls) != len(calls):
             return (*self._standard_local_continuation(
                 request, output, calls, [_profile_tool_rejection("unsupported_tool") for _ in calls]
-            ), None, False)
+            ), None, False, None)
         scope = self._active_analysis_scope(thread_id)
         if scope is None:
             return (*self._standard_local_continuation(
                 request, output, calls, [_profile_tool_rejection("no_active_dataset") for _ in calls]
-            ), None, False)
+            ), None, False, None)
         dataset_id, mapping_version_id = scope.dataset_id, scope.mapping_version_id
         if pause_for_qualitative_consent and not include_approved_notes and any(
             call["name"] == QUALITATIVE_TOOL_NAME for call in calls
@@ -628,7 +632,7 @@ class ChatService:
             )
         if qualitative is None:
             response = self._responses_create(raw_continuation_request, "local_tool_continuation")
-            return response, leading_output, replay_leading_output, raw_continuation_request, None, False
+            return response, leading_output, replay_leading_output, raw_continuation_request, None, False, None
 
         qualitative_call, qualitative_evidence = qualitative
         safe_request = {
@@ -656,6 +660,7 @@ class ChatService:
             safe_request,
             None,
             True,
+            _qualitative_review(continuation.metadata),
         )
 
     def _standard_local_continuation(
@@ -927,6 +932,7 @@ class ChatService:
         replay_leading_output: list[dict] | None = None,
         profile_update: dict[str, str] | None = None,
         qualitative_exchange: bool = False,
+        qualitative_review: dict[str, int | bool] | None = None,
         dataset_attachment_id: str | None = None,
         prior_empirical_evidence_reused: bool = False,
         auto_mapping_policy_upgraded: bool = False,
@@ -986,6 +992,7 @@ class ChatService:
             draft_response=draft_response,
             prior_empirical_evidence_reused=prior_empirical_evidence_reused,
             auto_mapping_policy_upgraded=auto_mapping_policy_upgraded,
+            qualitative_review=qualitative_review,
         )
         self.storage.record_response_diagnostics(
             thread_id, diagnostics.response_id, diagnostics.__dict__
@@ -1413,6 +1420,7 @@ def _diagnostics(
     draft_response: Any | None = None,
     prior_empirical_evidence_reused: bool = False,
     auto_mapping_policy_upgraded: bool = False,
+    qualitative_review: dict[str, int | bool] | None = None,
 ) -> ResponseDiagnostics:
     responses = [response] if draft_response is None else [draft_response, response]
     input_tokens = _usage_total(responses, "input_tokens")
@@ -1421,7 +1429,7 @@ def _diagnostics(
     output_tokens = _usage_total(responses, "output_tokens")
     response_model = str(_field(response, "model") or model)
     file_search_calls, file_search_queries = _file_search_details(output)
-    analysis = _analysis_tool_details(output)
+    analysis = _analysis_tool_details(output, qualitative_review=qualitative_review)
     estimate = _estimate_text_cost(
         response_model, input_tokens, cached_input_tokens, cache_write_tokens or 0, output_tokens
     )
@@ -1452,22 +1460,27 @@ def _diagnostics(
         analysis_operations=analysis["operations"],
         deterministic_result_chars=analysis["deterministic_result_chars"],
         qualitative_calls=analysis["qualitative_calls"],
+        qualitative_review=analysis["qualitative_review"],
         analysis_batch_status=analysis["status"],
         prior_empirical_evidence_reused=prior_empirical_evidence_reused,
         auto_mapping_policy_upgraded=auto_mapping_policy_upgraded,
     )
 
 
-def _analysis_tool_details(output: list[dict]) -> dict[str, object]:
+def _analysis_tool_details(
+    output: list[dict], *, qualitative_review: dict[str, int | bool] | None = None
+) -> dict[str, object]:
     calls = [item for item in output if item.get("type") == "function_call" and item.get("name") in ANALYSIS_TOOL_NAMES]
     if not calls:
-        return {
+        details: dict[str, object] = {
             "calls": {"requested": 0, "executed": 0, "rejected": 0},
             "operations": [],
             "deterministic_result_chars": 0,
             "qualitative_calls": 0,
             "status": "not_requested",
+            "qualitative_review": None,
         }
+        return _with_qualitative_review(details, qualitative_review)
     outputs = {
         item.get("call_id"): item.get("output")
         for item in output
@@ -1488,12 +1501,43 @@ def _analysis_tool_details(output: list[dict]) -> dict[str, object]:
                 deterministic_result_chars += len(encoded)
         elif isinstance(result, dict) and result.get("status") == "rejected":
             rejected += 1
-    return {
+    details = {
         "calls": {"requested": len(calls), "executed": executed, "rejected": rejected},
         "operations": list(dict.fromkeys(str(call["name"]) for call in calls)),
         "deterministic_result_chars": deterministic_result_chars,
         "qualitative_calls": sum(call.get("name") == QUALITATIVE_TOOL_NAME for call in calls),
         "status": "complete" if rejected == 0 else "partial" if executed else "rejected",
+        "qualitative_review": None,
+    }
+    return _with_qualitative_review(details, qualitative_review)
+
+
+def _qualitative_review(metadata: QualitativeEvidenceMetadata) -> dict[str, int | bool]:
+    payload = metadata.to_dict()
+    return {
+        "returned_rows": _nonnegative_int(payload.get("returned_rows")),
+        "usable_text_rows": _nonnegative_int(payload.get("usable_text_rows")),
+        "omitted_rows": _nonnegative_int(payload.get("omitted_rows")),
+        "complete": bool(payload.get("complete")),
+        "context_field_count": len(payload.get("context_fields", ())),
+    }
+
+
+def _with_qualitative_review(
+    details: dict[str, object], qualitative_review: dict[str, int | bool] | None
+) -> dict[str, object]:
+    if qualitative_review is None:
+        return details
+    calls = dict(details["calls"])
+    calls["requested"] += 1
+    calls["executed"] += 1
+    return {
+        **details,
+        "calls": calls,
+        "operations": [*details["operations"], QUALITATIVE_TOOL_NAME],
+        "qualitative_calls": int(details["qualitative_calls"]) + 1,
+        "status": "partial" if calls["rejected"] else "complete",
+        "qualitative_review": qualitative_review,
     }
 
 
@@ -1533,6 +1577,10 @@ def _field(value: Any, name: str) -> Any:
 
 def _int_or_none(value: Any) -> int | None:
     return int(value) if isinstance(value, int | float) else None
+
+
+def _nonnegative_int(value: object) -> int:
+    return int(value) if isinstance(value, int) and value >= 0 else 0
 
 
 def _effective_research_depth(question: str, requested_depth: str) -> str:

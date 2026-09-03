@@ -251,6 +251,13 @@ function showDiagnostics(diagnostics) {
     ["Qualitative calls", String(diagnostics.qualitative_calls || 0)],
     ["Analysis batch", diagnostics.analysis_batch_status || "Not requested"],
   ];
+  if (diagnostics.qualitative_review) {
+    const review = diagnostics.qualitative_review;
+    rows.splice(-1, 0,
+      ["Qualitative review", `${review.returned_rows} / ${review.usable_text_rows} usable notes returned · ${review.complete ? "complete" : "partial"}`],
+      ...(review.context_field_count ? [["Context fields", String(review.context_field_count)]] : []),
+    );
+  }
   rows.push(["Native compaction", diagnostics.native_compaction_applied
     ? "Applied for future model replay; included in this response usage."
     : "Not applied on this turn"]);

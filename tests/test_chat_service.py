@@ -39,6 +39,21 @@ class SequenceResponses:
         return self.responses.pop(0)
 
 
+class ModelDumpUsage:
+    """SDK-shaped usage fixture; only allowlisted counts may survive."""
+
+    def model_dump(self, *, mode):
+        assert mode == "json"
+        return {
+            "input_tokens": 120,
+            "output_tokens": 45,
+            "total_tokens": 165,
+            "input_tokens_details": {"cached_tokens": 30, "cache_write_tokens": 6, "ignored": 99},
+            "output_tokens_details": {"reasoning_tokens": 12, "ignored": 99},
+            "prompt": "must never be projected",
+        }
+
+
 def source_response(text, annotations, *, status="completed", usage=None):
     return SimpleNamespace(
         status=status,
@@ -144,9 +159,10 @@ def analysis_tool_call(name, arguments, *, call_id="call_analysis"):
     }
 
 
-def terminal_response(text="The local evidence is bounded."):
+def terminal_response(text="The local evidence is bounded.", *, usage=None):
     return SimpleNamespace(
         status="completed",
+        usage=usage,
         output=[{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": text}]}],
     )
 
@@ -173,6 +189,7 @@ def test_analysis_batch_runs_locally_and_persists_bounded_empirical_evidence(tmp
     assert len(storage.analysis_tool_outputs(thread_id)) == 2
     assert all("Journal" not in item["output"] for item in outputs)
     assert all(tool.get("name") != "summarize_results" for tool in responses.calls[1]["tools"])
+    assert answer.diagnostics.qualitative_calls == 0
 
 
 def test_exact_smt_critical_prompt_persists_a_boolean_comparison_and_completes(tmp_path):
@@ -408,12 +425,15 @@ def test_qualitative_tool_needs_current_turn_server_consent_and_never_replays_no
     )
     responses = SequenceResponses(first, terminal_response("The disclosed notes suggest checking entry timing."))
 
-    ChatService(storage, SimpleNamespace(responses=responses)).reply(
+    answer = ChatService(storage, SimpleNamespace(responses=responses)).reply(
         thread_id, "Read my approved notes.", include_approved_notes=False
     )
 
     output = next(item for item in responses.calls[1]["input"] if item.get("type") == "function_call_output")
     assert json.loads(output["output"])["reason"] == "qualitative_consent_required"
+    assert answer.diagnostics.analysis_calls == {"requested": 1, "executed": 0, "rejected": 1}
+    assert answer.diagnostics.qualitative_calls == 1
+    assert answer.diagnostics.qualitative_review is None
     assert "waited for confirmation" not in json.dumps(storage.thread_items(thread_id))
 
 
@@ -608,6 +628,17 @@ def test_approved_qualitative_notes_use_only_the_ephemeral_transport_and_persist
     )
 
     assert answer.text == "The notes show a possible entry-timing pattern."
+    assert answer.diagnostics.analysis_calls == {"requested": 1, "executed": 1, "rejected": 0}
+    assert answer.diagnostics.qualitative_calls == 1
+    assert answer.diagnostics.analysis_batch_status == "complete"
+    assert answer.diagnostics.qualitative_review == {
+        "returned_rows": 2,
+        "usable_text_rows": 2,
+        "omitted_rows": 0,
+        "complete": True,
+        "context_field_count": 0,
+    }
+    assert answer.diagnostics.input_tokens is None
     assert "waited for confirmation" in responses.calls[1]["input"][-1]["output"]
     persisted = json.dumps({
         "thread": storage.thread_items(thread_id),
@@ -619,6 +650,77 @@ def test_approved_qualitative_notes_use_only_the_ephemeral_transport_and_persist
     assert "entered early" not in persisted
     assert all(item.get("name") != "read_text_evidence" for item in storage.replay_items(thread_id))
     assert storage.qualitative_metadata(thread_id)[0]["returned_rows"] == 2
+
+
+def test_qualitative_diagnostics_include_safe_context_counts_and_sdk_usage(tmp_path):
+    storage, thread_id, _dataset, _mapping, fields = _scoped_analysis_dataset(tmp_path, allow_notes=True)
+    first = SimpleNamespace(
+        status="completed",
+        output=[analysis_tool_call(
+            "read_text_evidence",
+            {"text_field_ids": [fields["Journal"]], "context_field_ids": [fields["Session"]], "filters": [], "order_by": "source"},
+            call_id="notes",
+        )],
+    )
+    responses = SequenceResponses(first, terminal_response("The notes suggest an entry-timing pattern.", usage=ModelDumpUsage()))
+
+    answer = ChatService(storage, SimpleNamespace(responses=responses)).reply(
+        thread_id, "Read my approved notes with session context.", include_approved_notes=True
+    )
+
+    assert answer.diagnostics.qualitative_review == {
+        "returned_rows": 2,
+        "usable_text_rows": 2,
+        "omitted_rows": 0,
+        "complete": True,
+        "context_field_count": 1,
+    }
+    assert (answer.diagnostics.input_tokens, answer.diagnostics.output_tokens, answer.diagnostics.total_tokens) == (120, 45, 165)
+    assert (answer.diagnostics.cached_input_tokens, answer.diagnostics.cache_write_tokens, answer.diagnostics.reasoning_tokens) == (30, 6, 12)
+    assert "must never be projected" not in json.dumps(storage.response_diagnostics(thread_id))
+
+
+def test_qualitative_diagnostics_report_partial_review_without_note_text(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    storage.set_vector_store("vs_jacob")
+    source = tmp_path / "trades.csv"
+    source.write_text(
+        "Result,Outcome,Journal\n" + "\n".join(f"1,Win,synthetic note {index}" for index in range(101)),
+        encoding="utf-8",
+    )
+    dataset = import_local_dataset(source, storage, dataset_id_factory=lambda: "partial-notes").dataset
+    draft = create_inspected_mapping_draft(
+        storage,
+        inspect_local_dataset(storage, dataset.id),
+        [
+            MappingEntry(0, semantic_role="trade_return", unit="R"),
+            MappingEntry(1, semantic_role="trade_outcome"),
+            MappingEntry(2, analysis_label="Journal", mentor_access="allow_row_values_when_analysing_notes"),
+        ],
+    )
+    mapping = storage.confirm_mapping_version(draft.id)
+    thread_id = storage.create_thread("Partial qualitative review")
+    storage.set_thread_dataset_scope(thread_id, dataset.id)
+    journal = next(entry.field_id for entry in storage.mapping_entries(mapping.id) if entry.analysis_label == "Journal")
+    first = SimpleNamespace(status="completed", output=[analysis_tool_call(
+        "read_text_evidence",
+        {"text_field_ids": [journal], "context_field_ids": [], "filters": [], "order_by": "source"},
+        call_id="notes",
+    )])
+    answer = ChatService(storage, SimpleNamespace(responses=SequenceResponses(first, terminal_response()))).reply(
+        thread_id, "Read my approved notes.", include_approved_notes=True
+    )
+
+    assert answer.diagnostics.qualitative_review == {
+        "returned_rows": 100,
+        "usable_text_rows": 101,
+        "omitted_rows": 1,
+        "complete": False,
+        "context_field_count": 0,
+    }
+    persisted = json.dumps({"replay": storage.replay_items(thread_id), "diagnostics": storage.response_diagnostics(thread_id)})
+    assert "synthetic note 0" not in persisted
 
 
 def test_analysis_batch_limit_and_wrong_thread_scope_are_rejected_locally(tmp_path):
@@ -1813,6 +1915,7 @@ def test_reply_persists_continuation_state_and_extracts_evidence(tmp_path):
                 "analysis_operations": [],
                 "deterministic_result_chars": 0,
                 "qualitative_calls": 0,
+                "qualitative_review": None,
                 "analysis_batch_status": "not_requested",
                 "prior_empirical_evidence_reused": False,
                 "auto_mapping_policy_upgraded": False,

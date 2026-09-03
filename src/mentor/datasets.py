@@ -264,16 +264,28 @@ def _safe_optional_string(value: object) -> str | None:
 
 
 def _safe_usage(value: object) -> Mapping[str, object] | None:
-    if not isinstance(value, Mapping):
+    if isinstance(value, Mapping):
+        raw = value
+    elif hasattr(value, "model_dump"):
+        try:
+            raw = value.model_dump(mode="json")
+        except (TypeError, ValueError):
+            return None
+        if not isinstance(raw, Mapping):
+            return None
+    else:
         return None
     allowed = {"input_tokens", "output_tokens", "total_tokens"}
-    details = {"input_tokens_details", "output_tokens_details"}
-    safe: dict[str, object] = {
-        key: item for key in allowed if isinstance((item := value.get(key)), int | float)
+    details = {
+        "input_tokens_details": {"cached_tokens", "cache_write_tokens"},
+        "output_tokens_details": {"reasoning_tokens"},
     }
-    for key in details:
-        if isinstance((item := value.get(key)), Mapping):
-            safe[key] = {name: count for name, count in item.items() if isinstance(count, int | float)}
+    safe: dict[str, object] = {
+        key: item for key in allowed if isinstance((item := raw.get(key)), int | float)
+    }
+    for key, fields in details.items():
+        if isinstance((item := raw.get(key)), Mapping):
+            safe[key] = {name: count for name in fields if isinstance((count := item.get(name)), int | float)}
     return safe
 
 
