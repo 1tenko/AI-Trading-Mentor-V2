@@ -2140,6 +2140,59 @@ def test_streaming_exact_auto_mapped_notes_pause_for_consent_without_manual_mapp
     assert len(responses.calls) == 1
 
 
+def test_safe_qualitative_trade_context_pauses_for_consent_without_disclosure(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    storage.set_vector_store("vs_jacob")
+    source = tmp_path / "trades.csv"
+    source.write_text(
+        "Timestamp,Result,Outcome,Mistake tag,Rule adherence,Trade notes\n"
+        "2026-01-01T09:30:00,1,Win,None,High,synthetic note one\n"
+        "2026-01-02T09:30:00,-1,Loss,Early,Low,synthetic note two\n",
+        encoding="utf-8",
+    )
+    dataset = import_local_dataset(source, storage, dataset_id_factory=lambda: "context-notes").dataset
+    mapping = storage.confirm_mapping_version(create_inspected_mapping_draft(
+        storage, inspect_local_dataset(storage, dataset.id),
+        [
+            MappingEntry(0, semantic_role="trade_timestamp"),
+            MappingEntry(1, semantic_role="trade_return", unit="R"),
+            MappingEntry(2, semantic_role="trade_outcome"),
+            MappingEntry(3, analysis_label="Mistake tag", model_disclosure=True, source="deterministic_auto"),
+            MappingEntry(4, analysis_label="Rule adherence", model_disclosure=True, source="deterministic_auto"),
+            MappingEntry(5, analysis_label="Trade notes", mentor_access="allow_row_values_when_analysing_notes"),
+        ],
+    ).id)
+    fields = {entry.analysis_label or entry.semantic_role: entry.field_id for entry in storage.mapping_entries(mapping.id)}
+    assert all(
+        entry.mentor_access == "aggregates_only"
+        for entry in storage.mapping_entries(mapping.id)
+        if entry.field_id in {fields["trade_timestamp"], fields["Mistake tag"], fields["Rule adherence"]}
+    )
+    thread_id = storage.create_thread("Analysis")
+    storage.set_thread_dataset_scope(thread_id, dataset.id)
+    response = SimpleNamespace(status="completed", output=[analysis_tool_call(
+        "read_text_evidence",
+        {
+            "text_field_ids": [fields["Trade notes"]],
+            "context_field_ids": [fields["trade_timestamp"], fields["Mistake tag"], fields["Rule adherence"]],
+            "filters": [{"field_id": fields["Trade notes"], "operator": "not_blank", "value": None}],
+            "order_by": "timestamp",
+        },
+        call_id="notes",
+    )])
+    responses = FakeResponses([SimpleNamespace(type="response.completed", response=response)])
+
+    events = list(ChatService(storage, SimpleNamespace(responses=responses)).stream_reply(
+        thread_id, "Are there recurring themes in my trade notes?"
+    ))
+
+    assert [event.type for event in events] == ["consent_required"]
+    assert events[0].qualitative_field_count == 1
+    assert events[0].qualitative_context_field_count == 3
+    assert storage.display_turns(thread_id) == []
+
+
 def test_streaming_invalid_qualitative_request_does_not_offer_consent(tmp_path):
     storage, thread_id, _dataset, _mapping, fields = _scoped_analysis_dataset(tmp_path, allow_notes=False)
     response = SimpleNamespace(
@@ -2155,7 +2208,7 @@ def test_streaming_invalid_qualitative_request_does_not_offer_consent(tmp_path):
 
     assert [event.type for event in events] == ["complete"]
     output = next(item for item in responses.calls[1]["input"] if item.get("type") == "function_call_output")
-    assert json.loads(output["output"])["reason"] == "invalid_analysis_arguments"
+    assert json.loads(output["output"])["reason"] == "qualitative_text_not_eligible"
 
 
 def test_streaming_incompatible_qualitative_filter_does_not_offer_consent(tmp_path):

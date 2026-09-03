@@ -418,6 +418,8 @@ class _Handler(BaseHTTPRequestHandler):
             body["error_classification"] = event.error_classification
         if event.qualitative_field_count:
             body["qualitative_field_count"] = event.qualitative_field_count
+        if event.qualitative_context_field_count:
+            body["qualitative_context_field_count"] = event.qualitative_context_field_count
         self.wfile.write(f"data: {json.dumps(body)}\n\n".encode())
         self.wfile.flush()
 

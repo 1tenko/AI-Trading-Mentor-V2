@@ -34,6 +34,11 @@ class FailingStreamingFakeChatService:
         yield StreamEvent("error", error="The mentor request failed. Try again.", error_classification="responses_continuation_error")
 
 
+class ConsentStreamingFakeChatService:
+    def stream_reply(self, thread_id, question, evaluation, *, include_approved_notes=False):
+        yield StreamEvent("consent_required", qualitative_field_count=1, qualitative_context_field_count=3)
+
+
 class ExplodingStreamingFakeChatService:
     def stream_reply(self, thread_id, question, evaluation, *, include_approved_notes=False):
         raise RuntimeError("simulated server failure")
@@ -137,6 +142,24 @@ def test_server_streams_chat_events(tmp_path):
         assert chat_service.evaluation.reasoning_mode == "pro"
         assert chat_service.evaluation.research_depth == "deep"
         assert chat_service.include_approved_notes is False
+    finally:
+        server.shutdown()
+        worker.join()
+
+
+def test_server_streams_safe_qualitative_context_count(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    thread_id = storage.create_thread("Plan")
+    server = create_server(storage, ConsentStreamingFakeChatService(), port=0)
+    worker = threading.Thread(target=server.serve_forever)
+    worker.start()
+    try:
+        status, _, body = request(server, "POST", f"/api/threads/{thread_id}/messages", b'{"question":"Read notes"}')
+        assert status == 200
+        assert b'"type": "consent_required"' in body
+        assert b'"qualitative_field_count": 1' in body
+        assert b'"qualitative_context_field_count": 3' in body
     finally:
         server.shutdown()
         worker.join()

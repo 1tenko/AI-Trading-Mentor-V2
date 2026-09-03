@@ -38,10 +38,14 @@ _SUMMARY_METRICS = (
 _GROUP_LIMIT = 50
 _TEMPORAL_BUCKET_LIMIT = 50
 _FILTER_LIMIT = ANALYSIS_FILTER_LIMIT
-_TEXT_FIELD_LIMIT = 3
+_TEXT_FIELD_LIMIT = 1
+_TEXT_CONTEXT_FIELD_LIMIT = 3
 _TEXT_ROW_LIMIT = 100
 _TEXT_CELL_LIMIT = 1_200
 _TEXT_CHARACTER_LIMIT = 24_000
+_QUALITATIVE_CONTEXT_ROLES = frozenset({
+    "trade_outcome", "trade_return", "trade_timestamp", "session", "direction", "instrument", "setup",
+})
 ANALYSIS_SCHEMA_VERSION = "1.0"
 _GROUP_METRICS = (
     "wins", "losses", "breakevens", "win_rate", "loss_rate", "wilson_95_lower", "wilson_95_upper",
@@ -346,7 +350,7 @@ def read_text_evidence(
     use_guard.consume()
     if (
         not _field_ids_are_bounded(text_field_ids, _TEXT_FIELD_LIMIT)
-        or not _field_ids_are_bounded(context_field_ids, _TEXT_FIELD_LIMIT, required=False)
+        or not _field_ids_are_bounded(context_field_ids, _TEXT_CONTEXT_FIELD_LIMIT, required=False)
         or set(text_field_ids) & set(context_field_ids)
     ):
         raise ValueError("text and context fields must be unique bounded field IDs")
@@ -359,17 +363,14 @@ def read_text_evidence(
     selected_ids = (*text_field_ids, *context_field_ids)
     if any(field_id not in entries for field_id in selected_ids):
         raise ValueError("text evidence field is unsupported")
-    if any(entries[field_id].mentor_access != "allow_row_values_when_analysing_notes" for field_id in selected_ids):
-        raise ValueError("text evidence field is not approved")
-    if any(entries[field_id].value_type != "categorical" for field_id in text_field_ids):
-        raise ValueError("text evidence fields must be mapped text")
+    _validate_qualitative_field_eligibility(entries, text_field_ids, context_field_ids)
     timestamp_id = next((entry.field_id for entry in entries.values() if entry.semantic_role == "trade_timestamp"), None)
     if order_by not in _ORDER_MODES:
         raise ValueError("text evidence order is unsupported")
     if order_by == "timestamp" and (
-        timestamp_id is None or entries[timestamp_id].mentor_access != "allow_row_values_when_analysing_notes"
+        timestamp_id is None or not _is_safe_qualitative_context_field(entries[timestamp_id])
     ):
-        raise ValueError("timestamp order requires an approved timestamp field")
+        raise ValueError("timestamp order requires a safe qualitative context field")
 
     frame = build_analysis_frame(
         storage, dataset_id, mapping_version_id, required_roles=(), filters=filters, order_by="source"
@@ -434,7 +435,7 @@ def read_text_evidence(
         "context_fields": [_safe_text_field(entries[field_id]) for field_id in context_field_ids],
         "filters": [_text_filter_payload(item) for item in frame.filter_descriptors],
         "ordering": {"mode": order_by, "timestamp_field_id": timestamp_id if order_by == "timestamp" else None},
-        "bounds": {"text_field_limit": _TEXT_FIELD_LIMIT, "context_field_limit": _TEXT_FIELD_LIMIT, "row_limit": _TEXT_ROW_LIMIT, "cell_character_limit": _TEXT_CELL_LIMIT, "character_limit": _TEXT_CHARACTER_LIMIT},
+        "bounds": {"text_field_limit": _TEXT_FIELD_LIMIT, "context_field_limit": _TEXT_CONTEXT_FIELD_LIMIT, "row_limit": _TEXT_ROW_LIMIT, "cell_character_limit": _TEXT_CELL_LIMIT, "character_limit": _TEXT_CHARACTER_LIMIT},
         "matching_rows": len(rows),
         "usable_text_rows": len(candidates),
         "returned_rows": returned_rows,
@@ -468,7 +469,7 @@ def validate_text_evidence_request(
     """Check qualitative eligibility locally without reading a note value."""
     if (
         not _field_ids_are_bounded(text_field_ids, _TEXT_FIELD_LIMIT)
-        or not _field_ids_are_bounded(context_field_ids, _TEXT_FIELD_LIMIT, required=False)
+        or not _field_ids_are_bounded(context_field_ids, _TEXT_CONTEXT_FIELD_LIMIT, required=False)
         or set(text_field_ids) & set(context_field_ids)
     ):
         raise ValueError("text and context fields must be unique bounded field IDs")
@@ -480,10 +481,7 @@ def validate_text_evidence_request(
     selected_ids = (*text_field_ids, *context_field_ids)
     if any(field_id not in entries for field_id in selected_ids):
         raise ValueError("text evidence field is unsupported")
-    if any(entries[field_id].mentor_access != "allow_row_values_when_analysing_notes" for field_id in selected_ids):
-        raise ValueError("text evidence field is not approved")
-    if any(entries[field_id].value_type != "categorical" for field_id in text_field_ids):
-        raise ValueError("text evidence fields must be mapped text")
+    _validate_qualitative_field_eligibility(entries, text_field_ids, context_field_ids)
     fields = {field.field_id: field for field in (_field(entry) for entry in entries.values())}
     for filter_ in filters:
         _validate_filter(filter_, fields)
@@ -491,9 +489,34 @@ def validate_text_evidence_request(
     if order_by not in _ORDER_MODES:
         raise ValueError("text evidence order is unsupported")
     if order_by == "timestamp" and (
-        timestamp_id is None or entries[timestamp_id].mentor_access != "allow_row_values_when_analysing_notes"
+        timestamp_id is None or not _is_safe_qualitative_context_field(entries[timestamp_id])
     ):
-        raise ValueError("timestamp order requires an approved timestamp field")
+        raise ValueError("timestamp order requires a safe qualitative context field")
+
+
+def _validate_qualitative_field_eligibility(
+    entries: dict[str, "MappingEntry"], text_field_ids: Sequence[str], context_field_ids: Sequence[str]
+) -> None:
+    if any(not _is_approved_qualitative_text_field(entries[field_id]) for field_id in text_field_ids):
+        raise ValueError("qualitative text field is not eligible")
+    if any(not _is_safe_qualitative_context_field(entries[field_id]) for field_id in context_field_ids):
+        raise ValueError("qualitative context field is not eligible")
+
+
+def _is_approved_qualitative_text_field(entry: "MappingEntry") -> bool:
+    return (
+        entry.semantic_role is None
+        and entry.mentor_access == "allow_row_values_when_analysing_notes"
+        and entry.value_type == "categorical"
+    )
+
+
+def _is_safe_qualitative_context_field(entry: "MappingEntry") -> bool:
+    if entry.mentor_access != "aggregates_only":
+        return False
+    return entry.semantic_role in _QUALITATIVE_CONTEXT_ROLES or (
+        entry.aggregate_labels_allowed and entry.analysis_label is not None
+    )
 
 
 def _safe_text_field(entry: "MappingEntry") -> dict[str, str]:

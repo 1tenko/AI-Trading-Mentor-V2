@@ -800,18 +800,19 @@ async function attachDataset() {
   attachmentFile.value = "";
 }
 
-function showNotesConsent(questionText, threadId, attachment, qualitativeFieldCount = 1) {
+function showNotesConsent(questionText, threadId, attachment, qualitativeFieldCount = 1, qualitativeContextFieldCount = 0) {
   if (activeThreadId !== threadId) return;
   pendingQualitativeQuestion = questionText;
   notesConsent.replaceChildren();
   notesConsent.hidden = false;
   const message = document.createElement("p");
-  message.textContent = qualitativeFieldCount > 1
-    ? "This spreadsheet contains more than one written field. Including written fields lets the Mentor read the relevant approved written fields for this answer only; the spreadsheet stays local."
-    : "This spreadsheet contains written trade notes. Reading approved notes will send those values to the AI for this answer; the spreadsheet stays local.";
+  const includesContext = qualitativeContextFieldCount > 0;
+  message.textContent = includesContext
+    ? "This answer would let the AI read up to 100 trade notes together with relevant trade context for this answer only. The spreadsheet stays local."
+    : "This answer would let the AI read up to 100 trade notes for this answer only. The spreadsheet stays local.";
   const include = document.createElement("button");
   include.type = "button";
-  include.textContent = qualitativeFieldCount > 1 ? "Include written fields" : "Include trade notes";
+  include.textContent = includesContext ? "Include notes + trade context" : "Include trade notes";
   include.addEventListener("click", () => {
     if (activeThreadId !== threadId) return;
     notesConsent.hidden = true;
@@ -893,7 +894,10 @@ async function sendMessage(text, showUser = true, includeApprovedNotes = false, 
           if (event.type === "consent_required") {
             terminal = true;
             mentor.message.remove();
-            showNotesConsent(text, threadId, attachment, event.qualitative_field_count || 1);
+            showNotesConsent(
+              text, threadId, attachment, event.qualitative_field_count || 1,
+              event.qualitative_context_field_count || 0,
+            );
           }
         });
       }

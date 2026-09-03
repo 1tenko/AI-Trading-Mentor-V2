@@ -180,7 +180,7 @@ ANALYSIS_TOOLS = [
     _tool("compare_groups", "Compare two distinct values in one approved group field.", {"field_id": {"type": "string", "minLength": 1, "maxLength": 120}, "value_a": _FILTER_VALUE_SCHEMA, "value_b": _FILTER_VALUE_SCHEMA, "filters": _FILTERS_SCHEMA}, ["field_id", "value_a", "value_b", "filters"]),
     _tool("analyze_mfe_mae", "Compute deterministic MFE and MAE aggregates when mapped.", {"filters": _FILTERS_SCHEMA}, ["filters"]),
     _tool("analyze_over_time", "Compute deterministic chronological aggregates for the active dataset.", {"mode": {"type": "string", "enum": ["month", "halves", "rolling"]}, "window_size": {"type": ["integer", "null"], "minimum": 1, "maximum": 250}, "filters": _FILTERS_SCHEMA}, ["mode", "window_size", "filters"]),
-    _tool("read_text_evidence", "Read one bounded, explicitly approved local note sample for this turn only.", {"text_field_ids": {**_FIELD_IDS_SCHEMA, "minItems": 1}, "context_field_ids": _FIELD_IDS_SCHEMA, "filters": _FILTERS_SCHEMA, "order_by": {"type": "string", "enum": ["source", "timestamp"]}}, ["text_field_ids", "context_field_ids", "filters", "order_by"]),
+    _tool("read_text_evidence", "Read one bounded, explicitly approved local note sample for this turn only.", {"text_field_ids": {**_FIELD_IDS_SCHEMA, "minItems": 1, "maxItems": 1}, "context_field_ids": _FIELD_IDS_SCHEMA, "filters": _FILTERS_SCHEMA, "order_by": {"type": "string", "enum": ["source", "timestamp"]}}, ["text_field_ids", "context_field_ids", "filters", "order_by"]),
 ]
 
 
@@ -282,6 +282,7 @@ class StreamEvent:
     error: str = ""
     error_classification: str = ""
     qualitative_field_count: int = 0
+    qualitative_context_field_count: int = 0
 
 
 class ChatService:
@@ -395,7 +396,11 @@ class ChatService:
                     )
                     return
         except _QualitativeConsentRequired as consent:
-            yield StreamEvent("consent_required", qualitative_field_count=consent.field_count)
+            yield StreamEvent(
+                "consent_required",
+                qualitative_field_count=consent.field_count,
+                qualitative_context_field_count=consent.context_field_count,
+            )
             return
         except _ResponsesRequestError as error:
             yield StreamEvent(
@@ -514,7 +519,9 @@ class ChatService:
             call["name"] == QUALITATIVE_TOOL_NAME for call in calls
         ):
             try:
-                self._validate_qualitative_tool(dataset_id, mapping_version_id, next(call for call in calls if call["name"] == QUALITATIVE_TOOL_NAME))
+                context_field_count = self._validate_qualitative_tool(
+                    dataset_id, mapping_version_id, next(call for call in calls if call["name"] == QUALITATIVE_TOOL_NAME)
+                )
             except (ValueError, TypeError, json.JSONDecodeError):
                 pass
             else:
@@ -524,7 +531,8 @@ class ChatService:
                         and entry.value_type == "categorical"
                         and entry.mentor_access == "allow_row_values_when_analysing_notes"
                         for entry in self.storage.mapping_entries(mapping_version_id)
-                    )
+                    ),
+                    context_field_count,
                 )
         deterministic: list[tuple[dict, dict]] = []
         qualitative: tuple[dict, Any] | None = None
@@ -560,8 +568,13 @@ class ChatService:
                     deterministic.append((call, result))
             except _LocalToolRejected as error:
                 rejection_results[call["call_id"]] = _profile_tool_rejection(error.reason)
-            except (ValueError, TypeError, json.JSONDecodeError):
-                rejection_results[call["call_id"]] = _profile_tool_rejection("invalid_analysis_arguments")
+            except (ValueError, TypeError, json.JSONDecodeError) as error:
+                reason = (
+                    _qualitative_rejection_reason(error)
+                    if call["name"] == QUALITATIVE_TOOL_NAME
+                    else "invalid_analysis_arguments"
+                )
+                rejection_results[call["call_id"]] = _profile_tool_rejection(reason)
 
         tool_outputs = [
             {
@@ -728,7 +741,7 @@ class ChatService:
             use_guard=capability,
         )
 
-    def _validate_qualitative_tool(self, dataset_id: str, mapping_version_id: int, call: dict) -> None:
+    def _validate_qualitative_tool(self, dataset_id: str, mapping_version_id: int, call: dict) -> int:
         arguments = _analysis_arguments(call)
         text_field_ids = arguments.pop("text_field_ids", None)
         context_field_ids = arguments.pop("context_field_ids", None)
@@ -739,6 +752,7 @@ class ChatService:
             self.storage, dataset_id, mapping_version_id,
             text_field_ids=text_field_ids, context_field_ids=context_field_ids, filters=filters, order_by=order_by,
         )
+        return len(context_field_ids)
 
     def _execute_profile_tool(self, thread_id: int, question: str, call: dict) -> dict:
         call_id = call.get("call_id")
@@ -1020,8 +1034,9 @@ class _LocalToolRejected(ValueError):
 class _QualitativeConsentRequired(Exception):
     """A stream can safely pause before a raw qualitative disclosure."""
 
-    def __init__(self, field_count: int = 1):
+    def __init__(self, field_count: int = 1, context_field_count: int = 0):
         self.field_count = field_count
+        self.context_field_count = context_field_count
 
 
 class _ReplayProtocolError(ValueError):
@@ -1264,6 +1279,13 @@ def _raw_file_search_tools(tools: list[dict]) -> list[dict]:
 
 def _profile_tool_rejection(reason: str) -> dict[str, str]:
     return {"status": "rejected", "reason": reason}
+
+
+def _qualitative_rejection_reason(error: Exception) -> str:
+    return {
+        "qualitative text field is not eligible": "qualitative_text_not_eligible",
+        "qualitative context field is not eligible": "qualitative_context_not_eligible",
+    }.get(str(error), "invalid_analysis_arguments")
 
 
 def _safe_error_classification(error: Exception) -> str:

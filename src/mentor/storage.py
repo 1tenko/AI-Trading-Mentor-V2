@@ -2886,12 +2886,12 @@ def _is_safe_qualitative_audit_metadata(value: Mapping[str, object]) -> bool:
         or type(value["mapping_version_id"]) is not int
         or value["mapping_version_id"] < 1
         or type(value["include_approved_notes"]) is not bool
-        or not _safe_qualitative_fields(value["text_fields"])
-        or not _safe_qualitative_fields(value["context_fields"])
+        or not _safe_qualitative_fields(value["text_fields"], maximum=1)
+        or not _safe_qualitative_fields(value["context_fields"], maximum=3)
         or not _safe_qualitative_filters(value["filters"])
         or not _safe_qualitative_ordering(value["ordering"])
         or value["bounds"] != {
-            "text_field_limit": 3, "context_field_limit": 3, "row_limit": 100,
+            "text_field_limit": 1, "context_field_limit": 3, "row_limit": 100,
             "cell_character_limit": 1_200, "character_limit": 24_000,
         }
     ):
@@ -2910,10 +2910,10 @@ def _safe_identifier(value: object, maximum_length: int) -> bool:
     return isinstance(value, str) and 1 <= len(value) <= maximum_length and re.fullmatch(r"[A-Za-z0-9_-]+", value) is not None
 
 
-def _safe_qualitative_fields(value: object) -> bool:
+def _safe_qualitative_fields(value: object, *, maximum: int) -> bool:
     return (
         isinstance(value, list)
-        and len(value) <= 3
+        and len(value) <= maximum
         and all(
             isinstance(field, Mapping)
             and set(field) == {"field_id", "label"}

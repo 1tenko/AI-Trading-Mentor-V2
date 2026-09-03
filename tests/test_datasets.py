@@ -1297,7 +1297,7 @@ def test_legacy_mapping_migration_defaults_text_access_to_denied(tmp_path):
     entry = storage.mapping_entries(1)[0]
 
     assert entry.mentor_access == "aggregates_only"
-    with pytest.raises(ValueError, match="not approved"):
+    with pytest.raises(ValueError, match="text field is not eligible"):
         read_text_evidence(
             storage, "legacy", 1, text_field_ids=(entry.field_id or "",),
             include_approved_notes=True, use_guard=TextEvidenceUseGuard(),

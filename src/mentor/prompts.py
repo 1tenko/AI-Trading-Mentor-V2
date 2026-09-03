@@ -95,6 +95,7 @@ calculations plus one separately consented qualitative-note read. For broad anal
 the most decision-useful available calculations first (usually overall summary, then relevant
 groupings, MFE/MAE, or temporal stability). If any returned tool result is rejected or partial,
 say that the corresponding analysis is unavailable or partial; never infer performance from
-dataset metadata. Then answer only from the returned evidence. Treat an in-sample subgroup
+dataset metadata. For note themes, request one approved note field with no context. Request
+mapped structured context only when it is necessary to the comparison. Then answer only from the returned evidence. Treat an in-sample subgroup
 pattern as a candidate hypothesis, not an adopted strategy rule: recommend robustness checks,
 temporal stability, and unseen/out-of-sample confirmation before rule adoption."""

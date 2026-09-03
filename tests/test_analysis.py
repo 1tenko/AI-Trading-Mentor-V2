@@ -20,6 +20,7 @@ from mentor.analysis import (
     read_text_evidence,
     summarize_results,
     TextEvidenceUseGuard,
+    validate_text_evidence_request,
 )
 from mentor.datasets import MappingEntry, create_inspected_mapping_draft, import_local_dataset, inspect_local_dataset, safe_auto_mapping
 from mentor.datasets import continue_qualitative_model_transport
@@ -61,9 +62,9 @@ def test_text_evidence_requires_explicit_mapping_permission_and_consent(tmp_path
         "2,2026-01-02,synthetic second,New York\n",
         [
             MappingEntry(0, semantic_role="trade_return", unit="R"),
-            MappingEntry(1, semantic_role="trade_timestamp", mentor_access="allow_row_values_when_analysing_notes"),
+            MappingEntry(1, semantic_role="trade_timestamp"),
             MappingEntry(2, analysis_label="Journal", mentor_access="allow_row_values_when_analysing_notes"),
-            MappingEntry(3, analysis_label="Session", mentor_access="allow_row_values_when_analysing_notes"),
+            MappingEntry(3, semantic_role="session"),
         ],
     )
     entries = storage.mapping_entries(mapping.id)
@@ -75,8 +76,8 @@ def test_text_evidence_requires_explicit_mapping_permission_and_consent(tmp_path
             dataset.id,
             mapping.id,
             text_field_ids=(ids["Journal"] or "",),
-            context_field_ids=(ids["Session"] or "",),
-            filters=(AnalysisFilter(ids["Session"] or "", "eq", "London"),),
+            context_field_ids=(ids["session"] or "",),
+            filters=(AnalysisFilter(ids["session"] or "", "eq", "London"),),
             order_by="timestamp",
             include_approved_notes=False,
             use_guard=TextEvidenceUseGuard(),
@@ -87,8 +88,8 @@ def test_text_evidence_requires_explicit_mapping_permission_and_consent(tmp_path
         dataset.id,
         mapping.id,
         text_field_ids=(ids["Journal"] or "",),
-        context_field_ids=(ids["Session"] or "",),
-        filters=(AnalysisFilter(ids["Session"] or "", "eq", "London"),),
+        context_field_ids=(ids["session"] or "",),
+        filters=(AnalysisFilter(ids["session"] or "", "eq", "London"),),
         order_by="timestamp",
         include_approved_notes=True,
         use_guard=TextEvidenceUseGuard(),
@@ -98,9 +99,71 @@ def test_text_evidence_requires_explicit_mapping_permission_and_consent(tmp_path
     assert payload["provenance"] == "USER_SUPPLIED_QUALITATIVE_DATA"
     assert payload["matching_rows"] == 2
     assert payload["usable_text_rows"] == 2
+
+
+def test_approved_note_text_can_use_safe_structured_context_only_during_consent(tmp_path):
+    storage, dataset, mapping = _confirmed_dataset(
+        tmp_path,
+        "Result,Outcome,Rule Adherence,Trade Notes,Free Text\n"
+        "1,Win,High,synthetic note one,unapproved context one\n"
+        "-1,Loss,Low,synthetic note two,unapproved context two\n",
+        [
+            MappingEntry(0, semantic_role="trade_return", unit="R"),
+            MappingEntry(1, semantic_role="trade_outcome"),
+            MappingEntry(2, analysis_label="Rule adherence", model_disclosure=True, source="deterministic_auto"),
+            MappingEntry(3, analysis_label="Trade notes", mentor_access="allow_row_values_when_analysing_notes", source="deterministic_auto"),
+            MappingEntry(4, analysis_label="Free text"),
+        ],
+    )
+    fields = {entry.analysis_label or entry.semantic_role: entry.field_id or "" for entry in storage.mapping_entries(mapping.id)}
+    context = (fields["trade_outcome"], fields["Rule adherence"])
+
+    validate_text_evidence_request(
+        storage, dataset.id, mapping.id,
+        text_field_ids=(fields["Trade notes"],), context_field_ids=context,
+        filters=(), order_by="source",
+    )
+    evidence = read_text_evidence(
+        storage, dataset.id, mapping.id,
+        text_field_ids=(fields["Trade notes"],), context_field_ids=context,
+        include_approved_notes=True, use_guard=TextEvidenceUseGuard(),
+    )
+    payload = _qualitative_payload(evidence)
+
+    assert [value["label"] for value in payload["items"][0]["context"]] == ["trade_outcome", "Rule adherence"]
+    with pytest.raises(ValueError, match="context field is not eligible"):
+        validate_text_evidence_request(
+            storage, dataset.id, mapping.id,
+            text_field_ids=(fields["Trade notes"],), context_field_ids=(fields["Free text"],),
+            filters=(), order_by="source",
+        )
     assert payload["returned_rows"] == 2
-    assert [item["text"][0]["value"] for item in payload["items"]] == ["synthetic first", "synthetic third"]
-    assert "Result" not in json.dumps(payload)
+
+
+def test_qualitative_text_rejects_semantic_fields_and_multiple_note_fields(tmp_path):
+    storage, dataset, mapping = _confirmed_dataset(
+        tmp_path,
+        "Outcome,Trade notes,Second notes\nWin,synthetic note,synthetic second\n",
+        [
+            MappingEntry(0, semantic_role="trade_outcome", mentor_access="allow_row_values_when_analysing_notes"),
+            MappingEntry(1, analysis_label="Trade notes", mentor_access="allow_row_values_when_analysing_notes"),
+            MappingEntry(2, analysis_label="Second notes", mentor_access="allow_row_values_when_analysing_notes"),
+        ],
+    )
+    fields = {entry.analysis_label or entry.semantic_role: entry.field_id or "" for entry in storage.mapping_entries(mapping.id)}
+
+    with pytest.raises(ValueError, match="text field is not eligible"):
+        validate_text_evidence_request(storage, dataset.id, mapping.id, text_field_ids=(fields["trade_outcome"],))
+    with pytest.raises(ValueError, match="context field is not eligible"):
+        validate_text_evidence_request(
+            storage, dataset.id, mapping.id,
+            text_field_ids=(fields["Trade notes"],), context_field_ids=(fields["trade_outcome"],),
+        )
+    with pytest.raises(ValueError, match="unique bounded field IDs"):
+        validate_text_evidence_request(
+            storage, dataset.id, mapping.id,
+            text_field_ids=(fields["Trade notes"], fields["Second notes"]),
+        )
 
 
 def test_text_evidence_rejects_unapproved_fields_wrong_scope_and_raw_inputs(tmp_path):
@@ -114,12 +177,12 @@ def test_text_evidence_rejects_unapproved_fields_wrong_scope_and_raw_inputs(tmp_
     )
     journal_id, session_id = (entry.field_id or "" for entry in storage.mapping_entries(mapping.id))
 
-    with pytest.raises(ValueError, match="not approved"):
+    with pytest.raises(ValueError, match="context field is not eligible"):
         read_text_evidence(
             storage, dataset.id, mapping.id, text_field_ids=(journal_id,), context_field_ids=(session_id,),
             include_approved_notes=True, use_guard=TextEvidenceUseGuard()
         )
-    with pytest.raises(ValueError, match="field is not approved"):
+    with pytest.raises(ValueError, match="text field is not eligible"):
         read_text_evidence(
             storage, dataset.id, mapping.id, text_field_ids=(session_id,), include_approved_notes=True, use_guard=TextEvidenceUseGuard()
         )
@@ -146,7 +209,7 @@ def test_text_evidence_short_note_row_bound_and_deterministic_completeness(tmp_p
         tmp_path,
         f"Trade Date,Journal\n{rows}\n",
         [
-            MappingEntry(0, semantic_role="trade_timestamp", mentor_access="allow_row_values_when_analysing_notes"),
+            MappingEntry(0, semantic_role="trade_timestamp"),
             MappingEntry(1, analysis_label="Journal", mentor_access="allow_row_values_when_analysing_notes"),
         ],
     )
@@ -175,7 +238,7 @@ def test_text_evidence_bounds_cells_total_characters_and_unavailable_context_wit
         f"Journal,Session\n{rows}\n",
         [
             MappingEntry(0, analysis_label="Journal", mentor_access="allow_row_values_when_analysing_notes"),
-            MappingEntry(1, analysis_label="Session", mentor_access="allow_row_values_when_analysing_notes"),
+            MappingEntry(1, semantic_role="session"),
         ],
     )
     journal_id, session_id = (entry.field_id or "" for entry in storage.mapping_entries(mapping.id))
@@ -222,7 +285,7 @@ def test_text_evidence_revocation_requires_a_new_confirmed_mapping_and_consumes_
         read_text_evidence(
             storage, dataset.id, allowed.id, text_field_ids=(journal_id,), include_approved_notes=True, use_guard=guard
         )
-    with pytest.raises(ValueError, match="not approved"):
+    with pytest.raises(ValueError, match="text field is not eligible"):
         read_text_evidence(
             storage, dataset.id, revoked.id, text_field_ids=(journal_id,), include_approved_notes=True, use_guard=TextEvidenceUseGuard()
         )
@@ -233,7 +296,7 @@ def test_text_evidence_rejects_mixed_timestamp_timezones_before_ordering(tmp_pat
         tmp_path,
         "Trade Date,Journal\n2026-01-01,synthetic naive\n2026-01-02T00:00:00Z,synthetic aware\n",
         [
-            MappingEntry(0, semantic_role="trade_timestamp", mentor_access="allow_row_values_when_analysing_notes"),
+            MappingEntry(0, semantic_role="trade_timestamp"),
             MappingEntry(1, analysis_label="Journal", mentor_access="allow_row_values_when_analysing_notes"),
         ],
     )
