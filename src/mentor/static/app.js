@@ -27,6 +27,10 @@ const sourceImportReview = document.querySelector("#source-import-review");
 const sourceSettings = document.querySelector("#source-settings");
 const sourceList = document.querySelector("#source-list");
 const sourceScopeChip = document.querySelector("#source-scope-chip");
+const roadmapPanel = document.querySelector("#roadmap-panel");
+const roadmapTitle = document.querySelector("#roadmap-title");
+const roadmapContent = document.querySelector("#roadmap-content");
+const roadmapTrigger = document.querySelector("#roadmap-trigger");
 const SETTINGS_KEY = "trading-mentor-evaluation-settings";
 const ACTIVE_THREAD_KEY = "trading-mentor-active-thread";
 const THEME_KEY = "trading-mentor-theme";
@@ -448,8 +452,10 @@ async function loadProjectSources() {
   if (!activeProjectId) {
     sourceSettings.hidden = true;
     sourceScopeChip.hidden = true;
+    roadmapTrigger.textContent = "Projects";
     return;
   }
+  roadmapTrigger.textContent = "Roadmap";
   const projectId = activeProjectId;
   const response = await fetch(`/api/projects/${projectId}/libraries`);
   if (projectId !== activeProjectId) return;
@@ -464,6 +470,146 @@ async function loadProjectSources() {
   const enabled = data.libraries.filter((library) => library.enabled);
   sourceScopeChip.textContent = `Sources · ${enabled.length} enabled`;
   sourceScopeChip.hidden = false;
+}
+
+async function loadRoadmap() {
+  const projectId = activeProjectId;
+  roadmapContent.replaceChildren();
+  if (!projectId) {
+    roadmapTitle.textContent = "Strategy Projects";
+    const response = await fetch("/api/projects");
+    if (!response.ok || activeProjectId) return;
+    renderProjectSummaries((await response.json()).projects);
+    return;
+  }
+  roadmapTitle.textContent = "Roadmap";
+  const [roadmapResponse, ledgerResponse, playbookResponse] = await Promise.all([
+    fetch(`/api/projects/${projectId}/roadmap`),
+    fetch(`/api/projects/${projectId}/ledger`),
+    fetch(`/api/projects/${projectId}/playbook`),
+  ]);
+  if (projectId !== activeProjectId) return;
+  if (![roadmapResponse, ledgerResponse, playbookResponse].every((response) => response.ok)) {
+    throw new Error("Could not load this project Roadmap.");
+  }
+  renderProjectRoadmap(
+    await roadmapResponse.json(), await ledgerResponse.json(), await playbookResponse.json()
+  );
+}
+
+function renderProjectSummaries(projects) {
+  const heading = document.createElement("h2");
+  heading.textContent = "Project summaries";
+  roadmapContent.append(heading);
+  if (!projects.length) {
+    roadmapContent.append(document.createTextNode("No Strategy Projects yet."));
+    return;
+  }
+  const list = document.createElement("ul");
+  projects.forEach((project) => {
+    const item = document.createElement("li");
+    const name = document.createElement("strong");
+    name.textContent = project.name;
+    item.append(name, document.createTextNode(` · ${humanLabel(project.status)}`));
+    const detail = project.summary.next_action || project.summary.objective || project.summary.unresolved_question;
+    if (detail) item.append(document.createElement("br"), document.createTextNode(detail));
+    list.append(item);
+  });
+  roadmapContent.append(list);
+}
+
+function renderProjectRoadmap(roadmap, ledger, playbook) {
+  const current = roadmapSection("Current focus");
+  appendRoadmapValue(current, "Objective", roadmap.objective, "No objective has been set yet.");
+  appendRoadmapValue(current, "Next action", roadmap.next_action, "No next action has been set yet.");
+  appendRoadmapValue(current, "Experiment", roadmap.experiment, "No active experiment has been recorded.");
+  appendRoadmapList(current, "Blockers", roadmap.blockers, "No blockers are recorded.");
+  roadmapContent.append(current);
+
+  const mastery = roadmapSection("Mastery");
+  if (!roadmap.mastery.length) mastery.append(document.createTextNode("No concepts are being tracked yet."));
+  else appendRoadmapList(
+    mastery, "Concepts",
+    roadmap.mastery.map((item) => `${item.concept} · ${humanLabel(item.status)} — ${item.reason}`), ""
+  );
+  roadmapContent.append(mastery);
+
+  const history = document.createElement("details");
+  const historySummary = document.createElement("summary");
+  historySummary.textContent = "Research history";
+  history.append(historySummary);
+  if (!ledger.records.length) history.append(document.createTextNode("No research records yet."));
+  else {
+    const list = document.createElement("ul");
+    ledger.records.forEach((record) => {
+      const item = document.createElement("li");
+      const summary = document.createElement("strong");
+      summary.textContent = record.summary;
+      const provenance = document.createElement("small");
+      provenance.textContent = `Provenance: ${humanLabel(record.provenance)} · ${humanLabel(record.kind)} · ${humanLabel(record.status)}`;
+      item.append(summary, provenance);
+      list.append(item);
+    });
+    history.append(list);
+  }
+  roadmapContent.append(history);
+
+  const adopted = document.createElement("details");
+  const adoptedSummary = document.createElement("summary");
+  adoptedSummary.textContent = `Personal playbook · version ${playbook.version}`;
+  adopted.append(adoptedSummary);
+  if (!playbook.rules.length) adopted.append(document.createTextNode("No rules have been approved yet."));
+  else {
+    const list = document.createElement("ol");
+    const records = new Map(ledger.records.map((record) => [record.id, record]));
+    playbook.rules.forEach((rule) => {
+      const item = document.createElement("li");
+      const text = document.createElement("strong");
+      text.textContent = rule.rule;
+      const approval = document.createElement("small");
+      approval.textContent = `Approved in turn ${rule.approval.turn_number}${rule.approval.origin_available ? "" : " · original conversation deleted"}`;
+      const lineage = document.createElement("small");
+      const basis = rule.lineage.research_record_ids.map((id) => records.get(id)?.summary).filter(Boolean);
+      lineage.textContent = basis.length
+        ? `Lineage: ${basis.join(" → ")} · ${rule.lineage.analysis_evidence_ids.length} empirical evidence link${rule.lineage.analysis_evidence_ids.length === 1 ? "" : "s"} · explicit user decision.`
+        : `Lineage: ${rule.lineage.research_record_ids.length} linked research record${rule.lineage.research_record_ids.length === 1 ? "" : "s"} · explicit user decision.`;
+      item.append(text, approval, lineage);
+      list.append(item);
+    });
+    adopted.append(list);
+  }
+  roadmapContent.append(adopted);
+}
+
+function humanLabel(value) {
+  const text = String(value || "").replaceAll("_", " ").toLowerCase();
+  return text ? `${text[0].toUpperCase()}${text.slice(1)}` : "";
+}
+
+function roadmapSection(title) {
+  const section = document.createElement("section");
+  const heading = document.createElement("h2");
+  heading.textContent = title;
+  section.append(heading);
+  return section;
+}
+
+function appendRoadmapValue(parent, label, value, empty) {
+  const row = document.createElement("p");
+  const heading = document.createElement("strong");
+  heading.textContent = `${label}: `;
+  row.append(heading, document.createTextNode(value || empty));
+  parent.append(row);
+}
+
+function appendRoadmapList(parent, label, values, empty) {
+  const heading = document.createElement("strong");
+  heading.textContent = `${label}:`;
+  parent.append(heading);
+  if (!values.length) { parent.append(document.createTextNode(` ${empty}`)); return; }
+  const list = document.createElement("ul");
+  values.forEach((value) => { const item = document.createElement("li"); item.textContent = value; list.append(item); });
+  parent.append(list);
 }
 
 function sourceLibraryControl(projectId, library) {
@@ -1171,6 +1317,7 @@ async function sendMessage(text, showUser = true, includeApprovedNotes = false, 
       if (answer.incomplete_reason) showIncomplete(answer, mentor);
     }
     await refreshPromotionCards();
+    if (!roadmapPanel.hidden) await loadRoadmap();
     await loadThreads();
     status.textContent = "";
   } catch (error) {
@@ -1205,6 +1352,11 @@ sourceScopeChip.addEventListener("click", () => {
   sourceSettings.hidden = false;
   loadProjectSources().catch((error) => { status.textContent = error.message; });
 });
+roadmapTrigger.addEventListener("click", () => {
+  roadmapPanel.hidden = !roadmapPanel.hidden;
+  if (!roadmapPanel.hidden) loadRoadmap().catch((error) => { status.textContent = error.message; });
+});
+document.querySelector("#roadmap-close").addEventListener("click", () => { roadmapPanel.hidden = true; });
 sourceDirectory.addEventListener("change", () => stageSourceDirectory().catch((error) => {
   sourceImportReview.hidden = false;
   sourceImportReview.textContent = error.message;
@@ -1215,6 +1367,7 @@ scopeSelector.addEventListener("change", () => {
   localStorage.removeItem(ACTIVE_THREAD_KEY);
   renderThreads();
   loadProjectSources().catch((error) => { status.textContent = error.message; });
+  if (!roadmapPanel.hidden) loadRoadmap().catch((error) => { status.textContent = error.message; });
   showEmpty();
   status.textContent = activeProjectId ? "Strategy Project" : "General Mentor";
 });

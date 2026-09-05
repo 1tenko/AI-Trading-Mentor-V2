@@ -342,3 +342,21 @@ def test_archived_project_cannot_change_saved_source_settings(tmp_path):
 
     with pytest.raises(ValueError, match="archived"):
         service.set_library_enabled(project.id, "gxt.garrett", enabled=False)
+
+
+def test_general_project_summaries_expose_no_private_project_detail(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    service = ProjectService(storage)
+    project = service.create_project("GxT")
+    thread = service.create_project_thread(project.id, "Research")
+    service.apply_state_event(
+        project.id, event_key="objective", kind="OBJECTIVE",
+        payload={"operation": "SET", "value": "Build one tested model"},
+        origin_thread_id=thread.id, origin_turn_number=1,
+    )
+
+    summary = service.general_summaries()[0]
+
+    assert summary["summary"]["objective"] == "Build one tested model"
+    assert not ({"mastery", "recent_research", "playbook", "libraries", "threads"} & summary.keys())

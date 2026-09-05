@@ -404,6 +404,31 @@ def test_project_source_controls_are_chat_first_and_show_temporary_scope(tmp_pat
         worker.join()
 
 
+def test_roadmap_ui_is_read_only_honest_and_keeps_project_detail_out_of_general_view(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    server = create_server(storage, FakeChatService(), port=0)
+    worker = threading.Thread(target=server.serve_forever)
+    worker.start()
+    try:
+        _, _, page = request(server, "GET", "/")
+        _, _, script = request(server, "GET", "/app.js")
+        _, _, styles = request(server, "GET", "/app.css")
+        assert b'id="roadmap-trigger"' in page
+        assert b'id="roadmap-panel"' in page
+        assert b"Current focus" in script
+        assert b"No objective has been set yet." in script
+        assert b"Research history" in script
+        assert b"Personal playbook" in script
+        assert b"Provenance" in script
+        assert b"/ledger" in script and b"/playbook" in script
+        assert b"Project summaries" in script
+        assert b"roadmap-narrow" in styles
+    finally:
+        server.shutdown()
+        worker.join()
+
+
 def test_source_import_endpoints_stage_finalize_and_require_confirmation(tmp_path):
     storage = Storage(tmp_path / "mentor.sqlite3")
     storage.initialize()
