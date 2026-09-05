@@ -21,7 +21,15 @@ from mentor.datasets import (
     QualitativeEvidenceMetadata,
     ThreadDatasetScope,
 )
-from mentor.project_models import ProjectStatus, StrategyProject, ThreadContext, ThreadSourceBehavior
+from mentor.project_models import (
+    AuthorityKind,
+    CanonicalRole,
+    ProjectStatus,
+    SourceLibrary,
+    StrategyProject,
+    ThreadContext,
+    ThreadSourceBehavior,
+)
 
 
 _ANALYSIS_LIMITATION_CODES = frozenset(
@@ -344,6 +352,7 @@ def _validate_filter_mapping_specs(connection: sqlite3.Connection, envelope: Map
 _DATASET_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,79}")
 _TOOL_CALL_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}")
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
+_LIBRARY_KEY_PATTERN = re.compile(r"[a-z0-9]+(?:[._-][a-z0-9]+)+")
 _FILTER_CANONICAL_ID_PATTERN = re.compile(r"[0-9a-f]{12}")
 ANALYSIS_FILTER_LIMIT = 20
 ANALYSIS_EXCLUSION_LIMIT = ANALYSIS_FILTER_LIMIT + 18
@@ -1558,6 +1567,190 @@ class Storage:
             for row in rows
         ]
 
+    def create_source_library(
+        self,
+        library_key: str,
+        corpus_key: str,
+        authority_name: str,
+        authority_kind: AuthorityKind,
+        display_name: str,
+    ) -> SourceLibrary:
+        authority_kind = AuthorityKind(authority_kind)
+        corpus_key = " ".join(corpus_key.split())
+        authority_name = " ".join(authority_name.split())
+        display_name = " ".join(display_name.split())
+        if not _LIBRARY_KEY_PATTERN.fullmatch(library_key):
+            raise ValueError("library key is invalid")
+        if not corpus_key or not authority_name or not display_name:
+            raise ValueError("library metadata is invalid")
+        try:
+            with self._connect() as connection:
+                cursor = connection.execute(
+                    "INSERT INTO source_libraries(library_key, corpus_key, authority_name, authority_kind, display_name, status) "
+                    "VALUES (?, ?, ?, ?, ?, 'ACTIVE')",
+                    (library_key, corpus_key, authority_name, authority_kind.value, display_name),
+                )
+        except sqlite3.IntegrityError:
+            raise ValueError("source library already exists") from None
+        return self.source_library_by_id(int(cursor.lastrowid))
+
+    def source_library(self, library_key: str) -> SourceLibrary | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT id, library_key, corpus_key, authority_name, authority_kind, display_name, status "
+                "FROM source_libraries WHERE library_key = ?",
+                (library_key,),
+            ).fetchone()
+        return _source_library(row)
+
+    def source_library_by_id(self, library_id: int) -> SourceLibrary | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT id, library_key, corpus_key, authority_name, authority_kind, display_name, status "
+                "FROM source_libraries WHERE id = ?",
+                (library_id,),
+            ).fetchone()
+        return _source_library(row)
+
+    def revision_for_hash(self, sha256: str) -> tuple[int, int, str] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT mentor_library_source_revisions.id, source_libraries.id, source_libraries.library_key "
+                "FROM mentor_library_source_revisions JOIN mentor_library_sources "
+                "ON mentor_library_sources.id = mentor_library_source_revisions.source_id "
+                "JOIN source_libraries ON source_libraries.id = mentor_library_sources.library_id "
+                "WHERE mentor_library_source_revisions.sha256 = ? "
+                "ORDER BY mentor_library_source_revisions.id LIMIT 1",
+                (sha256,),
+            ).fetchone()
+        return None if row is None else (int(row[0]), int(row[1]), str(row[2]))
+
+    def register_library_revision(
+        self,
+        *,
+        library_id: int,
+        source_key: str,
+        display_title: str,
+        source_type: str,
+        relative_category: str,
+        source_date: str | None,
+        timestamps_available: bool,
+        sha256: str,
+        byte_size: int,
+        relative_path: str,
+        staged_path: str,
+        canonical_role: CanonicalRole | None,
+        file_id: str | None,
+        vector_store_file_id: str | None,
+        index_state: str,
+    ) -> int:
+        library = self.source_library_by_id(library_id)
+        if library is None:
+            raise ValueError("source library does not exist")
+        role = None if canonical_role is None else CanonicalRole(canonical_role).value
+        if role is not None and library.library_key != "gxt.garrett":
+            raise ValueError("Garrett canonical role is valid only inside gxt.garrett")
+        if not _SHA256_PATTERN.fullmatch(sha256) or byte_size < 0:
+            raise ValueError("source revision identity is invalid")
+        existing = self.revision_for_hash(sha256)
+        if existing is not None:
+            if existing[1] != library_id:
+                raise ValueError("source content already belongs to another library")
+            return existing[0]
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT id FROM mentor_library_sources WHERE library_id = ? AND source_key = ?",
+                (library_id, source_key),
+            ).fetchone()
+            if row is None:
+                cursor = connection.execute(
+                    "INSERT INTO mentor_library_sources(library_id, source_key, display_title, source_type, relative_category, source_date, timestamps_available) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (library_id, source_key, display_title, source_type, relative_category, source_date, int(timestamps_available)),
+                )
+                source_id = int(cursor.lastrowid)
+            else:
+                source_id = int(row[0])
+            cursor = connection.execute(
+                "INSERT INTO mentor_library_source_revisions(source_id, sha256, byte_size, relative_path, staged_path, canonical_role, file_id, vector_store_file_id, index_state) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (source_id, sha256, byte_size, relative_path, staged_path, role, file_id, vector_store_file_id, index_state),
+            )
+        return int(cursor.lastrowid)
+
+    def library_revision(self, revision_id: int) -> tuple | None:
+        with self._connect() as connection:
+            return connection.execute(
+                "SELECT id, sha256, byte_size, relative_path, canonical_role, file_id, vector_store_file_id, index_state "
+                "FROM mentor_library_source_revisions WHERE id = ?",
+                (revision_id,),
+            ).fetchone()
+
+    def library_revision_count(self, library_key: str) -> int:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT COUNT(*) FROM mentor_library_source_revisions JOIN mentor_library_sources "
+                "ON mentor_library_sources.id = mentor_library_source_revisions.source_id JOIN source_libraries "
+                "ON source_libraries.id = mentor_library_sources.library_id WHERE source_libraries.library_key = ?",
+                (library_key,),
+            ).fetchone()
+        return int(row[0])
+
+    def source_library_for_file(self, file_id: str) -> SourceLibrary | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT source_libraries.id, source_libraries.library_key, source_libraries.corpus_key, "
+                "source_libraries.authority_name, source_libraries.authority_kind, source_libraries.display_name, source_libraries.status "
+                "FROM mentor_library_source_revisions JOIN mentor_library_sources "
+                "ON mentor_library_sources.id = mentor_library_source_revisions.source_id "
+                "JOIN source_libraries ON source_libraries.id = mentor_library_sources.library_id "
+                "WHERE mentor_library_source_revisions.file_id = ? "
+                "AND mentor_library_source_revisions.index_state = 'READY'",
+                (file_id,),
+            ).fetchone()
+        return _source_library(row)
+
+    def set_project_library(self, project_id: int, library_id: int, *, enabled: bool) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT INTO project_source_libraries(project_id, library_id, enabled) VALUES (?, ?, ?) "
+                "ON CONFLICT(project_id, library_id) DO UPDATE SET enabled = excluded.enabled",
+                (project_id, library_id, int(enabled)),
+            )
+
+    def safe_project_libraries(self, project_id: int) -> list[dict[str, object]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT source_libraries.library_key, source_libraries.display_name, project_source_libraries.enabled, "
+                "COUNT(CASE WHEN mentor_library_source_revisions.index_state = 'READY' THEN 1 END), "
+                "COALESCE(library_vector_stores.state, 'NONE') "
+                "FROM project_source_libraries JOIN source_libraries ON source_libraries.id = project_source_libraries.library_id "
+                "LEFT JOIN mentor_library_sources ON mentor_library_sources.library_id = source_libraries.id "
+                "LEFT JOIN mentor_library_source_revisions "
+                "ON mentor_library_source_revisions.source_id = mentor_library_sources.id "
+                "LEFT JOIN library_vector_stores ON library_vector_stores.library_id = source_libraries.id "
+                "WHERE project_source_libraries.project_id = ? "
+                "GROUP BY source_libraries.id ORDER BY source_libraries.library_key",
+                (project_id,),
+            ).fetchall()
+        return [
+            {
+                "library_key": str(row[0]),
+                "display_name": str(row[1]),
+                "enabled": bool(row[2]),
+                "source_count": int(row[3]),
+                "index_status": str(row[4]),
+            }
+            for row in rows
+        ]
+
+    def legacy_source_records(self) -> list[tuple]:
+        with self._connect() as connection:
+            return connection.execute(
+                "SELECT relative_path, filename, year, local_path, file_id, vector_store_file_id "
+                "FROM sources ORDER BY relative_path"
+            ).fetchall()
+
     def create_thread(
         self,
         title: str,
@@ -1598,7 +1791,7 @@ class Storage:
         tables = (
             "strategy_projects",
             "source_libraries",
-            "library_source_revisions",
+            "mentor_library_source_revisions",
             "project_state_events",
             "project_research_records",
             "project_promotion_requests",
@@ -2995,8 +3188,29 @@ def _contains_ephemeral_qualitative_evidence(value: object) -> bool:
     return False
 
 
+def _retire_empty_obsolete_phase6_revision_table(connection: sqlite3.Connection) -> None:
+    """Remove only the empty Task 1 table whose FK targeted the Phase 3 schema."""
+    row = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'library_source_revisions'"
+    ).fetchone()
+    if row is None:
+        return
+    columns = tuple(item[1] for item in connection.execute("PRAGMA table_info(library_source_revisions)"))
+    obsolete_columns = (
+        "id", "source_id", "sha256", "byte_size", "relative_path", "staged_path",
+        "canonical_role", "file_id", "vector_store_file_id", "index_state", "created_at",
+    )
+    normalized_sql = " ".join(str(row[0]).split()).casefold()
+    if columns != obsolete_columns or "references library_sources(id)" not in normalized_sql:
+        return
+    if connection.execute("SELECT COUNT(*) FROM library_source_revisions").fetchone()[0]:
+        raise RuntimeError("obsolete Phase 6 source revision table contains data; migration stopped")
+    connection.execute("DROP TABLE library_source_revisions")
+
+
 def _initialize_phase6_schema(connection: sqlite3.Connection) -> None:
     """Add Phase 6 tables without rewriting accepted Phase 1–5 records."""
+    _retire_empty_obsolete_phase6_revision_table(connection)
     connection.executescript(
         """
         CREATE TABLE IF NOT EXISTS strategy_projects (
@@ -3029,7 +3243,7 @@ def _initialize_phase6_schema(connection: sqlite3.Connection) -> None:
             cleanup_audit_id TEXT,
             updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
-        CREATE TABLE IF NOT EXISTS library_sources (
+        CREATE TABLE IF NOT EXISTS mentor_library_sources (
             id INTEGER PRIMARY KEY,
             library_id INTEGER NOT NULL REFERENCES source_libraries(id),
             source_key TEXT NOT NULL,
@@ -3040,9 +3254,9 @@ def _initialize_phase6_schema(connection: sqlite3.Connection) -> None:
             timestamps_available INTEGER NOT NULL CHECK(timestamps_available IN (0, 1)),
             UNIQUE(library_id, source_key)
         );
-        CREATE TABLE IF NOT EXISTS library_source_revisions (
+        CREATE TABLE IF NOT EXISTS mentor_library_source_revisions (
             id INTEGER PRIMARY KEY,
-            source_id INTEGER NOT NULL REFERENCES library_sources(id),
+            source_id INTEGER NOT NULL REFERENCES mentor_library_sources(id),
             sha256 TEXT NOT NULL CHECK(length(sha256) = 64 AND sha256 NOT GLOB '*[^0-9a-f]*'),
             byte_size INTEGER NOT NULL CHECK(byte_size >= 0),
             relative_path TEXT NOT NULL,
@@ -3164,11 +3378,11 @@ def _initialize_phase6_schema(connection: sqlite3.Connection) -> None:
             rule_text TEXT NOT NULL,
             lineage_json TEXT NOT NULL
         );
-        CREATE TRIGGER IF NOT EXISTS source_revisions_are_immutable
-        BEFORE UPDATE ON library_source_revisions
+        CREATE TRIGGER IF NOT EXISTS mentor_library_source_revisions_are_immutable
+        BEFORE UPDATE ON mentor_library_source_revisions
         BEGIN SELECT RAISE(ABORT, 'source revisions are immutable'); END;
-        CREATE TRIGGER IF NOT EXISTS source_revisions_cannot_delete
-        BEFORE DELETE ON library_source_revisions
+        CREATE TRIGGER IF NOT EXISTS mentor_library_source_revisions_cannot_delete
+        BEFORE DELETE ON mentor_library_source_revisions
         BEGIN SELECT RAISE(ABORT, 'source revisions are immutable'); END;
         CREATE TRIGGER IF NOT EXISTS project_state_events_are_immutable
         BEFORE UPDATE ON project_state_events
@@ -3374,6 +3588,20 @@ def _validate_dataset_identity(dataset_id: str, content_sha256: str) -> None:
         raise ValueError("dataset identifier is invalid")
     if not isinstance(content_sha256, str) or _SHA256_PATTERN.fullmatch(content_sha256) is None:
         raise ValueError("content hash is invalid")
+
+
+def _source_library(row: tuple | None) -> SourceLibrary | None:
+    if row is None:
+        return None
+    return SourceLibrary(
+        id=int(row[0]),
+        library_key=str(row[1]),
+        corpus_key=str(row[2]),
+        authority_name=str(row[3]),
+        authority_kind=AuthorityKind(row[4]),
+        display_name=str(row[5]),
+        status=str(row[6]),
+    )
 
 
 def _thread_label(title: str, first_item_json: str | None) -> str:

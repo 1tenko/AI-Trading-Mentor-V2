@@ -13,6 +13,31 @@ class Transcript:
     modified_at: float
 
 
+@dataclass(frozen=True)
+class DiscoveredTextSource:
+    path: Path
+    relative_path: str
+    relative_category: str
+    filename: str
+    modified_at: float
+
+
+def discover_text_sources(root: Path) -> list[DiscoveredTextSource]:
+    """Discover text files below a declared root without guessing their authority."""
+    if not root.is_dir():
+        raise ValueError(f"Source directory does not exist: {root}")
+    return [
+        DiscoveredTextSource(
+            path=path,
+            relative_path=path.relative_to(root).as_posix(),
+            relative_category=path.relative_to(root).parent.as_posix(),
+            filename=path.name,
+            modified_at=path.stat().st_mtime,
+        )
+        for path in sorted(root.rglob("*.txt"))
+    ]
+
+
 def discover_transcripts(root: Path) -> list[Transcript]:
     """Return raw `.txt` transcripts without modifying their contents."""
     if not root.is_dir():

@@ -72,6 +72,123 @@ def test_phase5_database_migrates_additively_and_idempotently(tmp_path):
         assert connection.execute("SELECT COUNT(*) FROM source_libraries").fetchone() == (0,)
 
 
+def test_phase6_preserves_phase3_library_sources_and_uses_namespaced_tables(tmp_path):
+    database_path = tmp_path / "mentor.sqlite3"
+    with sqlite3.connect(database_path) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE library_sources (
+                source_id TEXT PRIMARY KEY,
+                collection_id TEXT NOT NULL,
+                identity_key TEXT NOT NULL,
+                source_type TEXT NOT NULL,
+                author TEXT NOT NULL,
+                course TEXT NOT NULL,
+                lesson_title TEXT NOT NULL,
+                year INTEGER,
+                original_filename TEXT NOT NULL,
+                local_provenance TEXT NOT NULL
+            );
+            INSERT INTO library_sources VALUES (
+                'source-phase3', 'jacob', '2026/lesson', 'transcript', 'Jacob',
+                'Mentorship', 'Lesson', 2026, 'lesson.txt', 'private-local-reference'
+            );
+            """
+        )
+
+    storage = Storage(database_path)
+    storage.initialize()
+    storage.initialize()
+
+    with sqlite3.connect(database_path) as connection:
+        phase3_columns = [row[1] for row in connection.execute("PRAGMA table_info(library_sources)")]
+        revision_foreign_keys = connection.execute(
+            "PRAGMA foreign_key_list(mentor_library_source_revisions)"
+        ).fetchall()
+        assert phase3_columns == [
+            "source_id", "collection_id", "identity_key", "source_type", "author",
+            "course", "lesson_title", "year", "original_filename", "local_provenance",
+        ]
+        assert connection.execute(
+            "SELECT source_id, lesson_title FROM library_sources"
+        ).fetchall() == [("source-phase3", "Lesson")]
+        assert [row[1] for row in connection.execute(
+            "PRAGMA table_info(mentor_library_sources)"
+        )][:3] == ["id", "library_id", "source_key"]
+        assert any(
+            row[2] == "mentor_library_sources" and row[3] == "source_id" and row[4] == "id"
+            for row in revision_foreign_keys
+        )
+        assert not any(
+            row[2] == "library_sources" for row in revision_foreign_keys
+        )
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+
+
+def test_phase6_retires_only_the_empty_obsolete_revision_table(tmp_path):
+    database_path = tmp_path / "mentor.sqlite3"
+    with sqlite3.connect(database_path) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE library_source_revisions (
+                id INTEGER PRIMARY KEY,
+                source_id INTEGER NOT NULL REFERENCES library_sources(id),
+                sha256 TEXT NOT NULL,
+                byte_size INTEGER NOT NULL,
+                relative_path TEXT NOT NULL,
+                staged_path TEXT NOT NULL,
+                canonical_role TEXT,
+                file_id TEXT,
+                vector_store_file_id TEXT,
+                index_state TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            """
+        )
+
+    Storage(database_path).initialize()
+
+    with sqlite3.connect(database_path) as connection:
+        assert connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'library_source_revisions'"
+        ).fetchone() is None
+        assert connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'mentor_library_source_revisions'"
+        ).fetchone() == ("mentor_library_source_revisions",)
+
+
+def test_phase6_stops_if_the_obsolete_revision_table_contains_data(tmp_path):
+    database_path = tmp_path / "mentor.sqlite3"
+    with sqlite3.connect(database_path) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE library_source_revisions (
+                id INTEGER PRIMARY KEY,
+                source_id INTEGER NOT NULL REFERENCES library_sources(id),
+                sha256 TEXT NOT NULL,
+                byte_size INTEGER NOT NULL,
+                relative_path TEXT NOT NULL,
+                staged_path TEXT NOT NULL,
+                canonical_role TEXT,
+                file_id TEXT,
+                vector_store_file_id TEXT,
+                index_state TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            INSERT INTO library_source_revisions(
+                source_id, sha256, byte_size, relative_path, staged_path, index_state
+            ) VALUES (1, 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 1,
+                      'lesson.txt', 'private-path', 'STAGED');
+            """
+        )
+
+    with pytest.raises(RuntimeError, match="contains data; migration stopped"):
+        Storage(database_path).initialize()
+
+    with sqlite3.connect(database_path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM library_source_revisions").fetchone() == (1,)
+
+
 def test_fresh_threads_are_neutral_and_project_threads_require_an_owner(tmp_path):
     storage = Storage(tmp_path / "mentor.sqlite3")
     storage.initialize()

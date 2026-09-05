@@ -72,9 +72,9 @@ local database. Existing Phase 1–5 tables/data remain untouched.
 |---|---|---|
 | `strategy_projects` | `id`, name, status, created/updated metadata | Stable local IDs; archived is not deleted. |
 | `threads.project_id` | General (`NULL`) versus one project | FK; old rows stay `NULL`. |
-| `mentor_libraries` | authority name/key, kind, state, local configuration | Unique key; no source content. |
-| `project_mentor_libraries` | saved enabled state per project/library | Unique pair; no implicit global default. |
-| `library_sources` / `library_source_revisions` | logical source + immutable content revision | Hash, metadata, local path, remote IDs, indexed status; revisions never mutate. |
+| `source_libraries` | authority name/key, kind, state, local configuration | Unique key; no source content. |
+| `project_source_libraries` | saved enabled state per project/library | Unique pair; no implicit global default. |
+| `mentor_library_sources` / `mentor_library_source_revisions` | Phase 6 logical source + immutable content revision | Physical names avoid the accepted Phase 3 `library_sources` table; hash, metadata, local path, remote IDs, indexed status; revisions never mutate. |
 | `library_import_batches` | staged confirmation/import/reconciliation | Explicit lifecycle and error status. |
 | `library_vector_stores` | vector-store ID, lifecycle and retention metadata | One active store per library; remote IDs private runtime only. |
 | `thread_source_scopes` | saved effective source scope per turn | Historic fidelity; safe labels/IDs only. |
@@ -677,8 +677,8 @@ uses an FK and service-level project ownership validation.
 | `source_libraries` | `id`, unique `library_key`, `corpus_key`, `authority_name`, `authority_kind CHECK('MENTOR','USER_NOTES','SYSTEM')`, `display_name`, `status` |
 | `project_source_libraries` | `project_id`, `library_id`, `enabled CHECK(0,1)`, primary key pair |
 | `library_vector_stores` | `library_id` primary key, unique `vector_store_id`, `state CHECK('NONE','CREATING','READY','FAILED','DELETING','DELETED')`, `cleanup_audit_id` |
-| `library_sources` | `library_id`, `source_key`, `display_title`, `source_type`, `relative_category`, optional `source_date`, `timestamps_available`, unique library/source key |
-| `library_source_revisions` | `source_id`, `sha256`, `byte_size`, `relative_path`, `staged_path`, optional `canonical_role CHECK(canonical_role IS NULL OR canonical_role IN ('CURRENT_CANONICAL_ADVANCED','CURRENT_CANONICAL_FOUNDATION','GARRETT_ARCHIVAL_AND_COMPLEMENTARY'))`, remote IDs, `index_state CHECK('STAGED','UPLOADING','INDEXING','READY','FAILED','SUPERSEDED')`, unique source/hash |
+| `mentor_library_sources` | `library_id`, `source_key`, `display_title`, `source_type`, `relative_category`, optional `source_date`, `timestamps_available`, unique library/source key; physically separate from accepted Phase 3 `library_sources` |
+| `mentor_library_source_revisions` | `source_id`, `sha256`, `byte_size`, `relative_path`, `staged_path`, optional `canonical_role CHECK(canonical_role IS NULL OR canonical_role IN ('CURRENT_CANONICAL_ADVANCED','CURRENT_CANONICAL_FOUNDATION','GARRETT_ARCHIVAL_AND_COMPLEMENTARY'))`, remote IDs, `index_state CHECK('STAGED','UPLOADING','INDEXING','READY','FAILED','SUPERSEDED')`, unique source/hash |
 | `library_import_batches` | `project_id`, `state CHECK('STAGING','READY_FOR_CONFIRMATION','IMPORTING','COMPLETE','FAILED','CANCELLED')`, safe `manifest_json`, `error_code`, timestamps |
 | `thread_source_scopes` | `thread_id`, `turn_number`, safe `scope_json`, primary key pair |
 | `project_state_events` | `project_id`, unique `event_key`, `kind CHECK('OBJECTIVE','EXPERIMENT','BLOCKER','NEXT_ACTION','MASTERY')`, payload/origin/timestamp |
