@@ -1777,6 +1777,247 @@ class Storage:
                 })
         return records
 
+    def create_project_promotion_request(
+        self,
+        *,
+        project_id: int,
+        provisional_rule_id: int,
+        proposed_rule: str,
+        proposed_thread_id: int,
+        proposed_turn_number: int,
+        shown_turn_number: int,
+    ) -> dict[str, object]:
+        with self._connect() as connection:
+            rule = connection.execute(
+                "SELECT kind, status, summary, supersedes_record_id FROM project_research_records WHERE id = ? AND project_id = ?",
+                (provisional_rule_id, project_id),
+            ).fetchone()
+            if rule is None or tuple(rule[:2]) != ("PROVISIONAL_RULE", "VALIDATED"):
+                raise ValueError("promotion requires a validated provisional rule")
+            basis_id, seen, supported = rule[3], set(), False
+            while basis_id is not None and basis_id not in seen and len(seen) < 100:
+                seen.add(int(basis_id))
+                basis = connection.execute(
+                    "SELECT kind, status, supersedes_record_id FROM project_research_records "
+                    "WHERE id = ? AND project_id = ?",
+                    (basis_id, project_id),
+                ).fetchone()
+                if basis is None:
+                    break
+                if tuple(basis[:2]) in {
+                    ("EMPIRICAL_FINDING", "SUPPORTED"), ("PROJECT_FINDING", "VALIDATED")
+                }:
+                    supported = True
+                    break
+                basis_id = basis[2]
+            if not supported:
+                raise ValueError("promotion requires a validated provisional rule with a supported finding")
+            if proposed_rule != rule[2]:
+                raise ValueError("promotion wording must match the validated provisional rule")
+            thread = connection.execute(
+                "SELECT 1 FROM threads WHERE id = ? AND project_id = ? AND thread_source_behavior = 'PROJECT'",
+                (proposed_thread_id, project_id),
+            ).fetchone()
+            if thread is None:
+                raise ValueError("promotion conversation does not belong to the project")
+            existing = connection.execute(
+                "SELECT id FROM project_promotion_requests WHERE provisional_rule_id = ? AND status = 'PENDING'",
+                (provisional_rule_id,),
+            ).fetchone()
+            if existing is None:
+                cursor = connection.execute(
+                    "INSERT INTO project_promotion_requests(project_id, provisional_rule_id, proposed_rule, status, "
+                    "proposed_thread_id, proposed_turn_number, shown_turn_number) VALUES (?, ?, ?, 'PENDING', ?, ?, ?)",
+                    (
+                        project_id, provisional_rule_id, proposed_rule, proposed_thread_id,
+                        proposed_turn_number, shown_turn_number,
+                    ),
+                )
+                promotion_id = int(cursor.lastrowid)
+            else:
+                promotion_id = int(existing[0])
+        return self.project_promotion_request(project_id, promotion_id)
+
+    def project_promotion_request(self, project_id: int, promotion_id: int) -> dict[str, object] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT id, project_id, provisional_rule_id, proposed_rule, status, proposed_thread_id, "
+                "proposed_turn_number, shown_turn_number, decision_thread_id, decision_turn_number "
+                "FROM project_promotion_requests WHERE id = ? AND project_id = ?",
+                (promotion_id, project_id),
+            ).fetchone()
+        if row is None:
+            return None
+        keys = (
+            "id", "project_id", "provisional_rule_id", "proposed_rule", "status",
+            "proposed_thread_id", "proposed_turn_number", "shown_turn_number",
+            "decision_thread_id", "decision_turn_number",
+        )
+        return dict(zip(keys, row, strict=True))
+
+    def pending_project_promotions(self, project_id: int) -> list[dict[str, object]]:
+        with self._connect() as connection:
+            ids = connection.execute(
+                "SELECT id FROM project_promotion_requests WHERE project_id = ? AND status = 'PENDING' ORDER BY id",
+                (project_id,),
+            ).fetchall()
+        return [self.project_promotion_request(project_id, int(row[0])) for row in ids]
+
+    def approve_project_promotion(
+        self,
+        *,
+        project_id: int,
+        promotion_id: int,
+        decision_thread_id: int,
+        decision_turn_number: int,
+    ) -> dict[str, object]:
+        with self._connect() as connection:
+            promotion = connection.execute(
+                "SELECT provisional_rule_id, proposed_rule, status FROM project_promotion_requests "
+                "WHERE id = ? AND project_id = ?",
+                (promotion_id, project_id),
+            ).fetchone()
+            if promotion is None:
+                raise LookupError("promotion request not found")
+            if promotion[2] == "APPROVED":
+                row = connection.execute(
+                    "SELECT project_playbook_versions.version, project_playbook_rules.rule_text "
+                    "FROM project_playbook_rules JOIN project_playbook_versions "
+                    "ON project_playbook_versions.id = project_playbook_rules.playbook_version_id "
+                    "WHERE project_playbook_rules.promotion_request_id = ?",
+                    (promotion_id,),
+                ).fetchone()
+                return {"promotion_id": promotion_id, "playbook_version": int(row[0]), "rule": row[1]}
+            if promotion[2] != "PENDING":
+                raise ValueError("promotion request is not pending")
+            if connection.execute(
+                "SELECT 1 FROM threads WHERE id = ? AND project_id = ? AND thread_source_behavior = 'PROJECT'",
+                (decision_thread_id, project_id),
+            ).fetchone() is None:
+                raise ValueError("approval conversation does not belong to the project")
+            lineage_ids: list[int] = []
+            current = int(promotion[0])
+            while current:
+                row = connection.execute(
+                    "SELECT supersedes_record_id FROM project_research_records WHERE id = ? AND project_id = ?",
+                    (current, project_id),
+                ).fetchone()
+                if row is None or current in lineage_ids or len(lineage_ids) >= 100:
+                    raise ValueError("promotion research lineage is invalid")
+                lineage_ids.append(current)
+                current = 0 if row[0] is None else int(row[0])
+            evidence_ids = [
+                int(row[0]) for row in connection.execute(
+                    "SELECT DISTINCT original_evidence_id FROM project_empirical_evidence_refs WHERE project_id = ? "
+                    f"AND research_record_id IN ({','.join('?' for _ in lineage_ids)}) ORDER BY original_evidence_id",
+                    (project_id, *lineage_ids),
+                )
+            ]
+            decision = connection.execute(
+                "INSERT INTO project_research_records(project_id, kind, status, summary, provenance, "
+                "origin_thread_id, origin_turn_number, supersedes_record_id) "
+                "VALUES (?, 'USER_DECISION', 'ACTIVE', ?, 'USER_DECISION', ?, ?, ?)",
+                (
+                    project_id, f"Approved promotion #{promotion_id}: {promotion[1]}",
+                    decision_thread_id, decision_turn_number, int(promotion[0]),
+                ),
+            )
+            version = int(connection.execute(
+                "SELECT COALESCE(MAX(version), 0) + 1 FROM project_playbook_versions WHERE project_id = ?",
+                (project_id,),
+            ).fetchone()[0])
+            playbook = connection.execute(
+                "INSERT INTO project_playbook_versions(project_id, version, approval_thread_id, approval_turn_number) "
+                "VALUES (?, ?, ?, ?)",
+                (project_id, version, decision_thread_id, decision_turn_number),
+            )
+            lineage = {
+                "promotion_id": promotion_id,
+                "research_record_ids": list(reversed(lineage_ids)),
+                "analysis_evidence_ids": evidence_ids,
+                "user_decision_record_id": int(decision.lastrowid),
+            }
+            connection.execute(
+                "INSERT INTO project_playbook_rules(playbook_version_id, promotion_request_id, rule_text, lineage_json) "
+                "VALUES (?, ?, ?, ?)",
+                (int(playbook.lastrowid), promotion_id, promotion[1], json.dumps(lineage, separators=(",", ":"))),
+            )
+            connection.execute(
+                "UPDATE project_promotion_requests SET status = 'APPROVED', decision_thread_id = ?, "
+                "decision_turn_number = ? WHERE id = ? AND status = 'PENDING'",
+                (decision_thread_id, decision_turn_number, promotion_id),
+            )
+        return {"promotion_id": promotion_id, "playbook_version": version, "rule": promotion[1]}
+
+    def reject_project_promotion(
+        self,
+        project_id: int,
+        promotion_id: int,
+        *,
+        decision_thread_id: int,
+        decision_turn_number: int,
+    ) -> dict[str, object]:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT status, provisional_rule_id, proposed_rule FROM project_promotion_requests "
+                "WHERE id = ? AND project_id = ?",
+                (promotion_id, project_id),
+            ).fetchone()
+            if row is None:
+                raise LookupError("promotion request not found")
+            if row[0] != "PENDING":
+                raise ValueError("promotion request is not pending")
+            if connection.execute(
+                "SELECT 1 FROM threads WHERE id = ? AND project_id = ? AND thread_source_behavior = 'PROJECT'",
+                (decision_thread_id, project_id),
+            ).fetchone() is None:
+                raise ValueError("rejection conversation does not belong to the project")
+            connection.execute(
+                "INSERT INTO project_research_records(project_id, kind, status, summary, provenance, "
+                "origin_thread_id, origin_turn_number, supersedes_record_id) "
+                "VALUES (?, 'USER_DECISION', 'ACTIVE', ?, 'USER_DECISION', ?, ?, ?)",
+                (
+                    project_id, f"Rejected promotion #{promotion_id}: {row[2]}",
+                    decision_thread_id, decision_turn_number, int(row[1]),
+                ),
+            )
+            connection.execute(
+                "UPDATE project_promotion_requests SET status = 'REJECTED', decision_thread_id = ?, "
+                "decision_turn_number = ? WHERE id = ?",
+                (decision_thread_id, decision_turn_number, promotion_id),
+            )
+        return self.project_promotion_request(project_id, promotion_id)
+
+    def project_playbook(self, project_id: int) -> dict[str, object]:
+        with self._connect() as connection:
+            if connection.execute("SELECT 1 FROM strategy_projects WHERE id = ?", (project_id,)).fetchone() is None:
+                raise LookupError("project not found")
+            version = int(connection.execute(
+                "SELECT COALESCE(MAX(version), 0) FROM project_playbook_versions WHERE project_id = ?",
+                (project_id,),
+            ).fetchone()[0])
+            rows = connection.execute(
+                "SELECT project_playbook_versions.version, project_playbook_rules.rule_text, "
+                "project_playbook_rules.lineage_json, project_playbook_versions.approval_thread_id, "
+                "project_playbook_versions.approval_turn_number FROM project_playbook_rules JOIN project_playbook_versions "
+                "ON project_playbook_versions.id = project_playbook_rules.playbook_version_id "
+                "WHERE project_playbook_versions.project_id = ? ORDER BY project_playbook_versions.version",
+                (project_id,),
+            ).fetchall()
+        return {
+            "version": version,
+            "rules": [
+                {
+                    "version": int(row[0]), "rule": row[1], "lineage": json.loads(row[2]),
+                    "approval": {
+                        "origin_available": row[3] is not None,
+                        "thread_id": row[3], "turn_number": int(row[4]),
+                    },
+                }
+                for row in rows
+            ],
+        }
+
     def create_source_library(
         self,
         library_key: str,
@@ -3360,6 +3601,23 @@ class Storage:
                 (thread_id,),
             )
             connection.execute(
+                "UPDATE project_promotion_requests SET status = 'CANCELLED' "
+                "WHERE proposed_thread_id = ? AND status = 'PENDING'",
+                (thread_id,),
+            )
+            connection.execute(
+                "UPDATE project_promotion_requests SET proposed_thread_id = NULL WHERE proposed_thread_id = ?",
+                (thread_id,),
+            )
+            connection.execute(
+                "UPDATE project_promotion_requests SET decision_thread_id = NULL WHERE decision_thread_id = ?",
+                (thread_id,),
+            )
+            connection.execute(
+                "UPDATE project_playbook_versions SET approval_thread_id = NULL WHERE approval_thread_id = ?",
+                (thread_id,),
+            )
+            connection.execute(
                 "DELETE FROM profile_tool_operations WHERE origin_thread_id = ?", (thread_id,)
             )
             connection.execute("DELETE FROM analysis_tool_outputs WHERE thread_id = ?", (thread_id,))
@@ -3560,9 +3818,22 @@ def _retire_empty_obsolete_phase6_revision_table(connection: sqlite3.Connection)
     connection.execute("DROP TABLE library_source_revisions")
 
 
+def _upgrade_empty_playbook_approval_origin_schema(connection: sqlite3.Connection) -> None:
+    """Permit thread deletion before Phase 6 has created any real playbook data."""
+    columns = connection.execute("PRAGMA table_info(project_playbook_versions)").fetchall()
+    approval = next((row for row in columns if row[1] == "approval_thread_id"), None)
+    if approval is None or not approval[3]:
+        return
+    if connection.execute("SELECT COUNT(*) FROM project_playbook_versions").fetchone()[0]:
+        raise RuntimeError("playbook approval-origin migration requires review because playbook data exists")
+    connection.execute("DROP TABLE IF EXISTS project_playbook_rules")
+    connection.execute("DROP TABLE project_playbook_versions")
+
+
 def _initialize_phase6_schema(connection: sqlite3.Connection) -> None:
     """Add Phase 6 tables without rewriting accepted Phase 1–5 records."""
     _retire_empty_obsolete_phase6_revision_table(connection)
+    _upgrade_empty_playbook_approval_origin_schema(connection)
     connection.executescript(
         """
         CREATE TABLE IF NOT EXISTS strategy_projects (
@@ -3718,7 +3989,7 @@ def _initialize_phase6_schema(connection: sqlite3.Connection) -> None:
             id INTEGER PRIMARY KEY,
             project_id INTEGER NOT NULL REFERENCES strategy_projects(id),
             version INTEGER NOT NULL CHECK(version > 0),
-            approval_thread_id INTEGER NOT NULL REFERENCES threads(id),
+            approval_thread_id INTEGER REFERENCES threads(id),
             approval_turn_number INTEGER NOT NULL CHECK(approval_turn_number > 0),
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             UNIQUE(project_id, version)
@@ -3749,6 +4020,18 @@ def _initialize_phase6_schema(connection: sqlite3.Connection) -> None:
         BEFORE UPDATE OF project_id, kind, status, summary, provenance, supersedes_record_id
         ON project_research_records
         BEGIN SELECT RAISE(ABORT, 'project research records are immutable'); END;
+        CREATE TRIGGER IF NOT EXISTS project_playbook_rules_are_immutable
+        BEFORE UPDATE ON project_playbook_rules
+        BEGIN SELECT RAISE(ABORT, 'playbook rules are immutable'); END;
+        CREATE TRIGGER IF NOT EXISTS project_playbook_rules_cannot_delete
+        BEFORE DELETE ON project_playbook_rules
+        BEGIN SELECT RAISE(ABORT, 'playbook rules are immutable'); END;
+        CREATE TRIGGER IF NOT EXISTS project_playbook_versions_are_immutable
+        BEFORE UPDATE OF project_id, version, approval_turn_number, created_at ON project_playbook_versions
+        BEGIN SELECT RAISE(ABORT, 'playbook versions are immutable'); END;
+        CREATE TRIGGER IF NOT EXISTS project_playbook_versions_cannot_delete
+        BEFORE DELETE ON project_playbook_versions
+        BEGIN SELECT RAISE(ABORT, 'playbook versions are immutable'); END;
         """
     )
     thread_columns = {row[1] for row in connection.execute("PRAGMA table_info(threads)")}

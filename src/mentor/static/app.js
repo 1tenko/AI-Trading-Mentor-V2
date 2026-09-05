@@ -538,6 +538,7 @@ async function loadThread(threadId) {
   activeDatasetScope = thread.dataset_scope;
   updateDatasetScope();
   status.textContent = `Conversation: ${thread.title}`;
+  await refreshPromotionCards();
 }
 
 function renderTimeline(turns) {
@@ -584,6 +585,53 @@ async function createThread(title = "New conversation") {
   localStorage.setItem(ACTIVE_THREAD_KEY, String(thread.id));
   showEmpty();
   await loadThreads();
+}
+
+async function refreshPromotionCards() {
+  messages.querySelectorAll(".promotion-card").forEach((card) => card.remove());
+  if (!activeProjectId || !activeThreadId) return;
+  const projectId = activeProjectId;
+  const threadId = activeThreadId;
+  const response = await fetch(`/api/projects/${projectId}/roadmap`);
+  if (!response.ok || projectId !== activeProjectId || threadId !== activeThreadId) return;
+  const roadmap = await response.json();
+  roadmap.pending_promotions.forEach((promotion) => messages.append(promotionCard(projectId, promotion)));
+}
+
+function promotionCard(projectId, promotion) {
+  const card = document.createElement("section");
+  card.className = "inline-card promotion-card";
+  const heading = document.createElement("strong");
+  heading.textContent = `Promotion #${promotion.id}`;
+  const rule = document.createElement("p");
+  rule.textContent = promotion.proposed_rule;
+  const approve = document.createElement("button");
+  approve.type = "button";
+  approve.textContent = "Approve rule";
+  const reject = document.createElement("button");
+  reject.type = "button";
+  reject.textContent = "Reject";
+  approve.addEventListener("click", () => decidePromotion(projectId, promotion.id, "approve", card).catch((error) => { status.textContent = error.message; }));
+  reject.addEventListener("click", () => decidePromotion(projectId, promotion.id, "reject", card).catch((error) => { status.textContent = error.message; }));
+  card.append(heading, rule, approve, reject);
+  return card;
+}
+
+async function decidePromotion(projectId, promotionId, decision, card) {
+  card.querySelectorAll("button").forEach((button) => { button.disabled = true; });
+  const response = await fetch(`/api/projects/${projectId}/promotion-requests/${promotionId}/${decision}`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      ...(decision === "approve" ? { "X-Idempotency-Key": `promotion:${promotionId}` } : {}),
+    },
+    body: JSON.stringify({ expected_status: "PENDING" }),
+  });
+  if (!response.ok) {
+    card.querySelectorAll("button").forEach((button) => { button.disabled = false; });
+    throw new Error((await response.json()).error || "Could not update this playbook proposal.");
+  }
+  card.replaceChildren(document.createTextNode(decision === "approve" ? "Rule approved." : "Proposal rejected."));
 }
 
 async function loadDatasets() {
@@ -1038,6 +1086,7 @@ async function sendMessage(text, showUser = true, includeApprovedNotes = false, 
       showDiagnostics(answer.diagnostics);
       if (answer.incomplete_reason) showIncomplete(answer, mentor);
     }
+    await refreshPromotionCards();
     await loadThreads();
     status.textContent = "";
   } catch (error) {

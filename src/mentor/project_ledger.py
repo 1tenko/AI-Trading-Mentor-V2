@@ -80,6 +80,87 @@ class ProjectLedgerService:
     def ledger(self, project_id: int) -> list[dict[str, object]]:
         return self.storage.project_research_records(project_id)
 
+    def create_promotion_request(
+        self,
+        project_id: int,
+        provisional_rule_id: int,
+        proposed_rule: str,
+        *,
+        proposed_thread_id: int,
+        proposed_turn_number: int,
+        shown_turn_number: int,
+    ) -> dict[str, object]:
+        self._require_active_project(project_id)
+        proposed_rule = _text(proposed_rule, 2_000, "proposed rule")
+        if any(type(value) is not int or value < 1 for value in (
+            provisional_rule_id, proposed_thread_id, proposed_turn_number, shown_turn_number,
+        )):
+            raise ValueError("promotion identifiers are invalid")
+        return self.storage.create_project_promotion_request(
+            project_id=project_id, provisional_rule_id=provisional_rule_id,
+            proposed_rule=proposed_rule, proposed_thread_id=proposed_thread_id,
+            proposed_turn_number=proposed_turn_number, shown_turn_number=shown_turn_number,
+        )
+
+    def approve_promotion(
+        self,
+        project_id: int,
+        promotion_id: int,
+        *,
+        expected_status: str,
+        idempotency_key: str,
+        decision_thread_id: int,
+        decision_turn_number: int,
+    ) -> dict[str, object]:
+        if expected_status != "PENDING":
+            raise ValueError("expected promotion status must be PENDING")
+        _text(idempotency_key, 128, "idempotency key")
+        if any(type(value) is not int or value < 1 for value in (promotion_id, decision_thread_id, decision_turn_number)):
+            raise ValueError("promotion approval identifiers are invalid")
+        promotion = self.storage.project_promotion_request(project_id, promotion_id)
+        if promotion is None:
+            raise LookupError("promotion request not found")
+        if promotion["status"] != "APPROVED":
+            self._require_active_project(project_id)
+        return self.storage.approve_project_promotion(
+            project_id=project_id, promotion_id=promotion_id,
+            decision_thread_id=decision_thread_id, decision_turn_number=decision_turn_number,
+        )
+
+    def reject_promotion(
+        self,
+        project_id: int,
+        promotion_id: int,
+        *,
+        expected_status: str,
+        decision_thread_id: int,
+        decision_turn_number: int,
+    ) -> dict[str, object]:
+        self._require_active_project(project_id)
+        if expected_status != "PENDING":
+            raise ValueError("expected promotion status must be PENDING")
+        if any(type(value) is not int or value < 1 for value in (
+            promotion_id, decision_thread_id, decision_turn_number,
+        )):
+            raise ValueError("promotion rejection identifiers are invalid")
+        return self.storage.reject_project_promotion(
+            project_id, promotion_id,
+            decision_thread_id=decision_thread_id, decision_turn_number=decision_turn_number,
+        )
+
+    def playbook(self, project_id: int) -> dict[str, object]:
+        return self.storage.project_playbook(project_id)
+
+    def pending_promotions(self, project_id: int) -> list[dict[str, object]]:
+        return self.storage.pending_project_promotions(project_id)
+
+    def _require_active_project(self, project_id: int) -> None:
+        project = self.storage.project(project_id)
+        if project is None:
+            raise LookupError("project not found")
+        if project.status is ProjectStatus.ARCHIVED:
+            raise ValueError("archived projects cannot change playbook state")
+
 
 def _text(value: object, limit: int, label: str) -> str:
     if not isinstance(value, str) or not (value := " ".join(value.split())) or len(value) > limit:

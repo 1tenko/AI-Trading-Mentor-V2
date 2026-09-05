@@ -378,6 +378,86 @@ def test_project_research_tool_records_a_typed_hypothesis_in_the_owning_ledger(t
     assert any(item.get("name") == "record_project_research" for item in storage.replay_items(thread_id))
 
 
+def _chat_pending_promotion(storage, project_id, thread_id):
+    from mentor.project_ledger import ProjectLedgerService
+    ledger = ProjectLedgerService(storage)
+    finding = ledger.record_research(
+        project_id, kind="PROJECT_FINDING", status="VALIDATED", summary="Setup A has sufficient evidence.",
+        provenance="AI_INTERPRETATION", origin_thread_id=thread_id, origin_turn_number=1,
+    )
+    return ledger.record_research(
+        project_id, kind="PROVISIONAL_RULE", status="VALIDATED", summary="Trade setup A only before noon.",
+        provenance="AI_RECOMMENDATION", origin_thread_id=thread_id, origin_turn_number=1,
+        supersedes_record_id=finding["id"],
+    )
+
+
+def test_exact_immediately_following_chat_approval_adopts_the_sole_shown_promotion(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    project = storage.create_project("GxT")
+    thread_id = storage.create_thread("Project", behavior=ThreadSourceBehavior.PROJECT, project_id=project.id)
+    rule = _chat_pending_promotion(storage, project.id, thread_id)
+    responses = SequenceResponses(
+        SimpleNamespace(status="completed", output=[{
+            "type": "function_call", "call_id": "promotion-1", "name": "propose_playbook_promotion",
+            "arguments": json.dumps({"provisional_rule_id": rule["id"], "proposed_rule": rule["summary"]}),
+        }]),
+        terminal_response("Promotion #1 is ready for your decision."),
+        terminal_response("Promotion #1 is now adopted as playbook version 1."),
+    )
+    service = ChatService(storage, SimpleNamespace(responses=responses))
+
+    service.reply(thread_id, "Propose that validated rule for my playbook.")
+    service.reply(thread_id, "approve promotion #1")
+
+    assert storage.project_playbook(project.id)["version"] == 1
+    assert storage.project_promotion_request(project.id, 1)["status"] == "APPROVED"
+
+
+def test_generic_acknowledgement_never_approves_a_pending_playbook_rule(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    project = storage.create_project("GxT")
+    thread_id = storage.create_thread("Project", behavior=ThreadSourceBehavior.PROJECT, project_id=project.id)
+    rule = _chat_pending_promotion(storage, project.id, thread_id)
+    from mentor.project_ledger import ProjectLedgerService
+    ProjectLedgerService(storage).create_promotion_request(
+        project.id, rule["id"], rule["summary"], proposed_thread_id=thread_id,
+        proposed_turn_number=1, shown_turn_number=1,
+    )
+    responses = FakeResponses(terminal_response("What would you like to do next?"))
+
+    ChatService(storage, SimpleNamespace(responses=responses)).reply(thread_id, "sure")
+
+    assert storage.project_playbook(project.id)["version"] == 0
+    assert storage.project_promotion_request(project.id, 1)["status"] == "PENDING"
+
+
+def test_exact_chat_approval_is_rejected_after_an_intervening_turn(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    project = storage.create_project("GxT")
+    thread_id = storage.create_thread("Project", behavior=ThreadSourceBehavior.PROJECT, project_id=project.id)
+    rule = _chat_pending_promotion(storage, project.id, thread_id)
+    responses = SequenceResponses(
+        SimpleNamespace(status="completed", output=[{
+            "type": "function_call", "call_id": "promotion-1", "name": "propose_playbook_promotion",
+            "arguments": json.dumps({"provisional_rule_id": rule["id"], "proposed_rule": rule["summary"]}),
+        }]),
+        terminal_response("Promotion #1 is ready."),
+        terminal_response("It remains pending."),
+    )
+    service = ChatService(storage, SimpleNamespace(responses=responses))
+    service.reply(thread_id, "Propose that rule.")
+    service.reply(thread_id, "not yet")
+
+    with pytest.raises(ValueError, match="immediately preceding"):
+        service.reply(thread_id, "approve promotion #1")
+
+    assert storage.project_playbook(project.id)["version"] == 0
+
+
 def source_response(text, annotations, *, status="completed", usage=None):
     return SimpleNamespace(
         status=status,

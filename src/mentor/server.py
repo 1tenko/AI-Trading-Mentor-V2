@@ -133,7 +133,12 @@ class _Handler(BaseHTTPRequestHandler):
         roadmap_match = re.fullmatch(r"/api/projects/(\d+)/roadmap", path)
         if roadmap_match:
             try:
-                roadmap = ProjectService(self.storage).roadmap(int(roadmap_match.group(1)))
+                project_id = int(roadmap_match.group(1))
+                roadmap = ProjectService(self.storage).roadmap(project_id)
+                roadmap["pending_promotions"] = [
+                    {"id": item["id"], "proposed_rule": item["proposed_rule"]}
+                    for item in ProjectLedgerService(self.storage).pending_promotions(project_id)
+                ]
             except LookupError:
                 self._send_json(HTTPStatus.NOT_FOUND, {"error": "Project not found."})
                 return
@@ -147,6 +152,15 @@ class _Handler(BaseHTTPRequestHandler):
                 self._send_json(HTTPStatus.NOT_FOUND, {"error": "Project not found."})
                 return
             self._send_json(HTTPStatus.OK, {"records": records})
+            return
+        playbook_match = re.fullmatch(r"/api/projects/(\d+)/playbook", path)
+        if playbook_match:
+            try:
+                playbook = ProjectLedgerService(self.storage).playbook(int(playbook_match.group(1)))
+            except LookupError:
+                self._send_json(HTTPStatus.NOT_FOUND, {"error": "Project not found."})
+                return
+            self._send_json(HTTPStatus.OK, playbook)
             return
         match = re.fullmatch(r"/api/sources/([^/]+)", path)
         if match and FILE_ID.fullmatch(unquote(match.group(1))):
@@ -190,6 +204,38 @@ class _Handler(BaseHTTPRequestHandler):
                 self._attach_dataset(int(attachment_match.group(1)))
                 return
             body = self._json_body()
+            promotion_match = re.fullmatch(
+                r"/api/projects/(\d+)/promotion-requests/(\d+)/(approve|reject)", path
+            )
+            if promotion_match:
+                _only_fields(body, {"expected_status"})
+                project_id, promotion_id = int(promotion_match.group(1)), int(promotion_match.group(2))
+                ledger = ProjectLedgerService(self.storage)
+                if promotion_match.group(3) == "approve":
+                    idempotency_key = self.headers.get("X-Idempotency-Key")
+                    if not isinstance(idempotency_key, str) or not idempotency_key.strip():
+                        raise ValueError("An idempotency key is required for approval.")
+                    promotion = self.storage.project_promotion_request(project_id, promotion_id)
+                    if promotion is None:
+                        raise LookupError("promotion request not found")
+                    result = ledger.approve_promotion(
+                        project_id, promotion_id, expected_status=body.get("expected_status"),
+                        idempotency_key=idempotency_key,
+                        decision_thread_id=promotion["proposed_thread_id"],
+                        decision_turn_number=promotion["shown_turn_number"],
+                    )
+                    self._send_json(HTTPStatus.CREATED, result)
+                else:
+                    promotion = self.storage.project_promotion_request(project_id, promotion_id)
+                    if promotion is None:
+                        raise LookupError("promotion request not found")
+                    result = ledger.reject_promotion(
+                        project_id, promotion_id, expected_status=body.get("expected_status"),
+                        decision_thread_id=promotion["proposed_thread_id"],
+                        decision_turn_number=promotion["shown_turn_number"],
+                    )
+                    self._send_json(HTTPStatus.OK, result)
+                return
             if path == "/api/threads":
                 _only_fields(body, {"title", "mode"})
                 if body.get("mode", "general") != "general":

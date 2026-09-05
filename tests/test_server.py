@@ -196,6 +196,7 @@ def test_project_roadmap_endpoint_returns_only_the_owning_project_state(tmp_path
         assert json.loads(body) == {
             "objective": None, "experiment": None, "blockers": [],
             "next_action": "Define one setup", "mastery": [], "recent_research": [],
+            "pending_promotions": [],
         }
         missing, _headers, _body = request(server, "GET", "/api/projects/999/roadmap")
         assert missing == 404
@@ -223,6 +224,96 @@ def test_project_ledger_endpoint_is_project_local_and_safe(tmp_path):
         payload = json.loads(body)
         assert payload["records"][0]["summary"] == "Test session alignment"
         assert "path" not in json.dumps(payload).casefold()
+    finally:
+        server.shutdown()
+        worker.join()
+
+
+def test_promotion_approval_endpoint_requires_expected_state_and_idempotency_key(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    project = storage.create_project("GxT")
+    thread = ProjectService(storage).create_project_thread(project.id, "Project")
+    finding = ProjectLedgerService(storage).record_research(
+        project.id, kind="PROJECT_FINDING", status="VALIDATED", summary="Validated finding",
+        provenance="AI_INTERPRETATION", origin_thread_id=thread.id, origin_turn_number=1,
+    )
+    rule = ProjectLedgerService(storage).record_research(
+        project.id, kind="PROVISIONAL_RULE", status="VALIDATED", summary="Adopt this bounded rule",
+        provenance="AI_RECOMMENDATION", origin_thread_id=thread.id, origin_turn_number=1,
+        supersedes_record_id=finding["id"],
+    )
+    promotion = ProjectLedgerService(storage).create_promotion_request(
+        project.id, rule["id"], rule["summary"], proposed_thread_id=thread.id,
+        proposed_turn_number=1, shown_turn_number=1,
+    )
+    server = create_server(storage, FakeChatService(), port=0)
+    worker = threading.Thread(target=server.serve_forever)
+    worker.start()
+    try:
+        missing_key, _headers, _body = request(
+            server, "POST", f"/api/projects/{project.id}/promotion-requests/{promotion['id']}/approve",
+            json.dumps({"expected_status": "PENDING"}).encode(),
+        )
+        assert missing_key == 400
+        status, _headers, body = request(
+            server, "POST", f"/api/projects/{project.id}/promotion-requests/{promotion['id']}/approve",
+            json.dumps({"expected_status": "PENDING"}).encode(), headers={"X-Idempotency-Key": "approve-ui-1"},
+        )
+        assert status == 201
+        assert json.loads(body)["playbook_version"] == 1
+        again, _headers, _body = request(
+            server, "POST", f"/api/projects/{project.id}/promotion-requests/{promotion['id']}/approve",
+            json.dumps({"expected_status": "PENDING"}).encode(), headers={"X-Idempotency-Key": "approve-ui-1"},
+        )
+        assert again == 201
+        playbook_status, _headers, playbook_body = request(server, "GET", f"/api/projects/{project.id}/playbook")
+        assert playbook_status == 200
+        assert json.loads(playbook_body)["version"] == 1
+    finally:
+        server.shutdown()
+        worker.join()
+
+
+def test_project_roadmap_exposes_pending_promotion_for_approve_or_reject_card(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    project = storage.create_project("GxT")
+    thread = ProjectService(storage).create_project_thread(project.id, "Project")
+    finding = ProjectLedgerService(storage).record_research(
+        project.id, kind="PROJECT_FINDING", status="VALIDATED", summary="Validated finding",
+        provenance="AI_INTERPRETATION", origin_thread_id=thread.id, origin_turn_number=1,
+    )
+    rule = ProjectLedgerService(storage).record_research(
+        project.id, kind="PROVISIONAL_RULE", status="VALIDATED", summary="Adopt this bounded rule",
+        provenance="AI_RECOMMENDATION", origin_thread_id=thread.id, origin_turn_number=1,
+        supersedes_record_id=finding["id"],
+    )
+    promotion = ProjectLedgerService(storage).create_promotion_request(
+        project.id, rule["id"], rule["summary"], proposed_thread_id=thread.id,
+        proposed_turn_number=1, shown_turn_number=1,
+    )
+    server = create_server(storage, FakeChatService(), port=0)
+    worker = threading.Thread(target=server.serve_forever)
+    worker.start()
+    try:
+        status, _, body = request(server, "GET", f"/api/projects/{project.id}/roadmap")
+        assert status == 200
+        assert json.loads(body)["pending_promotions"] == [{
+            "id": promotion["id"], "proposed_rule": "Adopt this bounded rule",
+        }]
+
+        _, _, script = request(server, "GET", "/app.js")
+        assert b"Approve rule" in script
+        assert b"Reject" in script
+        assert b"X-Idempotency-Key" in script
+        rejected, _, rejected_body = request(
+            server, "POST", f"/api/projects/{project.id}/promotion-requests/{promotion['id']}/reject",
+            json.dumps({"expected_status": "PENDING"}).encode(),
+        )
+        assert rejected == 200
+        assert json.loads(rejected_body)["status"] == "REJECTED"
+        assert ProjectLedgerService(storage).playbook(project.id)["version"] == 0
     finally:
         server.shutdown()
         worker.join()

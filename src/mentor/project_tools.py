@@ -11,7 +11,9 @@ from mentor.storage import Storage
 MASTERY_STATUSES = frozenset({
     "NOT_STARTED", "LEARNING", "OPERATIONALIZING", "TESTING", "PROVISIONAL", "VALIDATED"
 })
-PROJECT_TOOL_NAMES = frozenset({"update_project_state", "update_project_mastery", "record_project_research"})
+PROJECT_TOOL_NAMES = frozenset({
+    "update_project_state", "update_project_mastery", "record_project_research", "propose_playbook_promotion"
+})
 PROJECT_TOOLS = [
     {
         "type": "function", "name": "update_project_state", "strict": True,
@@ -63,6 +65,18 @@ PROJECT_TOOLS = [
             ],
         },
     },
+    {
+        "type": "function", "name": "propose_playbook_promotion", "strict": True,
+        "description": "Create a pending playbook proposal for Theo to approve or reject; never adopts the rule.",
+        "parameters": {
+            "type": "object", "additionalProperties": False,
+            "properties": {
+                "provisional_rule_id": {"type": "integer"},
+                "proposed_rule": {"type": "string"},
+            },
+            "required": ["provisional_rule_id", "proposed_rule"],
+        },
+    },
 ]
 
 
@@ -83,6 +97,21 @@ class ProjectToolDispatcher:
             raise ValueError("project tool arguments are invalid") from None
         if not isinstance(arguments, dict):
             raise ValueError("project tool arguments are invalid")
+        if name == "propose_playbook_promotion":
+            if set(arguments) != {"provisional_rule_id", "proposed_rule"}:
+                raise ValueError("promotion arguments are invalid")
+            promotion = ProjectLedgerService(self.storage).create_promotion_request(
+                thread.project_id,
+                arguments["provisional_rule_id"],
+                arguments["proposed_rule"],
+                proposed_thread_id=thread_id,
+                proposed_turn_number=origin_turn_number,
+                shown_turn_number=origin_turn_number,
+            )
+            return {
+                "status": "pending_user_approval", "promotion_id": promotion["id"],
+                "proposed_rule": promotion["proposed_rule"],
+            }
         if name == "record_project_research":
             if set(arguments) != {
                 "kind", "status", "summary", "provenance", "analysis_evidence_id", "supersedes_record_id"
