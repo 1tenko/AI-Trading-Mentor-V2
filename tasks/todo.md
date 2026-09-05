@@ -395,6 +395,6 @@ review, and present the human quality gate without beginning Phase 6.
 
 - [x] Task 10 — Chat-first project navigation, source controls, and browser folder import.
 - [x] Task 11 — Compact Roadmap, research history, and playbook inspection (66 focused tests; desktop/390px browser review).
-- [ ] Task 12 — Synthetic contract/behavioral proof, regressions, and human-gate package.
-- [ ] Checkpoint C — Full deterministic/live/browser/privacy review and clean pushed branch.
+- [x] Task 12 — Synthetic contract/behavioral proof, regressions, and human-gate package.
+- [x] Checkpoint C — 470 deterministic tests; synthetic live/browser/privacy review passed; clean pushed branch.
 - [ ] Theo human quality gate — stop before Phase 7.
