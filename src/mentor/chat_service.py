@@ -64,7 +64,8 @@ EXACT_SOURCE_REQUEST = re.compile(
     re.IGNORECASE,
 )
 CLOCK_TIME = re.compile(
-    r"(?<!\d)(\d{1,2}):(\d{2})(?:\s*[-\u2013\u2014]\s*(\d{1,2}):(\d{2}))?(?!\d)"
+    r"(?<!\d)(?:(\d{1,2}):)?(\d{1,2}):(\d{2})"
+    r"(?:\s*[-\u2013\u2014]\s*(?:(\d{1,2}):)?(\d{1,2}):(\d{2}))?(?!\d)"
 )
 EVIDENCE_TIME_RANGE = re.compile(r"\[(\d+(?:\.\d+)?)\s*(?:-->|\u2192)\s*(\d+(?:\.\d+)?)\]")
 CITATION_REPAIR_INSTRUCTION = """Citation repair: the immediately preceding draft contains
@@ -464,8 +465,12 @@ class ChatService:
         if _field(response, "status") != "completed" or not (needs_citation_repair or needs_timestamp_repair):
             return response, draft_output, None
         repair_instructions = f"{request['instructions']}\n\n{CITATION_REPAIR_INSTRUCTION}"
+        raw_tools = _raw_file_search_tools(request["tools"])
         if needs_timestamp_repair:
-            repair_instructions = f"{repair_instructions}\n\n{EXACT_TIMESTAMP_REPAIR_INSTRUCTION}"
+            repair_instructions = f"{repair_instructions}\n\n{EXACT_TIMESTAMP_REPAIR_INSTRUCTION}" if raw_tools else (
+                f"{repair_instructions}\n\nUse only the completed mentor-library raw research passages already supplied "
+                "in this request to repair the timestamp. If they do not support an exact timestamp, withhold it."
+            )
         repair_history = _qualitative_historic_items(draft_output) if qualitative_exchange else draft_output
         repair_request = {
             **request,
@@ -478,9 +483,9 @@ class ChatService:
                     "content": [{"type": "input_text", "text": "Please repair the citations now."}],
                 },
             ],
-            "tools": _raw_file_search_tools(request["tools"]),
+            "tools": raw_tools,
         }
-        if needs_timestamp_repair:
+        if needs_timestamp_repair and raw_tools:
             repair_request["tool_choice"] = {"type": "file_search"}
         repaired = self._responses_create(repair_request, "citation_repair")
         return repaired, [*draft_output, *(_as_dict(item) for item in repaired.output)], response
@@ -1084,7 +1089,9 @@ class ChatService:
                 f"{json.dumps(roadmap, separators=(',', ':'))}. "
                 "Use the project tools only to record an objective, experiment, blocker, exact next action, or "
                 "controlled mastery/research state established in this conversation. You may propose a validated rule "
-                "for promotion, but never claim it is adopted until Theo's exact approval action succeeds."
+                "for promotion, but never claim it is adopted until Theo's exact approval action succeeds. When an "
+                "active experiment and next action are recorded, keep the recorded next action stable by default and "
+                "explain the evidence-discipline reason for pushback against premature switching; Theo may explicitly override it."
                 f"{_project_source_instruction(project_source_scope, source_plan)}"
             )
         return user_item, {
@@ -1635,8 +1642,10 @@ def _has_unsupported_exact_timestamp(question: str, answer: Answer) -> bool:
         return False
     timestamps = []
     for match in CLOCK_TIME.finditer(answer.text):
-        start = int(match.group(1)) * 60 + int(match.group(2))
-        end = start if match.group(3) is None else int(match.group(3)) * 60 + int(match.group(4))
+        start = (int(match.group(1) or 0) * 60 + int(match.group(2))) * 60 + int(match.group(3))
+        end = start if match.group(5) is None else (
+            (int(match.group(4) or 0) * 60 + int(match.group(5))) * 60 + int(match.group(6))
+        )
         timestamps.append((start, end))
     if not timestamps:
         return False
@@ -1817,10 +1826,10 @@ def _estimate_text_cost(
         return None
     uncached_input = max(input_tokens - (cached_input_tokens or 0) - cache_write_tokens, 0)
     estimate = (
-        uncached_input * 5 / 1_000_000
-        + (cached_input_tokens or 0) * 0.5 / 1_000_000
-        + cache_write_tokens * 6.25 / 1_000_000
-        + output_tokens * 30 / 1_000_000
+        uncached_input * 4 / 1_000_000
+        + (cached_input_tokens or 0) * 0.4 / 1_000_000
+        + cache_write_tokens * 5 / 1_000_000
+        + output_tokens * 20 / 1_000_000
     )
     return round(estimate, 6)
 

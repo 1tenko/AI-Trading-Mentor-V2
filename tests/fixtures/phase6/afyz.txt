@@ -1,2 +1,3 @@
 Synthetic Afyz source
 [00:00:01 --> 00:00:08] Afyz teaches that synthetic setup A requires shared condition SHARED_X and Afyz-only condition AFYZ_ONLY_Y.
+[00:00:10 --> 00:00:18] For synthetic scenario Beta, Afyz explicitly teaches AFYZ_RULE_B instead of GARRETT_RULE_A.

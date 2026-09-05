@@ -1,0 +1,2 @@
+Synthetic Garrett Advanced source
+[60.0 --> 68.0] Garrett's current Advanced formulation retains FOUNDATION_CORE and adds ADVANCED_QUALIFIER. The exact timestamped rule is TIMESTAMP_RULE.

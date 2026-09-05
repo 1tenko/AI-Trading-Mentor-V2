@@ -147,3 +147,13 @@ def test_garrett_currentness_is_a_library_internal_hint_not_global_priority(tmp_
 
     assert scope.garrett_current_first is True
     assert scope.library_keys == ("gxt.afyz", "gxt.erik", "gxt.garrett")
+
+
+def test_exact_project_timestamp_request_always_plans_source_research(tmp_path):
+    storage, _, thread_id, _ = _project_with_libraries(tmp_path, ("gxt.garrett",))
+    question = "Where exactly does Garrett state TIMESTAMP_RULE? Give the timestamp."
+    scope = resolve_source_scope(storage, storage.thread_context(thread_id), question)
+
+    assert research_plan(scope, question, "normal") == (
+        SearchPass("gxt.garrett", 1, 8),
+    )

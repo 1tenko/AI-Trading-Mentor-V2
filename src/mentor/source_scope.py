@@ -34,7 +34,7 @@ _COMPARE = re.compile(
 _ALL_ENABLED = re.compile(r"^\s*use\s+all\s+enabled\s+mentors\s+again[.!?]?\s*$", re.IGNORECASE)
 _CURRENT_GARRETT = re.compile(r"\bgarrett\b.*\b(?:current|currently|now)\b|\b(?:current|currently)\b.*\bgarrett\b", re.IGNORECASE)
 _SOURCE_INTENT = re.compile(
-    r"\b(?:gxt|mentor|source|teach|teaching|explain|compare|comparison|concept|model|system|according)\b",
+    r"\b(?:gxt|mentor|source|teach|teaching|explain|compare|comparison|concept|model|system|according|timestamp|video)\b",
     re.IGNORECASE,
 )
 

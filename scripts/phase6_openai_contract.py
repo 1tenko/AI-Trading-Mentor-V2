@@ -202,7 +202,7 @@ def main() -> int:
         totals = [_usage(response) for response in responses]
         input_tokens = sum(value[0] for value in totals)
         output_tokens = sum(value[1] for value in totals)
-        estimated_cost = input_tokens * 5 / 1_000_000 + output_tokens * 30 / 1_000_000
+        estimated_cost = input_tokens * 4 / 1_000_000 + output_tokens * 20 / 1_000_000
         audit = {
             "run_id": run_id,
             "outcome": outcome,

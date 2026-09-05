@@ -222,15 +222,19 @@ def test_qualitative_transport_continuation_supports_same_turn_timestamp_repair_
     )
     repaired = _source_response("Direct source teaching: Jacob says this at 12:10–12:36.", citation)
     responses = _SequenceResponses(draft, repaired)
+    request = {
+        "model": "fake", "input": [], "instructions": "analyse",
+        "tools": [{"type": "file_search", "vector_store_ids": ["vs_jacob"]}],
+    }
 
     continuation = continue_qualitative_model_transport(
         client=type("Client", (), {"responses": responses})(),
-        request={"model": "fake", "input": [], "instructions": "analyse", "tools": []},
+        request=request,
         call_id="call_notes", evidence=evidence,
     )
     service = ChatService(storage, type("Client", (), {"responses": responses})())
     response, evidence_output, draft_response = service._citation_repaired_response(
-        {"model": "fake", "input": [], "instructions": "analyse", "tools": []},
+        request,
         continuation,
         "Where exactly does Jacob say this? Give me the timestamp.",
     )

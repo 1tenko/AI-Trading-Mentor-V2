@@ -1,0 +1,2 @@
+Synthetic Garrett Foundation source
+[00:00:20 --> 00:00:28] Garrett's Foundation teaching defines FOUNDATION_CORE and uses GARRETT_RULE_A for synthetic setup Alpha.

@@ -1,2 +1,3 @@
 Synthetic Garrett source
 [00:00:01 --> 00:00:08] Garrett teaches that synthetic setup A requires shared condition SHARED_X.
+[00:00:10 --> 00:00:18] Garrett's archival teaching used HISTORICAL_ONLY_A. It is historical context, not proof of the current formulation.

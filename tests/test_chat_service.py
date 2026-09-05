@@ -11,6 +11,7 @@ from mentor.chat_service import (
     FILE_SEARCH_RESULT_BUDGETS,
     _input_item,
     _effective_research_depth,
+    _estimate_text_cost,
     _profile_context_mode,
 )
 from mentor.prompts import ANALYSIS_TOOL_INSTRUCTIONS, MENTOR_INSTRUCTIONS, PROFILE_TOOL_INSTRUCTIONS
@@ -53,6 +54,10 @@ class ModelDumpUsage:
             "output_tokens_details": {"reasoning_tokens": 12, "ignored": 99},
             "prompt": "must never be projected",
         }
+
+
+def test_sol_cost_projection_uses_current_standard_api_rates():
+    assert _estimate_text_cost("gpt-5.6-sol", 1_000, 200, 100, 1_000) == 0.02338
 
 
 def test_neutral_general_has_no_file_search_and_does_not_require_jacob_store(tmp_path):
@@ -301,6 +306,40 @@ def test_project_research_keeps_no_result_as_scoped_absence_not_a_fabricated_dis
     assert answer.diagnostics.mentor_search_calls == {"gxt.afyz": 1, "gxt.garrett": 1}
 
 
+def test_project_exact_timestamp_repair_reuses_serial_raw_evidence_without_invalid_tool_choice(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    project = storage.create_project("GxT")
+    thread_id = storage.create_thread(
+        "Project", behavior=ThreadSourceBehavior.PROJECT, project_id=project.id
+    )
+    _add_project_library(
+        storage, project.id, "gxt.garrett", "vs_garrett", file_id="file_garrett"
+    )
+    research = _project_source_response(
+        "gxt.garrett", "file_garrett",
+        "[60.0 --> 68.0] Garrett states TIMESTAMP_RULE.",
+    )
+    responses = SequenceResponses(
+        research,
+        terminal_response("Direct source teaching: Garrett states TIMESTAMP_RULE at 00:02:00."),
+        terminal_response(
+            "Direct source teaching: Garrett states TIMESTAMP_RULE at 00:01:00-00:01:08."
+        ),
+    )
+
+    answer = ChatService(storage, SimpleNamespace(responses=responses)).reply(
+        thread_id, "Where exactly does Garrett state TIMESTAMP_RULE? Give the timestamp."
+    )
+
+    assert answer.text.endswith("at 00:01:00-00:01:08.")
+    assert responses.calls[-1]["tools"] == []
+    assert "tool_choice" not in responses.calls[-1]
+    assert any(
+        item.get("type") == "file_search_call" for item in responses.calls[-1]["input"]
+    )
+
+
 def test_project_state_tool_updates_only_the_owning_project_and_replays_safely(tmp_path):
     storage = Storage(tmp_path / "mentor.sqlite3")
     storage.initialize()
@@ -325,6 +364,35 @@ def test_project_state_tool_updates_only_the_owning_project_and_replays_safely(t
     assert any(tool.get("name") == "update_project_state" for tool in responses.calls[0]["tools"])
     assert any(item.get("name") == "update_project_state" for item in storage.replay_items(thread_id))
     assert "Define the entry condition." in responses.calls[1]["input"][-1]["output"]
+
+
+def test_unfinished_project_context_requires_coaching_pushback_and_allows_theo_override(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    project = storage.create_project("GxT")
+    thread_id = storage.create_thread(
+        "Project", behavior=ThreadSourceBehavior.PROJECT, project_id=project.id
+    )
+    storage.apply_project_state_event(
+        project_id=project.id, event_key="experiment", kind="EXPERIMENT",
+        payload={"operation": "SET", "value": "TEST_FROZEN_ENTRY"},
+        origin_thread_id=thread_id, origin_turn_number=1,
+    )
+    storage.apply_project_state_event(
+        project_id=project.id, event_key="next", kind="NEXT_ACTION",
+        payload={"operation": "SET", "value": "LABEL_TWENTY_EXAMPLES"},
+        origin_thread_id=thread_id, origin_turn_number=1,
+    )
+    responses = FakeResponses(terminal_response("Continue LABEL_TWENTY_EXAMPLES."))
+
+    ChatService(storage, SimpleNamespace(responses=responses)).reply(
+        thread_id, "What should I do today?"
+    )
+
+    instructions = responses.calls[0]["instructions"]
+    assert "LABEL_TWENTY_EXAMPLES" in instructions
+    assert "keep the recorded next action stable" in instructions
+    assert "Theo may explicitly override" in instructions
 
 
 def test_general_request_receives_only_bounded_project_summary_not_project_tools(tmp_path):
