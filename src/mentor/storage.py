@@ -21,6 +21,7 @@ from mentor.datasets import (
     QualitativeEvidenceMetadata,
     ThreadDatasetScope,
 )
+from mentor.project_models import ProjectStatus, StrategyProject, ThreadContext, ThreadSourceBehavior
 
 
 _ANALYSIS_LIMITATION_CODES = frozenset(
@@ -1420,6 +1421,7 @@ class Storage:
                 "CREATE UNIQUE INDEX IF NOT EXISTS unique_profile_tool_call "
                 "ON trader_profile_items(tool_call_id) WHERE tool_call_id IS NOT NULL"
             )
+            _initialize_phase6_schema(connection)
             self._backfill_display_turns(connection)
 
     def set_vector_store(self, vector_store_id: str) -> None:
@@ -1503,10 +1505,99 @@ class Storage:
                 (modified_at, relative_path),
             )
 
-    def create_thread(self, title: str) -> int:
+    def create_project(self, name: str) -> StrategyProject:
+        name = " ".join(name.split())
+        if not 1 <= len(name) <= 120:
+            raise ValueError("project name is invalid")
         with self._connect() as connection:
-            cursor = connection.execute("INSERT INTO threads(title) VALUES (?)", (title,))
+            cursor = connection.execute(
+                "INSERT INTO strategy_projects(name, status) VALUES (?, 'ACTIVE')",
+                (name,),
+            )
+            row = connection.execute(
+                "SELECT id, name, status FROM strategy_projects WHERE id = ?",
+                (cursor.lastrowid,),
+            ).fetchone()
+        return StrategyProject(int(row[0]), str(row[1]), ProjectStatus(row[2]))
+
+    def project(self, project_id: int) -> StrategyProject | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT id, name, status FROM strategy_projects WHERE id = ?",
+                (project_id,),
+            ).fetchone()
+        return None if row is None else StrategyProject(int(row[0]), str(row[1]), ProjectStatus(row[2]))
+
+    def create_thread(
+        self,
+        title: str,
+        *,
+        behavior: ThreadSourceBehavior = ThreadSourceBehavior.GENERAL_NEUTRAL,
+        project_id: int | None = None,
+    ) -> int:
+        behavior = ThreadSourceBehavior(behavior)
+        if behavior is ThreadSourceBehavior.PROJECT and project_id is None:
+            raise ValueError("project thread requires a project")
+        if behavior is not ThreadSourceBehavior.PROJECT and project_id is not None:
+            raise ValueError("non-project thread cannot have a project")
+        with self._connect() as connection:
+            if project_id is not None and connection.execute(
+                "SELECT 1 FROM strategy_projects WHERE id = ?", (project_id,)
+            ).fetchone() is None:
+                raise ValueError("project does not exist")
+            cursor = connection.execute(
+                "INSERT INTO threads(title, thread_source_behavior, project_id) VALUES (?, ?, ?)",
+                (title, behavior.value, project_id),
+            )
         return int(cursor.lastrowid)
+
+    def thread_context(self, thread_id: int) -> ThreadContext | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT id, title, thread_source_behavior, project_id FROM threads WHERE id = ?",
+                (thread_id,),
+            ).fetchone()
+        return None if row is None else ThreadContext(
+            id=int(row[0]),
+            title=str(row[1]),
+            thread_source_behavior=ThreadSourceBehavior(row[2]),
+            project_id=None if row[3] is None else int(row[3]),
+        )
+
+    def phase6_table_counts(self) -> dict[str, int]:
+        tables = (
+            "strategy_projects",
+            "source_libraries",
+            "library_source_revisions",
+            "project_state_events",
+            "project_research_records",
+            "project_promotion_requests",
+            "project_playbook_versions",
+        )
+        with self._connect() as connection:
+            return {
+                table: int(connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+                for table in tables
+            }
+
+    def migrate_legacy_jacob_dry_run(self) -> dict[str, int | bool]:
+        """Inspect legacy Jacob metadata without writing or reading source bodies."""
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT local_path FROM sources ORDER BY relative_path"
+            ).fetchall()
+            configured = connection.execute(
+                "SELECT 1 FROM settings WHERE key = 'vector_store_id' AND trim(value) != ''"
+            ).fetchone() is not None
+        mappable = sum(Path(row[0]).is_file() for row in rows)
+        missing = len(rows) - mappable
+        return {
+            "legacy_source_count": len(rows),
+            "mappable_source_count": mappable,
+            "missing_local_source_count": missing,
+            "vector_store_configured": configured,
+            "has_discrepancy": bool(missing or (rows and not configured)),
+        }
 
     def threads(self) -> list[Thread]:
         with self._connect() as connection:
@@ -2872,6 +2963,214 @@ def _contains_ephemeral_qualitative_evidence(value: object) -> bool:
     if is_dataclass(value) and not isinstance(value, type):
         return any(_contains_ephemeral_qualitative_evidence(getattr(value, item.name)) for item in fields(value))
     return False
+
+
+def _initialize_phase6_schema(connection: sqlite3.Connection) -> None:
+    """Add Phase 6 tables without rewriting accepted Phase 1–5 records."""
+    connection.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS strategy_projects (
+            id INTEGER PRIMARY KEY,
+            name TEXT NOT NULL UNIQUE CHECK(length(name) BETWEEN 1 AND 120),
+            status TEXT NOT NULL CHECK(status IN ('ACTIVE', 'ARCHIVED')),
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS source_libraries (
+            id INTEGER PRIMARY KEY,
+            library_key TEXT NOT NULL UNIQUE,
+            corpus_key TEXT NOT NULL,
+            authority_name TEXT NOT NULL,
+            authority_kind TEXT NOT NULL CHECK(authority_kind IN ('MENTOR', 'USER_NOTES', 'SYSTEM')),
+            display_name TEXT NOT NULL,
+            status TEXT NOT NULL CHECK(status IN ('ACTIVE', 'ARCHIVED')),
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS project_source_libraries (
+            project_id INTEGER NOT NULL REFERENCES strategy_projects(id),
+            library_id INTEGER NOT NULL REFERENCES source_libraries(id),
+            enabled INTEGER NOT NULL CHECK(enabled IN (0, 1)),
+            PRIMARY KEY(project_id, library_id)
+        );
+        CREATE TABLE IF NOT EXISTS library_vector_stores (
+            library_id INTEGER PRIMARY KEY REFERENCES source_libraries(id),
+            vector_store_id TEXT UNIQUE,
+            state TEXT NOT NULL CHECK(state IN ('NONE', 'CREATING', 'READY', 'FAILED', 'DELETING', 'DELETED')),
+            cleanup_audit_id TEXT,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS library_sources (
+            id INTEGER PRIMARY KEY,
+            library_id INTEGER NOT NULL REFERENCES source_libraries(id),
+            source_key TEXT NOT NULL,
+            display_title TEXT NOT NULL,
+            source_type TEXT NOT NULL,
+            relative_category TEXT NOT NULL,
+            source_date TEXT,
+            timestamps_available INTEGER NOT NULL CHECK(timestamps_available IN (0, 1)),
+            UNIQUE(library_id, source_key)
+        );
+        CREATE TABLE IF NOT EXISTS library_source_revisions (
+            id INTEGER PRIMARY KEY,
+            source_id INTEGER NOT NULL REFERENCES library_sources(id),
+            sha256 TEXT NOT NULL CHECK(length(sha256) = 64 AND sha256 NOT GLOB '*[^0-9a-f]*'),
+            byte_size INTEGER NOT NULL CHECK(byte_size >= 0),
+            relative_path TEXT NOT NULL,
+            staged_path TEXT NOT NULL,
+            canonical_role TEXT CHECK(canonical_role IS NULL OR canonical_role IN (
+                'CURRENT_CANONICAL_ADVANCED',
+                'CURRENT_CANONICAL_FOUNDATION',
+                'GARRETT_ARCHIVAL_AND_COMPLEMENTARY'
+            )),
+            file_id TEXT,
+            vector_store_file_id TEXT,
+            index_state TEXT NOT NULL CHECK(index_state IN (
+                'STAGED', 'UPLOADING', 'INDEXING', 'READY', 'FAILED', 'SUPERSEDED'
+            )),
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(source_id, sha256)
+        );
+        CREATE TABLE IF NOT EXISTS library_import_batches (
+            id INTEGER PRIMARY KEY,
+            project_id INTEGER NOT NULL REFERENCES strategy_projects(id),
+            state TEXT NOT NULL CHECK(state IN (
+                'STAGING', 'READY_FOR_CONFIRMATION', 'IMPORTING', 'COMPLETE', 'FAILED', 'CANCELLED'
+            )),
+            manifest_json TEXT NOT NULL DEFAULT '{}',
+            error_code TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS thread_source_scopes (
+            thread_id INTEGER NOT NULL REFERENCES threads(id),
+            turn_number INTEGER NOT NULL CHECK(turn_number > 0),
+            scope_json TEXT NOT NULL,
+            PRIMARY KEY(thread_id, turn_number)
+        );
+        CREATE TABLE IF NOT EXISTS project_state_events (
+            id INTEGER PRIMARY KEY,
+            project_id INTEGER NOT NULL REFERENCES strategy_projects(id),
+            event_key TEXT NOT NULL UNIQUE,
+            kind TEXT NOT NULL CHECK(kind IN ('OBJECTIVE', 'EXPERIMENT', 'BLOCKER', 'NEXT_ACTION', 'MASTERY')),
+            payload_json TEXT NOT NULL,
+            origin_thread_id INTEGER REFERENCES threads(id),
+            origin_turn_number INTEGER,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            CHECK((origin_thread_id IS NULL AND origin_turn_number IS NULL) OR
+                  (origin_thread_id IS NOT NULL AND origin_turn_number > 0))
+        );
+        CREATE TABLE IF NOT EXISTS project_state_snapshots (
+            project_id INTEGER PRIMARY KEY REFERENCES strategy_projects(id),
+            objective TEXT,
+            experiment TEXT,
+            blockers_json TEXT NOT NULL DEFAULT '[]',
+            next_action TEXT,
+            updated_event_id INTEGER REFERENCES project_state_events(id),
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS project_mastery_items (
+            id INTEGER PRIMARY KEY,
+            project_id INTEGER NOT NULL REFERENCES strategy_projects(id),
+            concept TEXT NOT NULL,
+            status TEXT NOT NULL CHECK(status IN (
+                'NOT_STARTED', 'LEARNING', 'OPERATIONALIZING', 'TESTING', 'PROVISIONAL', 'VALIDATED'
+            )),
+            reason TEXT NOT NULL,
+            evidence_reference TEXT,
+            UNIQUE(project_id, concept)
+        );
+        CREATE TABLE IF NOT EXISTS project_research_records (
+            id INTEGER PRIMARY KEY,
+            project_id INTEGER NOT NULL REFERENCES strategy_projects(id),
+            kind TEXT NOT NULL CHECK(kind IN (
+                'OBSERVATION', 'HYPOTHESIS', 'OPERATIONAL_DEFINITION', 'EXPERIMENT',
+                'EMPIRICAL_FINDING', 'PROJECT_FINDING', 'LIMITATION', 'PROVISIONAL_RULE', 'USER_DECISION'
+            )),
+            status TEXT NOT NULL,
+            summary TEXT NOT NULL,
+            provenance TEXT NOT NULL,
+            origin_thread_id INTEGER REFERENCES threads(id),
+            origin_turn_number INTEGER,
+            supersedes_record_id INTEGER REFERENCES project_research_records(id),
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS project_empirical_evidence_refs (
+            id INTEGER PRIMARY KEY,
+            project_id INTEGER NOT NULL REFERENCES strategy_projects(id),
+            research_record_id INTEGER NOT NULL REFERENCES project_research_records(id),
+            original_evidence_id INTEGER NOT NULL,
+            safe_envelope_json TEXT NOT NULL,
+            origin_available INTEGER NOT NULL CHECK(origin_available IN (0, 1)),
+            UNIQUE(project_id, research_record_id, original_evidence_id)
+        );
+        CREATE TABLE IF NOT EXISTS project_promotion_requests (
+            id INTEGER PRIMARY KEY,
+            project_id INTEGER NOT NULL REFERENCES strategy_projects(id),
+            provisional_rule_id INTEGER NOT NULL REFERENCES project_research_records(id),
+            proposed_rule TEXT NOT NULL,
+            status TEXT NOT NULL CHECK(status IN ('PENDING', 'APPROVED', 'REJECTED', 'CANCELLED')),
+            proposed_thread_id INTEGER REFERENCES threads(id),
+            proposed_turn_number INTEGER NOT NULL CHECK(proposed_turn_number > 0),
+            shown_turn_number INTEGER NOT NULL CHECK(shown_turn_number > 0),
+            decision_thread_id INTEGER REFERENCES threads(id),
+            decision_turn_number INTEGER,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS one_pending_promotion_per_rule
+            ON project_promotion_requests(provisional_rule_id) WHERE status = 'PENDING';
+        CREATE TABLE IF NOT EXISTS project_playbook_versions (
+            id INTEGER PRIMARY KEY,
+            project_id INTEGER NOT NULL REFERENCES strategy_projects(id),
+            version INTEGER NOT NULL CHECK(version > 0),
+            approval_thread_id INTEGER NOT NULL REFERENCES threads(id),
+            approval_turn_number INTEGER NOT NULL CHECK(approval_turn_number > 0),
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(project_id, version)
+        );
+        CREATE TABLE IF NOT EXISTS project_playbook_rules (
+            id INTEGER PRIMARY KEY,
+            playbook_version_id INTEGER NOT NULL REFERENCES project_playbook_versions(id),
+            promotion_request_id INTEGER NOT NULL UNIQUE REFERENCES project_promotion_requests(id),
+            rule_text TEXT NOT NULL,
+            lineage_json TEXT NOT NULL
+        );
+        CREATE TRIGGER IF NOT EXISTS source_revisions_are_immutable
+        BEFORE UPDATE ON library_source_revisions
+        BEGIN SELECT RAISE(ABORT, 'source revisions are immutable'); END;
+        CREATE TRIGGER IF NOT EXISTS source_revisions_cannot_delete
+        BEFORE DELETE ON library_source_revisions
+        BEGIN SELECT RAISE(ABORT, 'source revisions are immutable'); END;
+        CREATE TRIGGER IF NOT EXISTS project_state_events_are_immutable
+        BEFORE UPDATE ON project_state_events
+        BEGIN SELECT RAISE(ABORT, 'project state events are immutable'); END;
+        """
+    )
+    thread_columns = {row[1] for row in connection.execute("PRAGMA table_info(threads)")}
+    if "thread_source_behavior" not in thread_columns:
+        connection.execute(
+            "ALTER TABLE threads ADD COLUMN thread_source_behavior TEXT NOT NULL "
+            "DEFAULT 'LEGACY_JACOB' CHECK(thread_source_behavior IN "
+            "('LEGACY_JACOB', 'GENERAL_NEUTRAL', 'PROJECT'))"
+        )
+    if "project_id" not in thread_columns:
+        connection.execute(
+            "ALTER TABLE threads ADD COLUMN project_id INTEGER REFERENCES strategy_projects(id)"
+        )
+    connection.executescript(
+        """
+        CREATE INDEX IF NOT EXISTS threads_by_project ON threads(project_id, id);
+        CREATE TRIGGER IF NOT EXISTS threads_require_valid_scope_on_insert
+        BEFORE INSERT ON threads
+        WHEN (NEW.thread_source_behavior = 'PROJECT' AND NEW.project_id IS NULL)
+          OR (NEW.thread_source_behavior != 'PROJECT' AND NEW.project_id IS NOT NULL)
+        BEGIN SELECT RAISE(ABORT, 'thread source scope is invalid'); END;
+        CREATE TRIGGER IF NOT EXISTS threads_require_valid_scope_on_update
+        BEFORE UPDATE OF thread_source_behavior, project_id ON threads
+        WHEN (NEW.thread_source_behavior = 'PROJECT' AND NEW.project_id IS NULL)
+          OR (NEW.thread_source_behavior != 'PROJECT' AND NEW.project_id IS NOT NULL)
+        BEGIN SELECT RAISE(ABORT, 'thread source scope is invalid'); END;
+        """
+    )
 
 
 def _is_safe_qualitative_audit_metadata(value: Mapping[str, object]) -> bool:
