@@ -22,6 +22,8 @@ const attachmentClarifications = document.querySelector("#attachment-clarificati
 const notesConsent = document.querySelector("#notes-consent");
 const theme = document.querySelector("#theme");
 const scopeSelector = document.querySelector("#scope-selector");
+const sourceDirectory = document.querySelector("#source-directory");
+const sourceImportReview = document.querySelector("#source-import-review");
 const SETTINGS_KEY = "trading-mentor-evaluation-settings";
 const ACTIVE_THREAD_KEY = "trading-mentor-active-thread";
 const THEME_KEY = "trading-mentor-theme";
@@ -451,6 +453,73 @@ async function createProject() {
   scopeSelector.value = String(project.id);
   renderThreads();
   await createThread();
+}
+
+async function stageSourceDirectory() {
+  if (!activeProjectId) throw new Error("Choose a Strategy Project before adding mentor transcripts.");
+  const files = [...sourceDirectory.files];
+  if (!files.length) return;
+  sourceImportReview.hidden = false;
+  sourceImportReview.textContent = "Checking transcripts locally…";
+  const createdResponse = await fetch("/api/source-imports", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ project_id: activeProjectId }),
+  });
+  if (!createdResponse.ok) throw new Error((await createdResponse.json()).error || "Could not start the source import.");
+  const batch = await createdResponse.json();
+  for (const [index, file] of files.entries()) {
+    const response = await fetch(`/api/source-imports/${batch.id}/files`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "text/plain",
+        "X-Source-Relative-Path": file.webkitRelativePath,
+        "X-Source-Import-Ordinal": String(index + 1),
+      },
+      body: file,
+    });
+    if (!response.ok) throw new Error((await response.json()).error || "One transcript could not be staged.");
+  }
+  const finalizedResponse = await fetch(`/api/source-imports/${batch.id}/finalize`, {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: "{}",
+  });
+  if (!finalizedResponse.ok) throw new Error((await finalizedResponse.json()).error || "Could not review the transcripts.");
+  renderSourceImportReview(await finalizedResponse.json());
+}
+
+function renderSourceImportReview(batch) {
+  sourceImportReview.replaceChildren();
+  const heading = document.createElement("strong");
+  heading.textContent = `${batch.file_count} transcript${batch.file_count === 1 ? "" : "s"} ready to review`;
+  const list = document.createElement("ul");
+  batch.libraries.forEach((library) => {
+    const item = document.createElement("li");
+    item.textContent = `${library.display_name}: ${library.new} new, ${library.duplicates} already added, ${library.conflicts} conflicts`;
+    list.append(item);
+  });
+  const confirm = document.createElement("button");
+  confirm.type = "button";
+  confirm.textContent = "Import transcripts";
+  confirm.disabled = batch.libraries.some((library) => library.conflicts);
+  confirm.addEventListener("click", () => confirmSourceImport(batch.id).catch((error) => {
+    sourceImportReview.textContent = error.message;
+  }));
+  const cancel = document.createElement("button");
+  cancel.type = "button";
+  cancel.textContent = "Cancel";
+  cancel.addEventListener("click", () => { sourceImportReview.hidden = true; sourceDirectory.value = ""; });
+  sourceImportReview.append(heading, list, confirm, cancel);
+}
+
+async function confirmSourceImport(batchId) {
+  sourceImportReview.textContent = "Importing transcripts…";
+  const response = await fetch(`/api/source-imports/${batchId}/confirm`, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ confirm: true }),
+  });
+  const data = await response.json();
+  if (!response.ok) throw new Error(data.error || "The transcripts could not be imported.");
+  sourceImportReview.textContent = `${data.imported} transcript${data.imported === 1 ? "" : "s"} imported.`;
+  sourceDirectory.value = "";
 }
 
 async function loadThread(threadId) {
@@ -989,6 +1058,11 @@ document.querySelector("#new-project-form").addEventListener("submit", (event) =
   event.preventDefault();
   createProject().catch((error) => { status.textContent = error.message; });
 });
+document.querySelector("#source-directory-trigger").addEventListener("click", () => sourceDirectory.click());
+sourceDirectory.addEventListener("change", () => stageSourceDirectory().catch((error) => {
+  sourceImportReview.hidden = false;
+  sourceImportReview.textContent = error.message;
+}));
 scopeSelector.addEventListener("change", () => {
   activeProjectId = scopeSelector.value === "general" ? undefined : Number(scopeSelector.value);
   activeThreadId = undefined;

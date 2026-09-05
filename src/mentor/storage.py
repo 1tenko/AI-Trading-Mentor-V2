@@ -1751,6 +1751,61 @@ class Storage:
                 "FROM sources ORDER BY relative_path"
             ).fetchall()
 
+    def create_library_import_batch(self, project_id: int) -> int:
+        with self._connect() as connection:
+            if connection.execute(
+                "SELECT 1 FROM strategy_projects WHERE id = ? AND status = 'ACTIVE'", (project_id,)
+            ).fetchone() is None:
+                raise ValueError("active project does not exist")
+            cursor = connection.execute(
+                "INSERT INTO library_import_batches(project_id, state, manifest_json) "
+                "VALUES (?, 'STAGING', ?)",
+                (project_id, json.dumps({"files": []})),
+            )
+        return int(cursor.lastrowid)
+
+    def library_import_batch(self, batch_id: int) -> tuple[int, int, str, dict, str | None] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT id, project_id, state, manifest_json, error_code "
+                "FROM library_import_batches WHERE id = ?",
+                (batch_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return int(row[0]), int(row[1]), str(row[2]), json.loads(row[3]), row[4]
+
+    def update_library_import_batch(
+        self, batch_id: int, *, state: str, manifest: dict, error_code: str | None = None
+    ) -> None:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "UPDATE library_import_batches SET state = ?, manifest_json = ?, error_code = ?, "
+                "updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (state, json.dumps(manifest), error_code, batch_id),
+            )
+        if cursor.rowcount != 1:
+            raise LookupError("source import does not exist")
+
+    def library_vector_store(self, library_id: int) -> tuple[str | None, str] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT vector_store_id, state FROM library_vector_stores WHERE library_id = ?",
+                (library_id,),
+            ).fetchone()
+        return None if row is None else (row[0], str(row[1]))
+
+    def set_library_vector_store(
+        self, library_id: int, vector_store_id: str | None, state: str
+    ) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT INTO library_vector_stores(library_id, vector_store_id, state) VALUES (?, ?, ?) "
+                "ON CONFLICT(library_id) DO UPDATE SET vector_store_id = excluded.vector_store_id, "
+                "state = excluded.state, updated_at = CURRENT_TIMESTAMP",
+                (library_id, vector_store_id, state),
+            )
+
     def create_thread(
         self,
         title: str,

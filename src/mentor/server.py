@@ -22,6 +22,7 @@ from mentor.datasets import (
 )
 from mentor.profile import QUESTIONNAIRE_FIELDS, ProfileService, ProfileValidationError
 from mentor.project_service import ProjectConflictError, ProjectService
+from mentor.source_libraries import MAX_SOURCE_BYTES, SourceImportService
 from mentor.storage import Storage
 
 LOGGER = logging.getLogger(__name__)
@@ -72,6 +73,15 @@ class _Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/projects":
             self._send_json(HTTPStatus.OK, {"projects": ProjectService(self.storage).project_summaries()})
+            return
+        source_import_match = re.fullmatch(r"/api/source-imports/(\d+)", path)
+        if source_import_match:
+            try:
+                status = self._source_import_service().import_status(int(source_import_match.group(1)))
+            except LookupError:
+                self._send_json(HTTPStatus.NOT_FOUND, {"error": "Source import not found."})
+                return
+            self._send_json(HTTPStatus.OK, status)
             return
         if path == "/api/datasets":
             self._send_json(HTTPStatus.OK, {"datasets": [_dataset_json(dataset) for dataset in self.storage.datasets()]})
@@ -152,6 +162,10 @@ class _Handler(BaseHTTPRequestHandler):
             if path == "/api/datasets/import":
                 self._import_dataset()
                 return
+            source_file_match = re.fullmatch(r"/api/source-imports/(\d+)/files", path)
+            if source_file_match:
+                self._stage_source_file(int(source_file_match.group(1)))
+                return
             attachment_match = re.fullmatch(r"/api/threads/(\d+)/attachments", path)
             if attachment_match:
                 self._attach_dataset(int(attachment_match.group(1)))
@@ -169,6 +183,30 @@ class _Handler(BaseHTTPRequestHandler):
                 _only_fields(body, {"name"})
                 project = ProjectService(self.storage).create_project(_title(body.get("name")))
                 self._send_json(HTTPStatus.CREATED, {"id": project.id, "name": project.name, "status": project.status.value})
+                return
+            if path == "/api/source-imports":
+                _only_fields(body, {"project_id"})
+                project_id = body.get("project_id")
+                if type(project_id) is not int:
+                    raise ValueError("Project must be selected.")
+                result = self._source_import_service().create_staging_import(project_id)
+                self._send_json(HTTPStatus.CREATED, result)
+                return
+            source_finalize_match = re.fullmatch(r"/api/source-imports/(\d+)/finalize", path)
+            if source_finalize_match:
+                _only_fields(body, set())
+                result = self._source_import_service().finalize_manifest(
+                    int(source_finalize_match.group(1))
+                )
+                self._send_json(HTTPStatus.OK, result)
+                return
+            source_confirm_match = re.fullmatch(r"/api/source-imports/(\d+)/confirm", path)
+            if source_confirm_match:
+                _only_fields(body, {"confirm"})
+                result = self._source_import_service().confirm_import(
+                    int(source_confirm_match.group(1)), confirm=body.get("confirm")
+                )
+                self._send_json(HTTPStatus.ACCEPTED, result)
                 return
             project_thread_match = re.fullmatch(r"/api/projects/(\d+)/threads", path)
             if project_thread_match:
@@ -321,6 +359,35 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "Source is unavailable locally."})
             return
         self._send_bytes(HTTPStatus.OK, path.read_bytes(), "text/plain; charset=utf-8")
+
+    def _source_import_service(self) -> SourceImportService:
+        return SourceImportService(
+            self.storage,
+            getattr(self.chat_service, "client", None),
+            staging_root=self.storage.database_path.parent / "source-imports",
+        )
+
+    def _stage_source_file(self, batch_id: int) -> None:
+        content_type = self.headers.get("Content-Type", "").split(";", 1)[0].strip().casefold()
+        if content_type != "text/plain":
+            raise ValueError("Source transcripts must use text/plain.")
+        relative_path = self.headers.get("X-Source-Relative-Path")
+        ordinal = self.headers.get("X-Source-Import-Ordinal")
+        content_length = self.headers.get("Content-Length")
+        if relative_path is None or ordinal is None or not ordinal.isdigit():
+            raise ValueError("Source path and import order are required.")
+        if content_length is None or not content_length.isdigit():
+            raise ValueError("A source upload body is required.")
+        length = int(content_length)
+        if not 0 < length <= MAX_SOURCE_BYTES:
+            raise ValueError("Source files must be between 1 byte and 10 MiB.")
+        content = self.rfile.read(length)
+        if len(content) != length:
+            raise ValueError("Source upload ended unexpectedly.")
+        result = self._source_import_service().stage_browser_file(
+            batch_id, relative_path, int(ordinal), content
+        )
+        self._send_json(HTTPStatus.CREATED, result)
 
     def _import_dataset(self) -> None:
         imported = self._receive_dataset_upload()

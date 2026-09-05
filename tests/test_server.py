@@ -181,6 +181,70 @@ def test_project_endpoints_create_archive_and_scope_threads(tmp_path):
         worker.join()
 
 
+def test_source_import_endpoints_stage_finalize_and_require_confirmation(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    project = storage.create_project("GxT")
+    server = create_server(storage, FakeChatService(), port=0)
+    worker = threading.Thread(target=server.serve_forever)
+    worker.start()
+    try:
+        status, _, body = request(
+            server, "POST", "/api/source-imports", json.dumps({"project_id": project.id}).encode()
+        )
+        assert status == 201
+        batch = json.loads(body)
+        source = b"private synthetic transcript"
+        status, _, body = request(
+            server,
+            "POST",
+            f"/api/source-imports/{batch['id']}/files",
+            source,
+            headers={
+                "Content-Type": "text/plain",
+                "X-Source-Relative-Path": "GxT/Erik/Youtube/lesson.txt",
+                "X-Source-Import-Ordinal": "1",
+            },
+        )
+        assert status == 201
+        assert b"private synthetic transcript" not in body
+        status, _, body = request(
+            server, "POST", f"/api/source-imports/{batch['id']}/finalize", b"{}"
+        )
+        assert status == 200
+        summary = json.loads(body)
+        assert summary["state"] == "READY_FOR_CONFIRMATION"
+        assert summary["libraries"][0]["library_key"] == "gxt.erik"
+        assert request(server, "GET", f"/api/source-imports/{batch['id']}")[0] == 200
+        assert request(
+            server, "POST", f"/api/source-imports/{batch['id']}/confirm", b'{"confirm":false}'
+        )[0] == 400
+    finally:
+        server.shutdown()
+        worker.join()
+
+
+def test_source_import_browser_ui_uses_folder_confirmation_flow(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    server = create_server(storage, FakeChatService(), port=0)
+    worker = threading.Thread(target=server.serve_forever)
+    worker.start()
+    try:
+        assert request(server, "GET", "/")[0] == 200
+        page = request(server, "GET", "/")[2]
+        script = request(server, "GET", "/app.js")[2]
+        assert b'id="source-directory"' in page
+        assert b"webkitdirectory" in page
+        assert b'id="source-import-review"' in page
+        assert b"Checking transcripts locally" in script
+        assert b"Import transcripts" in script
+        assert b"confirm: true" in script
+    finally:
+        server.shutdown()
+        worker.join()
+
+
 def test_server_streams_safe_qualitative_context_count(tmp_path):
     storage = Storage(tmp_path / "mentor.sqlite3")
     storage.initialize()

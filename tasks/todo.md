@@ -379,8 +379,8 @@ review, and present the human quality gate without beginning Phase 6.
 - [x] Task 1 — Phase 6 contracts, migration fixture, and synthetic-spike contract.
 - [x] Task 2 — Neutral General Mentor and project-local conversation scope.
 - [x] Task 3 — Corpus-scoped mentor libraries and legacy Jacob compatibility.
-- [ ] Task 4 — Browser folder staging, confirmation, immutable import, and remote adapter.
-- [ ] Checkpoint A — Source/project isolation, migration parity, privacy, full suite, review.
+- [x] Task 4 — Browser folder staging, confirmation, immutable import, and remote adapter.
+- [x] Checkpoint A — Source/project isolation, migration parity, privacy, full suite, review.
 
 ## Phase 6A Mentor behavior and Phase 6B state
 

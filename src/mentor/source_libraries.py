@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 import hashlib
+import os
 from pathlib import Path, PurePosixPath
 import time
 from typing import Any, Callable
@@ -12,6 +13,7 @@ from mentor.storage import Storage
 
 
 JACOB_LIBRARY_KEY = "jacob.speculates"
+MAX_SOURCE_BYTES = 10 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -87,8 +89,206 @@ def garrett_canonical_role(relative_path: str) -> CanonicalRole:
 
 
 class SourceImportService:
-    def __init__(self, storage: Storage):
+    def __init__(
+        self,
+        storage: Storage,
+        client: Any | None = None,
+        *,
+        staging_root: Path | None = None,
+    ):
         self.storage = storage
+        self.client = client
+        self.staging_root = staging_root or storage.database_path.parent / "source-imports"
+
+    def create_staging_import(self, project_id: int) -> dict[str, object]:
+        batch_id = self.storage.create_library_import_batch(project_id)
+        return {"id": batch_id, "state": "STAGING", "accepted_root": "GxT"}
+
+    def stage_browser_file(
+        self, batch_id: int, relative_path: str, ordinal: int, content: bytes
+    ) -> dict[str, object]:
+        batch = self._batch(batch_id)
+        if batch[2] != "STAGING":
+            raise ValueError("source import is no longer accepting files")
+        relative = _browser_source_path(relative_path)
+        definition = library_definition_for_browser_path(relative)
+        if type(ordinal) is not int or ordinal < 1:
+            raise ValueError("source import ordinal is invalid")
+        if not content or len(content) > MAX_SOURCE_BYTES:
+            raise ValueError("Source files must be between 1 byte and 10 MiB.")
+        try:
+            content.decode("utf-8")
+        except UnicodeDecodeError:
+            raise ValueError("Source transcripts must be UTF-8 text.") from None
+        manifest = batch[3]
+        if any(item["ordinal"] == ordinal or item["relative_path"] == relative for item in manifest["files"]):
+            raise ValueError("source file was already staged")
+        destination = self.staging_root / str(batch_id) / f"{ordinal}.txt"
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        temporary = destination.with_suffix(".tmp")
+        temporary.write_bytes(content)
+        os.replace(temporary, destination)
+        manifest["files"].append({
+            "ordinal": ordinal,
+            "relative_path": relative,
+            "staged_name": destination.name,
+            "library_key": definition.library_key,
+            "sha256": hashlib.sha256(content).hexdigest(),
+            "byte_size": len(content),
+        })
+        self.storage.update_library_import_batch(batch_id, state="STAGING", manifest=manifest)
+        return {"relative_path": relative, "ordinal": ordinal, "accepted": True}
+
+    def finalize_manifest(self, batch_id: int) -> dict[str, object]:
+        batch = self._batch(batch_id)
+        if batch[2] != "STAGING":
+            raise ValueError("source import cannot be finalized in its current state")
+        manifest = batch[3]
+        if not manifest["files"]:
+            raise ValueError("Select at least one transcript.")
+        seen: dict[str, str] = {}
+        counts: dict[str, dict[str, int]] = {}
+        for item in sorted(manifest["files"], key=lambda value: value["ordinal"]):
+            library_key = item["library_key"]
+            bucket = counts.setdefault(library_key, {"total": 0, "new": 0, "duplicates": 0, "conflicts": 0})
+            bucket["total"] += 1
+            existing = self.storage.revision_for_hash(item["sha256"])
+            prior_library = existing[2] if existing is not None else seen.get(item["sha256"])
+            if prior_library is None:
+                item["classification"] = "new"
+                bucket["new"] += 1
+                seen[item["sha256"]] = library_key
+            elif prior_library == library_key:
+                item["classification"] = "duplicate"
+                bucket["duplicates"] += 1
+            else:
+                item["classification"] = "conflict"
+                bucket["conflicts"] += 1
+        manifest["summary"] = counts
+        self.storage.update_library_import_batch(
+            batch_id, state="READY_FOR_CONFIRMATION", manifest=manifest
+        )
+        return self.import_status(batch_id)
+
+    def confirm_import(
+        self,
+        batch_id: int,
+        *,
+        confirm: bool,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> dict[str, object]:
+        if confirm is not True:
+            raise ValueError("Confirm the source import before uploading.")
+        batch = self._batch(batch_id)
+        if batch[2] == "COMPLETE":
+            return self.import_status(batch_id)
+        retryable = batch[2] == "FAILED" and batch[4] == "SOURCE_INDEXING_FAILED"
+        if batch[2] != "READY_FOR_CONFIRMATION" and not retryable:
+            raise ValueError("source import is not ready for confirmation")
+        manifest = batch[3]
+        if any(item.get("classification") == "conflict" for item in manifest["files"]):
+            raise ValueError("The same source content is assigned to more than one mentor library.")
+        if self.client is None:
+            raise RuntimeError("Source import is unavailable.")
+        self.storage.update_library_import_batch(batch_id, state="IMPORTING", manifest=manifest)
+        imported = sum(item.get("result") == "IMPORTED" for item in manifest["files"])
+        try:
+            for item in sorted(manifest["files"], key=lambda value: value["ordinal"]):
+                if item["classification"] == "duplicate" or item.get("result") == "IMPORTED":
+                    continue
+                definition = LIBRARIES[item["library_key"]]
+                library = self.ensure_library(definition.library_key)
+                vector_store_id = self._ready_vector_store(library)
+                path = self.staging_root / str(batch_id) / item["staged_name"]
+                with path.open("rb") as source:
+                    uploaded = self.client.files.create(file=source, purpose="assistants")
+                item["remote_file_id"] = uploaded.id
+                item["remote_status"] = "UPLOADED"
+                relative = _library_relative_path(item["relative_path"])
+                role = garrett_canonical_role(relative) if library.library_key == "gxt.garrett" else None
+                attributes = {
+                    "library_key": library.library_key,
+                    "source_revision_key": item["sha256"],
+                    "timestamps_available": "true",
+                }
+                if role is not None:
+                    attributes["canonical_role"] = role.value
+                vector_file = self.client.vector_stores.files.create(
+                    vector_store_id, file_id=uploaded.id, attributes=attributes
+                )
+                item["remote_vector_store_file_id"] = vector_file.id
+                item["remote_status"] = "INDEXING"
+                _wait_for_library_indexing(
+                    self.client, vector_store_id, uploaded.id, sleep
+                )
+                item["remote_status"] = "READY"
+                self.register_local_revision(
+                    library.library_key,
+                    path,
+                    relative,
+                    canonical_role=role,
+                    file_id=uploaded.id,
+                    vector_store_file_id=vector_file.id,
+                    index_state="READY",
+                )
+                self.storage.set_project_library(batch[1], library.id, enabled=True)
+                item["result"] = "IMPORTED"
+                imported += 1
+            manifest["imported"] = imported
+            self.storage.update_library_import_batch(batch_id, state="COMPLETE", manifest=manifest)
+        except Exception:
+            if "item" in locals() and item.get("remote_status") != "READY":
+                item["remote_status"] = "FAILED"
+            manifest["imported"] = imported
+            self.storage.update_library_import_batch(
+                batch_id, state="FAILED", manifest=manifest, error_code="SOURCE_INDEXING_FAILED"
+            )
+            raise RuntimeError("Source indexing failed. You can retry the import.") from None
+        return self.import_status(batch_id)
+
+    def import_status(self, batch_id: int) -> dict[str, object]:
+        batch = self._batch(batch_id)
+        manifest = batch[3]
+        libraries = []
+        for key, counts in sorted(manifest.get("summary", {}).items()):
+            libraries.append({
+                "library_key": key,
+                "display_name": LIBRARIES[key].display_name,
+                **counts,
+            })
+        result: dict[str, object] = {
+            "id": batch[0],
+            "project_id": batch[1],
+            "state": batch[2],
+            "accepted_root": "GxT",
+            "file_count": len(manifest["files"]),
+            "libraries": libraries,
+            "imported": int(manifest.get("imported", 0)),
+        }
+        if batch[4] == "SOURCE_INDEXING_FAILED":
+            result["error"] = "A source could not be indexed. You can retry the import."
+        return result
+
+    def _batch(self, batch_id: int):
+        batch = self.storage.library_import_batch(batch_id)
+        if batch is None:
+            raise LookupError("source import does not exist")
+        return batch
+
+    def _ready_vector_store(self, library: SourceLibrary) -> str:
+        existing = self.storage.library_vector_store(library.id)
+        if existing is not None and existing[0] and existing[1] == "READY":
+            return existing[0]
+        self.storage.set_library_vector_store(library.id, None, "CREATING")
+        try:
+            vector_store = self.client.vector_stores.create(
+                name=library.display_name, metadata={"library_key": library.library_key}
+            )
+        except Exception:
+            self.storage.set_library_vector_store(library.id, None, "FAILED")
+            raise
+        self.storage.set_library_vector_store(library.id, vector_store.id, "READY")
+        return vector_store.id
 
     def ensure_library(self, library_key: str) -> SourceLibrary:
         definition = LIBRARIES.get(library_key)
@@ -223,6 +423,24 @@ def _relative_source_path(value: str) -> str:
     return path.as_posix()
 
 
+def _browser_source_path(value: str) -> str:
+    if not isinstance(value, str) or len(value) > 500 or any(ord(character) < 32 for character in value):
+        raise ValueError("source relative path is invalid")
+    normalized = value.replace("\\", "/")
+    parts = normalized.split("/")
+    if normalized.startswith("/") or any(part in {"", ".", ".."} for part in parts):
+        raise ValueError("source relative path is invalid")
+    if not normalized.casefold().endswith(".txt"):
+        raise ValueError("Only .txt source transcripts are accepted.")
+    library_definition_for_browser_path(normalized)
+    return normalized
+
+
+def _library_relative_path(value: str) -> str:
+    parts = PurePosixPath(value).parts
+    return PurePosixPath(*parts[2:]).as_posix()
+
+
 def _file_identity(path: Path) -> tuple[str, int]:
     digest = hashlib.sha256()
     size = 0
@@ -262,3 +480,21 @@ def _wait_for_indexing(
             raise RuntimeError("OpenAI indexing failed for a Jacob source")
         sleep(0.5)
     raise TimeoutError("OpenAI indexing did not finish for a Jacob source")
+
+
+def _wait_for_library_indexing(
+    client: Any,
+    vector_store_id: str,
+    file_id: str,
+    sleep: Callable[[float], None],
+) -> None:
+    for _ in range(120):
+        vector_file = client.vector_stores.files.retrieve(
+            file_id, vector_store_id=vector_store_id
+        )
+        if vector_file.status == "completed":
+            return
+        if vector_file.status in {"cancelled", "failed"}:
+            raise RuntimeError("source indexing failed")
+        sleep(0.5)
+    raise TimeoutError("source indexing did not finish")
