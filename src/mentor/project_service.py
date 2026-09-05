@@ -50,7 +50,27 @@ class ProjectService:
             **self._safe_summary(project),
             "threads": [self._thread_json(thread) for thread in self.storage.project_threads(project.id)],
             "roadmap": self.roadmap(project.id),
+            "libraries": self.storage.safe_project_libraries(project.id),
         }
+
+    def set_library_enabled(
+        self, project_id: int, library_key: str, *, enabled: bool
+    ) -> dict[str, object]:
+        project = self._project(project_id)
+        if project.status is ProjectStatus.ARCHIVED:
+            raise ProjectConflictError("archived projects cannot change source settings")
+        current = next(
+            (item for item in self.storage.safe_project_libraries(project.id) if item["library_key"] == library_key),
+            None,
+        )
+        if current is None:
+            raise ValueError("source library is not available in this project")
+        library = self.storage.source_library(library_key)
+        self.storage.set_project_library(project.id, library.id, enabled=enabled)
+        return next(
+            item for item in self.storage.safe_project_libraries(project.id)
+            if item["library_key"] == library_key
+        )
 
     def apply_state_event(
         self,

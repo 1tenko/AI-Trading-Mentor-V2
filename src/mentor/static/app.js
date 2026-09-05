@@ -24,6 +24,9 @@ const theme = document.querySelector("#theme");
 const scopeSelector = document.querySelector("#scope-selector");
 const sourceDirectory = document.querySelector("#source-directory");
 const sourceImportReview = document.querySelector("#source-import-review");
+const sourceSettings = document.querySelector("#source-settings");
+const sourceList = document.querySelector("#source-list");
+const sourceScopeChip = document.querySelector("#source-scope-chip");
 const SETTINGS_KEY = "trading-mentor-evaluation-settings";
 const ACTIVE_THREAD_KEY = "trading-mentor-active-thread";
 const THEME_KEY = "trading-mentor-theme";
@@ -51,7 +54,9 @@ function showEmpty() {
   messages.replaceChildren();
   const empty = document.createElement("p");
   empty.className = "empty";
-  empty.textContent = "How can I help with your trading today?";
+  empty.textContent = activeProjectId
+    ? "What would you like to learn, test, or improve in this project?"
+    : "How can I help with your trading today?";
   messages.append(empty);
 }
 
@@ -438,6 +443,67 @@ async function loadProjects() {
   if ([...scopeSelector.options].some((option) => option.value === selected)) scopeSelector.value = selected;
 }
 
+async function loadProjectSources() {
+  sourceList.replaceChildren();
+  if (!activeProjectId) {
+    sourceSettings.hidden = true;
+    sourceScopeChip.hidden = true;
+    return;
+  }
+  const projectId = activeProjectId;
+  const response = await fetch(`/api/projects/${projectId}/libraries`);
+  if (projectId !== activeProjectId) return;
+  if (!response.ok) throw new Error("Could not load project sources.");
+  const data = await response.json();
+  data.libraries.forEach((library) => sourceList.append(sourceLibraryControl(projectId, library)));
+  if (!data.libraries.length) {
+    const empty = document.createElement("p");
+    empty.textContent = "No mentor transcripts have been added to this project yet.";
+    sourceList.append(empty);
+  }
+  const enabled = data.libraries.filter((library) => library.enabled);
+  sourceScopeChip.textContent = `Sources · ${enabled.length} enabled`;
+  sourceScopeChip.hidden = false;
+}
+
+function sourceLibraryControl(projectId, library) {
+  const label = document.createElement("label");
+  label.className = "source-library";
+  const toggle = document.createElement("input");
+  toggle.type = "checkbox";
+  toggle.checked = library.enabled;
+  const text = document.createElement("span");
+  const name = document.createElement("strong");
+  name.textContent = library.display_name;
+  const meta = document.createElement("small");
+  meta.textContent = `${library.source_count} transcript${library.source_count === 1 ? "" : "s"} · ${sourceStatus(library.index_status)}`;
+  text.append(name, meta);
+  toggle.addEventListener("change", () => saveSourceSetting(projectId, library.library_key, toggle));
+  label.append(toggle, text);
+  return label;
+}
+
+function sourceStatus(value) {
+  if (value === "READY") return "Ready";
+  if (["CREATING", "INDEXING"].includes(value)) return "Preparing";
+  if (value === "FAILED") return "Needs attention";
+  return "Not ready";
+}
+
+async function saveSourceSetting(projectId, libraryKey, toggle) {
+  toggle.disabled = true;
+  const response = await fetch(`/api/projects/${projectId}/libraries/${encodeURIComponent(libraryKey)}`, {
+    method: "PUT", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ enabled: toggle.checked }),
+  });
+  if (!response.ok) {
+    toggle.checked = !toggle.checked;
+    toggle.disabled = false;
+    throw new Error((await response.json()).error || "Could not update this source.");
+  }
+  await loadProjectSources();
+}
+
 async function createProject() {
   const input = document.querySelector("#new-project-name");
   const name = input.value.trim();
@@ -452,6 +518,7 @@ async function createProject() {
   activeProjectId = project.id;
   scopeSelector.value = String(project.id);
   renderThreads();
+  await loadProjectSources();
   await createThread();
 }
 
@@ -538,6 +605,7 @@ async function loadThread(threadId) {
   activeDatasetScope = thread.dataset_scope;
   updateDatasetScope();
   status.textContent = `Conversation: ${thread.title}`;
+  await loadProjectSources();
   await refreshPromotionCards();
 }
 
@@ -549,6 +617,7 @@ function renderTimeline(turns) {
   }
   turns.forEach((turn) => {
     showMessage("Theo", turn.user_text, turn.attachment);
+    showTurnSourceScope(turn.source_scope);
     if (!turn.answer_markdown && !turn.incomplete_reason) return;
     const mentor = showMessage("Mentor", turn.answer_markdown || "");
     showProfileUpdate(turn.profile_update);
@@ -556,6 +625,19 @@ function renderTimeline(turns) {
     showDiagnostics(turn.diagnostics);
     if (turn.incomplete_reason) showIncomplete(turn, mentor);
   });
+}
+
+function showTurnSourceScope(scope) {
+  if (!scope?.temporary) return;
+  const labels = {
+    "gxt.garrett": "Garrett", "gxt.afyz": "Afyz", "gxt.erik": "Erik",
+    "gxt.splash": "Splash", "gxt.zay": "Zay", "gxt.theo_notes": "Theo Notes",
+    "jacob.speculates": "Jacob Speculates",
+  };
+  const chip = document.createElement("aside");
+  chip.className = "turn-source-scope";
+  chip.textContent = `Temporary for this answer · ${scope.library_keys.map((key) => labels[key] || key).join(" + ")}`;
+  messages.append(chip);
 }
 
 async function deleteThread(thread) {
@@ -1046,6 +1128,7 @@ async function sendMessage(text, showUser = true, includeApprovedNotes = false, 
             terminal = true;
             completePendingMessageAttachment(attachment);
             renderMarkdown(mentor.content, event.answer.text);
+            showTurnSourceScope(event.answer.diagnostics?.source_scope);
             showProfileUpdate(event.answer.profile_update);
             showEvidence(event.answer.evidence, event.answer.citations);
             showDiagnostics(event.answer.diagnostics);
@@ -1081,6 +1164,7 @@ async function sendMessage(text, showUser = true, includeApprovedNotes = false, 
       const answer = await response.json();
       completePendingMessageAttachment(attachment);
       const mentor = showMessage("Mentor", answer.text);
+      showTurnSourceScope(answer.diagnostics?.source_scope);
       showProfileUpdate(answer.profile_update);
       showEvidence(answer.evidence, answer.citations);
       showDiagnostics(answer.diagnostics);
@@ -1107,7 +1191,20 @@ document.querySelector("#new-project-form").addEventListener("submit", (event) =
   event.preventDefault();
   createProject().catch((error) => { status.textContent = error.message; });
 });
-document.querySelector("#source-directory-trigger").addEventListener("click", () => sourceDirectory.click());
+document.querySelector("#source-directory-trigger").addEventListener("click", () => {
+  if (!activeProjectId) { status.textContent = "Choose a Strategy Project before adding mentor transcripts."; return; }
+  sourceDirectory.click();
+});
+document.querySelector("#source-settings-trigger").addEventListener("click", () => {
+  if (!activeProjectId) { status.textContent = "Choose a Strategy Project to manage its sources."; return; }
+  sourceSettings.hidden = !sourceSettings.hidden;
+  if (!sourceSettings.hidden) loadProjectSources().catch((error) => { status.textContent = error.message; });
+});
+document.querySelector("#source-settings-close").addEventListener("click", () => { sourceSettings.hidden = true; });
+sourceScopeChip.addEventListener("click", () => {
+  sourceSettings.hidden = false;
+  loadProjectSources().catch((error) => { status.textContent = error.message; });
+});
 sourceDirectory.addEventListener("change", () => stageSourceDirectory().catch((error) => {
   sourceImportReview.hidden = false;
   sourceImportReview.textContent = error.message;
@@ -1117,6 +1214,7 @@ scopeSelector.addEventListener("change", () => {
   activeThreadId = undefined;
   localStorage.removeItem(ACTIVE_THREAD_KEY);
   renderThreads();
+  loadProjectSources().catch((error) => { status.textContent = error.message; });
   showEmpty();
   status.textContent = activeProjectId ? "Strategy Project" : "General Mentor";
 });

@@ -62,6 +62,9 @@ class _Handler(BaseHTTPRequestHandler):
         if path == "/":
             self._send_bytes(HTTPStatus.OK, _static("index.html"), "text/html; charset=utf-8")
             return
+        if path == "/favicon.ico":
+            self._send_bytes(HTTPStatus.OK, b"", "image/x-icon")
+            return
         if path in STATIC_ASSETS:
             filename, content_type = STATIC_ASSETS[path]
             self._send_bytes(HTTPStatus.OK, _static(filename), content_type)
@@ -74,6 +77,16 @@ class _Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/projects":
             self._send_json(HTTPStatus.OK, {"projects": ProjectService(self.storage).project_summaries()})
+            return
+        libraries_match = re.fullmatch(r"/api/projects/(\d+)/libraries", path)
+        if libraries_match:
+            project_id = int(libraries_match.group(1))
+            if self.storage.project(project_id) is None:
+                self._send_json(HTTPStatus.NOT_FOUND, {"error": "Project not found."})
+                return
+            self._send_json(
+                HTTPStatus.OK, {"libraries": self.storage.safe_project_libraries(project_id)}
+            )
             return
         source_import_match = re.fullmatch(r"/api/source-imports/(\d+)", path)
         if source_import_match:
@@ -376,6 +389,27 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_PUT(self) -> None:  # noqa: N802
         path = urlparse(self.path).path
+        library_match = re.fullmatch(r"/api/projects/(\d+)/libraries/([A-Za-z0-9._-]+)", path)
+        if library_match:
+            try:
+                body = self._json_body()
+                _only_fields(body, {"enabled"})
+                if type(body.get("enabled")) is not bool:
+                    raise ValueError("Source setting must be on or off.")
+                result = ProjectService(self.storage).set_library_enabled(
+                    int(library_match.group(1)), library_match.group(2), enabled=body["enabled"]
+                )
+            except LookupError:
+                self._send_json(HTTPStatus.NOT_FOUND, {"error": "Project not found."})
+                return
+            except ProjectConflictError as error:
+                self._send_json(HTTPStatus.CONFLICT, {"error": str(error)})
+                return
+            except ValueError as error:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
+                return
+            self._send_json(HTTPStatus.OK, result)
+            return
         scope_match = re.fullmatch(r"/api/threads/(\d+)/dataset", path)
         if scope_match:
             try:

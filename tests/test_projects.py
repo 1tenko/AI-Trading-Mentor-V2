@@ -305,3 +305,40 @@ def test_archiving_project_preserves_general_and_project_threads(tmp_path):
     assert storage.thread_context(project_thread.id) is not None
     with pytest.raises(ValueError, match="archived"):
         service.create_project_thread(project.id, "Another")
+
+
+def test_project_detail_and_source_toggle_are_project_local_and_persistent(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    service = ProjectService(storage)
+    project = service.create_project("GxT")
+    other = service.create_project("Other")
+    garrett = storage.create_source_library(
+        "gxt.garrett", "gxt", "Garrett", AuthorityKind.MENTOR, "Garrett — GxT"
+    )
+    storage.set_project_library(project.id, garrett.id, enabled=True)
+
+    assert service.project_detail(project.id)["libraries"] == [{
+        "library_key": "gxt.garrett", "display_name": "Garrett — GxT",
+        "enabled": True, "source_count": 0, "index_status": "NONE",
+    }]
+    updated = service.set_library_enabled(project.id, "gxt.garrett", enabled=False)
+    assert updated["enabled"] is False
+    assert ProjectService(Storage(storage.database_path)).project_detail(project.id)["libraries"][0]["enabled"] is False
+    with pytest.raises(ValueError, match="not available"):
+        service.set_library_enabled(other.id, "gxt.garrett", enabled=True)
+
+
+def test_archived_project_cannot_change_saved_source_settings(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    service = ProjectService(storage)
+    project = service.create_project("GxT")
+    garrett = storage.create_source_library(
+        "gxt.garrett", "gxt", "Garrett", AuthorityKind.MENTOR, "Garrett — GxT"
+    )
+    storage.set_project_library(project.id, garrett.id, enabled=True)
+    service.update_project(project.id, status="ARCHIVED")
+
+    with pytest.raises(ValueError, match="archived"):
+        service.set_library_enabled(project.id, "gxt.garrett", enabled=False)

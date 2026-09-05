@@ -352,6 +352,58 @@ def test_project_endpoints_create_archive_and_scope_threads(tmp_path):
         worker.join()
 
 
+def test_project_library_endpoints_return_safe_state_and_persist_toggle(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    project = storage.create_project("GxT")
+    library = storage.create_source_library(
+        "gxt.garrett", "gxt", "Garrett", AuthorityKind.MENTOR, "Garrett — GxT"
+    )
+    storage.set_project_library(project.id, library.id, enabled=True)
+    server = create_server(storage, FakeChatService(), port=0)
+    worker = threading.Thread(target=server.serve_forever)
+    worker.start()
+    try:
+        status, _, body = request(server, "GET", f"/api/projects/{project.id}/libraries")
+        assert status == 200
+        assert json.loads(body) == {"libraries": [{
+            "library_key": "gxt.garrett", "display_name": "Garrett — GxT",
+            "enabled": True, "source_count": 0, "index_status": "NONE",
+        }]}
+        changed, _, body = request(
+            server, "PUT", f"/api/projects/{project.id}/libraries/gxt.garrett",
+            json.dumps({"enabled": False}).encode(),
+        )
+        assert changed == 200
+        assert json.loads(body)["enabled"] is False
+        assert storage.safe_project_libraries(project.id)[0]["enabled"] is False
+        assert b"vector_store" not in body and b"file_" not in body and str(tmp_path).encode() not in body
+    finally:
+        server.shutdown()
+        worker.join()
+
+
+def test_project_source_controls_are_chat_first_and_show_temporary_scope(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    server = create_server(storage, FakeChatService(), port=0)
+    worker = threading.Thread(target=server.serve_forever)
+    worker.start()
+    try:
+        _, _, page = request(server, "GET", "/")
+        _, _, script = request(server, "GET", "/app.js")
+        assert b'id="source-settings-trigger"' in page
+        assert b'id="source-settings"' in page
+        assert b'id="source-scope-chip"' in page
+        assert b"What would you like to learn, test, or improve in this project?" in script
+        assert b"Temporary for this answer" in script
+        assert b"/libraries/${encodeURIComponent(libraryKey)}" in script
+        assert b"Data workspace" not in page
+    finally:
+        server.shutdown()
+        worker.join()
+
+
 def test_source_import_endpoints_stage_finalize_and_require_confirmation(tmp_path):
     storage = Storage(tmp_path / "mentor.sqlite3")
     storage.initialize()

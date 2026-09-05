@@ -393,7 +393,7 @@ review, and present the human quality gate without beginning Phase 6.
 
 ## Phase 6 UI and final proof
 
-- [ ] Task 10 — Chat-first project navigation, source controls, and browser folder import.
+- [x] Task 10 — Chat-first project navigation, source controls, and browser folder import.
 - [ ] Task 11 — Compact Roadmap, research history, and playbook inspection.
 - [ ] Task 12 — Synthetic contract/behavioral proof, regressions, and human-gate package.
 - [ ] Checkpoint C — Full deterministic/live/browser/privacy review and clean pushed branch.
