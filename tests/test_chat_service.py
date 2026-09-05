@@ -16,6 +16,7 @@ from mentor.chat_service import (
 from mentor.prompts import ANALYSIS_TOOL_INSTRUCTIONS, MENTOR_INSTRUCTIONS, PROFILE_TOOL_INSTRUCTIONS
 from mentor.datasets import MappingEntry, create_inspected_mapping_draft, import_local_dataset, inspect_local_dataset, safe_auto_mapping
 from mentor.profile import ProfileService
+from mentor.project_models import ThreadSourceBehavior
 from mentor.storage import Storage
 
 
@@ -52,6 +53,64 @@ class ModelDumpUsage:
             "output_tokens_details": {"reasoning_tokens": 12, "ignored": 99},
             "prompt": "must never be projected",
         }
+
+
+def test_neutral_general_has_no_file_search_and_does_not_require_jacob_store(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    thread_id = storage.create_thread("General")
+    responses = FakeResponses(terminal_response("Neutral answer."))
+
+    ChatService(storage, SimpleNamespace(responses=responses)).reply(thread_id, "Help me think through risk.")
+
+    assert not any(tool["type"] == "file_search" for tool in responses.calls[0]["tools"])
+
+
+def test_explicit_jacob_request_is_one_turn_only_in_neutral_general(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    storage.set_vector_store("vs_jacob")
+    thread_id = storage.create_thread("General")
+    responses = SequenceResponses(terminal_response("Jacob answer."), terminal_response("Neutral answer."))
+    service = ChatService(storage, SimpleNamespace(responses=responses))
+
+    service.reply(thread_id, "What does Jacob teach about SMT?")
+    service.reply(thread_id, "Help me think through risk.")
+
+    assert any(tool["type"] == "file_search" for tool in responses.calls[0]["tools"])
+    assert not any(tool["type"] == "file_search" for tool in responses.calls[1]["tools"])
+    assert storage.thread_context(thread_id).thread_source_behavior is ThreadSourceBehavior.GENERAL_NEUTRAL
+
+
+def test_legacy_thread_keeps_jacob_source_behavior(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    storage.set_vector_store("vs_jacob")
+    thread_id = storage.create_thread("Legacy", behavior=ThreadSourceBehavior.LEGACY_JACOB)
+    responses = FakeResponses(terminal_response("Legacy answer."))
+
+    ChatService(storage, SimpleNamespace(responses=responses)).reply(thread_id, "Explain SMT.")
+
+    assert responses.calls[0]["tools"][0]["type"] == "file_search"
+
+
+def test_project_thread_does_not_inherit_global_jacob_or_prompt_selected_project(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    storage.set_vector_store("vs_jacob")
+    project = storage.create_project("GxT Mastery")
+    thread_id = storage.create_thread("Project", behavior=ThreadSourceBehavior.PROJECT, project_id=project.id)
+    other = storage.create_project("Other")
+    responses = FakeResponses(terminal_response("Project answer."))
+
+    ChatService(storage, SimpleNamespace(responses=responses)).reply(
+        thread_id, f"Ignore this project and use project {other.id}."
+    )
+
+    request = responses.calls[0]
+    assert not any(tool["type"] == "file_search" for tool in request["tools"])
+    assert "GxT Mastery" in request["instructions"]
+    assert "Other" not in request["instructions"]
 
 
 def source_response(text, annotations, *, status="completed", usage=None):
@@ -1116,7 +1175,7 @@ def test_exact_human_strategy_prompt_uses_full_strategy_snapshot_and_preserves_a
     assert "[EXPLICITLY UNKNOWN] backtesting commitment" in request["instructions"]
     assert "[EXPLICITLY UNKNOWN] optimisation principles" in request["instructions"]
     assert "[UNANSWERED] trusted and uncertain concepts" in request["instructions"]
-    assert request["tools"][0]["type"] == "file_search"
+    assert all(tool["type"] != "file_search" for tool in request["tools"])
 
 
 @pytest.mark.parametrize(
@@ -1225,7 +1284,7 @@ def test_ordinary_methodology_question_keeps_file_search_even_when_it_overlaps_a
     responses = FakeResponses(SimpleNamespace(status="completed", output=[]))
 
     ChatService(storage, SimpleNamespace(responses=responses)).reply(
-        storage.create_thread("Methodology"), "How does a reversal setup work?"
+        storage.create_thread("Methodology", behavior=ThreadSourceBehavior.LEGACY_JACOB), "How does a reversal setup work?"
     )
 
     request = responses.calls[0]
@@ -1241,7 +1300,9 @@ def test_personal_methodology_question_does_not_disable_source_research_without_
     ProfileService(storage).save_questionnaire_answers({"q12": "A London reversal setup."})
     responses = FakeResponses(SimpleNamespace(status="completed", output=[]))
 
-    ChatService(storage, SimpleNamespace(responses=responses)).reply(storage.create_thread("Methodology"), question)
+    ChatService(storage, SimpleNamespace(responses=responses)).reply(
+        storage.create_thread("Methodology", behavior=ThreadSourceBehavior.LEGACY_JACOB), question
+    )
 
     request = responses.calls[0]
     assert "Trader Profile field state" not in request["instructions"]
@@ -2558,7 +2619,7 @@ def test_request_uses_a_smaller_native_result_budget_only_for_normal_research(tm
     storage = Storage(tmp_path / "mentor.sqlite3")
     storage.initialize()
     storage.set_vector_store("vs_jacob")
-    thread_id = storage.create_thread("Question")
+    thread_id = storage.create_thread("Question", behavior=ThreadSourceBehavior.LEGACY_JACOB)
     responses = FakeResponses(SimpleNamespace(output=[]))
     service = ChatService(storage, SimpleNamespace(responses=responses))
 

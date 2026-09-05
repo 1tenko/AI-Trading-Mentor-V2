@@ -21,11 +21,14 @@ const attachmentMeta = document.querySelector("#attachment-meta");
 const attachmentClarifications = document.querySelector("#attachment-clarifications");
 const notesConsent = document.querySelector("#notes-consent");
 const theme = document.querySelector("#theme");
+const scopeSelector = document.querySelector("#scope-selector");
 const SETTINGS_KEY = "trading-mentor-evaluation-settings";
 const ACTIVE_THREAD_KEY = "trading-mentor-active-thread";
 const THEME_KEY = "trading-mentor-theme";
 const CONTINUE_PROMPT = "Continue the previous response from where it stopped. Do not repeat completed material.";
 let activeThreadId;
+let activeProjectId;
+let allThreads = [];
 let activeDatasetScope;
 let pendingAttachment;
 let pendingMessageAttachment;
@@ -389,8 +392,13 @@ function conversationTitle(text) {
 async function loadThreads() {
   const response = await fetch("/api/threads");
   const data = await response.json();
+  allThreads = data.threads;
+  renderThreads();
+}
+
+function renderThreads() {
   threads.replaceChildren();
-  data.threads.forEach((thread) => {
+  allThreads.filter((thread) => activeProjectId ? thread.project_id === activeProjectId : thread.project_id === null).forEach((thread) => {
     const row = document.createElement("div");
     row.className = "thread-row";
     const button = document.createElement("button");
@@ -416,6 +424,35 @@ async function loadThreads() {
   });
 }
 
+async function loadProjects() {
+  const response = await fetch("/api/projects");
+  if (!response.ok) throw new Error("Could not load Strategy Projects.");
+  const data = await response.json();
+  const selected = scopeSelector.value;
+  scopeSelector.replaceChildren(new Option("General Mentor", "general"));
+  data.projects.filter((project) => project.status === "ACTIVE").forEach((project) => {
+    scopeSelector.add(new Option(project.name, String(project.id)));
+  });
+  if ([...scopeSelector.options].some((option) => option.value === selected)) scopeSelector.value = selected;
+}
+
+async function createProject() {
+  const input = document.querySelector("#new-project-name");
+  const name = input.value.trim();
+  if (!name) return;
+  const response = await fetch("/api/projects", {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: name.trim() }),
+  });
+  if (!response.ok) throw new Error((await response.json()).error || "Could not create the project.");
+  const project = await response.json();
+  input.value = "";
+  await loadProjects();
+  activeProjectId = project.id;
+  scopeSelector.value = String(project.id);
+  renderThreads();
+  await createThread();
+}
+
 async function loadThread(threadId) {
   clearPendingChatInteraction();
   const requestToken = ++conversationLoadToken;
@@ -424,6 +461,9 @@ async function loadThread(threadId) {
   const thread = await response.json();
   if (requestToken !== conversationLoadToken) return;
   activeThreadId = thread.id;
+  activeProjectId = thread.project_id ?? undefined;
+  scopeSelector.value = activeProjectId ? String(activeProjectId) : "general";
+  renderThreads();
   localStorage.setItem(ACTIVE_THREAD_KEY, String(thread.id));
   renderTimeline(thread.turns);
   activeDatasetScope = thread.dataset_scope;
@@ -465,7 +505,8 @@ async function deleteThread(thread) {
 async function createThread(title = "New conversation") {
   clearPendingChatInteraction();
   conversationLoadToken += 1;
-  const response = await fetch("/api/threads", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ title }) });
+  const endpoint = activeProjectId ? `/api/projects/${activeProjectId}/threads` : "/api/threads";
+  const response = await fetch(endpoint, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ title }) });
   if (!response.ok) throw new Error("Could not create a conversation.");
   const thread = await response.json();
   activeThreadId = thread.id;
@@ -944,6 +985,18 @@ function openDataSettings() {
 }
 
 document.querySelector("#new-thread").addEventListener("click", () => createThread().catch((error) => { status.textContent = error.message; }));
+document.querySelector("#new-project-form").addEventListener("submit", (event) => {
+  event.preventDefault();
+  createProject().catch((error) => { status.textContent = error.message; });
+});
+scopeSelector.addEventListener("change", () => {
+  activeProjectId = scopeSelector.value === "general" ? undefined : Number(scopeSelector.value);
+  activeThreadId = undefined;
+  localStorage.removeItem(ACTIVE_THREAD_KEY);
+  renderThreads();
+  showEmpty();
+  status.textContent = activeProjectId ? "Strategy Project" : "General Mentor";
+});
 document.querySelector("#data-settings").addEventListener("click", openDataSettings);
 document.querySelector("#data-close").addEventListener("click", () => {
   dataWorkspace.hidden = true;
@@ -980,7 +1033,7 @@ mode.addEventListener("change", persistEvaluation);
 researchDepth.addEventListener("change", persistEvaluation);
 theme.addEventListener("change", () => applyTheme(theme.value));
 updateDatasetScope();
-Promise.all([loadThreads(), loadDatasets()]).then(async ([,]) => {
+Promise.all([loadProjects(), loadThreads(), loadDatasets()]).then(async () => {
   const savedThreadId = Number(localStorage.getItem(ACTIVE_THREAD_KEY));
   const firstThread = threads.querySelector(".thread");
   if (Number.isInteger(savedThreadId) && savedThreadId > 0) {

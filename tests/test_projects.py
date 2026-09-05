@@ -10,6 +10,7 @@ from mentor.project_models import (
     ResearchDepth,
     ThreadSourceBehavior,
 )
+from mentor.project_service import ProjectService
 from mentor.storage import Storage
 
 
@@ -143,3 +144,47 @@ def test_legacy_jacob_dry_run_is_read_only_and_safe(tmp_path):
         "has_discrepancy": True,
     }
     assert storage.phase6_table_counts() == before
+
+
+def test_project_service_lists_only_general_safe_summaries(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    service = ProjectService(storage)
+
+    project = service.create_project("GxT Mastery")
+    thread = service.create_project_thread(project.id, "Learn the model")
+    summaries = service.project_summaries()
+
+    assert summaries == [{
+        "id": project.id,
+        "name": "GxT Mastery",
+        "status": "ACTIVE",
+        "summary": {
+            "objective": None,
+            "experiment": None,
+            "progress": None,
+            "next_action": None,
+            "unresolved_question": None,
+        },
+    }]
+    assert service.project_thread(project.id, thread.id) == thread
+    other = service.create_project("Other")
+    with pytest.raises(ValueError, match="does not belong"):
+        service.project_thread(other.id, thread.id)
+
+
+def test_archiving_project_preserves_general_and_project_threads(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    service = ProjectService(storage)
+    general_id = storage.create_thread("General")
+    project = service.create_project("GxT Mastery")
+    project_thread = service.create_project_thread(project.id, "Project chat")
+
+    archived = service.update_project(project.id, status="ARCHIVED")
+
+    assert archived.status is ProjectStatus.ARCHIVED
+    assert storage.thread_context(general_id) is not None
+    assert storage.thread_context(project_thread.id) is not None
+    with pytest.raises(ValueError, match="archived"):
+        service.create_project_thread(project.id, "Another")

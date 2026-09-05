@@ -21,6 +21,7 @@ from mentor.datasets import (
     safe_auto_mapping,
 )
 from mentor.profile import QUESTIONNAIRE_FIELDS, ProfileService, ProfileValidationError
+from mentor.project_service import ProjectConflictError, ProjectService
 from mentor.storage import Storage
 
 LOGGER = logging.getLogger(__name__)
@@ -66,8 +67,11 @@ class _Handler(BaseHTTPRequestHandler):
         if path == "/api/threads":
             self._send_json(
                 HTTPStatus.OK,
-                {"threads": [thread.__dict__ for thread in self.storage.threads()]},
+                {"threads": [_thread_json(self.storage, thread.id) for thread in self.storage.threads()]},
             )
+            return
+        if path == "/api/projects":
+            self._send_json(HTTPStatus.OK, {"projects": ProjectService(self.storage).project_summaries()})
             return
         if path == "/api/datasets":
             self._send_json(HTTPStatus.OK, {"datasets": [_dataset_json(dataset) for dataset in self.storage.datasets()]})
@@ -99,10 +103,21 @@ class _Handler(BaseHTTPRequestHandler):
                 {
                     "id": thread.id,
                     "title": thread.title,
+                    "project_id": self.storage.thread_context(thread.id).project_id,
+                    "thread_source_behavior": self.storage.thread_context(thread.id).thread_source_behavior.value,
                     "turns": self.storage.display_turns(thread.id),
                     "dataset_scope": _thread_dataset_scope_json(self.storage, thread.id),
                 },
             )
+            return
+        project_match = re.fullmatch(r"/api/projects/(\d+)", path)
+        if project_match:
+            try:
+                detail = ProjectService(self.storage).project_detail(int(project_match.group(1)))
+            except LookupError:
+                self._send_json(HTTPStatus.NOT_FOUND, {"error": "Project not found."})
+                return
+            self._send_json(HTTPStatus.OK, detail)
             return
         match = re.fullmatch(r"/api/sources/([^/]+)", path)
         if match and FILE_ID.fullmatch(unquote(match.group(1))):
@@ -143,9 +158,25 @@ class _Handler(BaseHTTPRequestHandler):
                 return
             body = self._json_body()
             if path == "/api/threads":
+                _only_fields(body, {"title", "mode"})
+                if body.get("mode", "general") != "general":
+                    raise ValueError("Conversation mode must be general.")
                 title = _title(body.get("title"))
                 thread_id = self.storage.create_thread(title)
-                self._send_json(HTTPStatus.CREATED, {"id": thread_id, "title": title})
+                self._send_json(HTTPStatus.CREATED, _thread_json(self.storage, thread_id))
+                return
+            if path == "/api/projects":
+                _only_fields(body, {"name"})
+                project = ProjectService(self.storage).create_project(_title(body.get("name")))
+                self._send_json(HTTPStatus.CREATED, {"id": project.id, "name": project.name, "status": project.status.value})
+                return
+            project_thread_match = re.fullmatch(r"/api/projects/(\d+)/threads", path)
+            if project_thread_match:
+                _only_fields(body, {"title"})
+                thread = ProjectService(self.storage).create_project_thread(
+                    int(project_thread_match.group(1)), _title(body.get("title"))
+                )
+                self._send_json(HTTPStatus.CREATED, _thread_context_json(thread))
                 return
             if path == "/api/profile/items":
                 item = _create_profile_item(ProfileService(self.storage), body)
@@ -184,6 +215,12 @@ class _Handler(BaseHTTPRequestHandler):
                     arguments = {} if dataset_attachment_id is None else {"dataset_attachment_id": dataset_attachment_id}
                     self._send_json(HTTPStatus.OK, _answer_json(self.chat_service.reply(thread_id, question, **arguments)))
                 return
+        except ProjectConflictError as error:
+            self._send_json(HTTPStatus.CONFLICT, {"error": str(error)})
+            return
+        except LookupError:
+            self._send_json(HTTPStatus.NOT_FOUND, {"error": "Project not found."})
+            return
         except ValueError as error:
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
             return
@@ -193,7 +230,26 @@ class _Handler(BaseHTTPRequestHandler):
         self._send_json(HTTPStatus.NOT_FOUND, {"error": "Not found."})
 
     def do_PATCH(self) -> None:  # noqa: N802
-        match = re.fullmatch(r"/api/profile/items/(\d+)", urlparse(self.path).path)
+        path = urlparse(self.path).path
+        project_match = re.fullmatch(r"/api/projects/(\d+)", path)
+        if project_match:
+            try:
+                body = self._json_body()
+                _only_fields(body, {"status"})
+                if not isinstance(body.get("status"), str):
+                    raise ValueError("Project status must be text.")
+                project = ProjectService(self.storage).update_project(
+                    int(project_match.group(1)), status=body["status"]
+                )
+            except LookupError:
+                self._send_json(HTTPStatus.NOT_FOUND, {"error": "Project not found."})
+                return
+            except ValueError as error:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
+                return
+            self._send_json(HTTPStatus.OK, {"id": project.id, "name": project.name, "status": project.status.value})
+            return
+        match = re.fullmatch(r"/api/profile/items/(\d+)", path)
         if match is None:
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "Not found."})
             return
@@ -466,6 +522,19 @@ def _title(value: object) -> str:
     if len(title) > 120:
         raise ValueError("Thread title is too long.")
     return title
+
+
+def _thread_context_json(thread) -> dict[str, object]:
+    return {
+        "id": thread.id,
+        "title": thread.title,
+        "project_id": thread.project_id,
+        "thread_source_behavior": thread.thread_source_behavior.value,
+    }
+
+
+def _thread_json(storage: Storage, thread_id: int) -> dict[str, object]:
+    return _thread_context_json(storage.thread_context(thread_id))
 
 
 def _answer_json(answer: Answer) -> dict:

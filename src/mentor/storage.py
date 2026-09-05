@@ -1528,6 +1528,36 @@ class Storage:
             ).fetchone()
         return None if row is None else StrategyProject(int(row[0]), str(row[1]), ProjectStatus(row[2]))
 
+    def projects(self) -> list[StrategyProject]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT id, name, status FROM strategy_projects ORDER BY id"
+            ).fetchall()
+        return [StrategyProject(int(row[0]), str(row[1]), ProjectStatus(row[2])) for row in rows]
+
+    def update_project_status(self, project_id: int, status: ProjectStatus) -> StrategyProject:
+        status = ProjectStatus(status)
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "UPDATE strategy_projects SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (status.value, project_id),
+            )
+            if cursor.rowcount != 1:
+                raise LookupError("project not found")
+        return self.project(project_id)
+
+    def project_threads(self, project_id: int) -> list[ThreadContext]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT id, title, thread_source_behavior, project_id FROM threads "
+                "WHERE project_id = ? ORDER BY id DESC",
+                (project_id,),
+            ).fetchall()
+        return [
+            ThreadContext(int(row[0]), str(row[1]), ThreadSourceBehavior(row[2]), int(row[3]))
+            for row in rows
+        ]
+
     def create_thread(
         self,
         title: str,

@@ -111,6 +111,7 @@ def test_server_creates_thread_and_validates_message_json(tmp_path):
         status, _, body = request(server, "POST", "/api/threads", b'{"title":"Plan"}')
         assert status == 201
         assert b'"title": "Plan"' in body
+        assert b'"thread_source_behavior": "GENERAL_NEUTRAL"' in body
         assert request(server, "POST", "/api/threads", b'{"title":"   "}')[0] == 400
         assert request(server, "POST", "/api/threads/99/messages", b'{"question":"Hello"}')[0] == 404
         assert request(server, "POST", "/api/threads/1/messages", b'not json')[0] == 400
@@ -142,6 +143,39 @@ def test_server_streams_chat_events(tmp_path):
         assert chat_service.evaluation.reasoning_mode == "pro"
         assert chat_service.evaluation.research_depth == "deep"
         assert chat_service.include_approved_notes is False
+    finally:
+        server.shutdown()
+        worker.join()
+
+
+def test_project_endpoints_create_archive_and_scope_threads(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    server = create_server(storage, FakeChatService(), port=0)
+    worker = threading.Thread(target=server.serve_forever)
+    worker.start()
+    try:
+        status, _, body = request(server, "POST", "/api/projects", b'{"name":"GxT Mastery"}')
+        assert status == 201
+        project = json.loads(body)
+        assert request(server, "POST", "/api/projects", b'{"name":"GxT Mastery"}')[0] == 409
+        status, _, body = request(
+            server, "POST", f"/api/projects/{project['id']}/threads", b'{"title":"Learn GxT"}'
+        )
+        assert status == 201
+        thread = json.loads(body)
+        assert thread["project_id"] == project["id"]
+        assert thread["thread_source_behavior"] == "PROJECT"
+
+        status, _, body = request(server, "GET", f"/api/projects/{project['id']}")
+        assert status == 200
+        detail = json.loads(body)
+        assert detail["threads"][0]["id"] == thread["id"]
+        assert not ({"sources", "rules", "findings"} & detail["summary"].keys())
+
+        assert request(server, "PATCH", f"/api/projects/{project['id']}", b'{"status":"ARCHIVED"}')[0] == 200
+        assert request(server, "POST", f"/api/projects/{project['id']}/threads", b'{"title":"Blocked"}')[0] == 409
+        assert request(server, "PATCH", f"/api/projects/{project['id']}", b'{"name":"Nope"}')[0] == 400
     finally:
         server.shutdown()
         worker.join()
@@ -243,6 +277,9 @@ def test_server_serves_the_persistent_chat_controls(tmp_path):
         status, _, page = request(server, "GET", "/")
         assert status == 200
         assert b'id="research-depth"' in page
+        assert b'id="scope-selector"' in page
+        assert b'id="new-project-form"' in page
+        assert b'id="new-project-name"' in page
         status, _, script = request(server, "GET", "/app.js")
         assert status == 200
         assert b"/api/threads/${threadId}" in script
@@ -320,6 +357,8 @@ def test_server_restores_only_safe_display_turns_and_permanently_deletes_one_thr
         assert payload == {
             "id": thread_id,
             "title": "Question",
+            "project_id": None,
+            "thread_source_behavior": "GENERAL_NEUTRAL",
             "dataset_scope": None,
             "turns": [
                 {
