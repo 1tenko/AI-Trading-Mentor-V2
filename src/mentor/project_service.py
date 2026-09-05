@@ -99,6 +99,13 @@ class ProjectService:
                 for item in mastery[:5]
             ],
             "mastery_truncated": len(mastery) > 5,
+            "recent_research": [
+                {
+                    **{key: item[key] for key in ("id", "kind", "status", "provenance")},
+                    "summary": _bounded(item["summary"], 300),
+                }
+                for item in roadmap["recent_research"][:5]
+            ],
         }
 
     def general_summaries(self) -> list[dict[str, object]]:

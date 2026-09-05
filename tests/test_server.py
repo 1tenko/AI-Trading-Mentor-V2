@@ -8,6 +8,7 @@ from openpyxl import Workbook
 import mentor.server as server_module
 from mentor.chat_service import Answer, StreamEvent
 from mentor.profile import ProfileService
+from mentor.project_ledger import ProjectLedgerService
 from mentor.project_models import AuthorityKind
 from mentor.project_service import ProjectService
 from mentor.server import create_server
@@ -198,6 +199,30 @@ def test_project_roadmap_endpoint_returns_only_the_owning_project_state(tmp_path
         }
         missing, _headers, _body = request(server, "GET", "/api/projects/999/roadmap")
         assert missing == 404
+    finally:
+        server.shutdown()
+        worker.join()
+
+
+def test_project_ledger_endpoint_is_project_local_and_safe(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    service = ProjectService(storage)
+    project = service.create_project("GxT")
+    thread = service.create_project_thread(project.id, "Project")
+    ProjectLedgerService(storage).record_research(
+        project.id, kind="HYPOTHESIS", status="ACTIVE", summary="Test session alignment",
+        provenance="AI_RESEARCH_HYPOTHESIS", origin_thread_id=thread.id, origin_turn_number=1,
+    )
+    server = create_server(storage, FakeChatService(), port=0)
+    worker = threading.Thread(target=server.serve_forever)
+    worker.start()
+    try:
+        status, _headers, body = request(server, "GET", f"/api/projects/{project.id}/ledger")
+        assert status == 200
+        payload = json.loads(body)
+        assert payload["records"][0]["summary"] == "Test session alignment"
+        assert "path" not in json.dumps(payload).casefold()
     finally:
         server.shutdown()
         worker.join()

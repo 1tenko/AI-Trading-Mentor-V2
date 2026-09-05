@@ -2,6 +2,7 @@
 
 import json
 
+from mentor.project_ledger import ProjectLedgerService
 from mentor.project_models import ThreadSourceBehavior
 from mentor.project_service import ProjectService
 from mentor.storage import Storage
@@ -10,7 +11,7 @@ from mentor.storage import Storage
 MASTERY_STATUSES = frozenset({
     "NOT_STARTED", "LEARNING", "OPERATIONALIZING", "TESTING", "PROVISIONAL", "VALIDATED"
 })
-PROJECT_TOOL_NAMES = frozenset({"update_project_state", "update_project_mastery"})
+PROJECT_TOOL_NAMES = frozenset({"update_project_state", "update_project_mastery", "record_project_research"})
 PROJECT_TOOLS = [
     {
         "type": "function", "name": "update_project_state", "strict": True,
@@ -39,6 +40,29 @@ PROJECT_TOOLS = [
             "required": ["concept", "status", "reason", "evidence_reference"],
         },
     },
+    {
+        "type": "function", "name": "record_project_research", "strict": True,
+        "description": "Record one concise project research item with explicit provenance.",
+        "parameters": {
+            "type": "object", "additionalProperties": False,
+            "properties": {
+                "kind": {"type": "string", "enum": [
+                    "OBSERVATION", "HYPOTHESIS", "OPERATIONAL_DEFINITION", "EXPERIMENT",
+                    "EMPIRICAL_FINDING", "PROJECT_FINDING", "LIMITATION", "PROVISIONAL_RULE", "USER_DECISION",
+                ]},
+                "status": {"type": "string", "enum": [
+                    "DRAFT", "ACTIVE", "COMPLETED", "SUPPORTED", "REJECTED", "INCONCLUSIVE", "VALIDATED", "SUPERSEDED",
+                ]},
+                "summary": {"type": "string"},
+                "provenance": {"type": "string"},
+                "analysis_evidence_id": {"type": ["integer", "null"]},
+                "supersedes_record_id": {"type": ["integer", "null"]},
+            },
+            "required": [
+                "kind", "status", "summary", "provenance", "analysis_evidence_id", "supersedes_record_id",
+            ],
+        },
+    },
 ]
 
 
@@ -59,6 +83,21 @@ class ProjectToolDispatcher:
             raise ValueError("project tool arguments are invalid") from None
         if not isinstance(arguments, dict):
             raise ValueError("project tool arguments are invalid")
+        if name == "record_project_research":
+            if set(arguments) != {
+                "kind", "status", "summary", "provenance", "analysis_evidence_id", "supersedes_record_id"
+            }:
+                raise ValueError("project research arguments are invalid")
+            record = ProjectLedgerService(self.storage).record_research(
+                thread.project_id,
+                origin_thread_id=thread_id,
+                origin_turn_number=origin_turn_number,
+                **arguments,
+            )
+            return {
+                "status": "recorded", "record_id": record["id"],
+                "kind": record["kind"], "provenance": record["provenance"],
+            }
         if name == "update_project_state":
             payload = _state_payload(arguments)
             kind = str(payload.pop("kind"))

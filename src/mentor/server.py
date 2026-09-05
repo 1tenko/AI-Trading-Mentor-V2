@@ -22,6 +22,7 @@ from mentor.datasets import (
 )
 from mentor.profile import QUESTIONNAIRE_FIELDS, ProfileService, ProfileValidationError
 from mentor.project_service import ProjectConflictError, ProjectService
+from mentor.project_ledger import ProjectLedgerService
 from mentor.source_libraries import MAX_SOURCE_BYTES, SourceImportService
 from mentor.storage import Storage
 
@@ -137,6 +138,15 @@ class _Handler(BaseHTTPRequestHandler):
                 self._send_json(HTTPStatus.NOT_FOUND, {"error": "Project not found."})
                 return
             self._send_json(HTTPStatus.OK, roadmap)
+            return
+        ledger_match = re.fullmatch(r"/api/projects/(\d+)/ledger", path)
+        if ledger_match:
+            try:
+                records = ProjectLedgerService(self.storage).ledger(int(ledger_match.group(1)))
+            except LookupError:
+                self._send_json(HTTPStatus.NOT_FOUND, {"error": "Project not found."})
+                return
+            self._send_json(HTTPStatus.OK, {"records": records})
             return
         match = re.fullmatch(r"/api/sources/([^/]+)", path)
         if match and FILE_ID.fullmatch(unquote(match.group(1))):

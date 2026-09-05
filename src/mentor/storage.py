@@ -1657,6 +1657,11 @@ class Storage:
                 "WHERE project_id = ? ORDER BY concept COLLATE NOCASE",
                 (project_id,),
             ).fetchall()
+            research = connection.execute(
+                "SELECT id, kind, status, summary, provenance FROM project_research_records "
+                "WHERE project_id = ? ORDER BY id DESC LIMIT 5",
+                (project_id,),
+            ).fetchall()
         return {
             "objective": None if snapshot is None else snapshot[0],
             "experiment": None if snapshot is None else snapshot[1],
@@ -1669,8 +1674,108 @@ class Storage:
                 }
                 for row in mastery
             ],
-            "recent_research": [],
+            "recent_research": [
+                {"id": int(row[0]), "kind": row[1], "status": row[2], "summary": row[3], "provenance": row[4]}
+                for row in research
+            ],
         }
+
+    def create_project_research_record(
+        self,
+        *,
+        project_id: int,
+        kind: str,
+        status: str,
+        summary: str,
+        provenance: str,
+        origin_thread_id: int,
+        origin_turn_number: int,
+        supersedes_record_id: int | None = None,
+        analysis_evidence_id: int | None = None,
+    ) -> int:
+        with self._connect() as connection:
+            thread = connection.execute(
+                "SELECT project_id, thread_source_behavior FROM threads WHERE id = ?",
+                (origin_thread_id,),
+            ).fetchone()
+            if thread is None or thread[0] != project_id or thread[1] != ThreadSourceBehavior.PROJECT.value:
+                raise ValueError("research origin conversation does not belong to the owning project")
+            if supersedes_record_id is not None and connection.execute(
+                "SELECT 1 FROM project_research_records WHERE id = ? AND project_id = ?",
+                (supersedes_record_id, project_id),
+            ).fetchone() is None:
+                raise ValueError("superseded research record does not belong to the owning project")
+            evidence = None
+            if analysis_evidence_id is not None:
+                evidence = connection.execute(
+                    "SELECT analysis_evidence.result_json FROM analysis_evidence JOIN threads "
+                    "ON threads.id = analysis_evidence.thread_id WHERE analysis_evidence.id = ? "
+                    "AND threads.project_id = ? AND threads.thread_source_behavior = 'PROJECT'",
+                    (analysis_evidence_id, project_id),
+                ).fetchone()
+                if evidence is None:
+                    raise ValueError("validated AnalysisEvidence does not belong to the owning project")
+                validate_completed_evidence_envelope(json.loads(evidence[0]))
+            cursor = connection.execute(
+                "INSERT INTO project_research_records(project_id, kind, status, summary, provenance, "
+                "origin_thread_id, origin_turn_number, supersedes_record_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    project_id, kind, status, summary, provenance, origin_thread_id,
+                    origin_turn_number, supersedes_record_id,
+                ),
+            )
+            record_id = int(cursor.lastrowid)
+            if evidence is not None:
+                connection.execute(
+                    "INSERT INTO project_empirical_evidence_refs(project_id, research_record_id, "
+                    "original_evidence_id, safe_envelope_json, origin_available) VALUES (?, ?, ?, ?, 1)",
+                    (project_id, record_id, analysis_evidence_id, evidence[0]),
+                )
+        return record_id
+
+    def project_research_record(self, project_id: int, record_id: int) -> dict[str, object] | None:
+        records = self.project_research_records(project_id, record_id=record_id)
+        return records[0] if records else None
+
+    def project_research_records(
+        self, project_id: int, *, record_id: int | None = None, limit: int = 50
+    ) -> list[dict[str, object]]:
+        if type(limit) is not int or not 1 <= limit <= 50:
+            raise ValueError("research record limit is invalid")
+        with self._connect() as connection:
+            if connection.execute("SELECT 1 FROM strategy_projects WHERE id = ?", (project_id,)).fetchone() is None:
+                raise LookupError("project not found")
+            params: tuple[object, ...] = (project_id,) if record_id is None else (project_id, record_id)
+            rows = connection.execute(
+                "SELECT id, kind, status, summary, provenance, origin_thread_id, origin_turn_number, "
+                "supersedes_record_id, created_at FROM project_research_records WHERE project_id = ? "
+                + ("" if record_id is None else "AND id = ? ")
+                + "ORDER BY id DESC LIMIT ?",
+                (*params, limit),
+            ).fetchall()
+            records = []
+            for row in rows:
+                evidence = connection.execute(
+                    "SELECT original_evidence_id, safe_envelope_json, origin_available "
+                    "FROM project_empirical_evidence_refs WHERE project_id = ? AND research_record_id = ? "
+                    "ORDER BY id",
+                    (project_id, row[0]),
+                ).fetchall()
+                records.append({
+                    "id": int(row[0]), "kind": row[1], "status": row[2], "summary": row[3],
+                    "provenance": row[4], "origin_available": row[5] is not None,
+                    "origin_thread_id": row[5], "origin_turn_number": row[6],
+                    "supersedes_record_id": row[7], "created_at": row[8],
+                    "evidence": [
+                        {
+                            "original_evidence_id": int(item[0]),
+                            "safe_envelope": json.loads(item[1]),
+                            "origin_available": bool(item[2]),
+                        }
+                        for item in evidence
+                    ],
+                })
+        return records
 
     def create_source_library(
         self,
@@ -3245,6 +3350,16 @@ class Storage:
                 (thread_id,),
             )
             connection.execute(
+                "UPDATE project_empirical_evidence_refs SET origin_available = 0 WHERE original_evidence_id IN "
+                "(SELECT id FROM analysis_evidence WHERE thread_id = ?)",
+                (thread_id,),
+            )
+            connection.execute(
+                "UPDATE project_research_records SET origin_thread_id = NULL, origin_turn_number = NULL "
+                "WHERE origin_thread_id = ?",
+                (thread_id,),
+            )
+            connection.execute(
                 "DELETE FROM profile_tool_operations WHERE origin_thread_id = ?", (thread_id,)
             )
             connection.execute("DELETE FROM analysis_tool_outputs WHERE thread_id = ?", (thread_id,))
@@ -3629,6 +3744,11 @@ def _initialize_phase6_schema(connection: sqlite3.Connection) -> None:
         CREATE TRIGGER project_state_events_are_immutable
         BEFORE UPDATE OF project_id, event_key, kind, payload_json ON project_state_events
         BEGIN SELECT RAISE(ABORT, 'project state events are immutable'); END;
+        DROP TRIGGER IF EXISTS project_research_records_are_immutable;
+        CREATE TRIGGER project_research_records_are_immutable
+        BEFORE UPDATE OF project_id, kind, status, summary, provenance, supersedes_record_id
+        ON project_research_records
+        BEGIN SELECT RAISE(ABORT, 'project research records are immutable'); END;
         """
     )
     thread_columns = {row[1] for row in connection.execute("PRAGMA table_info(threads)")}

@@ -349,6 +349,35 @@ def test_general_request_receives_only_bounded_project_summary_not_project_tools
     assert not any(tool.get("name", "").startswith("update_project_") for tool in responses.calls[0]["tools"])
 
 
+def test_project_research_tool_records_a_typed_hypothesis_in_the_owning_ledger(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    project = storage.create_project("GxT")
+    thread_id = storage.create_thread("Project", behavior=ThreadSourceBehavior.PROJECT, project_id=project.id)
+    responses = SequenceResponses(
+        SimpleNamespace(status="completed", output=[{
+            "type": "function_call", "call_id": "hypothesis-1", "name": "record_project_research",
+            "arguments": json.dumps({
+                "kind": "HYPOTHESIS", "status": "ACTIVE",
+                "summary": "Session alignment may improve the setup's expectancy.",
+                "provenance": "AI_RESEARCH_HYPOTHESIS", "analysis_evidence_id": None,
+                "supersedes_record_id": None,
+            }),
+        }]),
+        terminal_response("I recorded that as a hypothesis, not a proven rule."),
+    )
+
+    answer = ChatService(storage, SimpleNamespace(responses=responses)).reply(
+        thread_id, "Record that as a hypothesis for this project."
+    )
+
+    assert answer.text.endswith("not a proven rule.")
+    record = storage.project_research_records(project.id)[0]
+    assert record["kind"] == "HYPOTHESIS"
+    assert record["provenance"] == "AI_RESEARCH_HYPOTHESIS"
+    assert any(item.get("name") == "record_project_research" for item in storage.replay_items(thread_id))
+
+
 def source_response(text, annotations, *, status="completed", usage=None):
     return SimpleNamespace(
         status=status,

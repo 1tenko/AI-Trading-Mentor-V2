@@ -24,7 +24,7 @@ def _call(name, arguments, call_id="project-call-1"):
 
 def test_project_tools_expose_only_constrained_state_and_mastery_updates():
     assert [tool["name"] for tool in PROJECT_TOOLS] == [
-        "update_project_state", "update_project_mastery"
+        "update_project_state", "update_project_mastery", "record_project_research"
     ]
     assert all(tool["type"] == "function" and tool["strict"] is True for tool in PROJECT_TOOLS)
 
