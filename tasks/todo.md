@@ -1,9 +1,8 @@
 # Phase 5 Task List — Backtest / Empirical Data Analysis Foundation
 
-**Status:** 2026-09-01 The Chat-first Task 9UX human-gate regressions are
-addressed: broad deterministic backtest analysis now has a bounded partial-batch
-path, and a ready spreadsheet is recorded on its sent conversation turn. Task
-10 remains Theo's human quality gate.
+**Status:** Phase 5 passed Theo's human quality gate and is the accepted Phase 6
+baseline at `70e49ffdc7366047672b04e848424b62251d67bb`. Phase 6 is authorized
+on 2026-09-05 under the approved design and plan appended below.
 Phase 4 passed and is recorded in [`docs/phase-4-acceptance.md`](../docs/phase-4-acceptance.md).
 
 ## dataset-foundation
@@ -345,17 +344,17 @@ approved examples, run deterministic/browser/full checks, obtain independent
 review, and present the human quality gate without beginning Phase 6.
 
 **Acceptance criteria:**
-- [ ] All design acceptance examples, including a combined numeric-plus-approved
+- [x] All design acceptance examples, including a combined numeric-plus-approved
   notes analysis, are covered by fixtures and the local UI.
-- [ ] Privacy, Git diff, bounded-context/sanitizer, source/provenance, deletion/
+- [x] Privacy, Git diff, bounded-context/sanitizer, source/provenance, deletion/
   historic-evidence, text completeness/replay, and Phase 1–4 regression checks
   are recorded.
-- [ ] Theo receives a clear pass/fail gate; no Projects, web research, or
+- [x] Theo receives a clear pass/fail gate; no Projects, web research, or
   scientific supervisor begins.
 
 **Verification:**
-- [ ] Focused tests, full pytest, browser smoke, and independent review pass.
-- [ ] Clean worktree and pushed feature branch are verified before handoff.
+- [x] Focused tests, full pytest, browser smoke, and independent review pass.
+- [x] Clean worktree and pushed feature branch are verified before handoff.
 
 **Dependencies:** Checkpoint C
 **Files likely touched:** `tests/test_analysis.py`, `tests/test_chat_service.py`,
@@ -364,8 +363,38 @@ review, and present the human quality gate without beginning Phase 6.
 
 ### Final checkpoint: Await Theo's Phase 5 decision
 
-- [ ] Complete deterministic suite, browser smoke, privacy/diff review, and
+- [x] Complete deterministic suite, browser smoke, privacy/diff review, and
   independent review are green.
-- [ ] Feature commits are pushed; runtime data stays ignored.
-- [ ] Theo has made the Phase 5 human acceptance decision.
-- [ ] Stop: do not start Phase 6, Phase 7, web research, or Strategy Projects.
+- [x] Feature commits are pushed; runtime data stays ignored.
+- [x] Theo has made the Phase 5 human acceptance decision.
+- [x] Phase 5 stopped at its gate; Phase 6 began only after separate design,
+  plan, and implementation authorization.
+
+# Phase 6 Task List — Strategy Projects, Multi-Mentor Knowledge & Coaching
+
+**Plan:** [`docs/superpowers/plans/2026-09-03-phase-6-strategy-projects-implementation-plan.md`](../docs/superpowers/plans/2026-09-03-phase-6-strategy-projects-implementation-plan.md)
+
+## Phase 6A foundation
+
+- [ ] Task 1 — Phase 6 contracts, migration fixture, and synthetic-spike contract.
+- [ ] Task 2 — Neutral General Mentor and project-local conversation scope.
+- [ ] Task 3 — Corpus-scoped mentor libraries and legacy Jacob compatibility.
+- [ ] Task 4 — Browser folder staging, confirmation, immutable import, and remote adapter.
+- [ ] Checkpoint A — Source/project isolation, migration parity, privacy, full suite, review.
+
+## Phase 6A Mentor behavior and Phase 6B state
+
+- [ ] Task 5 — Saved/temporary source scope, six-library budgets, native citation gate.
+- [ ] Task 6 — Project-aware attribution, citations, disagreement, and replay.
+- [ ] Task 7 — Persistent coaching state and constrained project tools.
+- [ ] Task 8 — Research ledger and safe Phase 5 empirical evidence links.
+- [ ] Task 9 — Explicit promotion gate and immutable playbook lineage.
+- [ ] Checkpoint B — Project/source/privacy/replay integrity, full suite, review.
+
+## Phase 6 UI and final proof
+
+- [ ] Task 10 — Chat-first project navigation, source controls, and browser folder import.
+- [ ] Task 11 — Compact Roadmap, research history, and playbook inspection.
+- [ ] Task 12 — Synthetic contract/behavioral proof, regressions, and human-gate package.
+- [ ] Checkpoint C — Full deterministic/live/browser/privacy review and clean pushed branch.
+- [ ] Theo human quality gate — stop before Phase 7.
