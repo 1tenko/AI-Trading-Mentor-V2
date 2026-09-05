@@ -1,0 +1,2 @@
+Synthetic Afyz source
+[00:00:01 --> 00:00:08] Afyz teaches that synthetic setup A requires shared condition SHARED_X and Afyz-only condition AFYZ_ONLY_Y.

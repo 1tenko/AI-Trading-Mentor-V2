@@ -1744,6 +1744,39 @@ class Storage:
             for row in rows
         ]
 
+    def project_library_access(self, project_id: int) -> list[tuple[str, str, str, bool]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT source_libraries.library_key, source_libraries.display_name, "
+                "library_vector_stores.vector_store_id, project_source_libraries.enabled "
+                "FROM project_source_libraries JOIN source_libraries "
+                "ON source_libraries.id = project_source_libraries.library_id "
+                "JOIN library_vector_stores ON library_vector_stores.library_id = source_libraries.id "
+                "WHERE project_source_libraries.project_id = ? AND source_libraries.status = 'ACTIVE' "
+                "AND library_vector_stores.state = 'READY' AND library_vector_stores.vector_store_id IS NOT NULL "
+                "ORDER BY source_libraries.library_key",
+                (project_id,),
+            ).fetchall()
+        return [(str(row[0]), str(row[1]), str(row[2]), bool(row[3])) for row in rows]
+
+    def record_thread_source_scope(
+        self, thread_id: int, turn_number: int, snapshot: dict[str, object]
+    ) -> None:
+        encoded = _source_scope_json(snapshot)
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT INTO thread_source_scopes(thread_id, turn_number, scope_json) VALUES (?, ?, ?)",
+                (thread_id, turn_number, encoded),
+            )
+
+    def thread_source_scope(self, thread_id: int, turn_number: int) -> dict[str, object] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT scope_json FROM thread_source_scopes WHERE thread_id = ? AND turn_number = ?",
+                (thread_id, turn_number),
+            ).fetchone()
+        return None if row is None else json.loads(row[0])
+
     def legacy_source_records(self) -> list[tuple]:
         with self._connect() as connection:
             return connection.execute(
@@ -2042,6 +2075,7 @@ class Storage:
         incomplete_reason: str | None,
         profile_update: dict[str, str] | None = None,
         dataset_attachment_id: str | None = None,
+        source_scope: dict[str, object] | None = None,
         raw_start_position: int | None = None,
         raw_end_position: int | None = None,
     ) -> None:
@@ -2049,6 +2083,7 @@ class Storage:
         evidence_json = _persistent_json(evidence)
         diagnostics_json = None if diagnostics is None else _persistent_json(diagnostics)
         profile_update_json = None if profile_update is None else _persistent_json(profile_update)
+        source_scope_json = None if source_scope is None else _source_scope_json(source_scope)
         with self._connect() as connection:
             row = connection.execute(
                 "SELECT COALESCE(MAX(turn_number), 0) FROM display_turns WHERE thread_id = ?",
@@ -2088,6 +2123,11 @@ class Storage:
                     "INSERT INTO thread_turn_dataset_attachments(thread_id, turn_number, dataset_id) VALUES (?, ?, ?)",
                     (thread_id, turn_number, dataset_attachment_id),
                 )
+            if source_scope_json is not None:
+                connection.execute(
+                    "INSERT INTO thread_source_scopes(thread_id, turn_number, scope_json) VALUES (?, ?, ?)",
+                    (thread_id, turn_number, source_scope_json),
+                )
 
     def display_turns(self, thread_id: int) -> list[dict]:
         with self._connect() as connection:
@@ -2096,12 +2136,15 @@ class Storage:
                 SELECT display_turns.turn_number, display_turns.user_text, display_turns.answer_markdown, display_turns.citations_json,
                        display_turns.evidence_json, display_turns.diagnostic_json, display_turns.profile_update_json, display_turns.response_id, display_turns.status,
                        display_turns.incomplete_reason, thread_turn_dataset_attachments.dataset_id,
-                       datasets.original_name, datasets.source_row_count
+                       datasets.original_name, datasets.source_row_count, thread_source_scopes.scope_json
                 FROM display_turns
                 LEFT JOIN thread_turn_dataset_attachments
                   ON thread_turn_dataset_attachments.thread_id = display_turns.thread_id
                  AND thread_turn_dataset_attachments.turn_number = display_turns.turn_number
                 LEFT JOIN datasets ON datasets.id = thread_turn_dataset_attachments.dataset_id
+                LEFT JOIN thread_source_scopes
+                  ON thread_source_scopes.thread_id = display_turns.thread_id
+                 AND thread_source_scopes.turn_number = display_turns.turn_number
                 WHERE display_turns.thread_id = ? ORDER BY display_turns.turn_number
                 """,
                 (thread_id,),
@@ -2119,6 +2162,7 @@ class Storage:
                 "incomplete_reason": row[9],
                 **({"profile_update": json.loads(row[6])} if row[6] is not None else {}),
                 **({"attachment": {"dataset_id": row[10], "original_name": row[11], "source_row_count": row[12]}} if row[10] is not None else {}),
+                **({"source_scope": json.loads(row[13])} if row[13] is not None else {}),
             }
             for row in rows
         ]
@@ -3084,6 +3128,7 @@ class Storage:
             connection.execute("DELETE FROM analysis_tool_outputs WHERE thread_id = ?", (thread_id,))
             connection.execute("DELETE FROM analysis_evidence WHERE thread_id = ?", (thread_id,))
             connection.execute("DELETE FROM qualitative_evidence_metadata WHERE thread_id = ?", (thread_id,))
+            connection.execute("DELETE FROM thread_source_scopes WHERE thread_id = ?", (thread_id,))
             connection.execute("DELETE FROM thread_dataset_scopes WHERE thread_id = ?", (thread_id,))
             connection.execute("DELETE FROM thread_turn_dataset_attachments WHERE thread_id = ?", (thread_id,))
             connection.execute("DELETE FROM display_turns WHERE thread_id = ?", (thread_id,))
@@ -3228,6 +3273,21 @@ def _persistent_json(value: object) -> str:
     if _contains_ephemeral_qualitative_evidence(value):
         raise ValueError("ephemeral qualitative evidence cannot be persisted")
     return json.dumps(value)
+
+
+def _source_scope_json(snapshot: dict[str, object]) -> str:
+    if set(snapshot) != {"library_keys", "temporary", "override"}:
+        raise ValueError("source scope snapshot is invalid")
+    keys = snapshot["library_keys"]
+    if (
+        not isinstance(keys, list)
+        or len(keys) > 6
+        or any(not isinstance(key, str) or not _LIBRARY_KEY_PATTERN.fullmatch(key) for key in keys)
+        or type(snapshot["temporary"]) is not bool
+        or snapshot["override"] not in {"saved", "only", "compare", "all_enabled"}
+    ):
+        raise ValueError("source scope snapshot is invalid")
+    return json.dumps(snapshot, separators=(",", ":"))
 
 
 def _contains_ephemeral_qualitative_evidence(value: object) -> bool:

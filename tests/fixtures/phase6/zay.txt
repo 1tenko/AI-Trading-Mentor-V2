@@ -1,0 +1,2 @@
+Synthetic Zay source
+[00:00:01 --> 00:00:08] Zay teaches that synthetic setup A requires shared condition SHARED_X.

@@ -1,0 +1,2 @@
+Synthetic Splash source
+[00:00:01 --> 00:00:08] Splash teaches that synthetic setup A requires shared condition SHARED_X and adds Splash-only application nuance SPLASH_ONLY_Z.

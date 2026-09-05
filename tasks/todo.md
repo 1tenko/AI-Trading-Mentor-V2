@@ -384,7 +384,7 @@ review, and present the human quality gate without beginning Phase 6.
 
 ## Phase 6A Mentor behavior and Phase 6B state
 
-- [ ] Task 5 — Saved/temporary source scope, six-library budgets, native citation gate.
+- [x] Task 5 — Saved/temporary source scope, six-library budgets, native citation gate.
 - [ ] Task 6 — Project-aware attribution, citations, disagreement, and replay.
 - [ ] Task 7 — Persistent coaching state and constrained project tools.
 - [ ] Task 8 — Research ledger and safe Phase 5 empirical evidence links.

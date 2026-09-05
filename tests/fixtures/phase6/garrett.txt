@@ -1,0 +1,2 @@
+Synthetic Garrett source
+[00:00:01 --> 00:00:08] Garrett teaches that synthetic setup A requires shared condition SHARED_X.

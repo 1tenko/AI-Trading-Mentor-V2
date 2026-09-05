@@ -16,7 +16,7 @@ from mentor.chat_service import (
 from mentor.prompts import ANALYSIS_TOOL_INSTRUCTIONS, MENTOR_INSTRUCTIONS, PROFILE_TOOL_INSTRUCTIONS
 from mentor.datasets import MappingEntry, create_inspected_mapping_draft, import_local_dataset, inspect_local_dataset, safe_auto_mapping
 from mentor.profile import ProfileService
-from mentor.project_models import ThreadSourceBehavior
+from mentor.project_models import AuthorityKind, ThreadSourceBehavior
 from mentor.storage import Storage
 
 
@@ -111,6 +111,140 @@ def test_project_thread_does_not_inherit_global_jacob_or_prompt_selected_project
     assert not any(tool["type"] == "file_search" for tool in request["tools"])
     assert "GxT Mastery" in request["instructions"]
     assert "Other" not in request["instructions"]
+
+
+def _add_project_library(storage, project_id, key, store_id, *, enabled=True, file_id=None):
+    name = key.split(".")[-1].title()
+    library = storage.create_source_library(key, "gxt", name, AuthorityKind.MENTOR, name)
+    storage.set_project_library(project_id, library.id, enabled=enabled)
+    storage.set_library_vector_store(library.id, store_id, "READY")
+    if file_id is not None:
+        storage.register_library_revision(
+            library_id=library.id,
+            source_key=f"{name.casefold()}.txt",
+            display_title=f"{name}.txt",
+            source_type="transcript",
+            relative_category="Synthetic",
+            source_date=None,
+            timestamps_available=True,
+            sha256=(str(library.id) * 64)[:64],
+            byte_size=10,
+            relative_path=f"Synthetic/{name}.txt",
+            staged_path=f"ignored/{name}.txt",
+            canonical_role=None,
+            file_id=file_id,
+            vector_store_file_id=f"vsf_{file_id}",
+            index_state="READY",
+        )
+    return library
+
+
+def test_project_request_uses_only_effective_enabled_vector_stores(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    project = storage.create_project("GxT")
+    thread_id = storage.create_thread("Project", behavior=ThreadSourceBehavior.PROJECT, project_id=project.id)
+    _add_project_library(storage, project.id, "gxt.garrett", "vs_garrett")
+    _add_project_library(storage, project.id, "gxt.afyz", "vs_afyz")
+    _add_project_library(storage, project.id, "gxt.erik", "vs_erik", enabled=False)
+    responses = FakeResponses(terminal_response("Scoped answer."))
+
+    ChatService(storage, SimpleNamespace(responses=responses)).reply(thread_id, "Teach me GxT.")
+
+    assert [call["tools"][0]["vector_store_ids"] for call in responses.calls[:2]] == [
+        ["vs_afyz"], ["vs_garrett"]
+    ]
+    assert "vs_erik" not in json.dumps(responses.calls)
+    assert "gxt.afyz" in responses.calls[-1]["instructions"]
+    assert "gxt.garrett" in responses.calls[-1]["instructions"]
+
+
+def test_project_one_turn_only_override_is_persisted_safely_and_not_saved(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    project = storage.create_project("GxT")
+    thread_id = storage.create_thread("Project", behavior=ThreadSourceBehavior.PROJECT, project_id=project.id)
+    _add_project_library(storage, project.id, "gxt.garrett", "vs_garrett")
+    _add_project_library(storage, project.id, "gxt.afyz", "vs_afyz")
+    responses = FakeResponses(terminal_response("Answer."))
+    service = ChatService(storage, SimpleNamespace(responses=responses))
+
+    service.reply(thread_id, "Afyz only")
+    service.reply(thread_id, "Teach me GxT.")
+
+    assert not any(tool["type"] == "file_search" for tool in responses.calls[0]["tools"])
+    assert [call["tools"][0]["vector_store_ids"] for call in responses.calls[1:3]] == [
+        ["vs_afyz"], ["vs_garrett"]
+    ]
+    assert storage.display_turns(thread_id)[0]["source_scope"] == {
+        "library_keys": ["gxt.afyz"], "temporary": True, "override": "only"
+    }
+
+
+def test_normal_project_teaching_instructions_require_enabled_mentor_coverage(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    project = storage.create_project("GxT")
+    thread_id = storage.create_thread("Project", behavior=ThreadSourceBehavior.PROJECT, project_id=project.id)
+    for label in ("garrett", "afyz", "erik", "splash", "zay"):
+        _add_project_library(storage, project.id, f"gxt.{label}", f"vs_{label}")
+    responses = FakeResponses(terminal_response("Teaching."))
+
+    ChatService(storage, SimpleNamespace(responses=responses)).reply(
+        thread_id, "Teach me how X works in GxT."
+    )
+
+    instructions = responses.calls[-1]["instructions"]
+    assert "Research each planned mentor library" in instructions
+    assert all(f"gxt.{label}" in instructions for label in ("garrett", "afyz", "erik", "splash", "zay"))
+    assert "creator status is not empirical superiority" in instructions
+
+
+def _project_source_response(key, file_id, statement):
+    return SimpleNamespace(
+        id=f"resp_{key}", model="gpt-5.6-sol", status="completed", usage=None,
+        output=[
+            {
+                "type": "file_search_call", "queries": [f"{key} synthetic query"],
+                "results": [{
+                    "file_id": file_id, "filename": f"{key}.txt", "text": statement,
+                    "attributes": {"library_key": key, "timestamps_available": "true"},
+                }],
+            },
+            {
+                "type": "message", "role": "assistant",
+                "content": [{
+                    "type": "output_text", "text": statement,
+                    "annotations": [{"type": "file_citation", "file_id": file_id, "filename": f"{key}.txt"}],
+                }],
+            },
+        ],
+    )
+
+
+def test_project_research_is_one_store_per_call_and_keeps_native_citations_out_of_replay(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    project = storage.create_project("GxT")
+    thread_id = storage.create_thread("Project", behavior=ThreadSourceBehavior.PROJECT, project_id=project.id)
+    keys = ("gxt.garrett", "gxt.afyz", "gxt.erik")
+    for key in keys:
+        _add_project_library(storage, project.id, key, f"vs_{key}", file_id=f"file_{key}")
+    research = [_project_source_response(key, f"file_{key}", f"{key} supports X.") for key in sorted(keys)]
+    responses = SequenceResponses(*research, terminal_response("Source synthesis: X is shared."))
+
+    answer = ChatService(storage, SimpleNamespace(responses=responses)).reply(
+        thread_id, "Teach me how X works in GxT."
+    )
+
+    assert [call["tools"][0]["vector_store_ids"] for call in responses.calls[:3]] == [
+        [f"vs_{key}"] for key in sorted(keys)
+    ]
+    assert not any(tool["type"] == "file_search" for tool in responses.calls[-1]["tools"])
+    assert {citation.file_id for citation in answer.citations} == {f"file_{key}" for key in keys}
+    assert len(answer.evidence) == 3
+    assert all(item.get("type") != "file_search_call" for item in storage.replay_items(thread_id))
+    assert all(item.get("type") != "file_search_call" for item in storage.thread_items(thread_id))
 
 
 def source_response(text, annotations, *, status="completed", usage=None):
