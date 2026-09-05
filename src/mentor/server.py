@@ -129,6 +129,15 @@ class _Handler(BaseHTTPRequestHandler):
                 return
             self._send_json(HTTPStatus.OK, detail)
             return
+        roadmap_match = re.fullmatch(r"/api/projects/(\d+)/roadmap", path)
+        if roadmap_match:
+            try:
+                roadmap = ProjectService(self.storage).roadmap(int(roadmap_match.group(1)))
+            except LookupError:
+                self._send_json(HTTPStatus.NOT_FOUND, {"error": "Project not found."})
+                return
+            self._send_json(HTTPStatus.OK, roadmap)
+            return
         match = re.fullmatch(r"/api/sources/([^/]+)", path)
         if match and FILE_ID.fullmatch(unquote(match.group(1))):
             self._source(unquote(match.group(1)))

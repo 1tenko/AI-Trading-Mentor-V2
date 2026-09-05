@@ -49,7 +49,60 @@ class ProjectService:
         return {
             **self._safe_summary(project),
             "threads": [self._thread_json(thread) for thread in self.storage.project_threads(project.id)],
+            "roadmap": self.roadmap(project.id),
         }
+
+    def apply_state_event(
+        self,
+        project_id: int,
+        *,
+        event_key: str,
+        kind: str,
+        payload: dict[str, object],
+        origin_thread_id: int,
+        origin_turn_number: int,
+    ) -> dict[str, object]:
+        project = self._project(project_id)
+        if project.status is ProjectStatus.ARCHIVED:
+            raise ProjectConflictError("archived projects cannot change coaching state")
+        applied = self.storage.apply_project_state_event(
+            project_id=project_id,
+            event_key=event_key,
+            kind=kind,
+            payload=payload,
+            origin_thread_id=origin_thread_id,
+            origin_turn_number=origin_turn_number,
+        )
+        return {"status": "applied" if applied else "already_applied", "roadmap": self.roadmap(project_id)}
+
+    def roadmap(self, project_id: int) -> dict[str, object]:
+        self._project(project_id)
+        return self.storage.project_roadmap(project_id)
+
+    def project_context(self, project_id: int) -> dict[str, object]:
+        roadmap = self.roadmap(project_id)
+        blockers = roadmap["blockers"]
+        mastery = roadmap["mastery"]
+        return {
+            "objective": _bounded(roadmap["objective"], 800),
+            "experiment": _bounded(roadmap["experiment"], 800),
+            "blockers": [_bounded(item, 250) for item in blockers[:4]],
+            "blockers_truncated": len(blockers) > 4,
+            "next_action": _bounded(roadmap["next_action"], 800),
+            "mastery": [
+                {
+                    "concept": _bounded(item["concept"], 100),
+                    "status": item["status"],
+                    "reason": _bounded(item["reason"], 200),
+                    "evidence_reference": _bounded(item["evidence_reference"], 100),
+                }
+                for item in mastery[:5]
+            ],
+            "mastery_truncated": len(mastery) > 5,
+        }
+
+    def general_summaries(self) -> list[dict[str, object]]:
+        return [self._safe_summary(project) for project in self.storage.projects()]
 
     def _project(self, project_id: int) -> StrategyProject:
         project = self.storage.project(project_id)
@@ -57,18 +110,19 @@ class ProjectService:
             raise LookupError("project not found")
         return project
 
-    @staticmethod
-    def _safe_summary(project: StrategyProject) -> dict[str, object]:
+    def _safe_summary(self, project: StrategyProject) -> dict[str, object]:
+        roadmap = self.storage.project_roadmap(project.id)
+        blockers = roadmap["blockers"]
         return {
             "id": project.id,
             "name": project.name,
             "status": project.status.value,
             "summary": {
-                "objective": None,
-                "experiment": None,
+                "objective": roadmap["objective"],
+                "experiment": roadmap["experiment"],
                 "progress": None,
-                "next_action": None,
-                "unresolved_question": None,
+                "next_action": roadmap["next_action"],
+                "unresolved_question": blockers[0] if blockers else None,
             },
         }
 
@@ -80,3 +134,7 @@ class ProjectService:
             "project_id": thread.project_id,
             "thread_source_behavior": thread.thread_source_behavior.value,
         }
+
+
+def _bounded(value: object, limit: int) -> object:
+    return value[:limit] if isinstance(value, str) else value

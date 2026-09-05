@@ -386,7 +386,7 @@ review, and present the human quality gate without beginning Phase 6.
 
 - [x] Task 5 — Saved/temporary source scope, six-library budgets, native citation gate.
 - [x] Task 6 — Project-aware attribution, citations, disagreement, and replay.
-- [ ] Task 7 — Persistent coaching state and constrained project tools.
+- [x] Task 7 — Persistent coaching state and constrained project tools.
 - [ ] Task 8 — Research ledger and safe Phase 5 empirical evidence links.
 - [ ] Task 9 — Explicit promotion gate and immutable playbook lineage.
 - [ ] Checkpoint B — Project/source/privacy/replay integrity, full suite, review.

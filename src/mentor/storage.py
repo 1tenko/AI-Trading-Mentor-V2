@@ -1567,6 +1567,111 @@ class Storage:
             for row in rows
         ]
 
+    def apply_project_state_event(
+        self,
+        *,
+        project_id: int,
+        event_key: str,
+        kind: str,
+        payload: dict[str, object],
+        origin_thread_id: int,
+        origin_turn_number: int,
+    ) -> bool:
+        encoded = json.dumps(payload, separators=(",", ":"), sort_keys=True)
+        with self._connect() as connection:
+            thread = connection.execute(
+                "SELECT project_id, thread_source_behavior FROM threads WHERE id = ?",
+                (origin_thread_id,),
+            ).fetchone()
+            if thread is None or thread[0] != project_id or thread[1] != ThreadSourceBehavior.PROJECT.value:
+                raise ValueError("conversation does not belong to this project")
+            existing = connection.execute(
+                "SELECT project_id, kind, payload_json, origin_thread_id, origin_turn_number "
+                "FROM project_state_events WHERE event_key = ?",
+                (event_key,),
+            ).fetchone()
+            expected = (project_id, kind, encoded, origin_thread_id, origin_turn_number)
+            if existing is not None:
+                if tuple(existing) != expected:
+                    raise ValueError("project event idempotency key was already used")
+                return False
+            cursor = connection.execute(
+                "INSERT INTO project_state_events(project_id, event_key, kind, payload_json, origin_thread_id, origin_turn_number) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (project_id, event_key, kind, encoded, origin_thread_id, origin_turn_number),
+            )
+            event_id = int(cursor.lastrowid)
+            if kind == "MASTERY":
+                connection.execute(
+                    "INSERT INTO project_mastery_items(project_id, concept, status, reason, evidence_reference) "
+                    "VALUES (?, ?, ?, ?, ?) ON CONFLICT(project_id, concept) DO UPDATE SET "
+                    "status = excluded.status, reason = excluded.reason, evidence_reference = excluded.evidence_reference",
+                    (
+                        project_id, payload["concept"], payload["status"], payload["reason"],
+                        payload.get("evidence_reference"),
+                    ),
+                )
+                return True
+            connection.execute(
+                "INSERT OR IGNORE INTO project_state_snapshots(project_id) VALUES (?)",
+                (project_id,),
+            )
+            if kind == "BLOCKER":
+                row = connection.execute(
+                    "SELECT blockers_json FROM project_state_snapshots WHERE project_id = ?",
+                    (project_id,),
+                ).fetchone()
+                blockers = json.loads(row[0])
+                operation, value = payload["operation"], payload.get("value")
+                if operation == "ADD" and value not in blockers:
+                    blockers.append(value)
+                elif operation == "REMOVE":
+                    blockers = [item for item in blockers if item != value]
+                elif operation == "CLEAR":
+                    blockers = []
+                connection.execute(
+                    "UPDATE project_state_snapshots SET blockers_json = ?, updated_event_id = ?, "
+                    "updated_at = CURRENT_TIMESTAMP WHERE project_id = ?",
+                    (json.dumps(blockers, separators=(",", ":")), event_id, project_id),
+                )
+                return True
+            column = {"OBJECTIVE": "objective", "EXPERIMENT": "experiment", "NEXT_ACTION": "next_action"}[kind]
+            value = payload["value"] if payload["operation"] == "SET" else None
+            connection.execute(
+                f"UPDATE project_state_snapshots SET {column} = ?, updated_event_id = ?, "
+                "updated_at = CURRENT_TIMESTAMP WHERE project_id = ?",
+                (value, event_id, project_id),
+            )
+        return True
+
+    def project_roadmap(self, project_id: int) -> dict[str, object]:
+        with self._connect() as connection:
+            if connection.execute("SELECT 1 FROM strategy_projects WHERE id = ?", (project_id,)).fetchone() is None:
+                raise LookupError("project not found")
+            snapshot = connection.execute(
+                "SELECT objective, experiment, blockers_json, next_action FROM project_state_snapshots WHERE project_id = ?",
+                (project_id,),
+            ).fetchone()
+            mastery = connection.execute(
+                "SELECT concept, status, reason, evidence_reference FROM project_mastery_items "
+                "WHERE project_id = ? ORDER BY concept COLLATE NOCASE",
+                (project_id,),
+            ).fetchall()
+        return {
+            "objective": None if snapshot is None else snapshot[0],
+            "experiment": None if snapshot is None else snapshot[1],
+            "blockers": [] if snapshot is None else json.loads(snapshot[2]),
+            "next_action": None if snapshot is None else snapshot[3],
+            "mastery": [
+                {
+                    "concept": row[0], "status": row[1], "reason": row[2],
+                    "evidence_reference": row[3],
+                }
+                for row in mastery
+            ],
+            "recent_research": [],
+        }
+
     def create_source_library(
         self,
         library_key: str,
@@ -3135,6 +3240,11 @@ class Storage:
                 (thread_id,),
             )
             connection.execute(
+                "UPDATE project_state_events SET origin_thread_id = NULL, origin_turn_number = NULL "
+                "WHERE origin_thread_id = ?",
+                (thread_id,),
+            )
+            connection.execute(
                 "DELETE FROM profile_tool_operations WHERE origin_thread_id = ?", (thread_id,)
             )
             connection.execute("DELETE FROM analysis_tool_outputs WHERE thread_id = ?", (thread_id,))
@@ -3511,8 +3621,13 @@ def _initialize_phase6_schema(connection: sqlite3.Connection) -> None:
         CREATE TRIGGER IF NOT EXISTS mentor_library_source_revisions_cannot_delete
         BEFORE DELETE ON mentor_library_source_revisions
         BEGIN SELECT RAISE(ABORT, 'source revisions are immutable'); END;
-        CREATE TRIGGER IF NOT EXISTS project_state_events_are_immutable
-        BEFORE UPDATE ON project_state_events
+        """
+    )
+    connection.executescript(
+        """
+        DROP TRIGGER IF EXISTS project_state_events_are_immutable;
+        CREATE TRIGGER project_state_events_are_immutable
+        BEFORE UPDATE OF project_id, event_key, kind, payload_json ON project_state_events
         BEGIN SELECT RAISE(ABORT, 'project state events are immutable'); END;
         """
     )

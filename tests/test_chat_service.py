@@ -301,6 +301,54 @@ def test_project_research_keeps_no_result_as_scoped_absence_not_a_fabricated_dis
     assert answer.diagnostics.mentor_search_calls == {"gxt.afyz": 1, "gxt.garrett": 1}
 
 
+def test_project_state_tool_updates_only_the_owning_project_and_replays_safely(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    project = storage.create_project("GxT")
+    thread_id = storage.create_thread("Project", behavior=ThreadSourceBehavior.PROJECT, project_id=project.id)
+    responses = SequenceResponses(
+        SimpleNamespace(status="completed", output=[{
+            "type": "function_call", "call_id": "next-action-1", "name": "update_project_state",
+            "arguments": json.dumps({
+                "kind": "NEXT_ACTION", "operation": "SET", "value": "Define the entry condition."
+            }),
+        }]),
+        terminal_response("Your next action is saved."),
+    )
+
+    answer = ChatService(storage, SimpleNamespace(responses=responses)).reply(
+        thread_id, "Set our next action to define the entry condition."
+    )
+
+    assert answer.text == "Your next action is saved."
+    assert storage.project_roadmap(project.id)["next_action"] == "Define the entry condition."
+    assert any(tool.get("name") == "update_project_state" for tool in responses.calls[0]["tools"])
+    assert any(item.get("name") == "update_project_state" for item in storage.replay_items(thread_id))
+    assert "Define the entry condition." in responses.calls[1]["input"][-1]["output"]
+
+
+def test_general_request_receives_only_bounded_project_summary_not_project_tools(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    project = storage.create_project("GxT")
+    project_thread = storage.create_thread(
+        "Project", behavior=ThreadSourceBehavior.PROJECT, project_id=project.id
+    )
+    storage.apply_project_state_event(
+        project_id=project.id, event_key="objective-1", kind="OBJECTIVE",
+        payload={"operation": "SET", "value": "Operationalize one setup"},
+        origin_thread_id=project_thread, origin_turn_number=1,
+    )
+    general_thread = storage.create_thread("General")
+    responses = FakeResponses(terminal_response("GxT is focused on one setup."))
+
+    ChatService(storage, SimpleNamespace(responses=responses)).reply(general_thread, "What am I working on?")
+
+    assert "Operationalize one setup" in responses.calls[0]["instructions"]
+    assert "recent_research" not in responses.calls[0]["instructions"]
+    assert not any(tool.get("name", "").startswith("update_project_") for tool in responses.calls[0]["tools"])
+
+
 def source_response(text, annotations, *, status="completed", usage=None):
     return SimpleNamespace(
         status=status,

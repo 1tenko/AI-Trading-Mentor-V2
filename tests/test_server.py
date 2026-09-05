@@ -9,6 +9,7 @@ import mentor.server as server_module
 from mentor.chat_service import Answer, StreamEvent
 from mentor.profile import ProfileService
 from mentor.project_models import AuthorityKind
+from mentor.project_service import ProjectService
 from mentor.server import create_server
 from mentor.storage import Storage
 
@@ -169,6 +170,34 @@ def test_server_serves_a_ready_project_mentor_source_for_citation_verification(t
         assert status == 200
         assert headers["Content-Type"].startswith("text/plain")
         assert body == transcript.read_bytes()
+    finally:
+        server.shutdown()
+        worker.join()
+
+
+def test_project_roadmap_endpoint_returns_only_the_owning_project_state(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    service = ProjectService(storage)
+    project = service.create_project("GxT")
+    thread = service.create_project_thread(project.id, "Project")
+    service.apply_state_event(
+        project.id, event_key="next-1", kind="NEXT_ACTION",
+        payload={"operation": "SET", "value": "Define one setup"},
+        origin_thread_id=thread.id, origin_turn_number=1,
+    )
+    server = create_server(storage, FakeChatService(), port=0)
+    worker = threading.Thread(target=server.serve_forever)
+    worker.start()
+    try:
+        status, _headers, body = request(server, "GET", f"/api/projects/{project.id}/roadmap")
+        assert status == 200
+        assert json.loads(body) == {
+            "objective": None, "experiment": None, "blockers": [],
+            "next_action": "Define one setup", "mastery": [], "recent_research": [],
+        }
+        missing, _headers, _body = request(server, "GET", "/api/projects/999/roadmap")
+        assert missing == 404
     finally:
         server.shutdown()
         worker.join()
