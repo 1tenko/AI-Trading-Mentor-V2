@@ -351,10 +351,11 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _source(self, file_id: str) -> None:
         source = self.storage.source_for_file(file_id)
-        if source is None:
+        mentor_source = self.storage.mentor_source_file(file_id) if source is None else None
+        if source is None and mentor_source is None:
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "Source not found."})
             return
-        path = Path(source.local_path)
+        path = Path(source.local_path if source is not None else mentor_source[1])
         if not path.is_file():
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "Source is unavailable locally."})
             return

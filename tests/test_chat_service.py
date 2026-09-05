@@ -243,8 +243,62 @@ def test_project_research_is_one_store_per_call_and_keeps_native_citations_out_o
     assert not any(tool["type"] == "file_search" for tool in responses.calls[-1]["tools"])
     assert {citation.file_id for citation in answer.citations} == {f"file_{key}" for key in keys}
     assert len(answer.evidence) == 3
+    assert answer.diagnostics.mentor_search_calls == {key: 1 for key in sorted(keys)}
+    assert answer.diagnostics.source_scope == {
+        "library_keys": list(sorted(keys)), "temporary": False, "override": "saved"
+    }
     assert all(item.get("type") != "file_search_call" for item in storage.replay_items(thread_id))
     assert all(item.get("type") != "file_search_call" for item in storage.thread_items(thread_id))
+
+
+def test_project_research_rejects_a_result_owned_by_another_library_before_persistence(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    project = storage.create_project("GxT")
+    thread_id = storage.create_thread("Project", behavior=ThreadSourceBehavior.PROJECT, project_id=project.id)
+    _add_project_library(storage, project.id, "gxt.garrett", "vs_garrett", file_id="file_garrett")
+    _add_project_library(storage, project.id, "gxt.afyz", "vs_afyz", file_id="file_afyz")
+    responses = SequenceResponses(
+        _project_source_response("gxt.afyz", "file_garrett", "Wrong-owner result."),
+    )
+
+    with pytest.raises(RuntimeError, match="ownership"):
+        ChatService(storage, SimpleNamespace(responses=responses)).reply(thread_id, "Teach me GxT.")
+
+    assert storage.display_turns(thread_id) == []
+    assert storage.replay_items(thread_id) == []
+
+
+def test_project_research_keeps_no_result_as_scoped_absence_not_a_fabricated_disagreement(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    project = storage.create_project("GxT")
+    thread_id = storage.create_thread("Project", behavior=ThreadSourceBehavior.PROJECT, project_id=project.id)
+    _add_project_library(storage, project.id, "gxt.garrett", "vs_garrett", file_id="file_garrett")
+    _add_project_library(storage, project.id, "gxt.afyz", "vs_afyz", file_id="file_afyz")
+    absent = SimpleNamespace(
+        id="resp_absent", model="gpt-5.6-sol", status="completed", usage=None,
+        output=[
+            {"type": "file_search_call", "queries": ["gxt.afyz X"], "results": []},
+            {"type": "message", "role": "assistant", "content": [{
+                "type": "output_text", "text": "No relevant Afyz evidence was found in this scoped search.",
+                "annotations": [],
+            }]},
+        ],
+    )
+    responses = SequenceResponses(
+        absent,
+        _project_source_response("gxt.garrett", "file_garrett", "Garrett supports X."),
+        terminal_response("Garrett supports X; this search found no Afyz evidence."),
+    )
+
+    answer = ChatService(storage, SimpleNamespace(responses=responses)).reply(
+        thread_id, "Teach me how X works in GxT."
+    )
+
+    assert answer.text == "Garrett supports X; this search found no Afyz evidence."
+    assert [citation.file_id for citation in answer.citations] == ["file_garrett"]
+    assert answer.diagnostics.mentor_search_calls == {"gxt.afyz": 1, "gxt.garrett": 1}
 
 
 def source_response(text, annotations, *, status="completed", usage=None):
@@ -2114,6 +2168,8 @@ def test_reply_persists_continuation_state_and_extracts_evidence(tmp_path):
                 "analysis_batch_status": "not_requested",
                 "prior_empirical_evidence_reused": False,
                 "auto_mapping_policy_upgraded": False,
+                "source_scope": None,
+                "mentor_search_calls": {},
             },
             "response_id": storage.response_diagnostics(thread_id)[0]["response_id"],
             "status": "completed",

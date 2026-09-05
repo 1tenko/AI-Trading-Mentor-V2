@@ -1710,6 +1710,18 @@ class Storage:
             ).fetchone()
         return _source_library(row)
 
+    def mentor_source_file(self, file_id: str) -> tuple[str, str] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT mentor_library_sources.display_title, mentor_library_source_revisions.staged_path "
+                "FROM mentor_library_source_revisions JOIN mentor_library_sources "
+                "ON mentor_library_sources.id = mentor_library_source_revisions.source_id "
+                "WHERE mentor_library_source_revisions.file_id = ? "
+                "AND mentor_library_source_revisions.index_state = 'READY'",
+                (file_id,),
+            ).fetchone()
+        return None if row is None else (str(row[0]), str(row[1]))
+
     def set_project_library(self, project_id: int, library_id: int, *, enabled: bool) -> None:
         with self._connect() as connection:
             connection.execute(

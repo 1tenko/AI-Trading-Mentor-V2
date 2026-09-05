@@ -8,6 +8,7 @@ from openpyxl import Workbook
 import mentor.server as server_module
 from mentor.chat_service import Answer, StreamEvent
 from mentor.profile import ProfileService
+from mentor.project_models import AuthorityKind
 from mentor.server import create_server
 from mentor.storage import Storage
 
@@ -143,6 +144,31 @@ def test_server_streams_chat_events(tmp_path):
         assert chat_service.evaluation.reasoning_mode == "pro"
         assert chat_service.evaluation.research_depth == "deep"
         assert chat_service.include_approved_notes is False
+    finally:
+        server.shutdown()
+        worker.join()
+
+
+def test_server_serves_a_ready_project_mentor_source_for_citation_verification(tmp_path):
+    transcript = tmp_path / "erik.txt"
+    transcript.write_text("[1.0 --> 3.0] synthetic Erik source", encoding="utf-8")
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    library = storage.create_source_library("gxt.erik", "gxt", "Erik", AuthorityKind.MENTOR, "Erik")
+    storage.register_library_revision(
+        library_id=library.id, source_key="erik.txt", display_title="Erik lesson", source_type="transcript",
+        relative_category="Youtube", source_date=None, timestamps_available=True, sha256="a" * 64,
+        byte_size=transcript.stat().st_size, relative_path="Youtube/erik.txt", staged_path=str(transcript),
+        canonical_role=None, file_id="file_erik", vector_store_file_id="vsf_erik", index_state="READY",
+    )
+    server = create_server(storage, FakeChatService(), port=0)
+    worker = threading.Thread(target=server.serve_forever)
+    worker.start()
+    try:
+        status, headers, body = request(server, "GET", "/api/sources/file_erik")
+        assert status == 200
+        assert headers["Content-Type"].startswith("text/plain")
+        assert body == transcript.read_bytes()
     finally:
         server.shutdown()
         worker.join()

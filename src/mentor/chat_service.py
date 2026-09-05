@@ -259,6 +259,8 @@ class ResponseDiagnostics:
     analysis_batch_status: str
     prior_empirical_evidence_reused: bool
     auto_mapping_policy_upgraded: bool
+    source_scope: dict[str, object] | None
+    mentor_search_calls: dict[str, int]
 
 
 @dataclass(frozen=True)
@@ -314,7 +316,7 @@ class ChatService:
     ) -> Answer:
         user_item, request, effective_depth, prior_empirical_evidence_reused, auto_mapping_policy_upgraded, turn_source_scope = self._request(thread_id, question, evaluation)
         started_at = perf_counter()
-        source_research_output, source_research_responses = self._project_source_research(
+        source_research_output, source_research_responses, source_search_calls = self._project_source_research(
             thread_id, user_item["content"][0]["text"], effective_depth
         )
         request = _request_with_project_research(request, source_research_output)
@@ -347,6 +349,7 @@ class ChatService:
             turn_source_scope=turn_source_scope,
             source_research_output=source_research_output,
             source_research_responses=source_research_responses,
+            source_search_calls=source_search_calls,
         )
 
     def stream_reply(
@@ -362,7 +365,7 @@ class ChatService:
         try:
             user_item, request, effective_depth, prior_empirical_evidence_reused, auto_mapping_policy_upgraded, turn_source_scope = self._request(thread_id, question, evaluation)
             started_at = perf_counter()
-            source_research_output, source_research_responses = self._project_source_research(
+            source_research_output, source_research_responses, source_search_calls = self._project_source_research(
                 thread_id, user_item["content"][0]["text"], effective_depth
             )
             request = _request_with_project_research(request, source_research_output)
@@ -404,6 +407,7 @@ class ChatService:
                         turn_source_scope=turn_source_scope,
                         source_research_output=source_research_output,
                         source_research_responses=source_research_responses,
+                        source_search_calls=source_search_calls,
                     )
                     if answer.incomplete_reason:
                         yield StreamEvent(
@@ -477,23 +481,24 @@ class ChatService:
 
     def _project_source_research(
         self, thread_id: int, question: str, effective_depth: str
-    ) -> tuple[list[dict], list[Any]]:
+    ) -> tuple[list[dict], list[Any], dict[str, int]]:
         thread = self.storage.thread_context(thread_id)
         if thread is None or thread.thread_source_behavior is not ThreadSourceBehavior.PROJECT:
-            return [], []
+            return [], [], {}
         context_mode = _profile_context_mode(question)
         field_state = questionnaire_field_state(question, self.storage.current_confirmed_profile_items())
         if context_mode == PROFILE_CONTEXT_FULL_PROFILE or (
             field_state is not None and not _explicit_profile_source_request(question)
         ):
-            return [], []
+            return [], [], {}
         scope = resolve_source_scope(self.storage, thread, question)
         plan = research_plan(scope, question, effective_depth)
         if not plan:
-            return [], []
+            return [], [], {}
         libraries = {library.library_key: library for library in scope.libraries}
         output: list[dict] = []
         responses: list[Any] = []
+        calls: dict[str, int] = {}
         for item in plan:
             library = libraries[item.library_key]
             response = self._responses_create(
@@ -520,7 +525,8 @@ class ChatService:
             _validate_project_source_ownership(self.storage, library.library_key, response_output)
             output.extend(response_output)
             responses.append(response)
-        return output, responses
+            calls[library.library_key] = calls.get(library.library_key, 0) + 1
+        return output, responses, calls
 
     def _local_tools_continued_response(
         self,
@@ -1045,6 +1051,7 @@ class ChatService:
         turn_source_scope: dict[str, object] | None = None,
         source_research_output: list[dict] | None = None,
         source_research_responses: list[Any] | None = None,
+        source_search_calls: dict[str, int] | None = None,
     ) -> Answer:
         response_output = [_as_dict(item) for item in response.output]
         historic_response_output = _qualitative_historic_items(response_output) if qualitative_exchange else response_output
@@ -1104,6 +1111,8 @@ class ChatService:
             auto_mapping_policy_upgraded=auto_mapping_policy_upgraded,
             qualitative_review=qualitative_review,
             source_responses=source_research_responses,
+            source_scope=turn_source_scope,
+            mentor_search_calls=source_search_calls,
         )
         self.storage.record_response_diagnostics(
             thread_id, diagnostics.response_id, diagnostics.__dict__
@@ -1584,6 +1593,8 @@ def _diagnostics(
     auto_mapping_policy_upgraded: bool = False,
     qualitative_review: dict[str, int | bool] | None = None,
     source_responses: list[Any] | None = None,
+    source_scope: dict[str, object] | None = None,
+    mentor_search_calls: dict[str, int] | None = None,
 ) -> ResponseDiagnostics:
     responses = [*(source_responses or []), *([response] if draft_response is None else [draft_response, response])]
     input_tokens = _usage_total(responses, "input_tokens")
@@ -1627,6 +1638,8 @@ def _diagnostics(
         analysis_batch_status=analysis["status"],
         prior_empirical_evidence_reused=prior_empirical_evidence_reused,
         auto_mapping_policy_upgraded=auto_mapping_policy_upgraded,
+        source_scope=source_scope,
+        mentor_search_calls=dict(mentor_search_calls or {}),
     )
 
 
