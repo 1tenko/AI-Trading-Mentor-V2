@@ -71,9 +71,20 @@ _GXT_FOLDERS = {
 
 
 def library_definition_for_browser_path(path: str) -> LibraryDefinition:
-    parts = PurePosixPath(path.replace("\\", "/")).parts
-    if len(parts) < 3 or parts[0] != "GxT" or parts[1] not in _GXT_FOLDERS or ".." in parts:
-        raise ValueError("source path does not match an approved GxT library")
+    normalized = path.replace("\\", "/")
+    parts = PurePosixPath(normalized).parts
+    if PurePosixPath(normalized).is_absolute() or not parts or any(":" in part for part in parts) or ".." in parts:
+        raise ValueError("source relative path is invalid")
+    if len(parts) < 3:
+        raise ValueError(
+            "This doesn't look like your GxT transcript root. Select the folder that directly "
+            "contains the Garrett, Afyz, Erik, Splash and Zay folders."
+        )
+    if parts[1] not in _GXT_FOLDERS:
+        raise ValueError(
+            f"This folder contains transcript files under an unrecognized mentor folder: "
+            f"'{parts[1]}'. Expected Garrett, Afyz, Erik, Splash, Zay, or Theo Notes."
+        )
     return LIBRARIES[_GXT_FOLDERS[parts[1]]]
 
 
@@ -102,7 +113,7 @@ class SourceImportService:
 
     def create_staging_import(self, project_id: int) -> dict[str, object]:
         batch_id = self.storage.create_library_import_batch(project_id)
-        return {"id": batch_id, "state": "STAGING", "accepted_root": "GxT"}
+        return {"id": batch_id, "state": "STAGING", "accepted_root": None}
 
     def stage_browser_file(
         self, batch_id: int, relative_path: str, ordinal: int, content: bytes
@@ -121,6 +132,10 @@ class SourceImportService:
         except UnicodeDecodeError:
             raise ValueError("Source transcripts must be UTF-8 text.") from None
         manifest = batch[3]
+        selected_root = PurePosixPath(relative).parts[0]
+        if manifest.get("selected_root", selected_root).casefold() != selected_root.casefold():
+            raise ValueError("All transcripts in one import must come from the same selected transcript folder.")
+        manifest.setdefault("selected_root", selected_root)
         if any(item["ordinal"] == ordinal or item["relative_path"] == relative for item in manifest["files"]):
             raise ValueError("source file was already staged")
         destination = self.staging_root / str(batch_id) / f"{ordinal}.txt"
@@ -194,7 +209,13 @@ class SourceImportService:
         imported = sum(item.get("result") == "IMPORTED" for item in manifest["files"])
         try:
             for item in sorted(manifest["files"], key=lambda value: value["ordinal"]):
-                if item["classification"] == "duplicate" or item.get("result") == "IMPORTED":
+                if item.get("result") in {"IMPORTED", "SKIPPED_DUPLICATE"}:
+                    continue
+                if item["classification"] == "duplicate":
+                    item["result"] = "SKIPPED_DUPLICATE"
+                    self.storage.update_library_import_batch(
+                        batch_id, state="IMPORTING", manifest=manifest
+                    )
                     continue
                 definition = LIBRARIES[item["library_key"]]
                 library = self.ensure_library(definition.library_key)
@@ -234,6 +255,10 @@ class SourceImportService:
                 self.storage.set_project_library(batch[1], library.id, enabled=True)
                 item["result"] = "IMPORTED"
                 imported += 1
+                manifest["imported"] = imported
+                self.storage.update_library_import_batch(
+                    batch_id, state="IMPORTING", manifest=manifest
+                )
             manifest["imported"] = imported
             self.storage.update_library_import_batch(batch_id, state="COMPLETE", manifest=manifest)
         except Exception:
@@ -251,16 +276,21 @@ class SourceImportService:
         manifest = batch[3]
         libraries = []
         for key, counts in sorted(manifest.get("summary", {}).items()):
+            items = [item for item in manifest["files"] if item["library_key"] == key]
             libraries.append({
                 "library_key": key,
                 "display_name": LIBRARIES[key].display_name,
                 **counts,
+                "processed": sum(
+                    item.get("result") in {"IMPORTED", "SKIPPED_DUPLICATE"} for item in items
+                ),
+                "imported": sum(item.get("result") == "IMPORTED" for item in items),
             })
         result: dict[str, object] = {
             "id": batch[0],
             "project_id": batch[1],
             "state": batch[2],
-            "accepted_root": "GxT",
+            "accepted_root": manifest.get("selected_root"),
             "file_count": len(manifest["files"]),
             "libraries": libraries,
             "imported": int(manifest.get("imported", 0)),

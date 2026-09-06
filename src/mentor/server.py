@@ -32,6 +32,7 @@ FILE_ID = re.compile(r"^[A-Za-z0-9_-]+$")
 STATIC_ASSETS = {
     "/app.css": ("app.css", "text/css; charset=utf-8"),
     "/app.js": ("app.js", "text/javascript; charset=utf-8"),
+    "/source_import.js": ("source_import.js", "text/javascript; charset=utf-8"),
     "/profile.js": ("profile.js", "text/javascript; charset=utf-8"),
     "/vendor/marked.esm.js": ("vendor/marked.esm.js", "text/javascript; charset=utf-8"),
     "/vendor/purify.min.js": ("vendor/purify.min.js", "text/javascript; charset=utf-8"),

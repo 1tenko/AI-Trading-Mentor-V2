@@ -395,7 +395,8 @@ def test_project_source_controls_are_chat_first_and_show_temporary_scope(tmp_pat
         assert b'id="source-settings-trigger"' in page
         assert b'id="source-settings"' in page
         assert b'id="source-scope-chip"' in page
-        assert b"What would you like to learn, test, or improve in this project?" in script
+        assert b"Import your GxT mentor transcripts to start source-grounded learning." in script
+        assert b"Ask about GxT, compare mentors, or continue your Roadmap." in script
         assert b"Temporary for this answer" in script
         assert b"/libraries/${encodeURIComponent(libraryKey)}" in script
         assert b"Data workspace" not in page
@@ -482,11 +483,24 @@ def test_source_import_browser_ui_uses_folder_confirmation_flow(tmp_path):
         assert request(server, "GET", "/")[0] == 200
         page = request(server, "GET", "/")[2]
         script = request(server, "GET", "/app.js")[2]
+        helper = request(server, "GET", "/source_import.js")[2]
         assert b'id="source-directory"' in page
         assert b"webkitdirectory" in page
         assert b'id="source-import-review"' in page
+        assert b'id="project-onboarding"' in page
+        assert b'id="project-chat-trigger"' in page
+        assert b'id="source-settings-trigger"' in page
+        assert b'id="new-project-trigger"' in page
+        assert b"+ New Strategy Project" in page
+        assert b"Create GxT Mastery" in page
         assert b"Checking transcripts locally" in script
-        assert b"Import transcripts" in script
+        assert b"Ready to import" in script
+        assert b"Confirm import" in script
+        assert b"Choose another folder" in script
+        assert b"Ignored non-transcript files" in script
+        assert b'endsWith(".txt")' in helper
+        assert b"No .txt transcripts were found in this folder." in helper
+        assert b"This doesn't look like your GxT transcript root." in helper
         assert b"confirm: true" in script
     finally:
         server.shutdown()

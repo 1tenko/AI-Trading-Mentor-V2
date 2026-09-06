@@ -1,4 +1,5 @@
 import { marked } from "/vendor/marked.esm.js";
+import { prepareSourceDirectory, sourceLibraryOrder } from "/source_import.js";
 
 const threads = document.querySelector("#threads");
 const messages = document.querySelector("#messages");
@@ -31,13 +32,30 @@ const roadmapPanel = document.querySelector("#roadmap-panel");
 const roadmapTitle = document.querySelector("#roadmap-title");
 const roadmapContent = document.querySelector("#roadmap-content");
 const roadmapTrigger = document.querySelector("#roadmap-trigger");
+const projectChatTrigger = document.querySelector("#project-chat-trigger");
+const projectOnboarding = document.querySelector("#project-onboarding");
+const projectOnboardingTitle = document.querySelector("#project-onboarding-title");
+const projectOnboardingCopy = document.querySelector("#project-onboarding-copy");
+const projectOnboardingPoints = document.querySelector("#project-onboarding-points");
+const createGxtProject = document.querySelector("#create-gxt-project");
+const projectOnboardingImport = document.querySelector("#project-onboarding-import");
+const workspaceTitle = document.querySelector("#workspace-title");
+const scopeDescription = document.querySelector("#scope-description");
+const newProjectTrigger = document.querySelector("#new-project-trigger");
+const newProjectForm = document.querySelector("#new-project-form");
+const sourceSettingsTrigger = document.querySelector("#source-settings-trigger");
+const sourceIndexSummary = document.querySelector("#source-index-summary");
 const SETTINGS_KEY = "trading-mentor-evaluation-settings";
 const ACTIVE_THREAD_KEY = "trading-mentor-active-thread";
 const THEME_KEY = "trading-mentor-theme";
+const SOURCE_IMPORT_KEY = "trading-mentor-active-source-import";
 const CONTINUE_PROMPT = "Continue the previous response from where it stopped. Do not repeat completed material.";
 let activeThreadId;
 let activeProjectId;
 let allThreads = [];
+let allProjects = [];
+let activeProjectSourceCount = 0;
+let sourceImportPollTimer;
 let activeDatasetScope;
 let pendingAttachment;
 let pendingMessageAttachment;
@@ -59,8 +77,10 @@ function showEmpty() {
   const empty = document.createElement("p");
   empty.className = "empty";
   empty.textContent = activeProjectId
-    ? "What would you like to learn, test, or improve in this project?"
-    : "How can I help with your trading today?";
+    ? activeProjectSourceCount
+      ? "Ask about GxT, compare mentors, or continue your Roadmap."
+      : "Import your GxT mentor transcripts to start source-grounded learning."
+    : "Ask general trading questions here. For methodology-specific learning, research, and mentor sources, open a Strategy Project.";
   messages.append(empty);
 }
 
@@ -439,12 +459,22 @@ async function loadProjects() {
   const response = await fetch("/api/projects");
   if (!response.ok) throw new Error("Could not load Strategy Projects.");
   const data = await response.json();
-  const selected = scopeSelector.value;
-  scopeSelector.replaceChildren(new Option("General Mentor", "general"));
-  data.projects.filter((project) => project.status === "ACTIVE").forEach((project) => {
-    scopeSelector.add(new Option(project.name, String(project.id)));
-  });
-  if ([...scopeSelector.options].some((option) => option.value === selected)) scopeSelector.value = selected;
+  allProjects = data.projects.filter((project) => project.status === "ACTIVE");
+  const selected = activeProjectId ? String(activeProjectId) : scopeSelector.value;
+  const general = document.createElement("optgroup");
+  general.label = "GENERAL";
+  general.append(new Option("General Mentor", "general"));
+  scopeSelector.replaceChildren(general);
+  if (allProjects.length) {
+    const projects = document.createElement("optgroup");
+    projects.label = "STRATEGY PROJECTS";
+    allProjects.forEach((project) => projects.append(new Option(project.name, String(project.id))));
+    scopeSelector.append(projects);
+  }
+  scopeSelector.value = [...scopeSelector.options].some((option) => option.value === selected)
+    ? selected : "general";
+  renderWorkspaceContext();
+  renderProjectOnboarding();
 }
 
 async function loadProjectSources() {
@@ -452,24 +482,72 @@ async function loadProjectSources() {
   if (!activeProjectId) {
     sourceSettings.hidden = true;
     sourceScopeChip.hidden = true;
-    roadmapTrigger.textContent = "Projects";
+    activeProjectSourceCount = 0;
+    renderWorkspaceContext();
+    renderProjectOnboarding();
+    if (messages.querySelector(".empty")) showEmpty();
     return;
   }
-  roadmapTrigger.textContent = "Roadmap";
   const projectId = activeProjectId;
   const response = await fetch(`/api/projects/${projectId}/libraries`);
   if (projectId !== activeProjectId) return;
   if (!response.ok) throw new Error("Could not load project sources.");
   const data = await response.json();
+  data.libraries.sort((left, right) => sourceLibraryOrder(left) - sourceLibraryOrder(right));
   data.libraries.forEach((library) => sourceList.append(sourceLibraryControl(projectId, library)));
+  activeProjectSourceCount = data.libraries.reduce((total, library) => total + library.source_count, 0);
   if (!data.libraries.length) {
     const empty = document.createElement("p");
-    empty.textContent = "No mentor transcripts have been added to this project yet.";
+    empty.textContent = "No mentor transcripts imported yet. Import the prepared transcript folder and each mentor will stay separate.";
     sourceList.append(empty);
   }
   const enabled = data.libraries.filter((library) => library.enabled);
-  sourceScopeChip.textContent = `Sources · ${enabled.length} enabled`;
+  sourceScopeChip.textContent = `${activeProjectSourceCount} transcript${activeProjectSourceCount === 1 ? "" : "s"} indexed`;
   sourceScopeChip.hidden = false;
+  sourceIndexSummary.textContent = activeProjectSourceCount
+    ? `${activeProjectSourceCount} transcript${activeProjectSourceCount === 1 ? "" : "s"} indexed · ${enabled.length} mentor ${enabled.length === 1 ? "library" : "libraries"} enabled`
+    : "";
+  renderWorkspaceContext();
+  renderProjectOnboarding();
+  if (messages.querySelector(".empty")) showEmpty();
+  restoreSourceImport().catch(() => localStorage.removeItem(SOURCE_IMPORT_KEY));
+}
+
+function renderWorkspaceContext() {
+  const project = allProjects.find((item) => item.id === activeProjectId);
+  workspaceTitle.textContent = project?.name || "Theo's Trading Mentor";
+  scopeDescription.textContent = project
+    ? "GxT learning, research, sources, roadmap and playbook"
+    : "Methodology-neutral trading help";
+  projectChatTrigger.hidden = !project;
+  sourceSettingsTrigger.hidden = !project;
+  roadmapTrigger.textContent = project ? "Roadmap" : "Projects overview";
+}
+
+function renderProjectOnboarding() {
+  const project = allProjects.find((item) => item.id === activeProjectId);
+  const noProjects = !project && allProjects.length === 0;
+  const needsSources = Boolean(project) && activeProjectSourceCount === 0;
+  if ((!noProjects && !needsSources) || !sourceSettings.hidden || !roadmapPanel.hidden) {
+    projectOnboarding.hidden = true;
+    return;
+  }
+  projectOnboarding.hidden = false;
+  projectOnboardingPoints.replaceChildren();
+  createGxtProject.hidden = !noProjects;
+  projectOnboardingImport.hidden = !needsSources;
+  if (noProjects) {
+    projectOnboardingTitle.textContent = "Start with GxT Mastery";
+    projectOnboardingCopy.textContent = "Create a Strategy Project for source-grounded GxT learning, research and coaching.";
+    return;
+  }
+  projectOnboardingTitle.textContent = `${project.name} is ready`;
+  projectOnboardingCopy.textContent = "Import your prepared mentor transcripts to start source-grounded learning.";
+  [
+    "Garrett, Afyz, Erik, Splash and Zay stay separate.",
+    "Nothing is uploaded until you review and confirm.",
+    "You can enable or disable mentors later.",
+  ].forEach((text) => { const item = document.createElement("li"); item.textContent = text; projectOnboardingPoints.append(item); });
 }
 
 async function loadRoadmap() {
@@ -502,7 +580,12 @@ function renderProjectSummaries(projects) {
   heading.textContent = "Project summaries";
   roadmapContent.append(heading);
   if (!projects.length) {
-    roadmapContent.append(document.createTextNode("No Strategy Projects yet."));
+    roadmapContent.append(document.createTextNode("Strategy Projects keep methodology sources, research, Roadmap and your playbook together."));
+    const create = document.createElement("button");
+    create.type = "button";
+    create.textContent = "Create GxT Mastery";
+    create.addEventListener("click", () => createProject("GxT Mastery").catch((error) => { status.textContent = error.message; }));
+    roadmapContent.append(create);
     return;
   }
   const list = document.createElement("ul");
@@ -519,6 +602,11 @@ function renderProjectSummaries(projects) {
 }
 
 function renderProjectRoadmap(roadmap, ledger, playbook) {
+  if (!roadmap.objective && !roadmap.next_action && !roadmap.experiment && !roadmap.blockers.length) {
+    const empty = document.createElement("p");
+    empty.textContent = "Your Mentor will keep track of your current objective, experiment, blockers and next action as you work.";
+    roadmapContent.append(empty);
+  }
   const current = roadmapSection("Current focus");
   appendRoadmapValue(current, "Objective", roadmap.objective, "No objective has been set yet.");
   appendRoadmapValue(current, "Next action", roadmap.next_action, "No next action has been set yet.");
@@ -620,7 +708,7 @@ function sourceLibraryControl(projectId, library) {
   toggle.checked = library.enabled;
   const text = document.createElement("span");
   const name = document.createElement("strong");
-  name.textContent = library.display_name;
+  name.textContent = library.display_name.split(" — ")[0];
   const meta = document.createElement("small");
   meta.textContent = `${library.source_count} transcript${library.source_count === 1 ? "" : "s"} · ${sourceStatus(library.index_status)}`;
   text.append(name, meta);
@@ -650,28 +738,39 @@ async function saveSourceSetting(projectId, libraryKey, toggle) {
   await loadProjectSources();
 }
 
-async function createProject() {
+async function createProject(requestedName) {
   const input = document.querySelector("#new-project-name");
-  const name = input.value.trim();
+  const name = (requestedName || input.value).trim();
   if (!name) return;
-  const response = await fetch("/api/projects", {
-    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: name.trim() }),
-  });
-  if (!response.ok) throw new Error((await response.json()).error || "Could not create the project.");
-  const project = await response.json();
+  let project = allProjects.find((item) => item.name.toLowerCase() === name.toLowerCase());
+  if (!project) {
+    const response = await fetch("/api/projects", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name }),
+    });
+    if (!response.ok) throw new Error((await response.json()).error || "Could not create the project.");
+    project = await response.json();
+  }
   input.value = "";
-  await loadProjects();
   activeProjectId = project.id;
+  await loadProjects();
   scopeSelector.value = String(project.id);
+  newProjectForm.hidden = true;
+  sourceSettings.hidden = true;
+  roadmapPanel.hidden = true;
   renderThreads();
   await loadProjectSources();
-  await createThread();
+  if (!allThreads.some((thread) => thread.project_id === project.id)) await createThread();
+  else showEmpty();
 }
 
 async function stageSourceDirectory() {
   if (!activeProjectId) throw new Error("Choose a Strategy Project before adding mentor transcripts.");
-  const files = [...sourceDirectory.files];
-  if (!files.length) return;
+  const selectedFiles = [...sourceDirectory.files];
+  if (!selectedFiles.length) return;
+  const { files, ignoredCount } = prepareSourceDirectory(selectedFiles);
+  sourceSettings.hidden = false;
+  roadmapPanel.hidden = true;
+  projectOnboarding.hidden = true;
   sourceImportReview.hidden = false;
   sourceImportReview.textContent = "Checking transcripts locally…";
   const createdResponse = await fetch("/api/source-imports", {
@@ -690,49 +789,211 @@ async function stageSourceDirectory() {
       },
       body: file,
     });
-    if (!response.ok) throw new Error((await response.json()).error || "One transcript could not be staged.");
+    if (!response.ok) throw new Error(sourceImportError((await response.json()).error));
   }
   const finalizedResponse = await fetch(`/api/source-imports/${batch.id}/finalize`, {
     method: "POST", headers: { "Content-Type": "application/json" }, body: "{}",
   });
-  if (!finalizedResponse.ok) throw new Error((await finalizedResponse.json()).error || "Could not review the transcripts.");
-  renderSourceImportReview(await finalizedResponse.json());
+  if (!finalizedResponse.ok) throw new Error(sourceImportError((await finalizedResponse.json()).error));
+  const finalized = await finalizedResponse.json();
+  rememberSourceImport(finalized.id, ignoredCount);
+  renderSourceImportReview(finalized, ignoredCount);
 }
 
-function renderSourceImportReview(batch) {
+function sourceImportError(message = "") {
+  if (message.includes("unrecognized mentor folder") || message.includes("doesn't look like your GxT transcript root") || message.includes("No .txt")) return message;
+  if (message.toLowerCase().includes("index")) return "Some transcripts couldn't be indexed. Nothing ambiguous was silently assigned. You can retry.";
+  return "I couldn't prepare or complete this transcript import. Choose another folder or try again.";
+}
+
+function rememberSourceImport(batchId, ignoredCount) {
+  localStorage.setItem(SOURCE_IMPORT_KEY, JSON.stringify({ batchId, projectId: activeProjectId, ignoredCount }));
+}
+
+function sourceImportIsCurrent(batchId, projectId) {
+  try {
+    const saved = JSON.parse(localStorage.getItem(SOURCE_IMPORT_KEY) || "null");
+    return saved?.batchId === batchId && saved.projectId === projectId && activeProjectId === projectId;
+  } catch {
+    return false;
+  }
+}
+
+function renderSourceImportReview(batch, ignoredCount = 0) {
+  projectOnboarding.hidden = true;
+  sourceImportReview.hidden = false;
   sourceImportReview.replaceChildren();
   const heading = document.createElement("strong");
-  heading.textContent = `${batch.file_count} transcript${batch.file_count === 1 ? "" : "s"} ready to review`;
+  heading.textContent = "Ready to import";
   const list = document.createElement("ul");
-  batch.libraries.forEach((library) => {
+  batch.libraries.sort((left, right) => sourceLibraryOrder(left) - sourceLibraryOrder(right)).forEach((library) => {
     const item = document.createElement("li");
-    item.textContent = `${library.display_name}: ${library.new} new, ${library.duplicates} already added, ${library.conflicts} conflicts`;
+    const name = library.display_name.split(" — ")[0];
+    item.textContent = `${name} — ${library.total} transcript${library.total === 1 ? "" : "s"}`;
     list.append(item);
   });
+  const total = document.createElement("p");
+  total.textContent = `Total — ${batch.file_count} transcript${batch.file_count === 1 ? "" : "s"}`;
+  const ignored = document.createElement("p");
+  ignored.textContent = `Ignored non-transcript files — ${ignoredCount}`;
+  ignored.hidden = ignoredCount === 0;
+  const notice = document.createElement("p");
+  notice.textContent = "Nothing has been uploaded yet.";
   const confirm = document.createElement("button");
   confirm.type = "button";
-  confirm.textContent = "Import transcripts";
+  confirm.textContent = "Confirm import";
   confirm.disabled = batch.libraries.some((library) => library.conflicts);
   confirm.addEventListener("click", () => confirmSourceImport(batch.id).catch((error) => {
-    sourceImportReview.textContent = error.message;
+    renderSourceImportFailure(error.message, batch.id);
   }));
+  const choose = document.createElement("button");
+  choose.type = "button";
+  choose.textContent = "Choose another folder";
+  choose.addEventListener("click", () => { sourceDirectory.value = ""; sourceDirectory.click(); });
   const cancel = document.createElement("button");
   cancel.type = "button";
   cancel.textContent = "Cancel";
-  cancel.addEventListener("click", () => { sourceImportReview.hidden = true; sourceDirectory.value = ""; });
-  sourceImportReview.append(heading, list, confirm, cancel);
+  cancel.addEventListener("click", () => {
+    stopSourceImportPolling();
+    localStorage.removeItem(SOURCE_IMPORT_KEY);
+    sourceImportReview.hidden = true;
+    sourceDirectory.value = "";
+    renderProjectOnboarding();
+  });
+  sourceImportReview.append(heading, list, total, ignored, notice, confirm, choose, cancel);
 }
 
 async function confirmSourceImport(batchId) {
-  sourceImportReview.textContent = "Importing transcripts…";
-  const response = await fetch(`/api/source-imports/${batchId}/confirm`, {
-    method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ confirm: true }),
-  });
+  const projectId = activeProjectId;
+  const saved = JSON.parse(localStorage.getItem(SOURCE_IMPORT_KEY) || "{}");
+  rememberSourceImport(batchId, saved.ignoredCount || 0);
+  renderSourceImportProgress({ state: "IMPORTING", libraries: [] });
+  startSourceImportPolling(batchId);
+  let response;
+  try {
+    response = await fetch(`/api/source-imports/${batchId}/confirm`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ confirm: true }),
+    });
+  } catch (error) {
+    if (sourceImportIsCurrent(batchId, projectId)) throw error;
+    return;
+  }
+  if (!sourceImportIsCurrent(batchId, projectId)) return;
   const data = await response.json();
-  if (!response.ok) throw new Error(data.error || "The transcripts could not be imported.");
-  sourceImportReview.textContent = `${data.imported} transcript${data.imported === 1 ? "" : "s"} imported.`;
+  if (!sourceImportIsCurrent(batchId, projectId)) return;
+  stopSourceImportPolling();
+  if (!response.ok) {
+    const statusResponse = await fetch(`/api/source-imports/${batchId}`);
+    const latest = statusResponse.ok ? await statusResponse.json() : undefined;
+    if (!sourceImportIsCurrent(batchId, projectId)) return;
+    throw new Error(sourceImportError(latest?.error || data.error));
+  }
+  localStorage.removeItem(SOURCE_IMPORT_KEY);
+  renderSourceImportProgress(data);
   sourceDirectory.value = "";
+  await loadProjectSources();
+}
+
+function renderSourceImportProgress(batch) {
+  projectOnboarding.hidden = true;
+  sourceImportReview.hidden = false;
+  sourceImportReview.replaceChildren();
+  const heading = document.createElement("strong");
+  heading.textContent = batch.state === "COMPLETE" ? "Import complete" : "Importing mentor transcripts…";
+  sourceImportReview.append(heading);
+  if (batch.libraries?.length) {
+    const list = document.createElement("ul");
+    batch.libraries.sort((left, right) => sourceLibraryOrder(left) - sourceLibraryOrder(right)).forEach((library) => {
+      const item = document.createElement("li");
+      item.textContent = `${library.display_name.split(" — ")[0]}: ${library.processed} / ${library.total}`;
+      list.append(item);
+    });
+    sourceImportReview.append(list);
+  }
+  if (batch.state === "COMPLETE") sourceImportReview.append(`${batch.imported} transcript${batch.imported === 1 ? "" : "s"} imported and indexed.`);
+}
+
+function startSourceImportPolling(batchId) {
+  stopSourceImportPolling();
+  const projectId = activeProjectId;
+  const timer = window.setInterval(async () => {
+    let response;
+    try { response = await fetch(`/api/source-imports/${batchId}`); }
+    catch {
+      if (sourceImportIsCurrent(batchId, projectId) && sourceImportPollTimer === timer) {
+        renderSourceImportFailure("The import status could not be checked.", batchId);
+      }
+      return;
+    }
+    if (!response.ok || !sourceImportIsCurrent(batchId, projectId)) return;
+    const batch = await response.json();
+    if (!sourceImportIsCurrent(batchId, projectId)) return;
+    renderSourceImportProgress(batch);
+    if (["COMPLETE", "FAILED"].includes(batch.state)) {
+      if (sourceImportPollTimer === timer) stopSourceImportPolling();
+      if (batch.state === "COMPLETE") {
+        localStorage.removeItem(SOURCE_IMPORT_KEY);
+        if (projectId === activeProjectId) loadProjectSources().catch((error) => { status.textContent = error.message; });
+      }
+      else renderSourceImportFailure(batch.error, batchId);
+    }
+  }, 800);
+  sourceImportPollTimer = timer;
+}
+
+function stopSourceImportPolling() {
+  if (sourceImportPollTimer) window.clearInterval(sourceImportPollTimer);
+  sourceImportPollTimer = undefined;
+}
+
+function renderSourceImportFailure(message, batchId) {
+  stopSourceImportPolling();
+  projectOnboarding.hidden = true;
+  sourceImportReview.hidden = false;
+  sourceImportReview.replaceChildren();
+  const copy = document.createElement("p");
+  copy.textContent = sourceImportError(message);
+  const retry = document.createElement("button");
+  retry.type = "button";
+  retry.textContent = "Retry";
+  retry.addEventListener("click", () => confirmSourceImport(batchId).catch((error) => renderSourceImportFailure(error.message, batchId)));
+  const choose = document.createElement("button");
+  choose.type = "button";
+  choose.textContent = "Choose another folder";
+  choose.addEventListener("click", () => { sourceDirectory.value = ""; sourceDirectory.click(); });
+  sourceImportReview.append(copy, retry, choose);
+}
+
+function renderSourceSelectionFailure(message) {
+  projectOnboarding.hidden = true;
+  sourceImportReview.hidden = false;
+  sourceImportReview.replaceChildren();
+  const copy = document.createElement("p");
+  copy.textContent = sourceImportError(message);
+  const choose = document.createElement("button");
+  choose.type = "button";
+  choose.textContent = "Choose another folder";
+  choose.addEventListener("click", () => { sourceDirectory.value = ""; sourceDirectory.click(); });
+  const cancel = document.createElement("button");
+  cancel.type = "button";
+  cancel.textContent = "Cancel";
+  cancel.addEventListener("click", () => { sourceImportReview.hidden = true; sourceDirectory.value = ""; renderProjectOnboarding(); });
+  sourceImportReview.append(copy, choose, cancel);
+}
+
+async function restoreSourceImport() {
+  let saved;
+  try { saved = JSON.parse(localStorage.getItem(SOURCE_IMPORT_KEY) || "null"); }
+  catch { localStorage.removeItem(SOURCE_IMPORT_KEY); return; }
+  if (!saved || saved.projectId !== activeProjectId) return;
+  const response = await fetch(`/api/source-imports/${saved.batchId}`);
+  if (!response.ok) { localStorage.removeItem(SOURCE_IMPORT_KEY); return; }
+  const batch = await response.json();
+  if (batch.state === "READY_FOR_CONFIRMATION") renderSourceImportReview(batch, saved.ignoredCount || 0);
+  else if (batch.state === "IMPORTING") { renderSourceImportProgress(batch); startSourceImportPolling(batch.id); }
+  else if (batch.state === "FAILED") renderSourceImportFailure(batch.error, batch.id);
+  else if (batch.state === "COMPLETE") { localStorage.removeItem(SOURCE_IMPORT_KEY); renderSourceImportProgress(batch); }
 }
 
 async function loadThread(threadId) {
@@ -1338,38 +1599,59 @@ document.querySelector("#new-project-form").addEventListener("submit", (event) =
   event.preventDefault();
   createProject().catch((error) => { status.textContent = error.message; });
 });
+newProjectTrigger.addEventListener("click", () => {
+  newProjectForm.hidden = !newProjectForm.hidden;
+  if (!newProjectForm.hidden) document.querySelector("#new-project-name").focus();
+});
+createGxtProject.addEventListener("click", () => createProject("GxT Mastery").catch((error) => { status.textContent = error.message; }));
+projectOnboardingImport.addEventListener("click", () => sourceDirectory.click());
 document.querySelector("#source-directory-trigger").addEventListener("click", () => {
   if (!activeProjectId) { status.textContent = "Choose a Strategy Project before adding mentor transcripts."; return; }
   sourceDirectory.click();
 });
-document.querySelector("#source-settings-trigger").addEventListener("click", () => {
-  if (!activeProjectId) { status.textContent = "Choose a Strategy Project to manage its sources."; return; }
-  sourceSettings.hidden = !sourceSettings.hidden;
-  if (!sourceSettings.hidden) loadProjectSources().catch((error) => { status.textContent = error.message; });
-});
-document.querySelector("#source-settings-close").addEventListener("click", () => { sourceSettings.hidden = true; });
-sourceScopeChip.addEventListener("click", () => {
+sourceSettingsTrigger.addEventListener("click", () => {
   sourceSettings.hidden = false;
+  roadmapPanel.hidden = true;
+  projectOnboarding.hidden = true;
   loadProjectSources().catch((error) => { status.textContent = error.message; });
 });
-roadmapTrigger.addEventListener("click", () => {
-  roadmapPanel.hidden = !roadmapPanel.hidden;
-  if (!roadmapPanel.hidden) loadRoadmap().catch((error) => { status.textContent = error.message; });
+document.querySelector("#source-settings-close").addEventListener("click", () => {
+  sourceSettings.hidden = true;
+  renderProjectOnboarding();
 });
-document.querySelector("#roadmap-close").addEventListener("click", () => { roadmapPanel.hidden = true; });
+projectChatTrigger.addEventListener("click", () => {
+  sourceSettings.hidden = true;
+  roadmapPanel.hidden = true;
+  renderProjectOnboarding();
+  question.focus();
+});
+roadmapTrigger.addEventListener("click", () => {
+  roadmapPanel.hidden = false;
+  sourceSettings.hidden = true;
+  projectOnboarding.hidden = true;
+  loadRoadmap().catch((error) => { status.textContent = error.message; });
+});
+document.querySelector("#roadmap-close").addEventListener("click", () => {
+  roadmapPanel.hidden = true;
+  renderProjectOnboarding();
+});
 sourceDirectory.addEventListener("change", () => stageSourceDirectory().catch((error) => {
-  sourceImportReview.hidden = false;
-  sourceImportReview.textContent = error.message;
+  renderSourceSelectionFailure(error.message);
 }));
 scopeSelector.addEventListener("change", () => {
   activeProjectId = scopeSelector.value === "general" ? undefined : Number(scopeSelector.value);
+  activeProjectSourceCount = 0;
   activeThreadId = undefined;
   localStorage.removeItem(ACTIVE_THREAD_KEY);
+  stopSourceImportPolling();
+  sourceSettings.hidden = true;
+  roadmapPanel.hidden = true;
+  sourceImportReview.hidden = true;
   renderThreads();
   loadProjectSources().catch((error) => { status.textContent = error.message; });
-  if (!roadmapPanel.hidden) loadRoadmap().catch((error) => { status.textContent = error.message; });
   showEmpty();
-  status.textContent = activeProjectId ? "Strategy Project" : "General Mentor";
+  const project = allProjects.find((item) => item.id === activeProjectId);
+  status.textContent = project?.name || "General Mentor";
 });
 document.querySelector("#data-settings").addEventListener("click", openDataSettings);
 document.querySelector("#data-close").addEventListener("click", () => {

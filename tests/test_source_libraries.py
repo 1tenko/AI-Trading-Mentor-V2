@@ -1,5 +1,6 @@
 import hashlib
 import json
+from pathlib import PurePosixPath
 from types import SimpleNamespace
 
 import pytest
@@ -28,6 +29,27 @@ from mentor.storage import Storage
 )
 def test_browser_path_maps_to_one_exact_first_class_library(path, key):
     assert library_definition_for_browser_path(path).library_key == key
+
+
+@pytest.mark.parametrize(
+    ("path", "key"),
+    [
+        ("GxT-Transcripts/Afyz/Q&A/Test.txt", "gxt.afyz"),
+        ("GxT-Transcripts/Erik/Youtube/Test.txt", "gxt.erik"),
+        ("GxT-Transcripts/Splash/Test.txt", "gxt.splash"),
+        ("GxT-Transcripts/Zay/Test.txt", "gxt.zay"),
+    ],
+)
+def test_actual_selected_root_name_does_not_define_mentor_authority(path, key):
+    assert library_definition_for_browser_path(path).library_key == key
+
+
+def test_actual_garrett_browser_path_preserves_advanced_canonical_role():
+    path = "GxT-Transcripts/Garrett/Anomaly Mentorship/GxT Advanced/Lesson 1.txt"
+
+    assert library_definition_for_browser_path(path).library_key == "gxt.garrett"
+    relative = PurePosixPath(*PurePosixPath(path).parts[2:]).as_posix()
+    assert garrett_canonical_role(relative) is CanonicalRole.CURRENT_CANONICAL_ADVANCED
 
 
 def test_library_identity_includes_corpus_and_does_not_merge_same_authority(tmp_path):
@@ -183,6 +205,7 @@ def test_browser_import_stages_and_finalizes_without_remote_calls(tmp_path):
     assert summary["libraries"] == [{
         "library_key": "gxt.erik", "display_name": "Erik — GxT",
         "total": 1, "new": 1, "duplicates": 0, "conflicts": 0,
+        "processed": 0, "imported": 0,
     }]
     assert client.uploaded == []
     assert client.stores == []
@@ -271,18 +294,59 @@ def test_failed_indexing_is_visible_safe_and_not_searchable(tmp_path):
 
 
 @pytest.mark.parametrize(
-    "path",
-    ["../Erik/one.txt", "/GxT/Erik/one.txt", "GxT/Unknown/one.txt", "GxT/Erik/one.pdf"],
+    ("path", "message"),
+    [
+        ("../Erik/one.txt", "invalid"),
+        ("/GxT/Erik/one.txt", "invalid"),
+        ("C:/GxT/Erik/one.txt", "invalid"),
+        ("GxT-Transcripts/Erik/C:/one.txt", "invalid"),
+        ("GxT-Transcripts/Unknown/one.txt", "unrecognized mentor folder: 'Unknown'"),
+        ("Q&A/one.txt", "directly contains the Garrett, Afyz, Erik, Splash and Zay folders"),
+        ("GxT-Transcripts/Erik/one.pdf", "Only .txt"),
+    ],
 )
-def test_browser_staging_rejects_unsafe_or_unknown_paths(tmp_path, path):
+def test_browser_staging_rejects_unsafe_or_unknown_paths(tmp_path, path, message):
     storage = Storage(tmp_path / "mentor.sqlite3")
     storage.initialize()
     project = storage.create_project("GxT")
     service = SourceImportService(storage, staging_root=tmp_path / "imports")
     batch = service.create_staging_import(project.id)
 
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match=message):
         service.stage_browser_file(batch["id"], path, 1, b"text")
+
+
+def test_one_import_batch_rejects_files_from_different_selected_roots(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    project = storage.create_project("GxT")
+    service = SourceImportService(storage, staging_root=tmp_path / "imports")
+    batch = service.create_staging_import(project.id)
+    service.stage_browser_file(
+        batch["id"], "GxT-Transcripts/Erik/Youtube/one.txt", 1, b"one"
+    )
+
+    with pytest.raises(ValueError, match="same selected transcript folder"):
+        service.stage_browser_file(batch["id"], "Other/Erik/Youtube/two.txt", 2, b"two")
+
+
+def test_import_status_reports_safe_per_library_progress(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    project = storage.create_project("GxT")
+    client = FakeSourceOpenAI()
+    service = SourceImportService(storage, client, staging_root=tmp_path / "imports")
+    batch = service.create_staging_import(project.id)
+    service.stage_browser_file(
+        batch["id"], "GxT-Transcripts/Erik/Youtube/one.txt", 1, b"one"
+    )
+    service.finalize_manifest(batch["id"])
+
+    result = service.confirm_import(batch["id"], confirm=True, sleep=lambda _: None)
+
+    assert result["libraries"][0]["processed"] == 1
+    assert result["libraries"][0]["imported"] == 1
+    assert result["libraries"][0]["total"] == 1
 
 
 def test_browser_staging_rejects_oversized_sources(tmp_path):
