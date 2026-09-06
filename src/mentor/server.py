@@ -477,6 +477,10 @@ class _Handler(BaseHTTPRequestHandler):
         content_length = self.headers.get("Content-Length")
         if relative_path is None or ordinal is None or not ordinal.isdigit():
             raise ValueError("Source path and import order are required.")
+        try:
+            relative_path = unquote(relative_path, encoding="utf-8", errors="strict")
+        except UnicodeDecodeError:
+            raise ValueError("Source path encoding is invalid.") from None
         if content_length is None or not content_length.isdigit():
             raise ValueError("A source upload body is required.")
         length = int(content_length)

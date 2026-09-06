@@ -1,5 +1,9 @@
 export const GXT_MENTORS = ["Garrett", "Afyz", "Erik", "Splash", "Zay", "Theo Notes"];
 
+export function sourceRelativePathHeader(relativePath) {
+  return encodeURIComponent(relativePath);
+}
+
 export function prepareSourceDirectory(selectedFiles) {
   const files = [...selectedFiles].filter((file) => file.name.toLowerCase().endsWith(".txt"));
   const ignoredCount = selectedFiles.length - files.length;

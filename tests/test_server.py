@@ -2,6 +2,7 @@ import http.client
 from io import BytesIO
 import json
 import threading
+from urllib.parse import quote
 
 from openpyxl import Workbook
 
@@ -468,6 +469,41 @@ def test_source_import_endpoints_stage_finalize_and_require_confirmation(tmp_pat
         assert request(
             server, "POST", f"/api/source-imports/{batch['id']}/confirm", b'{"confirm":false}'
         )[0] == 400
+    finally:
+        server.shutdown()
+        worker.join()
+
+
+def test_source_import_endpoint_decodes_unicode_relative_path_header(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    project = storage.create_project("GxT Mastery")
+    server = create_server(storage, FakeChatService(), port=0)
+    worker = threading.Thread(target=server.serve_forever)
+    worker.start()
+    try:
+        status, _, body = request(
+            server, "POST", "/api/source-imports", json.dumps({"project_id": project.id}).encode()
+        )
+        assert status == 201
+        batch = json.loads(body)
+        relative_path = "GxT-Transcripts/Afyz/Youtube/Lesson ｜ One.txt"
+
+        staged_status, _, _ = request(
+            server,
+            "POST",
+            f"/api/source-imports/{batch['id']}/files",
+            b"synthetic transcript",
+            headers={
+                "Content-Type": "text/plain",
+                "X-Source-Relative-Path": quote(relative_path, safe=""),
+                "X-Source-Import-Ordinal": "1",
+            },
+        )
+
+        assert staged_status == 201
+        stored = storage.library_import_batch(batch["id"])[3]
+        assert stored["files"][0]["relative_path"] == relative_path
     finally:
         server.shutdown()
         worker.join()

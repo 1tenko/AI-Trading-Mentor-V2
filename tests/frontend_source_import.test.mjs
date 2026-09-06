@@ -1,7 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { prepareSourceDirectory, sourceLibraryOrder } from "../src/mentor/static/source_import.js";
+import {
+  prepareSourceDirectory,
+  sourceLibraryOrder,
+  sourceRelativePathHeader,
+} from "../src/mentor/static/source_import.js";
 
 const file = (path) => ({ name: path.split("/").at(-1), webkitRelativePath: path });
 
@@ -55,4 +59,13 @@ test("review ordering keeps primary mentor labels human-readable", () => {
   const libraries = ["Zay", "Afyz", "Garrett", "Theo Notes"].map((name) => ({ display_name: `${name} — GxT` }));
   libraries.sort((left, right) => sourceLibraryOrder(left) - sourceLibraryOrder(right));
   assert.deepEqual(libraries.map((item) => item.display_name.split(" — ")[0]), ["Garrett", "Afyz", "Zay", "Theo Notes"]);
+});
+
+test("unicode transcript paths are encoded into an ASCII-safe request header", () => {
+  const path = "GxT-Transcripts/Afyz/Youtube/Lesson ｜ One.txt";
+
+  const header = sourceRelativePathHeader(path);
+
+  assert.match(header, /^[\x20-\x7e]+$/);
+  assert.equal(decodeURIComponent(header), path);
 });

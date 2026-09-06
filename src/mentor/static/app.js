@@ -1,5 +1,5 @@
 import { marked } from "/vendor/marked.esm.js";
-import { prepareSourceDirectory, sourceLibraryOrder } from "/source_import.js";
+import { prepareSourceDirectory, sourceLibraryOrder, sourceRelativePathHeader } from "/source_import.js";
 
 const threads = document.querySelector("#threads");
 const messages = document.querySelector("#messages");
@@ -784,7 +784,7 @@ async function stageSourceDirectory() {
       method: "POST",
       headers: {
         "Content-Type": "text/plain",
-        "X-Source-Relative-Path": file.webkitRelativePath,
+        "X-Source-Relative-Path": sourceRelativePathHeader(file.webkitRelativePath),
         "X-Source-Import-Ordinal": String(index + 1),
       },
       body: file,
