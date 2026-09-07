@@ -399,4 +399,6 @@ review, and present the human quality gate without beginning Phase 6.
 - [x] Checkpoint C — 470 deterministic tests; synthetic live/browser/privacy review passed; clean pushed branch.
 - [x] Post-gate cost/latency optimization — Luna evidence digests, Sol final Mentor,
   corrected Auto depth/source scope, stage diagnostics, and real-corpus benchmark.
+- [x] Post-gate pedagogical-scope refinement — typed mentor roles, Garrett/Afyz
+  curriculum backbone, supporting practical lenses, and bounded real-corpus validation.
 - [ ] Theo human quality gate — stop before Phase 7.

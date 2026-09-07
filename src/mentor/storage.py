@@ -24,6 +24,7 @@ from mentor.datasets import (
 from mentor.project_models import (
     AuthorityKind,
     CanonicalRole,
+    PedagogicalRole,
     ProjectStatus,
     SourceLibrary,
     StrategyProject,
@@ -2025,8 +2026,10 @@ class Storage:
         authority_name: str,
         authority_kind: AuthorityKind,
         display_name: str,
+        pedagogical_role: PedagogicalRole,
     ) -> SourceLibrary:
         authority_kind = AuthorityKind(authority_kind)
+        pedagogical_role = PedagogicalRole(pedagogical_role)
         corpus_key = " ".join(corpus_key.split())
         authority_name = " ".join(authority_name.split())
         display_name = " ".join(display_name.split())
@@ -2037,9 +2040,9 @@ class Storage:
         try:
             with self._connect() as connection:
                 cursor = connection.execute(
-                    "INSERT INTO source_libraries(library_key, corpus_key, authority_name, authority_kind, display_name, status) "
-                    "VALUES (?, ?, ?, ?, ?, 'ACTIVE')",
-                    (library_key, corpus_key, authority_name, authority_kind.value, display_name),
+                    "INSERT INTO source_libraries(library_key, corpus_key, authority_name, authority_kind, display_name, pedagogical_role, status) "
+                    "VALUES (?, ?, ?, ?, ?, ?, 'ACTIVE')",
+                    (library_key, corpus_key, authority_name, authority_kind.value, display_name, pedagogical_role.value),
                 )
         except sqlite3.IntegrityError:
             raise ValueError("source library already exists") from None
@@ -2048,7 +2051,7 @@ class Storage:
     def source_library(self, library_key: str) -> SourceLibrary | None:
         with self._connect() as connection:
             row = connection.execute(
-                "SELECT id, library_key, corpus_key, authority_name, authority_kind, display_name, status "
+                "SELECT id, library_key, corpus_key, authority_name, authority_kind, display_name, pedagogical_role, status "
                 "FROM source_libraries WHERE library_key = ?",
                 (library_key,),
             ).fetchone()
@@ -2057,7 +2060,7 @@ class Storage:
     def source_library_by_id(self, library_id: int) -> SourceLibrary | None:
         with self._connect() as connection:
             row = connection.execute(
-                "SELECT id, library_key, corpus_key, authority_name, authority_kind, display_name, status "
+                "SELECT id, library_key, corpus_key, authority_name, authority_kind, display_name, pedagogical_role, status "
                 "FROM source_libraries WHERE id = ?",
                 (library_id,),
             ).fetchone()
@@ -2151,7 +2154,8 @@ class Storage:
         with self._connect() as connection:
             row = connection.execute(
                 "SELECT source_libraries.id, source_libraries.library_key, source_libraries.corpus_key, "
-                "source_libraries.authority_name, source_libraries.authority_kind, source_libraries.display_name, source_libraries.status "
+                "source_libraries.authority_name, source_libraries.authority_kind, source_libraries.display_name, "
+                "source_libraries.pedagogical_role, source_libraries.status "
                 "FROM mentor_library_source_revisions JOIN mentor_library_sources "
                 "ON mentor_library_sources.id = mentor_library_source_revisions.source_id "
                 "JOIN source_libraries ON source_libraries.id = mentor_library_sources.library_id "
@@ -2184,7 +2188,8 @@ class Storage:
     def safe_project_libraries(self, project_id: int) -> list[dict[str, object]]:
         with self._connect() as connection:
             rows = connection.execute(
-                "SELECT source_libraries.library_key, source_libraries.display_name, project_source_libraries.enabled, "
+                "SELECT source_libraries.library_key, source_libraries.display_name, source_libraries.pedagogical_role, "
+                "project_source_libraries.enabled, "
                 "COUNT(CASE WHEN mentor_library_source_revisions.index_state = 'READY' THEN 1 END), "
                 "COALESCE(library_vector_stores.state, 'NONE') "
                 "FROM project_source_libraries JOIN source_libraries ON source_libraries.id = project_source_libraries.library_id "
@@ -2200,27 +2205,31 @@ class Storage:
             {
                 "library_key": str(row[0]),
                 "display_name": str(row[1]),
-                "enabled": bool(row[2]),
-                "source_count": int(row[3]),
-                "index_status": str(row[4]),
+                "pedagogical_role": str(row[2]),
+                "enabled": bool(row[3]),
+                "source_count": int(row[4]),
+                "index_status": str(row[5]),
             }
             for row in rows
         ]
 
-    def project_library_access(self, project_id: int) -> list[tuple[str, str, str, bool]]:
+    def project_library_access(self, project_id: int) -> list[tuple[str, str, str, str, bool]]:
         with self._connect() as connection:
             rows = connection.execute(
                 "SELECT source_libraries.library_key, source_libraries.display_name, "
-                "library_vector_stores.vector_store_id, project_source_libraries.enabled "
+                "library_vector_stores.vector_store_id, source_libraries.pedagogical_role, "
+                "project_source_libraries.enabled "
                 "FROM project_source_libraries JOIN source_libraries "
                 "ON source_libraries.id = project_source_libraries.library_id "
                 "JOIN library_vector_stores ON library_vector_stores.library_id = source_libraries.id "
                 "WHERE project_source_libraries.project_id = ? AND source_libraries.status = 'ACTIVE' "
                 "AND library_vector_stores.state = 'READY' AND library_vector_stores.vector_store_id IS NOT NULL "
-                "ORDER BY source_libraries.library_key",
+                "ORDER BY CASE source_libraries.pedagogical_role "
+                "WHEN 'FULL_MODEL_CREATOR' THEN 1 WHEN 'FULL_MODEL_EDUCATOR' THEN 2 "
+                "WHEN 'SUPPORTING_PRACTICAL' THEN 3 ELSE 4 END, source_libraries.library_key",
                 (project_id,),
             ).fetchall()
-        return [(str(row[0]), str(row[1]), str(row[2]), bool(row[3])) for row in rows]
+        return [(str(row[0]), str(row[1]), str(row[2]), str(row[3]), bool(row[4])) for row in rows]
 
     def record_thread_source_scope(
         self, thread_id: int, turn_number: int, snapshot: dict[str, object]
@@ -3856,6 +3865,9 @@ def _initialize_phase6_schema(connection: sqlite3.Connection) -> None:
             authority_name TEXT NOT NULL,
             authority_kind TEXT NOT NULL CHECK(authority_kind IN ('MENTOR', 'USER_NOTES', 'SYSTEM')),
             display_name TEXT NOT NULL,
+            pedagogical_role TEXT NOT NULL CHECK(pedagogical_role IN (
+                'FULL_MODEL_CREATOR', 'FULL_MODEL_EDUCATOR', 'SUPPORTING_PRACTICAL', 'USER_NOTES'
+            )),
             status TEXT NOT NULL CHECK(status IN ('ACTIVE', 'ARCHIVED')),
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
@@ -4015,6 +4027,21 @@ def _initialize_phase6_schema(connection: sqlite3.Connection) -> None:
         BEGIN SELECT RAISE(ABORT, 'source revisions are immutable'); END;
         """
     )
+    library_columns = {row[1] for row in connection.execute("PRAGMA table_info(source_libraries)")}
+    if "pedagogical_role" not in library_columns:
+        connection.execute(
+            "ALTER TABLE source_libraries ADD COLUMN pedagogical_role TEXT NOT NULL "
+            "DEFAULT 'SUPPORTING_PRACTICAL' CHECK(pedagogical_role IN "
+            "('FULL_MODEL_CREATOR', 'FULL_MODEL_EDUCATOR', 'SUPPORTING_PRACTICAL', 'USER_NOTES'))"
+        )
+        connection.execute(
+            "UPDATE source_libraries SET pedagogical_role = CASE library_key "
+            "WHEN 'gxt.garrett' THEN 'FULL_MODEL_CREATOR' "
+            "WHEN 'gxt.afyz' THEN 'FULL_MODEL_EDUCATOR' "
+            "WHEN 'gxt.theo_notes' THEN 'USER_NOTES' "
+            "WHEN 'jacob.speculates' THEN 'FULL_MODEL_EDUCATOR' "
+            "ELSE 'SUPPORTING_PRACTICAL' END"
+        )
     connection.executescript(
         """
         DROP TRIGGER IF EXISTS project_state_events_are_immutable;
@@ -4251,7 +4278,8 @@ def _source_library(row: tuple | None) -> SourceLibrary | None:
         authority_name=str(row[3]),
         authority_kind=AuthorityKind(row[4]),
         display_name=str(row[5]),
-        status=str(row[6]),
+        pedagogical_role=PedagogicalRole(row[6]),
+        status=str(row[7]),
     )
 
 

@@ -8,7 +8,7 @@ from threading import Lock
 import time
 from typing import Any, Callable
 
-from mentor.project_models import AuthorityKind, CanonicalRole, SourceLibrary
+from mentor.project_models import AuthorityKind, CanonicalRole, PedagogicalRole, SourceLibrary
 from mentor.source_registry import discover_transcripts
 from mentor.storage import Storage
 
@@ -26,6 +26,7 @@ class LibraryDefinition:
     authority_name: str
     authority_kind: AuthorityKind
     display_name: str
+    pedagogical_role: PedagogicalRole
 
 
 @dataclass(frozen=True)
@@ -52,14 +53,15 @@ class CrossLibraryDuplicateError(ValueError):
 
 
 LIBRARIES = {
-    "gxt.garrett": LibraryDefinition("gxt.garrett", "gxt", "Garrett", AuthorityKind.MENTOR, "Garrett — GxT"),
-    "gxt.afyz": LibraryDefinition("gxt.afyz", "gxt", "Afyz", AuthorityKind.MENTOR, "Afyz — GxT"),
-    "gxt.erik": LibraryDefinition("gxt.erik", "gxt", "Erik", AuthorityKind.MENTOR, "Erik — GxT"),
-    "gxt.splash": LibraryDefinition("gxt.splash", "gxt", "Splash", AuthorityKind.MENTOR, "Splash — GxT"),
-    "gxt.zay": LibraryDefinition("gxt.zay", "gxt", "Zay", AuthorityKind.MENTOR, "Zay — GxT"),
-    "gxt.theo_notes": LibraryDefinition("gxt.theo_notes", "gxt", "Theo", AuthorityKind.USER_NOTES, "Theo Notes — GxT"),
+    "gxt.garrett": LibraryDefinition("gxt.garrett", "gxt", "Garrett", AuthorityKind.MENTOR, "Garrett — GxT", PedagogicalRole.FULL_MODEL_CREATOR),
+    "gxt.afyz": LibraryDefinition("gxt.afyz", "gxt", "Afyz", AuthorityKind.MENTOR, "Afyz — GxT", PedagogicalRole.FULL_MODEL_EDUCATOR),
+    "gxt.erik": LibraryDefinition("gxt.erik", "gxt", "Erik", AuthorityKind.MENTOR, "Erik — GxT", PedagogicalRole.SUPPORTING_PRACTICAL),
+    "gxt.splash": LibraryDefinition("gxt.splash", "gxt", "Splash", AuthorityKind.MENTOR, "Splash — GxT", PedagogicalRole.SUPPORTING_PRACTICAL),
+    "gxt.zay": LibraryDefinition("gxt.zay", "gxt", "Zay", AuthorityKind.MENTOR, "Zay — GxT", PedagogicalRole.SUPPORTING_PRACTICAL),
+    "gxt.theo_notes": LibraryDefinition("gxt.theo_notes", "gxt", "Theo", AuthorityKind.USER_NOTES, "Theo Notes — GxT", PedagogicalRole.USER_NOTES),
     JACOB_LIBRARY_KEY: LibraryDefinition(
-        JACOB_LIBRARY_KEY, "jacob-speculates", "Jacob Speculates", AuthorityKind.MENTOR, "Jacob Speculates"
+        JACOB_LIBRARY_KEY, "jacob-speculates", "Jacob Speculates", AuthorityKind.MENTOR, "Jacob Speculates",
+        PedagogicalRole.FULL_MODEL_EDUCATOR,
     ),
 }
 
@@ -362,6 +364,7 @@ class SourceImportService:
             definition.authority_name,
             definition.authority_kind,
             definition.display_name,
+            definition.pedagogical_role,
         )
 
     def register_local_revision(

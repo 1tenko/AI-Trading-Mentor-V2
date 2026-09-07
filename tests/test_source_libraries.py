@@ -1,5 +1,6 @@
 import hashlib
 import json
+import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import PurePosixPath
 from threading import Event
@@ -7,9 +8,10 @@ from types import SimpleNamespace
 
 import pytest
 
-from mentor.project_models import AuthorityKind, CanonicalRole
+from mentor.project_models import AuthorityKind, CanonicalRole, PedagogicalRole
 from mentor.source_libraries import (
     CrossLibraryDuplicateError,
+    LIBRARIES,
     MAX_SOURCE_BYTES,
     SourceImportService,
     garrett_canonical_role,
@@ -31,6 +33,57 @@ from mentor.storage import Storage
 )
 def test_browser_path_maps_to_one_exact_first_class_library(path, key):
     assert library_definition_for_browser_path(path).library_key == key
+
+
+def test_gxt_library_pedagogical_roles_are_explicit_and_do_not_replace_authority():
+    assert LIBRARIES["gxt.garrett"].pedagogical_role is PedagogicalRole.FULL_MODEL_CREATOR
+    assert LIBRARIES["gxt.afyz"].pedagogical_role is PedagogicalRole.FULL_MODEL_EDUCATOR
+    assert {
+        LIBRARIES[key].pedagogical_role
+        for key in ("gxt.erik", "gxt.splash", "gxt.zay")
+    } == {PedagogicalRole.SUPPORTING_PRACTICAL}
+    assert LIBRARIES["gxt.theo_notes"].pedagogical_role is PedagogicalRole.USER_NOTES
+    assert all(LIBRARIES[key].authority_kind is AuthorityKind.MENTOR for key in (
+        "gxt.garrett", "gxt.afyz", "gxt.erik", "gxt.splash", "gxt.zay"
+    ))
+
+
+def test_existing_phase6_library_rows_receive_deterministic_pedagogical_roles(tmp_path):
+    database = tmp_path / "mentor.sqlite3"
+    with sqlite3.connect(database) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE source_libraries (
+                id INTEGER PRIMARY KEY, library_key TEXT NOT NULL UNIQUE, corpus_key TEXT NOT NULL,
+                authority_name TEXT NOT NULL, authority_kind TEXT NOT NULL, display_name TEXT NOT NULL,
+                status TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            INSERT INTO source_libraries
+                (library_key, corpus_key, authority_name, authority_kind, display_name, status)
+            VALUES
+                ('gxt.garrett', 'gxt', 'Garrett', 'MENTOR', 'Garrett', 'ACTIVE'),
+                ('gxt.afyz', 'gxt', 'Afyz', 'MENTOR', 'Afyz', 'ACTIVE'),
+                ('gxt.erik', 'gxt', 'Erik', 'MENTOR', 'Erik', 'ACTIVE');
+            """
+        )
+
+    storage = Storage(database)
+    storage.initialize()
+    storage.initialize()
+
+    assert storage.source_library("gxt.garrett").pedagogical_role is PedagogicalRole.FULL_MODEL_CREATOR
+    assert storage.source_library("gxt.afyz").pedagogical_role is PedagogicalRole.FULL_MODEL_EDUCATOR
+    assert storage.source_library("gxt.erik").pedagogical_role is PedagogicalRole.SUPPORTING_PRACTICAL
+
+
+def test_source_library_rejects_unknown_pedagogical_role(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+
+    with pytest.raises(ValueError):
+        storage.create_source_library(
+            "gxt.unknown", "gxt", "Unknown", AuthorityKind.MENTOR, "Unknown", "UNRANKED"
+        )
 
 
 @pytest.mark.parametrize(
@@ -58,16 +111,21 @@ def test_library_identity_includes_corpus_and_does_not_merge_same_authority(tmp_
     storage = Storage(tmp_path / "mentor.sqlite3")
     storage.initialize()
     gxt = storage.create_source_library(
-        "gxt.afyz", "gxt", "Afyz", AuthorityKind.MENTOR, "Afyz — GxT"
+        "gxt.afyz", "gxt", "Afyz", AuthorityKind.MENTOR, "Afyz — GxT",
+        PedagogicalRole.FULL_MODEL_EDUCATOR,
     )
     other = storage.create_source_library(
-        "other.afyz", "other-method", "Afyz", AuthorityKind.MENTOR, "Afyz — Other Method"
+        "other.afyz", "other-method", "Afyz", AuthorityKind.MENTOR, "Afyz — Other Method",
+        PedagogicalRole.FULL_MODEL_EDUCATOR,
     )
 
     assert gxt.id != other.id
     assert storage.source_library("gxt.afyz").corpus_key == "gxt"
     with pytest.raises(ValueError, match="already exists"):
-        storage.create_source_library("gxt.afyz", "gxt", "Afyz", AuthorityKind.MENTOR, "Duplicate")
+        storage.create_source_library(
+            "gxt.afyz", "gxt", "Afyz", AuthorityKind.MENTOR, "Duplicate",
+            PedagogicalRole.FULL_MODEL_EDUCATOR,
+        )
 
 
 def test_same_library_hash_dedupes_but_cross_library_hash_conflicts(tmp_path):
@@ -154,6 +212,7 @@ def test_project_library_summary_is_safe_and_contains_no_private_identifiers(tmp
     assert payload == [{
         "library_key": "gxt.zay",
         "display_name": "Zay — GxT",
+        "pedagogical_role": "SUPPORTING_PRACTICAL",
         "enabled": True,
         "source_count": 1,
         "index_status": "NONE",

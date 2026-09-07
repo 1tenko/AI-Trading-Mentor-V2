@@ -16,12 +16,13 @@ from mentor.chat_service import (
     _input_item,
     _effective_research_depth,
     _estimate_text_cost,
+    _is_curriculum_question,
     _profile_context_mode,
 )
 from mentor.prompts import ANALYSIS_TOOL_INSTRUCTIONS, MENTOR_INSTRUCTIONS, PROFILE_TOOL_INSTRUCTIONS
 from mentor.datasets import MappingEntry, create_inspected_mapping_draft, import_local_dataset, inspect_local_dataset, safe_auto_mapping
 from mentor.profile import ProfileService
-from mentor.project_models import AuthorityKind, ThreadSourceBehavior
+from mentor.project_models import AuthorityKind, PedagogicalRole, ThreadSourceBehavior
 from mentor.storage import Storage
 
 
@@ -158,7 +159,11 @@ def test_project_thread_does_not_inherit_global_jacob_or_prompt_selected_project
 
 def _add_project_library(storage, project_id, key, store_id, *, enabled=True, file_id=None):
     name = key.split(".")[-1].title()
-    library = storage.create_source_library(key, "gxt", name, AuthorityKind.MENTOR, name)
+    role = {
+        "gxt.garrett": PedagogicalRole.FULL_MODEL_CREATOR,
+        "gxt.afyz": PedagogicalRole.FULL_MODEL_EDUCATOR,
+    }.get(key, PedagogicalRole.SUPPORTING_PRACTICAL)
+    library = storage.create_source_library(key, "gxt", name, AuthorityKind.MENTOR, name, role)
     storage.set_project_library(project_id, library.id, enabled=enabled)
     storage.set_library_vector_store(library.id, store_id, "READY")
     if file_id is not None:
@@ -191,15 +196,15 @@ def test_project_request_uses_only_effective_enabled_vector_stores(tmp_path):
     _add_project_library(storage, project.id, "gxt.afyz", "vs_afyz", file_id="file_afyz")
     _add_project_library(storage, project.id, "gxt.erik", "vs_erik", enabled=False)
     responses = SequenceResponses(
-        _project_source_response("gxt.afyz", "file_afyz", "Afyz evidence."),
         _project_source_response("gxt.garrett", "file_garrett", "Garrett evidence."),
+        _project_source_response("gxt.afyz", "file_afyz", "Afyz evidence."),
         terminal_response("Scoped answer."),
     )
 
     ChatService(storage, SimpleNamespace(responses=responses)).reply(thread_id, "Teach me GxT.")
 
     assert [call["tools"][0]["vector_store_ids"] for call in responses.calls[:2]] == [
-        ["vs_afyz"], ["vs_garrett"]
+        ["vs_garrett"], ["vs_afyz"]
     ]
     assert "vs_erik" not in json.dumps(responses.calls)
     assert "gxt.afyz" in responses.calls[-1]["instructions"]
@@ -215,8 +220,8 @@ def test_project_one_turn_only_override_is_persisted_safely_and_not_saved(tmp_pa
     _add_project_library(storage, project.id, "gxt.afyz", "vs_afyz", file_id="file_afyz")
     responses = SequenceResponses(
         terminal_response("Answer."),
-        _project_source_response("gxt.afyz", "file_afyz", "Afyz evidence."),
         _project_source_response("gxt.garrett", "file_garrett", "Garrett evidence."),
+        _project_source_response("gxt.afyz", "file_afyz", "Afyz evidence."),
         terminal_response("Answer."),
     )
     service = ChatService(storage, SimpleNamespace(responses=responses))
@@ -226,7 +231,7 @@ def test_project_one_turn_only_override_is_persisted_safely_and_not_saved(tmp_pa
 
     assert not any(tool["type"] == "file_search" for tool in responses.calls[0]["tools"])
     assert [call["tools"][0]["vector_store_ids"] for call in responses.calls[1:3]] == [
-        ["vs_afyz"], ["vs_garrett"]
+        ["vs_garrett"], ["vs_afyz"]
     ]
     assert storage.display_turns(thread_id)[0]["source_scope"] == {
         "library_keys": ["gxt.afyz"], "temporary": True, "override": "only"
@@ -246,7 +251,7 @@ def test_normal_project_teaching_instructions_require_enabled_mentor_coverage(tm
     responses = SequenceResponses(
         *(
             _project_source_response(f"gxt.{label}", f"file_{label}", f"{label} evidence.")
-            for label in sorted(labels)
+            for label in labels
         ),
         terminal_response("Teaching."),
     )
@@ -262,6 +267,95 @@ def test_normal_project_teaching_instructions_require_enabled_mentor_coverage(tm
     assert "Research each planned mentor library" in instructions
     assert all(f"gxt.{label}" in instructions for label in ("garrett", "afyz", "erik", "splash", "zay"))
     assert "creator status is not empirical superiority" in instructions
+
+
+def test_from_scratch_curriculum_uses_full_model_backbone_and_supporting_lenses(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    project = storage.create_project("GxT")
+    thread_id = storage.create_thread(
+        "Project", behavior=ThreadSourceBehavior.PROJECT, project_id=project.id
+    )
+    labels = ("garrett", "afyz", "erik", "splash", "zay")
+    for label in labels:
+        _add_project_library(
+            storage, project.id, f"gxt.{label}", f"vs_{label}", file_id=f"file_{label}"
+        )
+    responses = SequenceResponses(
+        *(
+            _project_source_response(f"gxt.{label}", f"file_{label}", f"{label} evidence.")
+            for label in labels
+        ),
+        terminal_response("Curriculum."),
+    )
+
+    ChatService(storage, SimpleNamespace(responses=responses)).reply(
+        thread_id, "Teach me the core GxT model from scratch."
+    )
+
+    assert [call["tools"][0]["vector_store_ids"] for call in responses.calls[:-1]] == [
+        [f"vs_{label}"] for label in labels
+    ]
+    assert "Garrett and Afyz separately as the curriculum backbone" in responses.calls[-1]["instructions"]
+    assert "supporting practical lenses" in responses.calls[-1]["instructions"]
+    assert "Do not create a top-level GxT chapter, mastery-map node" in responses.calls[-1]["instructions"]
+    assert "creator role never settles a disagreement" in responses.calls[-1]["instructions"]
+    assert "full-model backbone" in responses.calls[0]["instructions"]
+    assert "full-model backbone" in responses.calls[1]["instructions"]
+    assert "isolated comment into a base-model chapter" in responses.calls[2]["instructions"]
+
+
+def test_specific_supporting_mentor_question_stays_direct_and_does_not_add_backbone(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    project = storage.create_project("GxT")
+    thread_id = storage.create_thread(
+        "Project", behavior=ThreadSourceBehavior.PROJECT, project_id=project.id
+    )
+    for label in ("garrett", "afyz", "erik"):
+        _add_project_library(
+            storage, project.id, f"gxt.{label}", f"vs_{label}", file_id=f"file_{label}"
+        )
+    responses = SequenceResponses(
+        _project_source_response("gxt.erik", "file_erik", "Erik evidence."),
+        terminal_response("Erik explanation."),
+    )
+
+    ChatService(storage, SimpleNamespace(responses=responses)).reply(
+        thread_id, "How does Erik explain the GxT entry sequence?"
+    )
+
+    assert responses.calls[0]["tools"][0]["vector_store_ids"] == ["vs_erik"]
+    assert "SUPPORTING_PRACTICAL" in responses.calls[0]["instructions"]
+    assert "curriculum backbone" not in responses.calls[-1]["instructions"]
+
+
+@pytest.mark.parametrize(
+    "question",
+    (
+        "Teach me GxT from scratch.",
+        "Explain the core GxT model.",
+        "What is the complete structure of GxT?",
+        "Give me a complete GxT system curriculum.",
+        "Build my GxT mastery map.",
+        "What should I learn first?",
+        "How does the whole GxT system fit together?",
+    ),
+)
+def test_curriculum_intent_is_deterministic_for_approved_wording(question):
+    assert _is_curriculum_question(question) is True
+
+
+@pytest.mark.parametrize(
+    "question",
+    (
+        "What does Erik teach about entries?",
+        "Compare all five mentors on SMT.",
+        "Where does Garrett mention the entry sequence?",
+    ),
+)
+def test_narrow_or_comparative_intent_does_not_force_curriculum_semantics(question):
+    assert _is_curriculum_question(question) is False
 
 
 def _project_source_response(key, file_id, statement):
@@ -295,7 +389,7 @@ def test_project_research_is_one_store_per_call_and_keeps_native_citations_out_o
     keys = ("gxt.garrett", "gxt.afyz", "gxt.erik")
     for key in keys:
         _add_project_library(storage, project.id, key, f"vs_{key}", file_id=f"file_{key}")
-    research = [_project_source_response(key, f"file_{key}", f"{key} supports X.") for key in sorted(keys)]
+    research = [_project_source_response(key, f"file_{key}", f"{key} supports X.") for key in keys]
     responses = SequenceResponses(*research, terminal_response("Source synthesis: X is shared."))
 
     answer = ChatService(storage, SimpleNamespace(responses=responses)).reply(
@@ -303,14 +397,14 @@ def test_project_research_is_one_store_per_call_and_keeps_native_citations_out_o
     )
 
     assert [call["tools"][0]["vector_store_ids"] for call in responses.calls[:3]] == [
-        [f"vs_{key}"] for key in sorted(keys)
+        [f"vs_{key}"] for key in keys
     ]
     assert not any(tool["type"] == "file_search" for tool in responses.calls[-1]["tools"])
     assert {citation.file_id for citation in answer.citations} == {f"file_{key}" for key in keys}
     assert len(answer.evidence) == 3
-    assert answer.diagnostics.mentor_search_calls == {key: 1 for key in sorted(keys)}
+    assert answer.diagnostics.mentor_search_calls == {key: 1 for key in keys}
     assert answer.diagnostics.source_scope == {
-        "library_keys": list(sorted(keys)), "temporary": False, "override": "saved"
+        "library_keys": list(keys), "temporary": False, "override": "saved"
     }
     assert all(item.get("type") != "file_search_call" for item in storage.replay_items(thread_id))
     assert all(item.get("type") != "file_search_call" for item in storage.thread_items(thread_id))
@@ -328,7 +422,9 @@ def test_project_research_rejects_a_result_owned_by_another_library_before_persi
     )
 
     with pytest.raises(RuntimeError, match="ownership"):
-        ChatService(storage, SimpleNamespace(responses=responses)).reply(thread_id, "Teach me GxT.")
+        ChatService(storage, SimpleNamespace(responses=responses)).reply(
+            thread_id, "What does Afyz teach about X?"
+        )
 
     assert storage.display_turns(thread_id) == []
     assert storage.replay_items(thread_id) == []
@@ -622,8 +718,8 @@ def test_project_research_retries_one_503_then_continues_without_restarting_ment
     monkeypatch.setattr(random, "random", lambda: 0.0)
     client = RetryRecordingClient(
         ProviderStatusError(503, error_type="server_error"),
-        _project_source_response("gxt.afyz", "file_afyz", "Afyz evidence."),
         _project_source_response("gxt.garrett", "file_garrett", "Garrett evidence."),
+        _project_source_response("gxt.afyz", "file_afyz", "Afyz evidence."),
         terminal_response("Complete comparison."),
     )
 
@@ -636,11 +732,11 @@ def test_project_research_retries_one_503_then_continues_without_restarting_ment
     assert answer.text == "Complete comparison."
     assert delays == [0.75]
     assert [call["tools"][0]["vector_store_ids"] for call in client.responses.calls[:3]] == [
-        ["vs_afyz"], ["vs_afyz"], ["vs_garrett"],
+        ["vs_garrett"], ["vs_garrett"], ["vs_afyz"],
     ]
-    afyz_attempts = answer.diagnostics.project_source_research["mentor_attempts"]["Afyz"]
-    assert len(afyz_attempts) == 2
-    assert afyz_attempts[0] == {
+    garrett_attempts = answer.diagnostics.project_source_research["mentor_attempts"]["Garrett"]
+    assert len(garrett_attempts) == 2
+    assert garrett_attempts[0] == {
         "attempt": 1, "pass": 1, "stage": "source_search", "provider_status": 503,
         "provider_type": "server_error", "provider_code": None, "retryable": True,
         "retry_delay": 0.75, "file_search": "not_started",
@@ -648,8 +744,8 @@ def test_project_research_retries_one_503_then_continues_without_restarting_ment
         "input_tokens": None, "output_tokens": None, "reasoning_tokens": None,
         "max_output_tokens": 2_500, "results": 0, "citations": 0,
     }
-    assert afyz_attempts[1]["research_response"] == "completed"
-    assert answer.diagnostics.project_source_research["mentor_research"]["Garrett"]["status"] == "completed"
+    assert garrett_attempts[1]["research_response"] == "completed"
+    assert answer.diagnostics.project_source_research["mentor_research"]["Afyz"]["status"] == "completed"
     assert client.max_retries == [0, 0, 0]
 
 
@@ -702,11 +798,11 @@ def test_project_research_stops_after_three_503_attempts_and_keeps_other_mentors
     assert len(client.responses.calls) == 3
     assert delays == [0.75, 1.5]
     diagnostics = events[0].source_diagnostics
-    assert len(diagnostics["mentor_attempts"]["Afyz"]) == 3
-    assert diagnostics["mentor_research"]["Garrett"]["status"] == "not_started"
+    assert len(diagnostics["mentor_attempts"]["Garrett"]) == 3
+    assert diagnostics["mentor_research"]["Afyz"]["status"] == "not_started"
     assert events[0].error == (
         "I couldn't complete the all-mentor research because the source service temporarily "
-        "failed while searching Afyz after 3 attempts. Your indexed sources are intact. "
+        "failed while searching Garrett after 3 attempts. Your indexed sources are intact. "
         "Try again shortly."
     )
     assert "PRIVATE PROVIDER MESSAGE" not in json.dumps(diagnostics)
@@ -817,7 +913,7 @@ def test_stream_project_research_reports_the_exact_failed_library_without_leakin
     _add_project_library(storage, project.id, "gxt.garrett", "vs_garrett", file_id="file_garrett")
     _add_project_library(storage, project.id, "gxt.afyz", "vs_afyz", file_id="file_afyz")
     responses = SequenceResponses(
-        _project_source_response("gxt.afyz", "file_stale_private", "PRIVATE TRANSCRIPT TEXT"),
+        _project_source_response("gxt.garrett", "file_stale_private", "PRIVATE TRANSCRIPT TEXT"),
     )
 
     events = list(ChatService(storage, SimpleNamespace(responses=responses)).stream_reply(
@@ -826,16 +922,16 @@ def test_stream_project_research_reports_the_exact_failed_library_without_leakin
 
     assert [event.type for event in events] == ["error"]
     assert events[0].error_classification == "project_source_ownership"
-    assert "Afyz" in events[0].error
+    assert "Garrett" in events[0].error
     assert "incomplete mentor comparison" in events[0].error
-    assert events[0].source_diagnostics["source_scope"] == ["Afyz", "Garrett"]
+    assert events[0].source_diagnostics["source_scope"] == ["Garrett", "Afyz"]
     assert events[0].source_diagnostics["mentor_research"] == {
-        "Afyz": {"status": "failed", "calls": 1, "results": 1, "citations": 1},
-        "Garrett": {"status": "not_started", "calls": 0, "results": 0, "citations": 0},
+        "Garrett": {"status": "failed", "calls": 1, "results": 1, "citations": 1},
+        "Afyz": {"status": "not_started", "calls": 0, "results": 0, "citations": 0},
     }
     assert events[0].source_diagnostics["file_search_calls"] == 1
     assert events[0].source_diagnostics["final_synthesis"] == "not_started"
-    assert events[0].source_diagnostics["failure_stage"] == "Afyz source ownership validation"
+    assert events[0].source_diagnostics["failure_stage"] == "Garrett source ownership validation"
     assert events[0].source_diagnostics["research_characters"] > 0
     assert events[0].source_diagnostics["estimated_input_tokens"] > 0
     assert events[0].source_diagnostics["output_item_types"] == {
@@ -984,7 +1080,8 @@ def test_project_source_diagnostics_use_human_mentor_names_not_library_labels(tm
         "Project", behavior=ThreadSourceBehavior.PROJECT, project_id=project.id
     )
     library = storage.create_source_library(
-        "gxt.afyz", "gxt", "Afyz", AuthorityKind.MENTOR, "Afyz — GxT"
+        "gxt.afyz", "gxt", "Afyz", AuthorityKind.MENTOR, "Afyz — GxT",
+        PedagogicalRole.FULL_MODEL_EDUCATOR,
     )
     storage.set_project_library(project.id, library.id, enabled=True)
     storage.set_library_vector_store(library.id, "vs_afyz", "READY")
@@ -1193,8 +1290,8 @@ def test_project_research_keeps_no_result_as_scoped_absence_not_a_fabricated_dis
         ],
     )
     responses = SequenceResponses(
-        absent,
         _project_source_response("gxt.garrett", "file_garrett", "Garrett supports X."),
+        absent,
         terminal_response("Garrett supports X; this search found no Afyz evidence."),
     )
 
@@ -1204,7 +1301,7 @@ def test_project_research_keeps_no_result_as_scoped_absence_not_a_fabricated_dis
 
     assert answer.text == "Garrett supports X; this search found no Afyz evidence."
     assert [citation.file_id for citation in answer.citations] == ["file_garrett"]
-    assert answer.diagnostics.mentor_search_calls == {"gxt.afyz": 1, "gxt.garrett": 1}
+    assert answer.diagnostics.mentor_search_calls == {"gxt.garrett": 1, "gxt.afyz": 1}
 
 
 def test_project_exact_timestamp_repair_reuses_serial_raw_evidence_without_invalid_tool_choice(tmp_path):

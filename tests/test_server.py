@@ -10,7 +10,7 @@ import mentor.server as server_module
 from mentor.chat_service import Answer, StreamEvent
 from mentor.profile import ProfileService
 from mentor.project_ledger import ProjectLedgerService
-from mentor.project_models import AuthorityKind
+from mentor.project_models import AuthorityKind, PedagogicalRole
 from mentor.project_service import ProjectService
 from mentor.server import create_server
 from mentor.storage import Storage
@@ -157,7 +157,10 @@ def test_server_serves_a_ready_project_mentor_source_for_citation_verification(t
     transcript.write_text("[1.0 --> 3.0] synthetic Erik source", encoding="utf-8")
     storage = Storage(tmp_path / "mentor.sqlite3")
     storage.initialize()
-    library = storage.create_source_library("gxt.erik", "gxt", "Erik", AuthorityKind.MENTOR, "Erik")
+    library = storage.create_source_library(
+        "gxt.erik", "gxt", "Erik", AuthorityKind.MENTOR, "Erik",
+        PedagogicalRole.SUPPORTING_PRACTICAL,
+    )
     storage.register_library_revision(
         library_id=library.id, source_key="erik.txt", display_title="Erik lesson", source_type="transcript",
         relative_category="Youtube", source_date=None, timestamps_available=True, sha256="a" * 64,
@@ -358,7 +361,8 @@ def test_project_library_endpoints_return_safe_state_and_persist_toggle(tmp_path
     storage.initialize()
     project = storage.create_project("GxT")
     library = storage.create_source_library(
-        "gxt.garrett", "gxt", "Garrett", AuthorityKind.MENTOR, "Garrett — GxT"
+        "gxt.garrett", "gxt", "Garrett", AuthorityKind.MENTOR, "Garrett — GxT",
+        PedagogicalRole.FULL_MODEL_CREATOR,
     )
     storage.set_project_library(project.id, library.id, enabled=True)
     server = create_server(storage, FakeChatService(), port=0)
@@ -369,6 +373,7 @@ def test_project_library_endpoints_return_safe_state_and_persist_toggle(tmp_path
         assert status == 200
         assert json.loads(body) == {"libraries": [{
             "library_key": "gxt.garrett", "display_name": "Garrett — GxT",
+            "pedagogical_role": "FULL_MODEL_CREATOR",
             "enabled": True, "source_count": 0, "index_status": "NONE",
         }]}
         changed, _, body = request(
@@ -398,6 +403,8 @@ def test_project_source_controls_are_chat_first_and_show_temporary_scope(tmp_pat
         assert b'id="source-scope-chip"' in page
         assert b"Import your GxT mentor transcripts to start source-grounded learning." in script
         assert b"Ask about GxT, compare mentors, or continue your Roadmap." in script
+        assert b"Full-model educator" in script
+        assert b"Supporting mentor" in script
         assert b"Temporary for this answer" in script
         assert b"/libraries/${encodeURIComponent(libraryKey)}" in script
         assert b"Data workspace" not in page

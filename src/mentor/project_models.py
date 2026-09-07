@@ -27,6 +27,13 @@ class CanonicalRole(StrEnum):
     GARRETT_ARCHIVAL_AND_COMPLEMENTARY = "GARRETT_ARCHIVAL_AND_COMPLEMENTARY"
 
 
+class PedagogicalRole(StrEnum):
+    FULL_MODEL_CREATOR = "FULL_MODEL_CREATOR"
+    FULL_MODEL_EDUCATOR = "FULL_MODEL_EDUCATOR"
+    SUPPORTING_PRACTICAL = "SUPPORTING_PRACTICAL"
+    USER_NOTES = "USER_NOTES"
+
+
 class ResearchDepth(StrEnum):
     NORMAL = "NORMAL"
     DEEP = "DEEP"
@@ -56,6 +63,7 @@ class SourceLibrary:
     authority_name: str
     authority_kind: AuthorityKind
     display_name: str
+    pedagogical_role: PedagogicalRole
     status: str
 
 

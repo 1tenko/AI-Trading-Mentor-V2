@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-from mentor.project_models import AuthorityKind, ThreadSourceBehavior
+from mentor.project_models import AuthorityKind, PedagogicalRole, ThreadSourceBehavior
 from mentor.source_scope import SearchPass, research_plan, resolve_source_scope, search_budget
 from mentor.storage import Storage
 
@@ -17,7 +17,13 @@ def _project_with_libraries(tmp_path, keys=("gxt.garrett", "gxt.afyz", "gxt.erik
     libraries = {}
     for key in keys:
         name = key.split(".")[-1].replace("_", " ").title()
-        library = storage.create_source_library(key, "gxt", name, AuthorityKind.MENTOR, name)
+        role = {
+            "gxt.garrett": PedagogicalRole.FULL_MODEL_CREATOR,
+            "gxt.afyz": PedagogicalRole.FULL_MODEL_EDUCATOR,
+        }.get(key, PedagogicalRole.SUPPORTING_PRACTICAL)
+        library = storage.create_source_library(
+            key, "gxt", name, AuthorityKind.MENTOR, name, role
+        )
         storage.set_project_library(project.id, library.id, enabled=True)
         storage.set_library_vector_store(library.id, f"vs_{name.casefold().replace(' ', '_')}", "READY")
         libraries[key] = library
@@ -30,8 +36,8 @@ def test_saved_disabled_library_is_absent_from_effective_scope(tmp_path):
 
     scope = resolve_source_scope(storage, storage.thread_context(thread_id), "Teach me GxT.")
 
-    assert scope.library_keys == ("gxt.erik", "gxt.garrett")
-    assert scope.vector_store_ids == ("vs_erik", "vs_garrett")
+    assert scope.library_keys == ("gxt.garrett", "gxt.erik")
+    assert scope.vector_store_ids == ("vs_garrett", "vs_erik")
     assert "vs_afyz" not in scope.vector_store_ids
 
 
@@ -53,10 +59,10 @@ def test_exact_one_turn_override_uses_only_enabled_named_authority(tmp_path):
     (
         ("What does Afyz teach about X?", ("gxt.afyz",)),
         ("Where exactly does Erik teach X?", ("gxt.erik",)),
-        ("Compare Garrett and Afyz on X.", ("gxt.afyz", "gxt.garrett")),
-        ("Compare Afyz to Garrett on X.", ("gxt.afyz", "gxt.garrett")),
+        ("Compare Garrett and Afyz on X.", ("gxt.garrett", "gxt.afyz")),
+        ("Compare Afyz to Garrett on X.", ("gxt.garrett", "gxt.afyz")),
         ("Do not use all mentors; use Afyz only.", ("gxt.afyz",)),
-        ("Compare Garrett and Afyz only.", ("gxt.afyz", "gxt.garrett")),
+        ("Compare Garrett and Afyz only.", ("gxt.garrett", "gxt.afyz")),
         ("I don't need all mentors. What does Afyz teach about X?", ("gxt.afyz",)),
         ("I don’t need all mentors. What does Afyz teach about X?", ("gxt.afyz",)),
     ),
@@ -82,7 +88,14 @@ def test_all_enabled_mentor_wording_keeps_every_enabled_authority(tmp_path):
         "Teach me X using all enabled mentors.",
     )
 
-    assert scope.library_keys == tuple(sorted(keys))
+    assert scope.library_keys == keys
+    assert [library.pedagogical_role for library in scope.libraries] == [
+        PedagogicalRole.FULL_MODEL_CREATOR,
+        PedagogicalRole.FULL_MODEL_EDUCATOR,
+        PedagogicalRole.SUPPORTING_PRACTICAL,
+        PedagogicalRole.SUPPORTING_PRACTICAL,
+        PedagogicalRole.SUPPORTING_PRACTICAL,
+    ]
 
 
 def test_compare_and_ignore_override_is_exact_and_does_not_mutate_saved_scope(tmp_path):
@@ -92,7 +105,7 @@ def test_compare_and_ignore_override_is_exact_and_does_not_mutate_saved_scope(tm
         storage, storage.thread_context(thread_id), "Compare Garrett and Erik, ignore Afyz."
     )
 
-    assert scope.library_keys == ("gxt.erik", "gxt.garrett")
+    assert scope.library_keys == ("gxt.garrett", "gxt.erik")
     assert scope.temporary is True
     assert len([item for item in storage.safe_project_libraries(project.id) if item["enabled"]]) == 3
 
@@ -104,7 +117,7 @@ def test_malformed_override_falls_back_to_saved_scope_without_broadening(tmp_pat
         storage, storage.thread_context(thread_id), "Compare Garrett, Erik, and an unknown mentor."
     )
 
-    assert scope.library_keys == ("gxt.afyz", "gxt.erik", "gxt.garrett")
+    assert scope.library_keys == ("gxt.garrett", "gxt.afyz", "gxt.erik")
     assert scope.temporary is False
 
 
@@ -143,7 +156,7 @@ def test_normal_gxt_teaching_plans_a_pass_for_each_enabled_mentor(tmp_path):
 
     plan = research_plan(scope, "Teach me how X works in GxT.", "normal")
 
-    assert plan == tuple(SearchPass(key, 1, 8) for key in sorted(keys))
+    assert plan == tuple(SearchPass(key, 1, 8) for key in keys)
 
 
 def test_exhaustive_plan_is_bounded_and_complementary(tmp_path):

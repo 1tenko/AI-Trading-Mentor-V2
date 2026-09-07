@@ -793,10 +793,20 @@ function sourceLibraryControl(projectId, library) {
   name.textContent = library.display_name.split(" — ")[0];
   const meta = document.createElement("small");
   meta.textContent = `${library.source_count} transcript${library.source_count === 1 ? "" : "s"} · ${sourceStatus(library.index_status)}`;
-  text.append(name, meta);
+  const role = document.createElement("small");
+  role.textContent = pedagogicalRole(library.pedagogical_role);
+  text.append(name, meta, role);
   toggle.addEventListener("change", () => saveSourceSetting(projectId, library.library_key, toggle));
   label.append(toggle, text);
   return label;
+}
+
+function pedagogicalRole(value) {
+  if (value === "FULL_MODEL_CREATOR") return "Full-model educator · GxT creator";
+  if (value === "FULL_MODEL_EDUCATOR") return "Full-model educator";
+  if (value === "SUPPORTING_PRACTICAL") return "Supporting mentor · Q&A / backtesting";
+  if (value === "USER_NOTES") return "Theo's notes";
+  return "Source library";
 }
 
 function sourceStatus(value) {

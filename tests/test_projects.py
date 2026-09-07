@@ -5,6 +5,7 @@ import pytest
 
 from mentor.project_models import (
     AuthorityKind,
+    PedagogicalRole,
     CanonicalRole,
     ProjectStatus,
     ResearchDepth,
@@ -17,6 +18,7 @@ from mentor.storage import Storage
 def test_phase6_enums_reject_unknown_values():
     for enum_type in (
         AuthorityKind,
+        PedagogicalRole,
         CanonicalRole,
         ProjectStatus,
         ResearchDepth,
@@ -314,12 +316,14 @@ def test_project_detail_and_source_toggle_are_project_local_and_persistent(tmp_p
     project = service.create_project("GxT")
     other = service.create_project("Other")
     garrett = storage.create_source_library(
-        "gxt.garrett", "gxt", "Garrett", AuthorityKind.MENTOR, "Garrett — GxT"
+        "gxt.garrett", "gxt", "Garrett", AuthorityKind.MENTOR, "Garrett — GxT",
+        PedagogicalRole.FULL_MODEL_CREATOR,
     )
     storage.set_project_library(project.id, garrett.id, enabled=True)
 
     assert service.project_detail(project.id)["libraries"] == [{
         "library_key": "gxt.garrett", "display_name": "Garrett — GxT",
+        "pedagogical_role": "FULL_MODEL_CREATOR",
         "enabled": True, "source_count": 0, "index_status": "NONE",
     }]
     updated = service.set_library_enabled(project.id, "gxt.garrett", enabled=False)
@@ -335,7 +339,8 @@ def test_archived_project_cannot_change_saved_source_settings(tmp_path):
     service = ProjectService(storage)
     project = service.create_project("GxT")
     garrett = storage.create_source_library(
-        "gxt.garrett", "gxt", "Garrett", AuthorityKind.MENTOR, "Garrett — GxT"
+        "gxt.garrett", "gxt", "Garrett", AuthorityKind.MENTOR, "Garrett — GxT",
+        PedagogicalRole.FULL_MODEL_CREATOR,
     )
     storage.set_project_library(project.id, garrett.id, enabled=True)
     service.update_project(project.id, status="ARCHIVED")

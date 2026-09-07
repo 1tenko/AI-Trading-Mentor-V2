@@ -3,7 +3,7 @@
 from dataclasses import dataclass
 import re
 
-from mentor.project_models import SearchBudget, ThreadContext, ThreadSourceBehavior
+from mentor.project_models import PedagogicalRole, SearchBudget, ThreadContext, ThreadSourceBehavior
 from mentor.storage import Storage
 
 
@@ -53,6 +53,7 @@ class ScopedLibrary:
     library_key: str
     display_name: str
     vector_store_id: str
+    pedagogical_role: PedagogicalRole
 
 
 @dataclass(frozen=True)
@@ -101,9 +102,9 @@ def resolve_source_scope(
     if thread.project_id is None:
         raise ValueError("project conversation has no project")
     available = {
-        row[0]: ScopedLibrary(row[0], row[1], row[2])
+        row[0]: ScopedLibrary(row[0], row[1], row[2], PedagogicalRole(row[3]))
         for row in storage.project_library_access(thread.project_id)
-        if row[3]
+        if row[4]
     }
     selected = set(available)
     temporary = False
@@ -143,7 +144,7 @@ def resolve_source_scope(
             selected, temporary, override = requested, True, "only" if len(requested) == 1 else "compare"
     if len(selected) > 6:
         raise ValueError("Choose up to six source libraries for this answer.")
-    libraries = tuple(available[key] for key in sorted(selected))
+    libraries = tuple(library for key, library in available.items() if key in selected)
     return ResolvedSourceScope(
         thread.project_id,
         libraries,
