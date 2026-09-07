@@ -360,10 +360,27 @@ function sourceResearchRows(sourceDiagnostics) {
   });
   const rows = [
     ["Source scope", scope],
+    ["Evidence model", humanModelName(sourceDiagnostics.evidence_model)],
     ["Mentor research", mentors.join("; ") || "Not requested"],
+    ["Mentor passes", Object.entries(sourceDiagnostics.mentor_passes || {}).map(([name, count]) => `${name} ${count}`).join(" · ") || "None"],
     ["File Search calls", String(sourceDiagnostics.file_search_calls || 0)],
     ["Final synthesis", String(sourceDiagnostics.final_synthesis || "not started").replaceAll("_", " ")],
   ];
+  for (const [label, value] of [
+    ["Mentor research cost", sourceDiagnostics.mentor_research_cost_usd],
+    ["File Search cost", sourceDiagnostics.file_search_cost_usd],
+    ["Final Sol synthesis cost", sourceDiagnostics.final_sol_synthesis_cost_usd],
+    ["Total estimated turn cost", sourceDiagnostics.total_estimated_turn_cost_usd],
+  ]) {
+    if (value != null) rows.push([label, `$${value.toFixed(4)}`]);
+  }
+  for (const [label, usage] of [
+    ["Mentor research tokens", sourceDiagnostics.mentor_research_usage],
+    ["Final synthesis tokens", sourceDiagnostics.final_synthesis_usage],
+  ]) {
+    if (!usage) continue;
+    rows.push([label, `${usage.uncached_input_tokens ?? "—"} uncached · ${usage.cached_input_tokens ?? "—"} cached · ${usage.cache_write_tokens ?? "—"} cache write · ${usage.output_tokens ?? "—"} output`]);
+  }
   if (sourceDiagnostics.failure_stage) rows.push(["Failure stage", sourceDiagnostics.failure_stage]);
   if (sourceDiagnostics.provider_error) {
     const provider = sourceDiagnostics.provider_error;
@@ -374,6 +391,15 @@ function sourceResearchRows(sourceDiagnostics) {
     rows.push(["Provider error", `HTTP ${provider.status || "unknown"}${label ? ` · ${label}` : ""}`]);
   }
   return rows;
+}
+
+function humanModelName(model) {
+  const names = {
+    "gpt-5.6-luna": "GPT-5.6 Luna",
+    "gpt-5.6-terra": "GPT-5.6 Terra",
+    "gpt-5.6-sol": "GPT-5.6 Sol",
+  };
+  return names[model] || model || "Unavailable";
 }
 
 function renderMessageAttachment(attachment) {

@@ -93,6 +93,11 @@ def test_sol_cost_projection_uses_current_standard_api_rates():
     assert _estimate_text_cost("gpt-5.6-sol", 1_000, 200, 100, 1_000) == 0.02338
 
 
+def test_evidence_model_cost_projection_uses_current_luna_and_terra_rates():
+    assert _estimate_text_cost("gpt-5.6-luna", 1_000, 200, 100, 1_000) == 0.001369
+    assert _estimate_text_cost("gpt-5.6-terra", 1_000, 200, 100, 1_000) == 0.01369
+
+
 def test_neutral_general_has_no_file_search_and_does_not_require_jacob_store(tmp_path):
     storage = Storage(tmp_path / "mentor.sqlite3")
     storage.initialize()
@@ -251,6 +256,9 @@ def test_normal_project_teaching_instructions_require_enabled_mentor_coverage(tm
     )
 
     instructions = responses.calls[-1]["instructions"]
+    assert all(call["model"] == "gpt-5.6-luna" for call in responses.calls[:-1])
+    assert all(call["reasoning"] == {"effort": "low"} for call in responses.calls[:-1])
+    assert responses.calls[-1]["model"] == "gpt-5.6-sol"
     assert "Research each planned mentor library" in instructions
     assert all(f"gxt.{label}" in instructions for label in ("garrett", "afyz", "erik", "splash", "zay"))
     assert "creator status is not empirical superiority" in instructions
@@ -357,7 +365,7 @@ def test_stream_project_research_rejects_incomplete_file_search_before_synthesis
     assert storage.display_turns(thread_id) == []
 
 
-def test_project_research_digest_has_measured_headroom_and_safe_attempt_diagnostics(tmp_path):
+def test_project_research_digest_is_bounded_and_has_safe_attempt_diagnostics(tmp_path):
     storage = Storage(tmp_path / "mentor.sqlite3")
     storage.initialize()
     project = storage.create_project("GxT")
@@ -372,39 +380,6 @@ def test_project_research_digest_has_measured_headroom_and_safe_attempt_diagnost
 
         def create(self, **kwargs):
             self.calls.append(kwargs)
-            if len(self.calls) == 1 and kwargs["max_output_tokens"] < 5_000:
-                return SimpleNamespace(
-                    id="resp_incomplete", model="gpt-5.6-sol", status="incomplete",
-                    incomplete_details=SimpleNamespace(reason="max_output_tokens"),
-                    usage=SimpleNamespace(
-                        input_tokens=29_126, output_tokens=2_500,
-                        output_tokens_details=SimpleNamespace(reasoning_tokens=995),
-                    ),
-                    output=[
-                        {
-                            "type": "file_search_call", "id": "fs_1", "status": "completed",
-                            "queries": ["synthetic"],
-                            "results": [
-                                {
-                                    "file_id": "file_afyz", "filename": "afyz.txt",
-                                    "text": "PRIVATE TRANSCRIPT TEXT",
-                                    "attributes": {"library_key": "gxt.afyz"},
-                                }
-                                for _ in range(32)
-                            ],
-                        },
-                        {
-                            "type": "message", "role": "assistant",
-                            "content": [{
-                                "type": "output_text", "text": "Bounded digest.",
-                                "annotations": [
-                                    {"type": "file_citation", "file_id": "file_afyz", "filename": "afyz.txt"}
-                                    for _ in range(12)
-                                ],
-                            }],
-                        },
-                    ],
-                )
             if len(self.calls) == 1:
                 return _project_source_response(
                     "gxt.afyz", "file_afyz", "PRIVATE TRANSCRIPT TEXT"
@@ -417,10 +392,14 @@ def test_project_research_digest_has_measured_headroom_and_safe_attempt_diagnost
     )
 
     research_request = responses.calls[0]
-    assert research_request["max_output_tokens"] == 5_000
-    assert research_request["reasoning"] == {"effort": "high"}
+    assert research_request["model"] == "gpt-5.6-luna"
+    assert research_request["max_output_tokens"] == 2_500
+    assert research_request["reasoning"] == {"effort": "low"}
+    assert research_request["text"] == {"verbosity": "low"}
     assert "Do not teach the user yet" in research_request["instructions"]
     assert "Do not write a comprehensive final answer" in research_request["instructions"]
+    assert "Key supported claims" in research_request["instructions"]
+    assert responses.calls[-1]["model"] == "gpt-5.6-sol"
     assert answer.text == "Bounded final answer."
     attempt = answer.diagnostics.project_source_research["mentor_attempts"]["Afyz"][0]
     assert attempt == {
@@ -438,11 +417,101 @@ def test_project_research_digest_has_measured_headroom_and_safe_attempt_diagnost
         "input_tokens": None,
         "output_tokens": None,
         "reasoning_tokens": None,
-        "max_output_tokens": 5_000,
+        "max_output_tokens": 2_500,
         "results": 1,
         "citations": 1,
     }
     assert "PRIVATE TRANSCRIPT TEXT" not in json.dumps(answer.diagnostics.project_source_research)
+
+
+def test_project_diagnostics_split_mixed_model_usage_and_cost_by_pipeline_stage(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    project = storage.create_project("GxT")
+    thread_id = storage.create_thread(
+        "Project", behavior=ThreadSourceBehavior.PROJECT, project_id=project.id
+    )
+    _add_project_library(storage, project.id, "gxt.afyz", "vs_afyz", file_id="file_afyz")
+    usage = SimpleNamespace(
+        input_tokens=1_000,
+        output_tokens=1_000,
+        total_tokens=2_000,
+        input_tokens_details=SimpleNamespace(cached_tokens=200, cache_write_tokens=100),
+        output_tokens_details=SimpleNamespace(reasoning_tokens=300),
+    )
+    research = _project_source_response("gxt.afyz", "file_afyz", "Afyz evidence.")
+    research.model = "gpt-5.6-luna"
+    research.usage = usage
+    final = terminal_response("Final Sol teaching.", usage=usage)
+    final.model = "gpt-5.6-sol"
+    responses = SequenceResponses(research, final)
+
+    answer = ChatService(storage, SimpleNamespace(responses=responses)).reply(
+        thread_id,
+        "What does Afyz teach about X?",
+        EvaluationConfig("xhigh", "pro", "auto"),
+    )
+
+    diagnostics = answer.diagnostics.project_source_research
+    assert responses.calls[0]["reasoning"] == {"effort": "low"}
+    assert responses.calls[-1]["reasoning"] == {"effort": "xhigh", "mode": "pro"}
+    assert diagnostics["evidence_model"] == "gpt-5.6-luna"
+    assert diagnostics["mentor_passes"] == {"Afyz": 1}
+    assert diagnostics["mentor_research_cost_usd"] == 0.001369
+    assert diagnostics["file_search_cost_usd"] == 0.0025
+    assert diagnostics["final_sol_synthesis_cost_usd"] == 0.02338
+    assert diagnostics["total_estimated_turn_cost_usd"] == 0.027249
+    assert diagnostics["mentor_research_usage"] == {
+        "uncached_input_tokens": 700,
+        "cached_input_tokens": 200,
+        "cache_write_tokens": 100,
+        "output_tokens": 1_000,
+    }
+    assert diagnostics["final_synthesis_usage"] == {
+        "uncached_input_tokens": 700,
+        "cached_input_tokens": 200,
+        "cache_write_tokens": 100,
+        "output_tokens": 1_000,
+    }
+    assert answer.diagnostics.estimated_text_cost_usd == 0.024749
+
+
+def test_project_diagnostics_include_every_final_sol_tool_continuation(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    project = storage.create_project("GxT")
+    thread_id = storage.create_thread(
+        "Project", behavior=ThreadSourceBehavior.PROJECT, project_id=project.id
+    )
+    _add_project_library(storage, project.id, "gxt.afyz", "vs_afyz", file_id="file_afyz")
+    usage = SimpleNamespace(input_tokens=1_000, output_tokens=100, total_tokens=1_100)
+    research = _project_source_response("gxt.afyz", "file_afyz", "Afyz evidence.")
+    research.model = "gpt-5.6-luna"
+    research.usage = usage
+    initial = SimpleNamespace(
+        id="resp_initial",
+        model="gpt-5.6-sol",
+        status="completed",
+        usage=usage,
+        output=[{
+            "type": "function_call", "call_id": "next-action-1", "name": "update_project_state",
+            "arguments": json.dumps({
+                "kind": "NEXT_ACTION", "operation": "SET", "value": "Define the entry condition."
+            }),
+        }],
+    )
+    continuation = terminal_response("Your next action is saved.", usage=usage)
+    continuation.id = "resp_continuation"
+    continuation.model = "gpt-5.6-sol"
+
+    answer = ChatService(
+        storage, SimpleNamespace(responses=SequenceResponses(research, initial, continuation))
+    ).reply(thread_id, "What does Afyz teach about X, and set our next action?")
+
+    diagnostics = answer.diagnostics.project_source_research
+    assert diagnostics["final_synthesis_usage"]["uncached_input_tokens"] == 2_000
+    assert diagnostics["final_synthesis_usage"]["output_tokens"] == 200
+    assert diagnostics["final_sol_synthesis_cost_usd"] == 0.012
 
 
 def test_completed_file_search_with_incomplete_digest_reports_truthful_safe_failure(tmp_path):
@@ -508,7 +577,7 @@ def test_completed_file_search_with_incomplete_digest_reports_truthful_safe_fail
         "input_tokens": 29_126,
         "output_tokens": 5_000,
         "reasoning_tokens": 1_100,
-        "max_output_tokens": 5_000,
+        "max_output_tokens": 2_500,
         "results": 1,
         "citations": 1,
     }
@@ -577,7 +646,7 @@ def test_project_research_retries_one_503_then_continues_without_restarting_ment
         "retry_delay": 0.75, "file_search": "not_started",
         "research_response": "failed", "incomplete_reason": None,
         "input_tokens": None, "output_tokens": None, "reasoning_tokens": None,
-        "max_output_tokens": 5_000, "results": 0, "citations": 0,
+        "max_output_tokens": 2_500, "results": 0, "citations": 0,
     }
     assert afyz_attempts[1]["research_response"] == "completed"
     assert answer.diagnostics.project_source_research["mentor_research"]["Garrett"]["status"] == "completed"
@@ -3861,6 +3930,26 @@ def test_auto_research_depth_distinguishes_definitions_research_comparisons_and_
     assert _effective_research_depth("Research this again and verify it.", "auto") == "deep"
     assert _effective_research_depth("What are the differences between 2025 and 2026 teachings?", "auto") == "deep"
     assert _effective_research_depth("Tell me everything Jacob teaches about SMT.", "auto") == "exhaustive"
+    assert _effective_research_depth("Teach me X using all enabled mentors.", "auto") == "normal"
+    assert _effective_research_depth("What do all five mentors teach about X?", "auto") == "normal"
+    assert _effective_research_depth("Compare all mentors on X.", "auto") == "deep"
+    assert _effective_research_depth("Critically compare how all five mentors treat X.", "auto") == "deep"
+    assert _effective_research_depth(
+        "Exhaustively find everything relevant all five mentors teach about X.", "auto"
+    ) == "exhaustive"
+    assert _effective_research_depth("Find all references to X.", "auto") == "exhaustive"
+    assert _effective_research_depth("List every GxT concept Afyz teaches.", "auto") == "exhaustive"
+
+
+def test_exact_human_gate_all_mentor_prompt_is_breadth_not_exhaustive_depth():
+    prompt = (
+        "Teach me the core GxT model as if I’m trying to properly understand it from scratch. "
+        "Use all enabled mentors, but keep Garrett, Afyz, Erik, Splash and Zay distinct. "
+        "Tell me what appears to be the shared core, what each mentor adds or explains differently, "
+        "and don’t merge one mentor’s nuance into another mentor’s teaching."
+    )
+
+    assert _effective_research_depth(prompt, "auto") == "deep"
 
 
 def test_request_uses_a_smaller_native_result_budget_only_for_normal_research(tmp_path):

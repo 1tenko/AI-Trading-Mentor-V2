@@ -648,6 +648,11 @@ def test_server_serves_the_persistent_chat_controls(tmp_path):
         assert b'method: "DELETE"' in script
         assert b"turn.answer_markdown" in script
         assert b"File Search/platform cost" in script
+        assert b"Evidence model" in script
+        assert b"Mentor research cost" in script
+        assert b"Final Sol synthesis cost" in script
+        assert b"Total estimated turn cost" in script
+        assert b"Mentor passes" in script
         assert b"Number.isFinite(diagnostics.latency_ms)" in script
         assert b"Show ${remaining} additional research result" in script
         assert b"Cited source" in script

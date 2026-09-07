@@ -88,3 +88,10 @@ Theo still decides whether Phase 6 passes. Human acceptance should verify:
 6. Phase 5 numerical attachment and fresh qualitative-consent flows still behave as accepted.
 
 Phase 7 is not authorized by this automated result.
+
+## Real-corpus cost optimization follow-up
+
+The post-gate Luna-evidence/Sol-mentor benchmark, Auto-depth correction, stage
+diagnostics, cost/latency matrix, and spend-control finding are recorded in
+[`phase-6-cost-efficiency.md`](phase-6-cost-efficiency.md). This follow-up does
+not pass Theo's human gate and does not authorize Phase 7.

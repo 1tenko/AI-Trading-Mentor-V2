@@ -23,15 +23,24 @@ _LABELS = {
 }
 _LABEL_PATTERN = "|".join(re.escape(label) for label in sorted(_LABELS, key=len, reverse=True))
 _ONLY = re.compile(
-    rf"^\s*(?:use\s+)?(?P<label>{_LABEL_PATTERN})\s+only(?:\s+for\s+this\s+answer)?[.!?]?\s*$",
+    rf"(?:^\s*|\buse\s+)(?P<label>{_LABEL_PATTERN})\s+only(?:\s+for\s+this\s+answer)?\b",
     re.IGNORECASE,
 )
 _COMPARE = re.compile(
-    rf"\bcompare\s+(?P<first>{_LABEL_PATTERN})\s+and\s+(?P<second>{_LABEL_PATTERN})"
+    rf"\bcompare\s+(?P<first>{_LABEL_PATTERN})\s+(?:and|with|to|versus|vs\.?)\s+(?P<second>{_LABEL_PATTERN})"
     rf"(?:\s*,?\s*ignore\s+(?P<ignored>{_LABEL_PATTERN}))?\b",
     re.IGNORECASE,
 )
-_ALL_ENABLED = re.compile(r"^\s*use\s+all\s+enabled\s+mentors\s+again[.!?]?\s*$", re.IGNORECASE)
+_ALL_ENABLED = re.compile(
+    r"\b(?:use\s+)?all(?:\s+five)?(?:\s+enabled)?\s+mentors\b|\b(?:each|every)\s+mentor\b",
+    re.IGNORECASE,
+)
+_NEGATED_ALL = re.compile(
+    r"\b(?:do not|don['’]t|dont|not)\s+(?:(?:need|want|use)\s+)?(?:use\s+)?"
+    r"all(?:\s+five)?(?:\s+enabled)?\s+mentors\b",
+    re.IGNORECASE,
+)
+_CROSS_MENTOR = re.compile(r"\b(?:other|all|each|every)\s+(?:enabled\s+)?mentors?\b", re.IGNORECASE)
 _CURRENT_GARRETT = re.compile(r"\bgarrett\b.*\b(?:current|currently|now)\b|\b(?:current|currently)\b.*\bgarrett\b", re.IGNORECASE)
 _SOURCE_INTENT = re.compile(
     r"\b(?:gxt|mentor|source|teach|teaching|explain|compare|comparison|concept|model|system|according|timestamp|video)\b",
@@ -100,14 +109,8 @@ def resolve_source_scope(
     temporary = False
     override = "saved"
     normalized = " ".join(question.split())
-    if _ALL_ENABLED.fullmatch(normalized):
-        temporary, override = True, "all_enabled"
-    elif match := _ONLY.fullmatch(normalized):
-        key = _LABELS[match.group("label").casefold()]
-        if key not in available:
-            raise ValueError(f"{match.group('label').title()} is not enabled for this project.")
-        selected, temporary, override = {key}, True, "only"
-    elif match := _COMPARE.search(normalized):
+    scope_text = _NEGATED_ALL.sub("", normalized)
+    if match := _COMPARE.search(scope_text):
         requested = {
             _LABELS[match.group("first").casefold()],
             _LABELS[match.group("second").casefold()],
@@ -120,6 +123,24 @@ def resolve_source_scope(
         if ignored:
             selected.discard(_LABELS[ignored.casefold()])
         temporary, override = True, "compare"
+    elif match := _ONLY.search(scope_text):
+        key = _LABELS[match.group("label").casefold()]
+        if key not in available:
+            raise ValueError(f"{match.group('label').title()} is not enabled for this project.")
+        selected, temporary, override = {key}, True, "only"
+    elif _ALL_ENABLED.search(scope_text):
+        temporary, override = True, "all_enabled"
+    elif not _CROSS_MENTOR.search(scope_text) and re.search(r"\bcompare\b", scope_text, re.IGNORECASE) is None:
+        requested = {
+            key
+            for label, key in _LABELS.items()
+            if re.search(rf"(?<!\w){re.escape(label)}(?!\w)", scope_text, re.IGNORECASE)
+        }
+        if requested:
+            unavailable = requested - available.keys()
+            if unavailable:
+                raise ValueError("A requested mentor is not enabled for this project.")
+            selected, temporary, override = requested, True, "only" if len(requested) == 1 else "compare"
     if len(selected) > 6:
         raise ValueError("Choose up to six source libraries for this answer.")
     libraries = tuple(available[key] for key in sorted(selected))

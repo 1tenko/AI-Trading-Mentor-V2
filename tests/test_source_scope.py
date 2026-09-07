@@ -48,6 +48,43 @@ def test_exact_one_turn_override_uses_only_enabled_named_authority(tmp_path):
         resolve_source_scope(storage, storage.thread_context(thread_id), "Afyz only")
 
 
+@pytest.mark.parametrize(
+    ("question", "expected"),
+    (
+        ("What does Afyz teach about X?", ("gxt.afyz",)),
+        ("Where exactly does Erik teach X?", ("gxt.erik",)),
+        ("Compare Garrett and Afyz on X.", ("gxt.afyz", "gxt.garrett")),
+        ("Compare Afyz to Garrett on X.", ("gxt.afyz", "gxt.garrett")),
+        ("Do not use all mentors; use Afyz only.", ("gxt.afyz",)),
+        ("Compare Garrett and Afyz only.", ("gxt.afyz", "gxt.garrett")),
+        ("I don't need all mentors. What does Afyz teach about X?", ("gxt.afyz",)),
+        ("I don’t need all mentors. What does Afyz teach about X?", ("gxt.afyz",)),
+    ),
+)
+def test_natural_named_questions_search_only_the_requested_mentors(tmp_path, question, expected):
+    storage, _, thread_id, _ = _project_with_libraries(
+        tmp_path, ("gxt.garrett", "gxt.afyz", "gxt.erik", "gxt.splash", "gxt.zay")
+    )
+
+    scope = resolve_source_scope(storage, storage.thread_context(thread_id), question)
+
+    assert scope.library_keys == expected
+    assert scope.temporary is True
+
+
+def test_all_enabled_mentor_wording_keeps_every_enabled_authority(tmp_path):
+    keys = ("gxt.garrett", "gxt.afyz", "gxt.erik", "gxt.splash", "gxt.zay")
+    storage, _, thread_id, _ = _project_with_libraries(tmp_path, keys)
+
+    scope = resolve_source_scope(
+        storage,
+        storage.thread_context(thread_id),
+        "Teach me X using all enabled mentors.",
+    )
+
+    assert scope.library_keys == tuple(sorted(keys))
+
+
 def test_compare_and_ignore_override_is_exact_and_does_not_mutate_saved_scope(tmp_path):
     storage, project, thread_id, _ = _project_with_libraries(tmp_path)
 
@@ -146,7 +183,7 @@ def test_garrett_currentness_is_a_library_internal_hint_not_global_priority(tmp_
     )
 
     assert scope.garrett_current_first is True
-    assert scope.library_keys == ("gxt.afyz", "gxt.erik", "gxt.garrett")
+    assert scope.library_keys == ("gxt.garrett",)
 
 
 def test_exact_project_timestamp_request_always_plans_source_research(tmp_path):
