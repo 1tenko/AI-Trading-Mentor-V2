@@ -794,7 +794,12 @@ def test_attachment_ui_keeps_a_replacement_needing_input_distinct_from_the_old_s
     try:
         status, _, script = request(server, "GET", "/app.js")
         assert status == 200
+        helper_status, _, helper = request(server, "GET", "/attachment_state.js")
+        assert helper_status == 200
+        assert b"pendingAttachmentView" in helper
         assert b"let pendingAttachment;" in script
+        assert b"pendingAttachmentView(activeThreadId, pendingAttachment, pendingMessageAttachment)" in script
+        assert b"activeThreadId = undefined;\n  activeDatasetScope = undefined;\n  clearPendingChatInteraction();" in script
         assert b"pendingAttachment = { threadId, dataset: data.dataset, previousDatasetId };" in script
         assert b"Resolve or remove the spreadsheet that needs attention before sending a message." in script
         assert b"async function removeAttachment()" in script

@@ -1,4 +1,5 @@
 import { marked } from "/vendor/marked.esm.js";
+import { pendingAttachmentView } from "/attachment_state.js";
 import { prepareSourceDirectory, sourceLibraryOrder, sourceRelativePathHeader } from "/source_import.js";
 
 const threads = document.querySelector("#threads");
@@ -1141,7 +1142,9 @@ function updateDatasetScope() {
   document.querySelector("#dataset-use").disabled = !activeThreadId || !datasetSelect.value;
   document.querySelector("#dataset-clear").disabled = !activeThreadId || !scope;
   dataScope.textContent = scope ? scope.original_name : "";
-  attachmentChip.hidden = true;
+  const attachment = pendingAttachmentView(activeThreadId, pendingAttachment, pendingMessageAttachment);
+  if (attachment) showAttachmentState(attachment.dataset, attachment.state);
+  else attachmentChip.hidden = true;
   if (scope) dataStatus.textContent = `Using ${scope.original_name} in this conversation only.`;
 }
 
@@ -1642,6 +1645,9 @@ scopeSelector.addEventListener("change", () => {
   activeProjectId = scopeSelector.value === "general" ? undefined : Number(scopeSelector.value);
   activeProjectSourceCount = 0;
   activeThreadId = undefined;
+  activeDatasetScope = undefined;
+  clearPendingChatInteraction();
+  updateDatasetScope();
   localStorage.removeItem(ACTIVE_THREAD_KEY);
   stopSourceImportPolling();
   sourceSettings.hidden = true;
