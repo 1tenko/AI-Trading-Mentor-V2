@@ -324,6 +324,174 @@ def test_stream_project_research_rejects_incomplete_file_search_before_synthesis
     assert storage.display_turns(thread_id) == []
 
 
+def test_project_research_digest_has_measured_headroom_and_safe_attempt_diagnostics(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    project = storage.create_project("GxT")
+    thread_id = storage.create_thread(
+        "Project", behavior=ThreadSourceBehavior.PROJECT, project_id=project.id
+    )
+    _add_project_library(storage, project.id, "gxt.afyz", "vs_afyz", file_id="file_afyz")
+
+    class BudgetSensitiveResponses:
+        def __init__(self):
+            self.calls = []
+
+        def create(self, **kwargs):
+            self.calls.append(kwargs)
+            if len(self.calls) == 1 and kwargs["max_output_tokens"] < 5_000:
+                return SimpleNamespace(
+                    id="resp_incomplete", model="gpt-5.6-sol", status="incomplete",
+                    incomplete_details=SimpleNamespace(reason="max_output_tokens"),
+                    usage=SimpleNamespace(
+                        input_tokens=29_126, output_tokens=2_500,
+                        output_tokens_details=SimpleNamespace(reasoning_tokens=995),
+                    ),
+                    output=[
+                        {
+                            "type": "file_search_call", "id": "fs_1", "status": "completed",
+                            "queries": ["synthetic"],
+                            "results": [
+                                {
+                                    "file_id": "file_afyz", "filename": "afyz.txt",
+                                    "text": "PRIVATE TRANSCRIPT TEXT",
+                                    "attributes": {"library_key": "gxt.afyz"},
+                                }
+                                for _ in range(32)
+                            ],
+                        },
+                        {
+                            "type": "message", "role": "assistant",
+                            "content": [{
+                                "type": "output_text", "text": "Bounded digest.",
+                                "annotations": [
+                                    {"type": "file_citation", "file_id": "file_afyz", "filename": "afyz.txt"}
+                                    for _ in range(12)
+                                ],
+                            }],
+                        },
+                    ],
+                )
+            if len(self.calls) == 1:
+                return _project_source_response(
+                    "gxt.afyz", "file_afyz", "PRIVATE TRANSCRIPT TEXT"
+                )
+            return terminal_response("Bounded final answer.")
+
+    responses = BudgetSensitiveResponses()
+    answer = ChatService(storage, SimpleNamespace(responses=responses)).reply(
+        thread_id, "Teach me one core GxT concept Afyz emphasizes. Cite the sources."
+    )
+
+    research_request = responses.calls[0]
+    assert research_request["max_output_tokens"] == 5_000
+    assert research_request["reasoning"] == {"effort": "high"}
+    assert "Do not teach the user yet" in research_request["instructions"]
+    assert "Do not write a comprehensive final answer" in research_request["instructions"]
+    assert answer.text == "Bounded final answer."
+    attempt = answer.diagnostics.project_source_research["mentor_attempts"]["Afyz"][0]
+    assert attempt == {
+        "pass": 1,
+        "file_search": "completed",
+        "research_response": "completed",
+        "incomplete_reason": None,
+        "input_tokens": None,
+        "output_tokens": None,
+        "reasoning_tokens": None,
+        "max_output_tokens": 5_000,
+        "results": 1,
+        "citations": 1,
+    }
+    assert "PRIVATE TRANSCRIPT TEXT" not in json.dumps(answer.diagnostics.project_source_research)
+
+
+def test_completed_file_search_with_incomplete_digest_reports_truthful_safe_failure(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    project = storage.create_project("GxT")
+    thread_id = storage.create_thread(
+        "Project", behavior=ThreadSourceBehavior.PROJECT, project_id=project.id
+    )
+    _add_project_library(storage, project.id, "gxt.afyz", "vs_afyz", file_id="file_afyz")
+    incomplete = SimpleNamespace(
+        id="resp_incomplete", model="gpt-5.6-sol", status="incomplete",
+        incomplete_details=SimpleNamespace(reason="max_output_tokens"),
+        usage=SimpleNamespace(
+            input_tokens=29_126, output_tokens=5_000,
+            output_tokens_details=SimpleNamespace(reasoning_tokens=1_100),
+        ),
+        output=[
+            {
+                "type": "file_search_call", "id": "fs_1", "status": "completed",
+                "queries": ["synthetic"],
+                "results": [{
+                    "file_id": "file_afyz", "filename": "afyz.txt",
+                    "text": "PRIVATE TRANSCRIPT TEXT",
+                    "attributes": {"library_key": "gxt.afyz"},
+                }],
+            },
+            {
+                "type": "message", "role": "assistant",
+                "content": [{
+                    "type": "output_text", "text": "Partial digest.",
+                    "annotations": [{
+                        "type": "file_citation", "file_id": "file_afyz", "filename": "afyz.txt",
+                    }],
+                }],
+            },
+        ],
+    )
+
+    events = list(ChatService(
+        storage, SimpleNamespace(responses=SequenceResponses(incomplete))
+    ).stream_reply(thread_id, "Teach me one core GxT concept Afyz emphasizes."))
+
+    assert [event.type for event in events] == ["error"]
+    assert events[0].error_classification == "project_source_incomplete"
+    assert events[0].error == (
+        "I found Afyz source evidence, but the Afyz research pass did not finish cleanly, "
+        "so I stopped rather than pretending the requested mentor coverage was complete."
+    )
+    attempt = events[0].source_diagnostics["mentor_attempts"]["Afyz"][0]
+    assert attempt == {
+        "pass": 1,
+        "file_search": "completed",
+        "research_response": "incomplete",
+        "incomplete_reason": "max_output_tokens",
+        "input_tokens": 29_126,
+        "output_tokens": 5_000,
+        "reasoning_tokens": 1_100,
+        "max_output_tokens": 5_000,
+        "results": 1,
+        "citations": 1,
+    }
+    assert "PRIVATE TRANSCRIPT TEXT" not in json.dumps(events[0].source_diagnostics)
+
+
+def test_failed_file_search_is_not_reported_as_completed_evidence(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    project = storage.create_project("GxT")
+    thread_id = storage.create_thread(
+        "Project", behavior=ThreadSourceBehavior.PROJECT, project_id=project.id
+    )
+    _add_project_library(storage, project.id, "gxt.afyz", "vs_afyz", file_id="file_afyz")
+    incomplete = SimpleNamespace(
+        status="incomplete", incomplete_details=SimpleNamespace(reason="other"), usage=None,
+        output=[{
+            "type": "file_search_call", "id": "fs_1", "status": "failed",
+            "queries": ["synthetic"], "results": [],
+        }],
+    )
+
+    events = list(ChatService(
+        storage, SimpleNamespace(responses=SequenceResponses(incomplete))
+    ).stream_reply(thread_id, "Teach me one core GxT concept Afyz emphasizes."))
+
+    assert events[0].source_diagnostics["mentor_attempts"]["Afyz"][0]["file_search"] == "failed"
+    assert not events[0].error.startswith("I found Afyz source evidence")
+
+
 def test_stream_project_research_reports_the_exact_failed_library_without_leaking_source_data(tmp_path):
     storage = Storage(tmp_path / "mentor.sqlite3")
     storage.initialize()

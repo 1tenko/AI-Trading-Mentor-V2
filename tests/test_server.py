@@ -660,6 +660,9 @@ def test_server_serves_the_persistent_chat_controls(tmp_path):
         assert b"Mentor unavailable. You can retry." in script
         assert b"Source scope" in script
         assert b"Mentor research" in script
+        assert b"mentor_attempts" in script
+        assert b"output tokens" in script
+        assert b"File Search ${latest.file_search}" in script
         assert b"Final synthesis" in script
         assert b"File Search calls" in script
         assert b"Provider error" in script

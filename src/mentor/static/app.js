@@ -343,7 +343,16 @@ function sourceResearchRows(sourceDiagnostics) {
     : "Unavailable";
   const mentors = Object.entries(sourceDiagnostics.mentor_research || {}).map(([name, item]) => {
     const counts = ` · ${item.calls || 0} search${item.calls === 1 ? "" : "es"} · ${item.results || 0} results · ${item.citations || 0} citations`;
-    return `${name} — ${String(item.status || "unknown").replaceAll("_", " ")}${counts}`;
+    const attempts = sourceDiagnostics.mentor_attempts?.[name] || [];
+    const latest = attempts.at(-1);
+    const completion = latest
+      ? ` · File Search ${latest.file_search} · response ${latest.research_response}`
+      : "";
+    const reason = latest?.incomplete_reason ? ` · ${latest.incomplete_reason.replaceAll("_", " ")}` : "";
+    const tokens = latest?.output_tokens != null
+      ? ` · ${latest.output_tokens} / ${latest.max_output_tokens} output tokens`
+      : "";
+    return `${name} — ${String(item.status || "unknown").replaceAll("_", " ")} · ${attempts.length} attempt${attempts.length === 1 ? "" : "s"}${counts}${completion}${reason}${tokens}`;
   });
   const rows = [
     ["Source scope", scope],
