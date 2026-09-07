@@ -342,7 +342,7 @@ function sourceResearchRows(sourceDiagnostics) {
     ? sourceDiagnostics.source_scope.join(", ")
     : "Unavailable";
   const mentors = Object.entries(sourceDiagnostics.mentor_research || {}).map(([name, item]) => {
-    const counts = ` · ${item.calls || 0} search${item.calls === 1 ? "" : "es"} · ${item.results || 0} results · ${item.citations || 0} citations`;
+    const counts = ` · ${item.calls || 0} search${item.calls === 1 ? "" : "es"} · ${item.results || 0} results · ${item.citations || 0} digest citations`;
     const attempts = sourceDiagnostics.mentor_attempts?.[name] || [];
     const latest = attempts.at(-1);
     const retried = attempts.some((attempt) => attempt.attempt > 1);

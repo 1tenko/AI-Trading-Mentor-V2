@@ -400,7 +400,7 @@ def test_project_research_is_one_store_per_call_and_keeps_native_citations_out_o
         [f"vs_{key}"] for key in keys
     ]
     assert not any(tool["type"] == "file_search" for tool in responses.calls[-1]["tools"])
-    assert {citation.file_id for citation in answer.citations} == {f"file_{key}" for key in keys}
+    assert answer.citations == []
     assert len(answer.evidence) == 3
     assert answer.diagnostics.mentor_search_calls == {key: 1 for key in keys}
     assert answer.diagnostics.source_scope == {
@@ -1300,11 +1300,11 @@ def test_project_research_keeps_no_result_as_scoped_absence_not_a_fabricated_dis
     )
 
     assert answer.text == "Garrett supports X; this search found no Afyz evidence."
-    assert [citation.file_id for citation in answer.citations] == ["file_garrett"]
+    assert answer.citations == []
     assert answer.diagnostics.mentor_search_calls == {"gxt.garrett": 1, "gxt.afyz": 1}
 
 
-def test_project_exact_timestamp_repair_reuses_serial_raw_evidence_without_invalid_tool_choice(tmp_path):
+def test_project_exact_timestamp_repair_uses_scoped_raw_search_and_native_citation(tmp_path):
     storage = Storage(tmp_path / "mentor.sqlite3")
     storage.initialize()
     project = storage.create_project("GxT")
@@ -1321,8 +1321,9 @@ def test_project_exact_timestamp_repair_reuses_serial_raw_evidence_without_inval
     responses = SequenceResponses(
         research,
         terminal_response("Direct source teaching: Garrett states TIMESTAMP_RULE at 00:02:00."),
-        terminal_response(
-            "Direct source teaching: Garrett states TIMESTAMP_RULE at 00:01:00-00:01:08."
+        _project_source_response(
+            "gxt.garrett", "file_garrett",
+            "Direct source teaching: Garrett states TIMESTAMP_RULE at 00:01:00-00:01:08.",
         ),
     )
 
@@ -1331,8 +1332,12 @@ def test_project_exact_timestamp_repair_reuses_serial_raw_evidence_without_inval
     )
 
     assert answer.text.endswith("at 00:01:00-00:01:08.")
-    assert responses.calls[-1]["tools"] == []
-    assert "tool_choice" not in responses.calls[-1]
+    assert responses.calls[-1]["tools"] == [{
+        "type": "file_search",
+        "vector_store_ids": ["vs_garrett"],
+        "max_num_results": 8,
+    }]
+    assert responses.calls[-1]["tool_choice"] == {"type": "file_search"}
     assert any(
         item.get("type") == "file_search_call" for item in responses.calls[-1]["input"]
     )
@@ -3350,7 +3355,7 @@ def test_reply_persists_continuation_state_and_extracts_evidence(tmp_path):
             "turn_number": 1,
             "user_text": "What does Jacob teach?",
             "answer_markdown": "Jacob teaches patience.",
-            "citations": [{"file_id": "file_2025", "filename": "lesson.txt"}],
+                "citations": [{"file_id": "file_2025", "filename": "lesson.txt", "indices": []}],
             "evidence": [
                 {
                     "file_id": "file_2025",

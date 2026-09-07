@@ -672,6 +672,7 @@ def test_server_serves_the_persistent_chat_controls(tmp_path):
         assert b"Mentor unavailable. You can retry." in script
         assert b"Source scope" in script
         assert b"Mentor research" in script
+        assert b"digest citations" in script
         assert b"mentor_attempts" in script
         assert b"output tokens" in script
         assert b"File Search ${latest.file_search}" in script
@@ -821,7 +822,8 @@ def test_attachment_ui_keeps_a_replacement_needing_input_distinct_from_the_old_s
         assert b"pendingAttachmentView" in helper
         assert b"let pendingAttachment;" in script
         assert b"pendingAttachmentView(activeThreadId, pendingAttachment, pendingMessageAttachment)" in script
-        assert b"activeThreadId = undefined;\n  activeDatasetScope = undefined;\n  clearPendingChatInteraction();" in script
+        normalized_script = script.replace(b"\r\n", b"\n")
+        assert b"activeThreadId = undefined;\n  activeDatasetScope = undefined;\n  clearPendingChatInteraction();" in normalized_script
         assert b"pendingAttachment = { threadId, dataset: data.dataset, previousDatasetId };" in script
         assert b"Resolve or remove the spreadsheet that needs attention before sending a message." in script
         assert b"async function removeAttachment()" in script

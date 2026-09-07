@@ -49,7 +49,13 @@ from mentor.project_ledger import ProjectLedgerService
 from mentor.project_models import PedagogicalRole, ThreadSourceBehavior
 from mentor.project_service import ProjectService
 from mentor.project_tools import PROJECT_TOOLS, PROJECT_TOOL_NAMES, ProjectToolDispatcher
-from mentor.source_scope import ResolvedSourceScope, research_plan, resolve_source_scope, search_budget
+from mentor.source_scope import (
+    ResolvedSourceScope,
+    conversation_research_context,
+    research_plan,
+    resolve_source_scope,
+    search_budget,
+)
 from mentor.storage import Storage
 
 
@@ -77,7 +83,11 @@ CLOCK_TIME = re.compile(
     r"(?<!\d)(?:(\d{1,2}):)?(\d{1,2}):(\d{2})"
     r"(?:\s*[-\u2013\u2014]\s*(?:(\d{1,2}):)?(\d{1,2}):(\d{2}))?(?!\d)"
 )
-EVIDENCE_TIME_RANGE = re.compile(r"\[(\d+(?:\.\d+)?)\s*(?:-->|\u2192)\s*(\d+(?:\.\d+)?)\]")
+EVIDENCE_TIME_RANGE = re.compile(
+    r"\[((?:\d{1,2}:){2}\d{2}(?:\.\d+)?|\d+(?:\.\d+)?)\s*"
+    r"(?:-->|\u2192)\s*((?:\d{1,2}:){2}\d{2}(?:\.\d+)?|\d+(?:\.\d+)?)\]"
+)
+LITERAL_FILECITE = re.compile(r"\ue200filecite\ue202.*?\ue201")
 CITATION_REPAIR_INSTRUCTION = """Citation repair: the immediately preceding draft contains
 Direct source teaching claims but no native File Search citations. Reissue the same substantive
 answer with the same uncertainty. Attach native File Search citations to relevant Direct source
@@ -231,6 +241,7 @@ DEFAULT_EVALUATION_CONFIG = EvaluationConfig()
 class Citation:
     file_id: str
     filename: str
+    indices: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -543,14 +554,21 @@ class ChatService:
         self, request: dict, response: Any, question: str, *, qualitative_exchange: bool = False,
         source_citation_output: list[dict] | None = None,
     ) -> tuple[Any, list[dict], Any | None]:
-        draft_output = [_as_dict(item) for item in response.output]
-        draft = _answer(draft_output, evidence_output=source_citation_output, citation_output=source_citation_output)
+        draft_output = _without_literal_filecites([_as_dict(item) for item in response.output])
+        # Intermediate research annotations describe the digest's sources; they
+        # are evidence, not native support attached to the final teaching text.
+        draft = _answer(draft_output, evidence_output=source_citation_output)
         needs_citation_repair = _has_direct_source_claim(draft.text) and not draft.citations
         needs_timestamp_repair = _has_unsupported_exact_timestamp(question, draft)
+        project_tools, project_keys = _project_citation_repair_tools(
+            self.storage, source_citation_output or []
+        )
+        if project_keys:
+            _validate_project_source_ownership(self.storage, project_keys, draft_output)
         if _field(response, "status") != "completed" or not (needs_citation_repair or needs_timestamp_repair):
             return response, draft_output, None
         repair_instructions = f"{request['instructions']}\n\n{CITATION_REPAIR_INSTRUCTION}"
-        raw_tools = _raw_file_search_tools(request["tools"])
+        raw_tools = _raw_file_search_tools(request["tools"]) or project_tools
         if needs_timestamp_repair:
             repair_instructions = f"{repair_instructions}\n\n{EXACT_TIMESTAMP_REPAIR_INSTRUCTION}" if raw_tools else (
                 f"{repair_instructions}\n\nUse only the completed mentor-library raw research passages already supplied "
@@ -570,10 +588,13 @@ class ChatService:
             ],
             "tools": raw_tools,
         }
-        if needs_timestamp_repair and raw_tools:
+        if raw_tools:
             repair_request["tool_choice"] = {"type": "file_search"}
         repaired = self._responses_create(repair_request, "citation_repair")
-        return repaired, [*draft_output, *(_as_dict(item) for item in repaired.output)], response
+        repaired_output = _without_literal_filecites([_as_dict(item) for item in repaired.output])
+        if project_keys:
+            _validate_project_source_ownership(self.storage, project_keys, repaired_output)
+        return repaired, [*draft_output, *repaired_output], response
 
     def _project_source_research(
         self, thread_id: int, question: str, effective_depth: str
@@ -581,14 +602,22 @@ class ChatService:
         thread = self.storage.thread_context(thread_id)
         if thread is None or thread.thread_source_behavior is not ThreadSourceBehavior.PROJECT:
             return [], [], {}, None
+        research_context = conversation_research_context(
+            question, self.storage.display_turns(thread_id)[-2:]
+        )
         context_mode = _profile_context_mode(question)
         field_state = questionnaire_field_state(question, self.storage.current_confirmed_profile_items())
-        if context_mode == PROFILE_CONTEXT_FULL_PROFILE or (
-            field_state is not None and not _explicit_profile_source_request(question)
+        if (context_mode == PROFILE_CONTEXT_FULL_PROFILE and not research_context.source_required) or (
+            field_state is not None and not research_context.source_required
         ):
             return [], [], {}, None
-        scope = resolve_source_scope(self.storage, thread, question)
-        plan = research_plan(scope, question, effective_depth)
+        scope = resolve_source_scope(
+            self.storage,
+            thread,
+            research_context.scope_text,
+            inherited_library_keys=research_context.inherited_library_keys,
+        )
+        plan = research_plan(scope, research_context.query, effective_depth)
         if not plan:
             return [], [], {}, None
         libraries = {library.library_key: library for library in scope.libraries}
@@ -633,9 +662,9 @@ class ChatService:
                 "model": self.evidence_model,
                 "instructions": _project_research_instruction(
                     library.display_name, library.library_key, library.pedagogical_role,
-                    item.pass_number, _is_curriculum_question(question)
+                    item.pass_number, _is_curriculum_question(research_context.query)
                 ),
-                "input": question,
+                "input": research_context.query,
                 "tools": [{
                     "type": "file_search",
                     "vector_store_ids": [library.vector_store_id],
@@ -1232,13 +1261,21 @@ class ChatService:
             raise RuntimeError("Import the Jacob transcripts before asking Jacob source questions.")
         user_item = {"role": "user", "content": [{"type": "input_text", "text": question}]}
         effective_depth = _effective_research_depth(question, evaluation.research_depth)
-        project_source_scope = resolve_source_scope(self.storage, thread, question)
+        research_context = conversation_research_context(
+            question, self.storage.display_turns(thread_id)[-2:]
+        )
+        project_source_scope = resolve_source_scope(
+            self.storage,
+            thread,
+            research_context.scope_text,
+            inherited_library_keys=research_context.inherited_library_keys,
+        )
         turn_source_scope = (
             project_source_scope.safe_snapshot()
             if thread.thread_source_behavior is ThreadSourceBehavior.PROJECT
             else None
         )
-        source_plan = research_plan(project_source_scope, question, effective_depth)
+        source_plan = research_plan(project_source_scope, research_context.query, effective_depth)
         project_vector_store_ids = list(project_source_scope.vector_store_ids)
         scope = self._active_analysis_scope(thread_id)
         replay_items, prior_empirical_evidence_reused = _dataset_bound_empirical_replay(
@@ -1267,6 +1304,12 @@ class ChatService:
                     "Use this only to personalise relevant advice; it is not Jacob source material."
                 )
             field_state = questionnaire_field_state(question, confirmed_profile)
+            if (
+                thread.thread_source_behavior is ThreadSourceBehavior.PROJECT
+                and research_context.source_required
+                and not _explicit_personal_profile_request(question)
+            ):
+                field_state = None
         if field_state is not None:
             profile_context += f"\n\n{field_state.context}"
         source_vector_store_ids = [vector_store_id] if vector_store_id is not None else []
@@ -1388,10 +1431,14 @@ class ChatService:
         project_source_research: dict[str, object] | None = None,
         initial_response: Any | None = None,
     ) -> Answer:
-        response_output = [_as_dict(item) for item in response.output]
+        response_output = _without_literal_filecites([_as_dict(item) for item in response.output])
         historic_response_output = _qualitative_historic_items(response_output) if qualitative_exchange else response_output
-        output = [*(leading_output or []), *historic_response_output]
-        replay_output = [*(replay_leading_output if replay_leading_output is not None else (leading_output or [])), *historic_response_output]
+        safe_leading = _without_literal_filecites(leading_output or [])
+        safe_replay_leading = _without_literal_filecites(
+            replay_leading_output if replay_leading_output is not None else (leading_output or [])
+        )
+        output = [*safe_leading, *historic_response_output]
+        replay_output = [*safe_replay_leading, *historic_response_output]
         _validate_replay_protocol(replay_output)
         if dataset_attachment_id is not None:
             scope = self.storage.thread_dataset_scope(thread_id)
@@ -1412,7 +1459,6 @@ class ChatService:
         answer = _answer(
             output,
             evidence_output=[*(source_research_output or []), *(evidence_output or [])],
-            citation_output=source_research_output,
             incomplete_reason=_incomplete_reason(response),
         )
         question = user_item["content"][0]["text"]
@@ -1675,7 +1721,18 @@ def _is_full_profile_question(question: str) -> bool:
 
 def _explicit_profile_source_request(question: str) -> bool:
     normalized = question.casefold()
-    return any(term in normalized for term in ("jacob", "source", "transcript", "citation", "according to"))
+    return any(
+        term in normalized
+        for term in ("jacob", "source", "transcript", "citation", "according to", "video", "timestamp")
+    )
+
+
+def _explicit_personal_profile_request(question: str) -> bool:
+    normalized = question.casefold()
+    return any(
+        phrase in normalized
+        for phrase in ("trader profile", "my profile", "my preference", "i prefer")
+    )
 
 
 def _as_dict(item: Any) -> dict:
@@ -1756,8 +1813,9 @@ def _final_synthesis_error_message(source_diagnostics: dict[str, object] | None)
 
 
 def _validate_project_source_ownership(
-    storage: Storage, expected_library_key: str, output: list[dict]
+    storage: Storage, expected_library_key: str | set[str], output: list[dict]
 ) -> None:
+    expected = {expected_library_key} if isinstance(expected_library_key, str) else expected_library_key
     file_ids = {
         result.get("file_id")
         for item in output if item.get("type") == "file_search_call"
@@ -1771,8 +1829,52 @@ def _validate_project_source_ownership(
     )
     for file_id in file_ids:
         library = storage.source_library_for_file(file_id) if isinstance(file_id, str) else None
-        if library is None or library.library_key != expected_library_key:
+        if library is None or library.library_key not in expected:
             raise RuntimeError("A source result failed its mentor-library ownership check.")
+
+
+def _project_citation_repair_tools(
+    storage: Storage, research_output: list[dict]
+) -> tuple[list[dict], set[str]]:
+    file_ids = {
+        result.get("file_id")
+        for item in research_output if item.get("type") == "file_search_call"
+        for result in item.get("results") or []
+    }
+    libraries = {
+        library.library_key: library
+        for file_id in file_ids if isinstance(file_id, str)
+        if (library := storage.source_library_for_file(file_id)) is not None
+    }
+    vector_store_ids = []
+    for library_key in sorted(libraries):
+        library = libraries[library_key]
+        vector_store = storage.library_vector_store(library.id)
+        if vector_store is not None and vector_store[0] and vector_store[1] == "READY":
+            vector_store_ids.append(vector_store[0])
+    if not vector_store_ids:
+        return [], set()
+    return [{
+        "type": "file_search",
+        "vector_store_ids": vector_store_ids,
+        "max_num_results": FILE_SEARCH_RESULT_BUDGETS["normal"],
+    }], set(libraries)
+
+
+def _without_literal_filecites(items: list[dict]) -> list[dict]:
+    sanitized = []
+    for item in items:
+        copied = dict(item)
+        if item.get("type") == "message":
+            copied["content"] = [
+                {
+                    **content,
+                    "text": LITERAL_FILECITE.sub("", content.get("text", "")),
+                } if content.get("type") == "output_text" else dict(content)
+                for content in item.get("content") or []
+            ]
+        sanitized.append(copied)
+    return sanitized
 
 
 def _input_item(item: dict) -> dict:
@@ -1924,11 +2026,10 @@ def _answer(
     output: list[dict],
     diagnostics: ResponseDiagnostics | None = None,
     evidence_output: list[dict] | None = None,
-    citation_output: list[dict] | None = None,
     incomplete_reason: str | None = None,
 ) -> Answer:
     text_parts: list[str] = []
-    citations: list[Citation] = []
+    citation_positions: dict[tuple[str, str], list[int]] = {}
     evidence: list[Evidence] = []
     for item in evidence_output or output:
         if item.get("type") == "file_search_call":
@@ -1949,8 +2050,8 @@ def _answer(
         for content in item.get("content") or []:
             if content.get("type") != "output_text":
                 continue
-            text_parts.append(content.get("text", ""))
-    for item in [*output, *(citation_output or [])]:
+            text_parts.append(LITERAL_FILECITE.sub("", content.get("text", "")))
+    for item in output:
         if item.get("type") != "message" or item.get("role") != "assistant":
             continue
         for content in item.get("content") or []:
@@ -1958,14 +2059,20 @@ def _answer(
                 continue
             for annotation in content.get("annotations") or []:
                 if annotation.get("type") == "file_citation":
-                    citation = Citation(
-                        file_id=annotation["file_id"],
-                        filename=annotation.get("filename", "Unknown source"),
+                    key = (
+                        annotation["file_id"],
+                        annotation.get("filename", "Unknown source"),
                     )
-                    if citation not in citations:
-                        citations.append(citation)
+                    position = annotation.get("index")
+                    positions = citation_positions.setdefault(key, [])
+                    if isinstance(position, int) and position >= 0 and position not in positions:
+                        positions.append(position)
+    citations = [
+        Citation(file_id, filename, tuple(sorted(positions)))
+        for (file_id, filename), positions in citation_positions.items()
+    ]
     return Answer(
-        text="".join(text_parts),
+        text="".join(text_parts).strip(),
         citations=citations,
         evidence=evidence,
         diagnostics=diagnostics,
@@ -1990,16 +2097,44 @@ def _has_unsupported_exact_timestamp(question: str, answer: Answer) -> bool:
     if not timestamps:
         return False
     cited_file_ids = {citation.file_id for citation in answer.citations}
-    ranges = [
-        (float(match.group(1)), float(match.group(2)))
-        for evidence in answer.evidence
-        if evidence.file_id in cited_file_ids
-        for match in EVIDENCE_TIME_RANGE.finditer(evidence.excerpt)
-    ]
-    return any(
-        not any(start >= evidence_start and end <= evidence_end for evidence_start, evidence_end in ranges)
-        for start, end in timestamps
-    )
+    ranges_by_file = {
+        file_id: [
+            (_timestamp_seconds(match.group(1)), _timestamp_seconds(match.group(2)))
+            for evidence in answer.evidence if evidence.file_id == file_id
+            for match in EVIDENCE_TIME_RANGE.finditer(evidence.excerpt)
+        ]
+        for file_id in cited_file_ids
+    }
+    for match, (start, end) in zip(CLOCK_TIME.finditer(answer.text), timestamps):
+        if len(answer.citations) == 1:
+            file_id = answer.citations[0].file_id
+        else:
+            positioned = [
+                (index, citation.file_id)
+                for citation in answer.citations
+                for index in citation.indices
+                if index >= match.end()
+            ]
+            if not positioned:
+                return True
+            nearest = min(index for index, _file_id in positioned)
+            candidates = {file_id for index, file_id in positioned if index == nearest}
+            if len(candidates) != 1:
+                return True
+            file_id = candidates.pop()
+        if not any(
+            start >= evidence_start and end <= evidence_end
+            for evidence_start, evidence_end in ranges_by_file.get(file_id, [])
+        ):
+            return True
+    return False
+
+
+def _timestamp_seconds(value: str) -> float:
+    if ":" not in value:
+        return float(value)
+    hours, minutes, seconds = value.split(":")
+    return int(hours) * 3_600 + int(minutes) * 60 + float(seconds)
 
 
 def _incomplete_reason(response: Any) -> str | None:
@@ -2357,6 +2492,18 @@ def _project_source_instruction(scope: ResolvedSourceScope, plan: tuple, questio
         "Treat each mentor library as a separate first-class authority. Garrett's creator status is not empirical "
         "superiority, an automatic recommendation, or Theo's adopted strategy."
     )
+    if re.search(r"\b(?:exercise|practice|chart)\b", question, re.IGNORECASE):
+        instruction += (
+            " For a practice exercise, state the timeframe roles and distinguish a source-taught procedure from an "
+            "AI-selected practice constraint. Do not claim an exercise detail was supplied earlier unless it appears "
+            "in the conversation. This app cannot inspect chart screenshots: ask Theo to inspect the chart and report "
+            "specific observations instead of promising visual assessment."
+        )
+    if re.search(r"\b(?:wrong|incorrect|correct|correction|contradict|challenge|verify)\b", question, re.IGNORECASE):
+        instruction += (
+            " Treat prior assistant prose as an unverified claim, not source evidence. Verify the contested point "
+            "against raw sources before correcting Theo or agreeing with the challenge."
+        )
     if plan:
         planned = ", ".join(dict.fromkeys(item.library_key for item in plan))
         instruction += (

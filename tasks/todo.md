@@ -402,3 +402,14 @@ review, and present the human quality gate without beginning Phase 6.
 - [x] Post-gate pedagogical-scope refinement — typed mentor roles, Garrett/Afyz
   curriculum backbone, supporting practical lenses, and bounded real-corpus validation.
 - [ ] Theo human quality gate — stop before Phase 7.
+
+# Phase 6.5 Task List — Source-Grounded Teaching Pilot Preparation
+
+**Plan:** [`docs/superpowers/plans/2026-09-07-phase-6-5-source-grounded-teaching-pilot.md`](../docs/superpowers/plans/2026-09-07-phase-6-5-source-grounded-teaching-pilot.md)
+
+- [x] Task 1 — Freeze the observed multi-turn routing, scope, citation, and timestamp failures.
+- [x] Task 2 — Repair source intent, contextual research, scope, citation, timestamp, and teaching policy.
+- [x] Task 3 — Build the ignored private two-topic source reference set and coverage log.
+- [x] Task 4 — Build the disabled A/B/C harness, lesson continuity, frozen cases, and budget gate.
+- [x] Task 5 — Pass focused/full/browser/privacy verification and fresh review with no P0/P1.
+- [x] Task 6 — Commit/push the isolated branch and stop before paid comparison.

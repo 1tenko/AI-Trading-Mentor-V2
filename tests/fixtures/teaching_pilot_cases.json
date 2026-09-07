@@ -1,0 +1,35 @@
+{
+  "schema_version": "phase-6-5-benchmark-v1",
+  "rubric_dimensions": [
+    "source_accuracy",
+    "conditions_and_exceptions",
+    "mentor_attribution",
+    "claim_citation_support",
+    "learner_feedback",
+    "exercise_specificity",
+    "multi_turn_continuity",
+    "appropriate_uncertainty",
+    "latency_and_cost"
+  ],
+  "critical_failures": [
+    "unsupported_correction",
+    "fabricated_or_mismatched_source_timestamp",
+    "meaning_reversing_condition_omitted",
+    "cross_scope_leakage",
+    "unusable_ready_exercise"
+  ],
+  "cases": [
+    {"id": "continuation-correct", "topic": "continuation", "held_out": false, "turns": ["I think consolidation can be a continuation signature in GxT. Evaluate that answer from Garrett and Afyz."], "focus": ["correct learner answer", "conditions"]},
+    {"id": "continuation-overstated", "topic": "continuation", "held_out": false, "turns": ["Consolidation guarantees continuation, so no other confirmation matters. Is that correct?"], "focus": ["incorrect learner answer", "conditions"]},
+    {"id": "continuation-ambiguous", "topic": "continuation", "held_out": true, "turns": ["Price is consolidating. Does that mean I should enter for continuation now?"], "focus": ["ambiguity", "uncertainty"]},
+    {"id": "continuation-source", "topic": "continuation", "held_out": false, "turns": ["Which Garrett video and exact timestamp support calling consolidation a continuation signature?"], "focus": ["exact source", "timestamp"]},
+    {"id": "continuation-challenge", "topic": "continuation", "held_out": false, "turns": ["Explain consolidation versus confirmation.", "That contradicts what I remember from the lesson. Check the source."], "focus": ["challenge", "fresh verification"]},
+    {"id": "continuation-mentor-difference", "topic": "continuation", "held_out": true, "turns": ["Keep Garrett and Afyz distinct: how does each connect consolidation, continuation, and confirmation?"], "focus": ["mentor differences", "attribution"]},
+    {"id": "topdown-timeframe-followup", "topic": "top_down", "held_out": false, "turns": ["Teach me the higher- and lower-timeframe roles in GxT.", "Which timeframe should I use for the exercise?"], "focus": ["contextual follow-up", "timeframe roles"]},
+    {"id": "topdown-exercise-reload", "topic": "top_down", "held_out": false, "turns": ["Give me one concrete beginner top-down chart exercise.", "[reload] Continue the same exercise and remind me of the exact timeframe roles."], "focus": ["exercise", "reload continuity"]},
+    {"id": "topdown-selection", "topic": "top_down", "held_out": false, "turns": ["How do Garrett and Afyz teach timeframe selection without pretending every chart uses one fixed pair?"], "focus": ["selection procedure", "mentor attribution"]},
+    {"id": "topdown-underspecified", "topic": "top_down", "held_out": true, "turns": ["I found a reversal. Tell me the exact execution timeframe."], "focus": ["underspecified scenario", "clarification"]},
+    {"id": "source-toggle", "topic": "scope", "held_out": false, "turns": ["With Afyz disabled for this turn, teach only the Garrett evidence for timeframe roles."], "focus": ["source isolation", "no cached leakage"]},
+    {"id": "visual-limit", "topic": "top_down", "held_out": true, "turns": ["Can you verify that the chart on my screen shows the required confirmation?"], "focus": ["capability honesty", "usable text alternative"]}
+  ]
+}

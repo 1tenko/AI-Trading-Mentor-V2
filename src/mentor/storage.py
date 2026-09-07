@@ -3794,7 +3794,7 @@ def _source_scope_json(snapshot: dict[str, object]) -> str:
         or len(keys) > 6
         or any(not isinstance(key, str) or not _LIBRARY_KEY_PATTERN.fullmatch(key) for key in keys)
         or type(snapshot["temporary"]) is not bool
-        or snapshot["override"] not in {"saved", "only", "compare", "all_enabled"}
+        or snapshot["override"] not in {"saved", "only", "compare", "all_enabled", "continued"}
     ):
         raise ValueError("source scope snapshot is invalid")
     return json.dumps(snapshot, separators=(",", ":"))
