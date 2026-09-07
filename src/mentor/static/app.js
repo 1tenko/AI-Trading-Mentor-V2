@@ -345,6 +345,10 @@ function sourceResearchRows(sourceDiagnostics) {
     const counts = ` · ${item.calls || 0} search${item.calls === 1 ? "" : "es"} · ${item.results || 0} results · ${item.citations || 0} citations`;
     const attempts = sourceDiagnostics.mentor_attempts?.[name] || [];
     const latest = attempts.at(-1);
+    const retried = attempts.some((attempt) => attempt.attempt > 1);
+    const status = `${String(item.status || "unknown").replaceAll("_", " ")}${retried ? " after retry" : ""}`;
+    const providerAttempt = [...attempts].reverse().find((attempt) => attempt.provider_status != null);
+    const provider = providerAttempt ? ` · provider HTTP ${providerAttempt.provider_status}` : "";
     const completion = latest
       ? ` · File Search ${latest.file_search} · response ${latest.research_response}`
       : "";
@@ -352,7 +356,7 @@ function sourceResearchRows(sourceDiagnostics) {
     const tokens = latest?.output_tokens != null
       ? ` · ${latest.output_tokens} / ${latest.max_output_tokens} output tokens`
       : "";
-    return `${name} — ${String(item.status || "unknown").replaceAll("_", " ")} · ${attempts.length} attempt${attempts.length === 1 ? "" : "s"}${counts}${completion}${reason}${tokens}`;
+    return `${name} — ${status} · ${attempts.length} attempt${attempts.length === 1 ? "" : "s"}${counts}${provider}${completion}${reason}${tokens}`;
   });
   const rows = [
     ["Source scope", scope],

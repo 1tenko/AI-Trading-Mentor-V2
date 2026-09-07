@@ -3,12 +3,17 @@
 from dataclasses import dataclass
 import json
 import logging
+import math
+import random
 import re
 import sqlite3
+import time
 from time import perf_counter
 from typing import Any
 from types import SimpleNamespace
 from uuid import uuid4
+
+from openai import APIConnectionError
 
 from mentor.profile import (
     ProfileService,
@@ -51,6 +56,9 @@ from mentor.storage import Storage
 LOGGER = logging.getLogger(__name__)
 MAX_OUTPUT_TOKENS = 25_000
 PROJECT_RESEARCH_MAX_OUTPUT_TOKENS = 5_000
+PROJECT_RESEARCH_MAX_ATTEMPTS = 3
+PROJECT_RETRY_BASE_SECONDS = 0.75
+PROJECT_RETRY_MAX_SECONDS = 2.0
 COMPACTION_TOKEN_THRESHOLD = 50_000
 FILE_SEARCH_RESULT_BUDGETS = {"normal": 8, "deep": 20, "exhaustive": 20}
 FILE_SEARCH_CALL_COST_USD = 0.0025
@@ -604,43 +612,66 @@ class ChatService:
             mentor = diagnostics["mentor_research"][mentor_name]
             mentor["status"] = "in_progress"
             pass_started_at = perf_counter()
-            try:
-                response = self._responses_create({
-                    "model": self.model,
-                    "instructions": _project_research_instruction(
-                        library.display_name, library.library_key, item.pass_number
-                    ),
-                    "input": question,
-                    "tools": [{
-                        "type": "file_search",
-                        "vector_store_ids": [library.vector_store_id],
-                        "max_num_results": item.results_per_pass,
-                    }],
-                    "tool_choice": {"type": "file_search"},
-                    "include": ["reasoning.encrypted_content", "file_search_call.results"],
-                    "reasoning": {"effort": "high"},
-                    "max_output_tokens": PROJECT_RESEARCH_MAX_OUTPUT_TOKENS,
-                    "store": False,
-                }, f"project_source_research:{library.library_key}")
-            except _ResponsesRequestError as error:
-                mentor["status"] = "failed"
-                diagnostics["mentor_attempts"][mentor_name].append({
-                    "pass": item.pass_number,
-                    "file_search": "not_started",
-                    "research_response": "failed",
-                    "incomplete_reason": None,
-                    "input_tokens": None,
-                    "output_tokens": None,
-                    "reasoning_tokens": None,
-                    "max_output_tokens": PROJECT_RESEARCH_MAX_OUTPUT_TOKENS,
-                    "results": 0,
-                    "citations": 0,
-                })
-                diagnostics["failure_stage"] = f"{mentor_name} source search"
-                diagnostics["provider_error"] = error.safe_details
-                raise _ProjectSourceResearchError(
-                    mentor_name, "provider", diagnostics
-                ) from None
+            research_request = {
+                "model": self.model,
+                "instructions": _project_research_instruction(
+                    library.display_name, library.library_key, item.pass_number
+                ),
+                "input": question,
+                "tools": [{
+                    "type": "file_search",
+                    "vector_store_ids": [library.vector_store_id],
+                    "max_num_results": item.results_per_pass,
+                }],
+                "tool_choice": {"type": "file_search"},
+                "include": ["reasoning.encrypted_content", "file_search_call.results"],
+                "reasoning": {"effort": "high"},
+                "max_output_tokens": PROJECT_RESEARCH_MAX_OUTPUT_TOKENS,
+                "store": False,
+            }
+            for attempt_number in range(1, PROJECT_RESEARCH_MAX_ATTEMPTS + 1):
+                try:
+                    response = self._responses_create(
+                        research_request, f"project_source_research:{library.library_key}"
+                    )
+                    break
+                except _ResponsesRequestError as error:
+                    retryable = error.retryable and attempt_number < PROJECT_RESEARCH_MAX_ATTEMPTS
+                    retry_delay = _project_retry_delay(error, attempt_number) if retryable else None
+                    diagnostics["mentor_attempts"][mentor_name].append({
+                        "attempt": attempt_number,
+                        "pass": item.pass_number,
+                        "stage": "source_search",
+                        "provider_status": error.safe_details.get("status"),
+                        "provider_type": error.safe_details.get("type"),
+                        "provider_code": error.safe_details.get("code"),
+                        "retryable": error.retryable,
+                        "retry_delay": retry_delay,
+                        "file_search": "not_started",
+                        "research_response": "failed",
+                        "incomplete_reason": None,
+                        "input_tokens": None,
+                        "output_tokens": None,
+                        "reasoning_tokens": None,
+                        "max_output_tokens": PROJECT_RESEARCH_MAX_OUTPUT_TOKENS,
+                        "results": 0,
+                        "citations": 0,
+                    })
+                    if retryable:
+                        LOGGER.info(
+                            "Retrying project source research library=%s pass=%s attempt=%s "
+                            "status=%s delay_seconds=%s",
+                            library.library_key, item.pass_number, attempt_number,
+                            error.safe_details.get("status"), retry_delay,
+                        )
+                        time.sleep(retry_delay)
+                        continue
+                    mentor["status"] = "failed"
+                    diagnostics["failure_stage"] = f"{mentor_name} source search"
+                    diagnostics["provider_error"] = error.safe_details
+                    raise _ProjectSourceResearchError(
+                        mentor_name, "provider", diagnostics
+                    ) from None
             response_output = [_as_dict(candidate) for candidate in response.output]
             metrics = _project_research_metrics(response_output)
             file_search_statuses = [
@@ -651,7 +682,14 @@ class ChatService:
             if response_status not in {"completed", "incomplete", "failed"}:
                 response_status = "unknown"
             diagnostics["mentor_attempts"][mentor_name].append({
+                "attempt": attempt_number,
                 "pass": item.pass_number,
+                "stage": "source_search",
+                "provider_status": None,
+                "provider_type": None,
+                "provider_code": None,
+                "retryable": False,
+                "retry_delay": None,
                 "file_search": (
                     "completed" if file_search_statuses and all(
                         status == "completed" for status in file_search_statuses
@@ -1463,6 +1501,8 @@ class _ResponsesRequestError(RuntimeError):
                 "param": param, "request_id": request_id,
             }.items() if value is not None
         }
+        self.retryable = _project_provider_error_is_retryable(cause, self.safe_details)
+        self.retry_after = _project_retry_after(cause)
 
 
 class _ProjectSourceResearchError(RuntimeError):
@@ -1473,6 +1513,12 @@ class _ProjectSourceResearchError(RuntimeError):
     ):
         provider_error = source_diagnostics.get("provider_error") or {}
         quota = provider_error.get("code") == "credit_balance_exhausted"
+        attempts = source_diagnostics.get("mentor_attempts", {}).get(display_name, [])
+        transient = kind == "provider" and bool(attempts and attempts[-1].get("retryable"))
+        research_kind = (
+            "all-mentor research" if len(source_diagnostics.get("source_scope", [])) > 1
+            else "source research"
+        )
         self.classification = (
             "project_source_ownership" if kind == "ownership"
             else "project_source_incomplete" if kind == "incomplete"
@@ -1483,6 +1529,10 @@ class _ProjectSourceResearchError(RuntimeError):
             f"I couldn't search {display_name}'s source library because OpenAI API credits are "
             "unavailable. Add credits, then retry the source search."
             if quota else
+            f"I couldn't complete the {research_kind} because the source service temporarily "
+            f"failed while searching {display_name} after {len(attempts)} attempts. Your indexed "
+            "sources are intact. Try again shortly."
+            if transient else
             f"I found {display_name} source evidence, but the {display_name} research pass did "
             "not finish cleanly, so I stopped rather than pretending the requested mentor "
             "coverage was complete."
@@ -1939,6 +1989,44 @@ def _incomplete_reason(response: Any) -> str | None:
 def _safe_project_incomplete_reason(response: Any) -> str | None:
     reason = _incomplete_reason(response)
     return reason if reason in {"max_output_tokens", "content_filter"} else "other" if reason else None
+
+
+def _project_provider_error_is_retryable(
+    error: Exception, safe_details: dict[str, object]
+) -> bool:
+    if safe_details.get("code") == "credit_balance_exhausted":
+        return False
+    status = safe_details.get("status")
+    headers = getattr(getattr(error, "response", None), "headers", None)
+    should_retry = headers.get("x-should-retry") if hasattr(headers, "get") else None
+    if should_retry == "false":
+        return False
+    return (
+        isinstance(error, APIConnectionError)
+        or status in {408, 409, 429}
+        or isinstance(status, int) and status >= 500
+    )
+
+
+def _project_retry_after(error: Exception) -> float | None:
+    headers = getattr(getattr(error, "response", None), "headers", None)
+    if not hasattr(headers, "get"):
+        return None
+    for name, divisor in (("retry-after-ms", 1_000), ("retry-after", 1)):
+        try:
+            delay = float(headers.get(name)) / divisor
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(delay) and 0 < delay <= PROJECT_RETRY_MAX_SECONDS:
+            return round(delay, 3)
+    return None
+
+
+def _project_retry_delay(error: _ResponsesRequestError, attempt_number: int) -> float:
+    if error.retry_after is not None:
+        return error.retry_after
+    base = min(PROJECT_RETRY_BASE_SECONDS * 2 ** (attempt_number - 1), PROJECT_RETRY_MAX_SECONDS)
+    return round(base * (1 - 0.25 * random.random()), 3)
 
 
 def _project_search_completed(source_diagnostics: dict[str, object], display_name: str) -> bool:

@@ -1,9 +1,13 @@
 import json
 from dataclasses import replace
 from pathlib import Path
+import random
+import time
 from types import SimpleNamespace
 
+import httpx
 import pytest
+from openai import APIConnectionError
 
 from mentor.chat_service import (
     ChatService,
@@ -39,6 +43,35 @@ class SequenceResponses:
     def create(self, **kwargs):
         self.calls.append(kwargs)
         return self.responses.pop(0)
+
+
+class OutcomeResponses(SequenceResponses):
+    def create(self, **kwargs):
+        self.calls.append(kwargs)
+        outcome = self.responses.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+
+class RetryRecordingClient:
+    def __init__(self, *outcomes):
+        self.responses = OutcomeResponses(*outcomes)
+        self.max_retries = []
+
+    def with_options(self, *, max_retries):
+        self.max_retries.append(max_retries)
+        return self
+
+
+class ProviderStatusError(RuntimeError):
+    def __init__(self, status_code, *, headers=None, error_type=None, code=None):
+        super().__init__("PRIVATE PROVIDER MESSAGE")
+        self.status_code = status_code
+        self.type = error_type
+        self.code = code
+        self.param = None
+        self.response = SimpleNamespace(status_code=status_code, headers=headers or {})
 
 
 class ModelDumpUsage:
@@ -391,7 +424,14 @@ def test_project_research_digest_has_measured_headroom_and_safe_attempt_diagnost
     assert answer.text == "Bounded final answer."
     attempt = answer.diagnostics.project_source_research["mentor_attempts"]["Afyz"][0]
     assert attempt == {
+        "attempt": 1,
         "pass": 1,
+        "stage": "source_search",
+        "provider_status": None,
+        "provider_type": None,
+        "provider_code": None,
+        "retryable": False,
+        "retry_delay": None,
         "file_search": "completed",
         "research_response": "completed",
         "incomplete_reason": None,
@@ -454,7 +494,14 @@ def test_completed_file_search_with_incomplete_digest_reports_truthful_safe_fail
     )
     attempt = events[0].source_diagnostics["mentor_attempts"]["Afyz"][0]
     assert attempt == {
+        "attempt": 1,
         "pass": 1,
+        "stage": "source_search",
+        "provider_status": None,
+        "provider_type": None,
+        "provider_code": None,
+        "retryable": False,
+        "retry_delay": None,
         "file_search": "completed",
         "research_response": "incomplete",
         "incomplete_reason": "max_output_tokens",
@@ -490,6 +537,205 @@ def test_failed_file_search_is_not_reported_as_completed_evidence(tmp_path):
 
     assert events[0].source_diagnostics["mentor_attempts"]["Afyz"][0]["file_search"] == "failed"
     assert not events[0].error.startswith("I found Afyz source evidence")
+
+
+def test_project_research_retries_one_503_then_continues_without_restarting_mentors(tmp_path, monkeypatch):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    project = storage.create_project("GxT")
+    thread_id = storage.create_thread(
+        "Project", behavior=ThreadSourceBehavior.PROJECT, project_id=project.id
+    )
+    _add_project_library(storage, project.id, "gxt.afyz", "vs_afyz", file_id="file_afyz")
+    _add_project_library(storage, project.id, "gxt.garrett", "vs_garrett", file_id="file_garrett")
+    delays = []
+    monkeypatch.setattr(time, "sleep", delays.append)
+    monkeypatch.setattr(random, "random", lambda: 0.0)
+    client = RetryRecordingClient(
+        ProviderStatusError(503, error_type="server_error"),
+        _project_source_response("gxt.afyz", "file_afyz", "Afyz evidence."),
+        _project_source_response("gxt.garrett", "file_garrett", "Garrett evidence."),
+        terminal_response("Complete comparison."),
+    )
+
+    answer = ChatService(storage, client).reply(
+        thread_id,
+        "Teach me GxT using all enabled mentors.",
+        EvaluationConfig(research_depth="normal"),
+    )
+
+    assert answer.text == "Complete comparison."
+    assert delays == [0.75]
+    assert [call["tools"][0]["vector_store_ids"] for call in client.responses.calls[:3]] == [
+        ["vs_afyz"], ["vs_afyz"], ["vs_garrett"],
+    ]
+    afyz_attempts = answer.diagnostics.project_source_research["mentor_attempts"]["Afyz"]
+    assert len(afyz_attempts) == 2
+    assert afyz_attempts[0] == {
+        "attempt": 1, "pass": 1, "stage": "source_search", "provider_status": 503,
+        "provider_type": "server_error", "provider_code": None, "retryable": True,
+        "retry_delay": 0.75, "file_search": "not_started",
+        "research_response": "failed", "incomplete_reason": None,
+        "input_tokens": None, "output_tokens": None, "reasoning_tokens": None,
+        "max_output_tokens": 5_000, "results": 0, "citations": 0,
+    }
+    assert afyz_attempts[1]["research_response"] == "completed"
+    assert answer.diagnostics.project_source_research["mentor_research"]["Garrett"]["status"] == "completed"
+    assert client.max_retries == [0, 0, 0]
+
+
+def test_project_research_succeeds_on_third_attempt_after_two_503s(tmp_path, monkeypatch):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    project = storage.create_project("GxT")
+    thread_id = storage.create_thread(
+        "Project", behavior=ThreadSourceBehavior.PROJECT, project_id=project.id
+    )
+    _add_project_library(storage, project.id, "gxt.afyz", "vs_afyz", file_id="file_afyz")
+    delays = []
+    monkeypatch.setattr(time, "sleep", delays.append)
+    monkeypatch.setattr(random, "random", lambda: 0.0)
+    client = RetryRecordingClient(
+        ProviderStatusError(503, error_type="server_error"),
+        ProviderStatusError(503, error_type="server_error"),
+        _project_source_response("gxt.afyz", "file_afyz", "Afyz evidence."),
+        terminal_response("Recovered."),
+    )
+
+    answer = ChatService(storage, client).reply(thread_id, "Teach me one Afyz GxT concept.")
+
+    assert answer.text == "Recovered."
+    assert delays == [0.75, 1.5]
+    assert len(answer.diagnostics.project_source_research["mentor_attempts"]["Afyz"]) == 3
+
+
+def test_project_research_stops_after_three_503_attempts_and_keeps_other_mentors_unstarted(tmp_path, monkeypatch):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    project = storage.create_project("GxT")
+    thread_id = storage.create_thread(
+        "Project", behavior=ThreadSourceBehavior.PROJECT, project_id=project.id
+    )
+    _add_project_library(storage, project.id, "gxt.afyz", "vs_afyz", file_id="file_afyz")
+    _add_project_library(storage, project.id, "gxt.garrett", "vs_garrett", file_id="file_garrett")
+    delays = []
+    monkeypatch.setattr(time, "sleep", delays.append)
+    monkeypatch.setattr(random, "random", lambda: 0.0)
+    client = RetryRecordingClient(*[
+        ProviderStatusError(503, error_type="server_error") for _ in range(3)
+    ])
+
+    events = list(ChatService(storage, client).stream_reply(
+        thread_id, "Teach me GxT using all enabled mentors."
+    ))
+
+    assert [event.type for event in events] == ["error"]
+    assert len(client.responses.calls) == 3
+    assert delays == [0.75, 1.5]
+    diagnostics = events[0].source_diagnostics
+    assert len(diagnostics["mentor_attempts"]["Afyz"]) == 3
+    assert diagnostics["mentor_research"]["Garrett"]["status"] == "not_started"
+    assert events[0].error == (
+        "I couldn't complete the all-mentor research because the source service temporarily "
+        "failed while searching Afyz after 3 attempts. Your indexed sources are intact. "
+        "Try again shortly."
+    )
+    assert "PRIVATE PROVIDER MESSAGE" not in json.dumps(diagnostics)
+
+
+def test_project_research_does_not_retry_http_400(tmp_path, monkeypatch):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    project = storage.create_project("GxT")
+    thread_id = storage.create_thread(
+        "Project", behavior=ThreadSourceBehavior.PROJECT, project_id=project.id
+    )
+    _add_project_library(storage, project.id, "gxt.afyz", "vs_afyz", file_id="file_afyz")
+    delays = []
+    monkeypatch.setattr(time, "sleep", delays.append)
+    client = RetryRecordingClient(ProviderStatusError(400, error_type="invalid_request_error"))
+
+    events = list(ChatService(storage, client).stream_reply(thread_id, "Teach me one GxT concept."))
+
+    assert [event.type for event in events] == ["error"]
+    assert len(client.responses.calls) == 1
+    assert delays == []
+    attempt = events[0].source_diagnostics["mentor_attempts"]["Afyz"][0]
+    assert attempt["provider_status"] == 400
+    assert attempt["retryable"] is False
+
+
+def test_project_research_honors_provider_do_not_retry_header(tmp_path, monkeypatch):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    project = storage.create_project("GxT")
+    thread_id = storage.create_thread(
+        "Project", behavior=ThreadSourceBehavior.PROJECT, project_id=project.id
+    )
+    _add_project_library(storage, project.id, "gxt.afyz", "vs_afyz", file_id="file_afyz")
+    delays = []
+    monkeypatch.setattr(time, "sleep", delays.append)
+    client = RetryRecordingClient(
+        ProviderStatusError(503, headers={"x-should-retry": "false"}, error_type="server_error")
+    )
+
+    events = list(ChatService(storage, client).stream_reply(thread_id, "Teach me one GxT concept."))
+
+    assert [event.type for event in events] == ["error"]
+    assert len(client.responses.calls) == 1
+    assert delays == []
+    attempt = events[0].source_diagnostics["mentor_attempts"]["Afyz"][0]
+    assert attempt["provider_status"] == 503
+    assert attempt["retryable"] is False
+
+
+def test_project_research_respects_bounded_retry_after_for_429(tmp_path, monkeypatch):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    project = storage.create_project("GxT")
+    thread_id = storage.create_thread(
+        "Project", behavior=ThreadSourceBehavior.PROJECT, project_id=project.id
+    )
+    _add_project_library(storage, project.id, "gxt.afyz", "vs_afyz", file_id="file_afyz")
+    delays = []
+    monkeypatch.setattr(time, "sleep", delays.append)
+    client = RetryRecordingClient(
+        ProviderStatusError(
+            429, headers={"retry-after": "1.25"}, error_type="rate_limit_error",
+            code="rate_limit_exceeded",
+        ),
+        _project_source_response("gxt.afyz", "file_afyz", "Afyz evidence."),
+        terminal_response("Recovered."),
+    )
+
+    answer = ChatService(storage, client).reply(thread_id, "Teach me one GxT concept.")
+
+    assert answer.text == "Recovered."
+    assert delays == [1.25]
+    assert answer.diagnostics.project_source_research["mentor_attempts"]["Afyz"][0]["retry_delay"] == 1.25
+
+
+def test_project_research_retries_connection_error_then_succeeds(tmp_path, monkeypatch):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    project = storage.create_project("GxT")
+    thread_id = storage.create_thread(
+        "Project", behavior=ThreadSourceBehavior.PROJECT, project_id=project.id
+    )
+    _add_project_library(storage, project.id, "gxt.afyz", "vs_afyz", file_id="file_afyz")
+    monkeypatch.setattr(time, "sleep", lambda _: None)
+    client = RetryRecordingClient(
+        APIConnectionError(request=httpx.Request("POST", "https://api.openai.com/v1/responses")),
+        _project_source_response("gxt.afyz", "file_afyz", "Afyz evidence."),
+        terminal_response("Recovered."),
+    )
+
+    answer = ChatService(storage, client).reply(thread_id, "Teach me one GxT concept.")
+
+    assert answer.text == "Recovered."
+    first = answer.diagnostics.project_source_research["mentor_attempts"]["Afyz"][0]
+    assert first["provider_status"] is None
+    assert first["retryable"] is True
 
 
 def test_stream_project_research_reports_the_exact_failed_library_without_leaking_source_data(tmp_path):
