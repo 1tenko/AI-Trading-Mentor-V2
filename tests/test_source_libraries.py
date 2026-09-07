@@ -1,6 +1,8 @@
 import hashlib
 import json
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import PurePosixPath
+from threading import Event
 from types import SimpleNamespace
 
 import pytest
@@ -260,6 +262,64 @@ def test_confirmed_import_indexes_then_registers_an_immutable_ready_revision(tmp
     assert revision[4] == CanonicalRole.CURRENT_CANONICAL_FOUNDATION
     assert revision[7] == "READY"
     assert client.uploaded == [(b"A", "assistants")]
+
+
+def test_confirm_import_rechecks_a_stale_new_item_before_remote_upload(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    project = storage.create_project("GxT")
+    client = FakeSourceOpenAI()
+    service = SourceImportService(storage, client, staging_root=tmp_path / "imports")
+    batch = service.create_staging_import(project.id)
+    service.stage_browser_file(batch["id"], "GxT/Afyz/Course/one.txt", 1, b"same lesson")
+    service.finalize_manifest(batch["id"])
+    existing = tmp_path / "existing.txt"
+    existing.write_bytes(b"same lesson")
+    service.register_local_revision(
+        "gxt.afyz", existing, "Course/one.txt", file_id="file_existing", index_state="READY"
+    )
+
+    result = service.confirm_import(batch["id"], confirm=True, sleep=lambda _: None)
+
+    assert result["state"] == "COMPLETE"
+    assert result["imported"] == 0
+    assert result["libraries"][0]["processed"] == 1
+    assert client.uploaded == []
+
+
+def test_only_one_transcript_import_can_upload_at_a_time(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    project = storage.create_project("GxT")
+    started = Event()
+    release = Event()
+
+    class BlockingSourceOpenAI(FakeSourceOpenAI):
+        def create_file(self, *, file, purpose):
+            started.set()
+            assert release.wait(timeout=5)
+            return super().create_file(file=file, purpose=purpose)
+
+    client = BlockingSourceOpenAI()
+    service = SourceImportService(storage, client, staging_root=tmp_path / "imports")
+    first = service.create_staging_import(project.id)
+    second = service.create_staging_import(project.id)
+    service.stage_browser_file(first["id"], "GxT/Afyz/Course/one.txt", 1, b"one")
+    service.stage_browser_file(second["id"], "GxT/Erik/Course/two.txt", 1, b"two")
+    service.finalize_manifest(first["id"])
+    service.finalize_manifest(second["id"])
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(service.confirm_import, first["id"], confirm=True, sleep=lambda _: None)
+        assert started.wait(timeout=5)
+        try:
+            with pytest.raises(ValueError, match="already running"):
+                service.confirm_import(second["id"], confirm=True, sleep=lambda _: None)
+        finally:
+            release.set()
+        assert future.result()["state"] == "COMPLETE"
+
+    assert storage.library_import_batch(second["id"])[2] == "READY_FOR_CONFIRMATION"
 
 
 def test_failed_indexing_is_visible_safe_and_not_searchable(tmp_path):

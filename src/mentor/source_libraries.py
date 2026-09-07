@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import hashlib
 import os
 from pathlib import Path, PurePosixPath
+from threading import Lock
 import time
 from typing import Any, Callable
 
@@ -14,6 +15,8 @@ from mentor.storage import Storage
 
 JACOB_LIBRARY_KEY = "jacob.speculates"
 MAX_SOURCE_BYTES = 10 * 1024 * 1024
+# ponytail: one local import at a time; use per-project locks if multi-user imports are introduced.
+_IMPORT_LOCK = Lock()
 
 
 @dataclass(frozen=True)
@@ -192,6 +195,20 @@ class SourceImportService:
         confirm: bool,
         sleep: Callable[[float], None] = time.sleep,
     ) -> dict[str, object]:
+        if not _IMPORT_LOCK.acquire(blocking=False):
+            raise ValueError("Another transcript import is already running. Wait for it to finish and try again.")
+        try:
+            return self._confirm_import(batch_id, confirm=confirm, sleep=sleep)
+        finally:
+            _IMPORT_LOCK.release()
+
+    def _confirm_import(
+        self,
+        batch_id: int,
+        *,
+        confirm: bool,
+        sleep: Callable[[float], None],
+    ) -> dict[str, object]:
         if confirm is not True:
             raise ValueError("Confirm the source import before uploading.")
         batch = self._batch(batch_id)
@@ -212,6 +229,18 @@ class SourceImportService:
                 if item.get("result") in {"IMPORTED", "SKIPPED_DUPLICATE"}:
                     continue
                 if item["classification"] == "duplicate":
+                    item["result"] = "SKIPPED_DUPLICATE"
+                    self.storage.update_library_import_batch(
+                        batch_id, state="IMPORTING", manifest=manifest
+                    )
+                    continue
+                existing = self.storage.revision_for_hash(item["sha256"])
+                if existing is not None:
+                    if existing[2] != item["library_key"]:
+                        raise CrossLibraryDuplicateError(
+                            "source content is already assigned to another library"
+                        )
+                    item["classification"] = "duplicate"
                     item["result"] = "SKIPPED_DUPLICATE"
                     self.storage.update_library_import_batch(
                         batch_id, state="IMPORTING", manifest=manifest
