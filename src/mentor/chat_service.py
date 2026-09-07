@@ -266,6 +266,7 @@ class ResponseDiagnostics:
     auto_mapping_policy_upgraded: bool
     source_scope: dict[str, object] | None
     mentor_search_calls: dict[str, int]
+    project_source_research: dict[str, object] | None
 
 
 @dataclass(frozen=True)
@@ -293,6 +294,7 @@ class StreamEvent:
     incomplete_reason: str | None = None
     error: str = ""
     error_classification: str = ""
+    source_diagnostics: dict[str, object] | None = None
     qualitative_field_count: int = 0
     qualitative_context_field_count: int = 0
 
@@ -305,7 +307,12 @@ class ChatService:
 
     def _responses_create(self, request: dict, stage: str, *, stream: bool = False) -> Any:
         try:
-            return self.client.responses.create(**request, **({"stream": True} if stream else {}))
+            client = (
+                self.client.with_options(max_retries=0)
+                if stage.startswith("project_source_research:") and hasattr(self.client, "with_options")
+                else self.client
+            )
+            return client.responses.create(**request, **({"stream": True} if stream else {}))
         except Exception as error:
             _log_safe_responses_error(stage, error)
             raise _ResponsesRequestError(stage, error) from None
@@ -322,7 +329,7 @@ class ChatService:
         self._approve_chat_promotion_if_requested(thread_id, question)
         user_item, request, effective_depth, prior_empirical_evidence_reused, auto_mapping_policy_upgraded, turn_source_scope = self._request(thread_id, question, evaluation)
         started_at = perf_counter()
-        source_research_output, source_research_responses, source_search_calls = self._project_source_research(
+        source_research_output, source_research_responses, source_search_calls, source_diagnostics = self._project_source_research(
             thread_id, user_item["content"][0]["text"], effective_depth
         )
         request = _request_with_project_research(request, source_research_output)
@@ -356,6 +363,7 @@ class ChatService:
             source_research_output=source_research_output,
             source_research_responses=source_research_responses,
             source_search_calls=source_search_calls,
+            project_source_research=source_diagnostics,
         )
 
     def stream_reply(
@@ -368,19 +376,25 @@ class ChatService:
         qualitative_consent_prompt: bool = True,
         dataset_attachment_id: str | None = None,
     ):
+        source_diagnostics = None
+        source_stage = None
         try:
             self._approve_chat_promotion_if_requested(thread_id, question)
             user_item, request, effective_depth, prior_empirical_evidence_reused, auto_mapping_policy_upgraded, turn_source_scope = self._request(thread_id, question, evaluation)
             started_at = perf_counter()
-            source_research_output, source_research_responses, source_search_calls = self._project_source_research(
+            source_research_output, source_research_responses, source_search_calls, source_diagnostics = self._project_source_research(
                 thread_id, user_item["content"][0]["text"], effective_depth
             )
             request = _request_with_project_research(request, source_research_output)
+            source_stage = "final synthesis request"
             stream = self._responses_create(request, "initial_stream", stream=True)
+            if source_diagnostics is not None:
+                source_diagnostics["final_synthesis"] = "in_progress"
             for event in stream:
                 if event.type == "response.output_text.delta":
                     yield StreamEvent("delta", event.delta)
                 elif event.type in {"response.completed", "response.incomplete"}:
+                    source_stage = "project/local-tool continuation"
                     response, leading_output, replay_leading_output, response_request, profile_update, qualitative_exchange, qualitative_review = self._local_tools_continued_response(
                         thread_id,
                         request,
@@ -389,11 +403,13 @@ class ChatService:
                         include_approved_notes=include_approved_notes,
                         pause_for_qualitative_consent=qualitative_consent_prompt,
                     )
+                    source_stage = "citation repair"
                     response, evidence_output, draft_response = self._citation_repaired_response(
                         response_request, response, user_item["content"][0]["text"],
                         qualitative_exchange=qualitative_exchange,
                         source_citation_output=source_research_output,
                     )
+                    source_stage = "replay/finalization"
                     answer = self._finalize(
                         thread_id,
                         user_item,
@@ -415,6 +431,7 @@ class ChatService:
                         source_research_output=source_research_output,
                         source_research_responses=source_research_responses,
                         source_search_calls=source_search_calls,
+                        project_source_research=source_diagnostics,
                     )
                     if answer.incomplete_reason:
                         yield StreamEvent(
@@ -427,8 +444,14 @@ class ChatService:
                     return
                 elif event.type in {"response.failed", "response.cancelled", "error"}:
                     LOGGER.warning("OpenAI stream ended with %s", event.type)
+                    if source_diagnostics is not None:
+                        source_diagnostics["final_synthesis"] = "failed"
+                        source_diagnostics["failure_stage"] = "final synthesis stream"
                     yield StreamEvent(
-                        "error", error="The mentor request failed. Try again.", error_classification="responses_continuation_error"
+                        "error",
+                        error=_final_synthesis_error_message(source_diagnostics),
+                        error_classification="final_synthesis_error" if source_diagnostics else "responses_continuation_error",
+                        source_diagnostics=source_diagnostics,
                     )
                     return
         except _QualitativeConsentRequired as consent:
@@ -438,21 +461,61 @@ class ChatService:
                 qualitative_context_field_count=consent.context_field_count,
             )
             return
-        except _ResponsesRequestError as error:
+        except _ProjectSourceResearchError as error:
             yield StreamEvent(
                 "error",
-                error="The mentor request failed. Try again.",
-                error_classification="qualitative_continuation_error" if error.stage == "qualitative_continuation" else "responses_continuation_error",
+                error=error.user_message,
+                error_classification=error.classification,
+                source_diagnostics=error.source_diagnostics,
+            )
+            return
+        except _ResponsesRequestError as error:
+            project_answer_stage = source_diagnostics is not None and error.stage in {
+                "initial_stream", "local_tool_continuation", "qualitative_continuation",
+                "citation_repair",
+            }
+            if project_answer_stage:
+                source_diagnostics["final_synthesis"] = "failed"
+                source_diagnostics["failure_stage"] = {
+                    "initial_stream": "final synthesis request",
+                    "local_tool_continuation": "project/local-tool continuation",
+                    "qualitative_continuation": "project/local-tool continuation",
+                    "citation_repair": "citation repair",
+                }[error.stage]
+            yield StreamEvent(
+                "error",
+                error=_final_synthesis_error_message(source_diagnostics),
+                error_classification=(
+                    "qualitative_continuation_error" if error.stage == "qualitative_continuation"
+                    else "final_synthesis_error" if project_answer_stage
+                    else "responses_continuation_error"
+                ),
+                source_diagnostics=source_diagnostics,
             )
             return
         except Exception as error:
             LOGGER.warning("OpenAI stream raised %s", type(error).__name__)
+            final_synthesis_failed = source_diagnostics is not None and source_stage is not None
+            if final_synthesis_failed:
+                source_diagnostics["final_synthesis"] = "failed"
+                source_diagnostics["failure_stage"] = source_stage
             yield StreamEvent(
-                "error", error="The mentor request failed. Try again.", error_classification=_safe_error_classification(error)
+                "error",
+                error=_final_synthesis_error_message(source_diagnostics) if final_synthesis_failed else "The mentor request failed. Try again.",
+                error_classification="final_synthesis_error" if final_synthesis_failed else _safe_error_classification(error),
+                source_diagnostics=source_diagnostics,
             )
             return
         LOGGER.warning("OpenAI stream ended without a terminal response event")
-        yield StreamEvent("error", error="The mentor stream ended before returning a usable response. Try again.")
+        if source_diagnostics is not None:
+            source_diagnostics["final_synthesis"] = "failed"
+            source_diagnostics["failure_stage"] = "final synthesis stream"
+        yield StreamEvent(
+            "error",
+            error=_final_synthesis_error_message(source_diagnostics),
+            error_classification="final_synthesis_error" if source_diagnostics else "responses_continuation_error",
+            source_diagnostics=source_diagnostics,
+        )
 
     def _citation_repaired_response(
         self, request: dict, response: Any, question: str, *, qualitative_exchange: bool = False,
@@ -492,28 +555,53 @@ class ChatService:
 
     def _project_source_research(
         self, thread_id: int, question: str, effective_depth: str
-    ) -> tuple[list[dict], list[Any], dict[str, int]]:
+    ) -> tuple[list[dict], list[Any], dict[str, int], dict[str, object] | None]:
         thread = self.storage.thread_context(thread_id)
         if thread is None or thread.thread_source_behavior is not ThreadSourceBehavior.PROJECT:
-            return [], [], {}
+            return [], [], {}, None
         context_mode = _profile_context_mode(question)
         field_state = questionnaire_field_state(question, self.storage.current_confirmed_profile_items())
         if context_mode == PROFILE_CONTEXT_FULL_PROFILE or (
             field_state is not None and not _explicit_profile_source_request(question)
         ):
-            return [], [], {}
+            return [], [], {}, None
         scope = resolve_source_scope(self.storage, thread, question)
         plan = research_plan(scope, question, effective_depth)
         if not plan:
-            return [], [], {}
+            return [], [], {}, None
         libraries = {library.library_key: library for library in scope.libraries}
+        mentor_names = {
+            key: _mentor_diagnostic_name(library.display_name) for key, library in libraries.items()
+        }
+        planned_calls = {
+            key: sum(item.library_key == key for item in plan) for key in libraries
+        }
+        diagnostics: dict[str, object] = {
+            "source_scope": [mentor_names[library.library_key] for library in scope.libraries],
+            "mentor_research": {
+                mentor_names[library.library_key]: {
+                    "status": "not_started", "calls": 0, "results": 0, "citations": 0,
+                }
+                for library in scope.libraries
+            },
+            "file_search_calls": 0,
+            "research_characters": 0,
+            "estimated_input_tokens": 0,
+            "output_item_types": {},
+            "final_synthesis": "not_started",
+            "failure_stage": None,
+        }
         output: list[dict] = []
         responses: list[Any] = []
         calls: dict[str, int] = {}
         for item in plan:
             library = libraries[item.library_key]
-            response = self._responses_create(
-                {
+            mentor_name = mentor_names[library.library_key]
+            mentor = diagnostics["mentor_research"][mentor_name]
+            mentor["status"] = "in_progress"
+            pass_started_at = perf_counter()
+            try:
+                response = self._responses_create({
                     "model": self.model,
                     "instructions": _project_research_instruction(
                         library.display_name, library.library_key, item.pass_number
@@ -529,15 +617,73 @@ class ChatService:
                     "reasoning": {"effort": "high"},
                     "max_output_tokens": 2_500,
                     "store": False,
-                },
-                "project_source_research",
-            )
+                }, f"project_source_research:{library.library_key}")
+            except _ResponsesRequestError as error:
+                mentor["status"] = "failed"
+                diagnostics["failure_stage"] = f"{mentor_name} source search"
+                diagnostics["provider_error"] = error.safe_details
+                raise _ProjectSourceResearchError(
+                    mentor_name, "provider", diagnostics
+                ) from None
             response_output = [_as_dict(candidate) for candidate in response.output]
-            _validate_project_source_ownership(self.storage, library.library_key, response_output)
+            metrics = _project_research_metrics(response_output)
+            mentor["calls"] += metrics["calls"]
+            mentor["results"] += metrics["results"]
+            mentor["citations"] += metrics["citations"]
+            diagnostics["file_search_calls"] += metrics["calls"]
+            diagnostics["research_characters"] += metrics["characters"]
+            diagnostics["estimated_input_tokens"] = (diagnostics["research_characters"] + 3) // 4
+            for item_type, count in metrics["item_types"].items():
+                diagnostics["output_item_types"][item_type] = (
+                    diagnostics["output_item_types"].get(item_type, 0) + count
+                )
+            if (
+                _field(response, "status") != "completed"
+                or metrics["calls"] == 0
+                or any(
+                    candidate.get("status") != "completed"
+                    for candidate in response_output if candidate.get("type") == "file_search_call"
+                )
+            ):
+                mentor["status"] = "failed"
+                diagnostics["failure_stage"] = f"{mentor_name} source research incomplete"
+                raise _ProjectSourceResearchError(
+                    mentor_name, "incomplete", diagnostics
+                ) from None
+            try:
+                _validate_project_source_ownership(self.storage, library.library_key, response_output)
+            except RuntimeError:
+                mentor["status"] = "failed"
+                diagnostics["failure_stage"] = f"{mentor_name} source ownership validation"
+                LOGGER.warning(
+                    "Project source research failed library=%s stage=source_ownership_validation "
+                    "calls=%s results=%s citations=%s",
+                    library.library_key, mentor["calls"], mentor["results"], mentor["citations"],
+                )
+                raise _ProjectSourceResearchError(
+                    mentor_name, "ownership", diagnostics
+                ) from None
             output.extend(response_output)
             responses.append(response)
             calls[library.library_key] = calls.get(library.library_key, 0) + 1
-        return output, responses, calls
+            mentor["status"] = (
+                "completed" if calls[library.library_key] == planned_calls[library.library_key]
+                else "in_progress"
+            )
+            LOGGER.info(
+                "Project source research completed library=%s pass=%s calls=%s results=%s "
+                "citations=%s output_items=%s response_chars=%s elapsed_ms=%s",
+                library.library_key, item.pass_number, metrics["calls"], metrics["results"],
+                metrics["citations"], metrics["item_types"], metrics["characters"],
+                round((perf_counter() - pass_started_at) * 1_000),
+            )
+        LOGGER.info(
+            "Project source aggregation ready mentors=%s responses=%s items=%s chars=%s "
+            "estimated_tokens=%s item_types=%s",
+            len(libraries), len(responses), len(output), diagnostics["research_characters"],
+            diagnostics["estimated_input_tokens"], diagnostics["output_item_types"],
+        )
+        return output, responses, calls, diagnostics
 
     def _approve_chat_promotion_if_requested(self, thread_id: int, question: str) -> None:
         match = CHAT_PROMOTION_APPROVAL.fullmatch(" ".join(question.split()))
@@ -1139,6 +1285,7 @@ class ChatService:
         source_research_output: list[dict] | None = None,
         source_research_responses: list[Any] | None = None,
         source_search_calls: dict[str, int] | None = None,
+        project_source_research: dict[str, object] | None = None,
     ) -> Answer:
         response_output = [_as_dict(item) for item in response.output]
         historic_response_output = _qualitative_historic_items(response_output) if qualitative_exchange else response_output
@@ -1184,6 +1331,11 @@ class ChatService:
                 diagnostics=answer.diagnostics,
                 incomplete_reason=answer.incomplete_reason,
             )
+        if project_source_research is not None:
+            project_source_research["final_synthesis"] = (
+                "incomplete" if answer.incomplete_reason else "completed"
+            )
+            project_source_research["failure_stage"] = None
         diagnostics = _diagnostics(
             response,
             self.model,
@@ -1200,9 +1352,7 @@ class ChatService:
             source_responses=source_research_responses,
             source_scope=turn_source_scope,
             mentor_search_calls=source_search_calls,
-        )
-        self.storage.record_response_diagnostics(
-            thread_id, diagnostics.response_id, diagnostics.__dict__
+            project_source_research=project_source_research,
         )
         answer = Answer(
             text=answer.text,
@@ -1264,6 +1414,39 @@ class _ResponsesRequestError(RuntimeError):
     def __init__(self, stage: str, cause: Exception):
         super().__init__(str(cause))
         self.stage = stage
+        status, error_type, code, param, request_id = safe_provider_error_details(cause)
+        self.safe_details = {
+            key: value for key, value in {
+                "status": status, "type": error_type, "code": code,
+                "param": param, "request_id": request_id,
+            }.items() if value is not None
+        }
+
+
+class _ProjectSourceResearchError(RuntimeError):
+    """Safe project-source failure context; never contains source content or provider IDs."""
+
+    def __init__(
+        self, display_name: str, kind: str, source_diagnostics: dict[str, object]
+    ):
+        provider_error = source_diagnostics.get("provider_error") or {}
+        quota = provider_error.get("code") == "credit_balance_exhausted"
+        self.classification = (
+            "project_source_ownership" if kind == "ownership"
+            else "project_source_incomplete" if kind == "incomplete"
+            else "project_source_quota" if quota
+            else "project_source_provider_error"
+        )
+        self.user_message = (
+            f"I couldn't search {display_name}'s source library because OpenAI API credits are "
+            "unavailable. Add credits, then retry the source search."
+            if quota else
+            f"I couldn't complete this source-grounded answer because {display_name}'s source "
+            "library couldn't be searched and verified. No incomplete mentor comparison was "
+            "generated. Retry the source search."
+        )
+        self.source_diagnostics = source_diagnostics
+        super().__init__(self.classification)
 
 
 def _analysis_arguments(call: dict) -> dict[str, object]:
@@ -1418,6 +1601,41 @@ def _request_with_project_research(request: dict, output: list[dict]) -> dict:
     }
 
 
+def _project_research_metrics(output: list[dict]) -> dict[str, object]:
+    item_types: dict[str, int] = {}
+    for item in output:
+        item_type = str(item.get("type") or "unknown")
+        item_types[item_type] = item_types.get(item_type, 0) + 1
+    calls = [item for item in output if item.get("type") == "file_search_call"]
+    citations = [
+        annotation
+        for item in output if item.get("type") == "message"
+        for content in item.get("content") or [] if content.get("type") == "output_text"
+        for annotation in content.get("annotations") or []
+        if annotation.get("type") == "file_citation"
+    ]
+    return {
+        "calls": len(calls),
+        "results": sum(len(item.get("results") or []) for item in calls),
+        "citations": len(citations),
+        "characters": len(json.dumps(output, ensure_ascii=False, separators=(",", ":"))),
+        "item_types": item_types,
+    }
+
+
+def _mentor_diagnostic_name(display_name: str) -> str:
+    return re.split(r"\s+(?:\u2013|\u2014|\ufffd|-)\s+", display_name, maxsplit=1)[0]
+
+
+def _final_synthesis_error_message(source_diagnostics: dict[str, object] | None) -> str:
+    if source_diagnostics is None:
+        return "The mentor request failed. Try again."
+    return (
+        "The mentor research completed, but the final answer couldn't be generated. "
+        "Your sources are still intact. Retry the answer."
+    )
+
+
 def _validate_project_source_ownership(
     storage: Storage, expected_library_key: str, output: list[dict]
 ) -> None:
@@ -1440,7 +1658,10 @@ def _validate_project_source_ownership(
 
 def _input_item(item: dict) -> dict:
     """Keep full API output locally but omit fields the input endpoint rejects."""
-    return {key: value for key, value in item.items() if key not in {"status", "created_by"}}
+    omitted = {"created_by"}
+    if item.get("type") not in {"file_search_call", "message"}:
+        omitted.add("status")
+    return {key: value for key, value in item.items() if key not in omitted}
 
 
 def _validate_replay_protocol(items: list[dict], *, replay: bool = True) -> None:
@@ -1684,6 +1905,7 @@ def _diagnostics(
     source_responses: list[Any] | None = None,
     source_scope: dict[str, object] | None = None,
     mentor_search_calls: dict[str, int] | None = None,
+    project_source_research: dict[str, object] | None = None,
 ) -> ResponseDiagnostics:
     responses = [*(source_responses or []), *([response] if draft_response is None else [draft_response, response])]
     input_tokens = _usage_total(responses, "input_tokens")
@@ -1729,6 +1951,7 @@ def _diagnostics(
         auto_mapping_policy_upgraded=auto_mapping_policy_upgraded,
         source_scope=source_scope,
         mentor_search_calls=dict(mentor_search_calls or {}),
+        project_source_research=project_source_research,
     )
 
 

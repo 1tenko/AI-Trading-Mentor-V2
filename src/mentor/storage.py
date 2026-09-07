@@ -2591,6 +2591,12 @@ class Storage:
                     "INSERT INTO thread_source_scopes(thread_id, turn_number, scope_json) VALUES (?, ?, ?)",
                     (thread_id, turn_number, source_scope_json),
                 )
+            if diagnostics_json is not None and response_id is not None:
+                connection.execute(
+                    "INSERT OR REPLACE INTO response_diagnostics(response_id, thread_id, diagnostic_json) "
+                    "VALUES (?, ?, ?)",
+                    (response_id, thread_id, diagnostics_json),
+                )
 
     def display_turns(self, thread_id: int) -> list[dict]:
         with self._connect() as connection:

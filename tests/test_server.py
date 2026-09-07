@@ -658,6 +658,12 @@ def test_server_serves_the_persistent_chat_controls(tmp_path):
         assert b"Applied for future model replay" in script
         assert b'event.type === "error"' in script
         assert b"Mentor unavailable. You can retry." in script
+        assert b"Source scope" in script
+        assert b"Mentor research" in script
+        assert b"Final synthesis" in script
+        assert b"File Search calls" in script
+        assert b"Provider error" in script
+        assert b"source_diagnostics" in script
         assert b"showProfileUpdate" in script
         assert b"Profile update needs confirmation" in script
         assert b"Review in Trader Profile" in script
@@ -810,7 +816,7 @@ def test_attachment_ui_keeps_a_replacement_needing_input_distinct_from_the_old_s
         assert b"restorePendingMessageAttachment(attachment);" in script
         assert b"function completePendingMessageAttachment(attachment)" in script
         assert b"Prior empirical evidence reused" in script
-        assert b"Error classification: ${errorClassification}" in script
+        assert b'["Error classification", errorClassification]' in script
     finally:
         server.shutdown()
         worker.join()

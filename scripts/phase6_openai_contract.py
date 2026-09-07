@@ -13,6 +13,7 @@ from uuid import uuid4
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+from mentor.chat_service import _input_item  # noqa: E402
 from mentor.config import load_config  # noqa: E402
 
 
@@ -166,7 +167,7 @@ def main() -> int:
             ),
             input=[
                 {"role": "user", "content": [{"type": "input_text", "text": "Compare every enabled synthetic mentor."}]},
-                *({key: value for key, value in item.items() if key not in {"status", "created_by"}} for item in research_outputs),
+                *(_input_item(item) for item in research_outputs),
                 {"role": "user", "content": [{"type": "input_text", "text": "Give the final attributed comparison now."}]},
             ],
             tools=[],

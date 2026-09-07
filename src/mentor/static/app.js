@@ -286,6 +286,9 @@ function showDiagnostics(diagnostics) {
     ["Qualitative calls", String(diagnostics.qualitative_calls || 0)],
     ["Analysis batch", diagnostics.analysis_batch_status || "Not requested"],
   ];
+  if (diagnostics.project_source_research) {
+    rows.splice(4, 0, ...sourceResearchRows(diagnostics.project_source_research));
+  }
   if (diagnostics.qualitative_review) {
     const review = diagnostics.qualitative_review;
     rows.splice(-1, 0,
@@ -333,6 +336,33 @@ function showProfileUpdate(update) {
   messages.append(block);
 }
 
+function sourceResearchRows(sourceDiagnostics) {
+  if (!sourceDiagnostics) return [];
+  const scope = Array.isArray(sourceDiagnostics.source_scope)
+    ? sourceDiagnostics.source_scope.join(", ")
+    : "Unavailable";
+  const mentors = Object.entries(sourceDiagnostics.mentor_research || {}).map(([name, item]) => {
+    const counts = ` · ${item.calls || 0} search${item.calls === 1 ? "" : "es"} · ${item.results || 0} results · ${item.citations || 0} citations`;
+    return `${name} — ${String(item.status || "unknown").replaceAll("_", " ")}${counts}`;
+  });
+  const rows = [
+    ["Source scope", scope],
+    ["Mentor research", mentors.join("; ") || "Not requested"],
+    ["File Search calls", String(sourceDiagnostics.file_search_calls || 0)],
+    ["Final synthesis", String(sourceDiagnostics.final_synthesis || "not started").replaceAll("_", " ")],
+  ];
+  if (sourceDiagnostics.failure_stage) rows.push(["Failure stage", sourceDiagnostics.failure_stage]);
+  if (sourceDiagnostics.provider_error) {
+    const provider = sourceDiagnostics.provider_error;
+    const label = [provider.type, provider.code]
+      .filter(Boolean)
+      .map((value) => String(value).replaceAll("_", " "))
+      .join(" · ");
+    rows.push(["Provider error", `HTTP ${provider.status || "unknown"}${label ? ` · ${label}` : ""}`]);
+  }
+  return rows;
+}
+
 function renderMessageAttachment(attachment) {
   const card = document.createElement("section");
   card.className = "message-attachment";
@@ -369,7 +399,7 @@ function showIncomplete(answer, mentor) {
   messages.append(block);
 }
 
-function showStreamError(mentor, message, retryText, errorClassification = "") {
+function showStreamError(mentor, message, retryText, errorClassification = "", sourceDiagnostics = null) {
   mentor.heading.textContent = "Mentor — unavailable";
   mentor.content.classList.remove("markdown");
   mentor.content.replaceChildren(document.createTextNode(message));
@@ -378,14 +408,26 @@ function showStreamError(mentor, message, retryText, errorClassification = "") {
   retry.textContent = "Retry";
   retry.addEventListener("click", () => sendMessage(retryText, false));
   mentor.content.append(document.createElement("br"), retry);
-  if (errorClassification) {
+  if (errorClassification || sourceDiagnostics) {
     const diagnostics = document.createElement("details");
     diagnostics.className = "diagnostics";
     const summary = document.createElement("summary");
     summary.textContent = "Evaluation diagnostics";
     const detail = document.createElement("div");
     detail.className = "diagnostics-content";
-    detail.textContent = `Error classification: ${errorClassification}`;
+    const list = document.createElement("dl");
+    const rows = [
+      ...(errorClassification ? [["Error classification", errorClassification]] : []),
+      ...sourceResearchRows(sourceDiagnostics),
+    ];
+    rows.forEach(([name, value]) => {
+      const term = document.createElement("dt");
+      term.textContent = name;
+      const description = document.createElement("dd");
+      description.textContent = value;
+      list.append(term, description);
+    });
+    detail.append(list);
     diagnostics.append(summary, detail);
     mentor.content.append(diagnostics);
   }
@@ -1547,7 +1589,13 @@ async function sendMessage(text, showUser = true, includeApprovedNotes = false, 
           if (event.type === "error") {
             terminal = true;
             restorePendingMessageAttachment(attachment);
-            showStreamError(mentor, event.error || "The mentor request failed. Try again.", text, event.error_classification);
+            showStreamError(
+              mentor,
+              event.error || "The mentor request failed. Try again.",
+              text,
+              event.error_classification,
+              event.source_diagnostics,
+            );
           }
           if (event.type === "consent_required") {
             terminal = true;

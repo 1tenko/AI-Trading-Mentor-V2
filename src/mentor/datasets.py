@@ -46,10 +46,11 @@ AUTO_MAPPING_POLICY_VERSION = 3
 MENTOR_ACCESS_POLICIES = frozenset({"aggregates_only", "allow_row_values_when_analysing_notes"})
 _SAFE_PROVIDER_ERROR_TYPES = frozenset({
     "authentication_error", "invalid_request_error", "not_found_error",
-    "permission_error", "rate_limit_error", "server_error",
+    "permission_error", "rate_limit_error", "server_error", "insufficient_quota",
 })
 _SAFE_PROVIDER_ERROR_CODES = frozenset({
-    "invalid_request", "invalid_tool_protocol", "invalid_value", "rate_limit_exceeded", "unsupported_parameter",
+    "credit_balance_exhausted", "invalid_request", "invalid_tool_protocol", "invalid_value",
+    "rate_limit_exceeded", "unsupported_parameter",
 })
 _SAFE_PROVIDER_ERROR_PARAMS = frozenset({
     "input", "max_output_tokens", "model", "previous_response_id", "reasoning", "tool_choice", "tools",

@@ -645,6 +645,8 @@ class _Handler(BaseHTTPRequestHandler):
             body["error"] = event.error
         if event.error_classification:
             body["error_classification"] = event.error_classification
+        if event.source_diagnostics is not None:
+            body["source_diagnostics"] = event.source_diagnostics
         if event.qualitative_field_count:
             body["qualitative_field_count"] = event.qualitative_field_count
         if event.qualitative_context_field_count:

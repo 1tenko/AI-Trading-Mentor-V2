@@ -149,10 +149,14 @@ def test_project_request_uses_only_effective_enabled_vector_stores(tmp_path):
     storage.initialize()
     project = storage.create_project("GxT")
     thread_id = storage.create_thread("Project", behavior=ThreadSourceBehavior.PROJECT, project_id=project.id)
-    _add_project_library(storage, project.id, "gxt.garrett", "vs_garrett")
-    _add_project_library(storage, project.id, "gxt.afyz", "vs_afyz")
+    _add_project_library(storage, project.id, "gxt.garrett", "vs_garrett", file_id="file_garrett")
+    _add_project_library(storage, project.id, "gxt.afyz", "vs_afyz", file_id="file_afyz")
     _add_project_library(storage, project.id, "gxt.erik", "vs_erik", enabled=False)
-    responses = FakeResponses(terminal_response("Scoped answer."))
+    responses = SequenceResponses(
+        _project_source_response("gxt.afyz", "file_afyz", "Afyz evidence."),
+        _project_source_response("gxt.garrett", "file_garrett", "Garrett evidence."),
+        terminal_response("Scoped answer."),
+    )
 
     ChatService(storage, SimpleNamespace(responses=responses)).reply(thread_id, "Teach me GxT.")
 
@@ -169,9 +173,14 @@ def test_project_one_turn_only_override_is_persisted_safely_and_not_saved(tmp_pa
     storage.initialize()
     project = storage.create_project("GxT")
     thread_id = storage.create_thread("Project", behavior=ThreadSourceBehavior.PROJECT, project_id=project.id)
-    _add_project_library(storage, project.id, "gxt.garrett", "vs_garrett")
-    _add_project_library(storage, project.id, "gxt.afyz", "vs_afyz")
-    responses = FakeResponses(terminal_response("Answer."))
+    _add_project_library(storage, project.id, "gxt.garrett", "vs_garrett", file_id="file_garrett")
+    _add_project_library(storage, project.id, "gxt.afyz", "vs_afyz", file_id="file_afyz")
+    responses = SequenceResponses(
+        terminal_response("Answer."),
+        _project_source_response("gxt.afyz", "file_afyz", "Afyz evidence."),
+        _project_source_response("gxt.garrett", "file_garrett", "Garrett evidence."),
+        terminal_response("Answer."),
+    )
     service = ChatService(storage, SimpleNamespace(responses=responses))
 
     service.reply(thread_id, "Afyz only")
@@ -191,9 +200,18 @@ def test_normal_project_teaching_instructions_require_enabled_mentor_coverage(tm
     storage.initialize()
     project = storage.create_project("GxT")
     thread_id = storage.create_thread("Project", behavior=ThreadSourceBehavior.PROJECT, project_id=project.id)
-    for label in ("garrett", "afyz", "erik", "splash", "zay"):
-        _add_project_library(storage, project.id, f"gxt.{label}", f"vs_{label}")
-    responses = FakeResponses(terminal_response("Teaching."))
+    labels = ("garrett", "afyz", "erik", "splash", "zay")
+    for label in labels:
+        _add_project_library(
+            storage, project.id, f"gxt.{label}", f"vs_{label}", file_id=f"file_{label}"
+        )
+    responses = SequenceResponses(
+        *(
+            _project_source_response(f"gxt.{label}", f"file_{label}", f"{label} evidence.")
+            for label in sorted(labels)
+        ),
+        terminal_response("Teaching."),
+    )
 
     ChatService(storage, SimpleNamespace(responses=responses)).reply(
         thread_id, "Teach me how X works in GxT."
@@ -210,14 +228,15 @@ def _project_source_response(key, file_id, statement):
         id=f"resp_{key}", model="gpt-5.6-sol", status="completed", usage=None,
         output=[
             {
-                "type": "file_search_call", "queries": [f"{key} synthetic query"],
+                "type": "file_search_call", "id": f"fs_{key}", "status": "completed",
+                "queries": [f"{key} synthetic query"],
                 "results": [{
                     "file_id": file_id, "filename": f"{key}.txt", "text": statement,
                     "attributes": {"library_key": key, "timestamps_available": "true"},
                 }],
             },
             {
-                "type": "message", "role": "assistant",
+                "type": "message", "id": f"msg_{key}", "status": "completed", "role": "assistant",
                 "content": [{
                     "type": "output_text", "text": statement,
                     "annotations": [{"type": "file_citation", "file_id": file_id, "filename": f"{key}.txt"}],
@@ -274,6 +293,403 @@ def test_project_research_rejects_a_result_owned_by_another_library_before_persi
     assert storage.replay_items(thread_id) == []
 
 
+def test_stream_project_research_rejects_incomplete_file_search_before_synthesis(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    project = storage.create_project("GxT")
+    thread_id = storage.create_thread(
+        "Project", behavior=ThreadSourceBehavior.PROJECT, project_id=project.id
+    )
+    _add_project_library(storage, project.id, "gxt.garrett", "vs_garrett", file_id="file_garrett")
+    incomplete = SimpleNamespace(
+        id="resp_incomplete",
+        model="gpt-5.6-sol",
+        status="incomplete",
+        usage=None,
+        output=[{
+            "type": "file_search_call", "id": "fs_incomplete", "status": "incomplete",
+            "queries": ["synthetic"], "results": [],
+        }],
+    )
+
+    events = list(ChatService(
+        storage, SimpleNamespace(responses=SequenceResponses(incomplete))
+    ).stream_reply(thread_id, "Teach me one core GxT concept."))
+
+    assert [event.type for event in events] == ["error"]
+    assert events[0].error_classification == "project_source_incomplete"
+    assert events[0].source_diagnostics["mentor_research"]["Garrett"]["status"] == "failed"
+    assert events[0].source_diagnostics["final_synthesis"] == "not_started"
+    assert events[0].source_diagnostics["failure_stage"] == "Garrett source research incomplete"
+    assert storage.display_turns(thread_id) == []
+
+
+def test_stream_project_research_reports_the_exact_failed_library_without_leaking_source_data(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    project = storage.create_project("GxT")
+    thread_id = storage.create_thread(
+        "Project", behavior=ThreadSourceBehavior.PROJECT, project_id=project.id
+    )
+    _add_project_library(storage, project.id, "gxt.garrett", "vs_garrett", file_id="file_garrett")
+    _add_project_library(storage, project.id, "gxt.afyz", "vs_afyz", file_id="file_afyz")
+    responses = SequenceResponses(
+        _project_source_response("gxt.afyz", "file_stale_private", "PRIVATE TRANSCRIPT TEXT"),
+    )
+
+    events = list(ChatService(storage, SimpleNamespace(responses=responses)).stream_reply(
+        thread_id, "Teach me GxT using all enabled mentors."
+    ))
+
+    assert [event.type for event in events] == ["error"]
+    assert events[0].error_classification == "project_source_ownership"
+    assert "Afyz" in events[0].error
+    assert "incomplete mentor comparison" in events[0].error
+    assert events[0].source_diagnostics["source_scope"] == ["Afyz", "Garrett"]
+    assert events[0].source_diagnostics["mentor_research"] == {
+        "Afyz": {"status": "failed", "calls": 1, "results": 1, "citations": 1},
+        "Garrett": {"status": "not_started", "calls": 0, "results": 0, "citations": 0},
+    }
+    assert events[0].source_diagnostics["file_search_calls"] == 1
+    assert events[0].source_diagnostics["final_synthesis"] == "not_started"
+    assert events[0].source_diagnostics["failure_stage"] == "Afyz source ownership validation"
+    assert events[0].source_diagnostics["research_characters"] > 0
+    assert events[0].source_diagnostics["estimated_input_tokens"] > 0
+    assert events[0].source_diagnostics["output_item_types"] == {
+        "file_search_call": 1, "message": 1,
+    }
+    assert "PRIVATE TRANSCRIPT TEXT" not in json.dumps(events[0].source_diagnostics)
+    assert "file_stale_private" not in json.dumps(events[0].source_diagnostics)
+    assert "vs_afyz" not in json.dumps(events[0].source_diagnostics)
+    assert storage.display_turns(thread_id) == []
+    assert storage.replay_items(thread_id) == []
+
+
+def test_stream_project_final_synthesis_failure_preserves_safe_completed_research_diagnostics(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    project = storage.create_project("GxT")
+    thread_id = storage.create_thread(
+        "Project", behavior=ThreadSourceBehavior.PROJECT, project_id=project.id
+    )
+    _add_project_library(storage, project.id, "gxt.garrett", "vs_garrett", file_id="file_garrett")
+
+    class FinalSynthesisFailure:
+        def __init__(self):
+            self.calls = []
+
+        def create(self, **kwargs):
+            self.calls.append(kwargs)
+            if len(self.calls) == 1:
+                return _project_source_response(
+                    "gxt.garrett", "file_garrett", "PRIVATE TRANSCRIPT TEXT"
+                )
+            raise RuntimeError("provider transport failed with PRIVATE TRANSCRIPT TEXT")
+
+    responses = FinalSynthesisFailure()
+    events = list(ChatService(storage, SimpleNamespace(responses=responses)).stream_reply(
+        thread_id, "Teach me one core GxT concept."
+    ))
+
+    assert [event.type for event in events] == ["error"]
+    assert events[0].error == (
+        "The mentor research completed, but the final answer couldn't be generated. "
+        "Your sources are still intact. Retry the answer."
+    )
+    assert events[0].error_classification == "final_synthesis_error"
+    assert events[0].source_diagnostics["mentor_research"] == {
+        "Garrett": {"status": "completed", "calls": 1, "results": 1, "citations": 1}
+    }
+    assert events[0].source_diagnostics["final_synthesis"] == "failed"
+    assert events[0].source_diagnostics["failure_stage"] == "final synthesis request"
+    assert "PRIVATE TRANSCRIPT TEXT" not in json.dumps(events[0].source_diagnostics)
+    assert storage.display_turns(thread_id) == []
+
+
+def test_project_source_quota_failure_is_safe_specific_and_not_retried(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    project = storage.create_project("GxT")
+    thread_id = storage.create_thread(
+        "Project", behavior=ThreadSourceBehavior.PROJECT, project_id=project.id
+    )
+    _add_project_library(storage, project.id, "gxt.garrett", "vs_garrett", file_id="file_garrett")
+
+    class QuotaError(RuntimeError):
+        status_code = 429
+        type = "insufficient_quota"
+        code = "credit_balance_exhausted"
+        param = None
+
+    class QuotaResponses:
+        def __init__(self):
+            self.calls = []
+
+        def create(self, **kwargs):
+            self.calls.append(kwargs)
+            raise QuotaError("PRIVATE PROVIDER MESSAGE")
+
+    responses = QuotaResponses()
+
+    class Client:
+        def __init__(self):
+            self.responses = responses
+            self.max_retries = []
+
+        def with_options(self, *, max_retries):
+            self.max_retries.append(max_retries)
+            return self
+
+    client = Client()
+    events = list(ChatService(storage, client).stream_reply(
+        thread_id, "Teach me one core GxT concept."
+    ))
+
+    assert [event.type for event in events] == ["error"]
+    assert events[0].error_classification == "project_source_quota"
+    assert events[0].error == (
+        "I couldn't search Garrett's source library because OpenAI API credits are unavailable. "
+        "Add credits, then retry the source search."
+    )
+    assert events[0].source_diagnostics["provider_error"] == {
+        "status": 429,
+        "type": "insufficient_quota",
+        "code": "credit_balance_exhausted",
+    }
+    assert len(responses.calls) == 1
+    assert client.max_retries == [0]
+    assert "PRIVATE PROVIDER MESSAGE" not in json.dumps(events[0].source_diagnostics)
+    assert storage.display_turns(thread_id) == []
+
+
+def test_successful_project_turn_persists_safe_per_mentor_research_diagnostics(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    project = storage.create_project("GxT")
+    thread_id = storage.create_thread(
+        "Project", behavior=ThreadSourceBehavior.PROJECT, project_id=project.id
+    )
+    _add_project_library(storage, project.id, "gxt.garrett", "vs_garrett", file_id="file_garrett")
+    responses = SequenceResponses(
+        _project_source_response("gxt.garrett", "file_garrett", "PRIVATE TRANSCRIPT TEXT"),
+        terminal_response("Source synthesis: one bounded concept."),
+    )
+
+    answer = ChatService(storage, SimpleNamespace(responses=responses)).reply(
+        thread_id, "Teach me one core GxT concept."
+    )
+
+    assert answer.diagnostics.project_source_research["source_scope"] == ["Garrett"]
+    assert answer.diagnostics.project_source_research["mentor_research"] == {
+        "Garrett": {"status": "completed", "calls": 1, "results": 1, "citations": 1}
+    }
+    assert answer.diagnostics.project_source_research["file_search_calls"] == 1
+    assert answer.diagnostics.project_source_research["final_synthesis"] == "completed"
+    assert answer.diagnostics.project_source_research["failure_stage"] is None
+    assert answer.diagnostics.project_source_research["research_characters"] > 0
+    assert "PRIVATE TRANSCRIPT TEXT" not in json.dumps(answer.diagnostics.project_source_research)
+    assert storage.response_diagnostics(thread_id)[0]["project_source_research"] == (
+        answer.diagnostics.project_source_research
+    )
+
+
+def test_project_source_diagnostics_use_human_mentor_names_not_library_labels(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    project = storage.create_project("GxT")
+    thread_id = storage.create_thread(
+        "Project", behavior=ThreadSourceBehavior.PROJECT, project_id=project.id
+    )
+    library = storage.create_source_library(
+        "gxt.afyz", "gxt", "Afyz", AuthorityKind.MENTOR, "Afyz — GxT"
+    )
+    storage.set_project_library(project.id, library.id, enabled=True)
+    storage.set_library_vector_store(library.id, "vs_afyz", "READY")
+    storage.register_library_revision(
+        library_id=library.id,
+        source_key="afyz.txt",
+        display_title="Afyz.txt",
+        source_type="transcript",
+        relative_category="Synthetic",
+        source_date=None,
+        timestamps_available=True,
+        sha256="a" * 64,
+        byte_size=10,
+        relative_path="Synthetic/Afyz.txt",
+        staged_path="ignored/Afyz.txt",
+        canonical_role=None,
+        file_id="file_afyz",
+        vector_store_file_id="vsf_file_afyz",
+        index_state="READY",
+    )
+    responses = SequenceResponses(
+        _project_source_response("gxt.afyz", "file_afyz", "PRIVATE TRANSCRIPT TEXT"),
+        terminal_response("Bounded answer."),
+    )
+
+    answer = ChatService(storage, SimpleNamespace(responses=responses)).reply(
+        thread_id, "Teach me one GxT concept."
+    )
+
+    assert answer.diagnostics.project_source_research["source_scope"] == ["Afyz"]
+    assert list(answer.diagnostics.project_source_research["mentor_research"]) == ["Afyz"]
+
+
+def test_project_research_input_preserves_required_status_fields():
+    file_search = {
+        "type": "file_search_call", "id": "fs_1", "status": "completed",
+        "queries": ["synthetic"], "results": [],
+    }
+    message = {
+        "type": "message", "id": "msg_1", "status": "completed", "role": "assistant",
+        "content": [{"type": "output_text", "text": "Bounded.", "annotations": []}],
+    }
+    reasoning = {
+        "type": "reasoning", "id": "rs_1", "status": "completed",
+        "encrypted_content": "opaque", "created_by": "server",
+    }
+
+    assert _input_item(file_search)["status"] == "completed"
+    assert _input_item(message)["status"] == "completed"
+    assert "status" not in _input_item(reasoning)
+    assert "created_by" not in _input_item(reasoning)
+
+
+def test_stream_project_citation_repair_failure_reports_the_exact_stage(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    project = storage.create_project("GxT")
+    thread_id = storage.create_thread(
+        "Project", behavior=ThreadSourceBehavior.PROJECT, project_id=project.id
+    )
+    _add_project_library(storage, project.id, "gxt.garrett", "vs_garrett", file_id="file_garrett")
+    research = _project_source_response(
+        "gxt.garrett", "file_garrett", "[60.0 --> 68.0] Garrett supports the bounded point."
+    )
+    draft = terminal_response(
+        "Direct source teaching: Garrett states the bounded point at 00:09:00."
+    )
+
+    class RepairFailure:
+        def __init__(self):
+            self.calls = []
+
+        def create(self, **kwargs):
+            self.calls.append(kwargs)
+            if len(self.calls) == 1:
+                return research
+            if len(self.calls) == 2:
+                return [SimpleNamespace(type="response.completed", response=draft)]
+            raise RuntimeError("PRIVATE PROVIDER MESSAGE")
+
+    events = list(ChatService(storage, SimpleNamespace(responses=RepairFailure())).stream_reply(
+        thread_id, "Where exactly does Garrett state the bounded point? Give the timestamp."
+    ))
+
+    assert [event.type for event in events] == ["error"]
+    assert events[0].error_classification == "final_synthesis_error"
+    assert events[0].source_diagnostics["final_synthesis"] == "failed"
+    assert events[0].source_diagnostics["failure_stage"] == "citation repair"
+    assert storage.display_turns(thread_id) == []
+
+
+def test_project_stream_without_a_terminal_event_keeps_source_failure_diagnostics(tmp_path):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    project = storage.create_project("GxT")
+    thread_id = storage.create_thread(
+        "Project", behavior=ThreadSourceBehavior.PROJECT, project_id=project.id
+    )
+    _add_project_library(storage, project.id, "gxt.garrett", "vs_garrett", file_id="file_garrett")
+    responses = SequenceResponses(
+        _project_source_response("gxt.garrett", "file_garrett", "PRIVATE TRANSCRIPT TEXT"),
+        [],
+    )
+
+    events = list(ChatService(storage, SimpleNamespace(responses=responses)).stream_reply(
+        thread_id, "Teach me one core GxT concept."
+    ))
+
+    assert [event.type for event in events] == ["error"]
+    assert events[0].error_classification == "final_synthesis_error"
+    assert events[0].source_diagnostics["final_synthesis"] == "failed"
+    assert events[0].source_diagnostics["failure_stage"] == "final synthesis stream"
+
+
+def test_project_qualitative_continuation_failure_closes_source_diagnostics(tmp_path, monkeypatch):
+    storage, _thread_id, dataset, _mapping, fields = _scoped_analysis_dataset(
+        tmp_path, allow_notes=True
+    )
+    project = storage.create_project("GxT")
+    thread_id = storage.create_thread(
+        "Project", behavior=ThreadSourceBehavior.PROJECT, project_id=project.id
+    )
+    storage.set_thread_dataset_scope(thread_id, dataset.id)
+    _add_project_library(
+        storage, project.id, "gxt.garrett", "vs_garrett", file_id="file_garrett"
+    )
+    initial = SimpleNamespace(
+        status="completed",
+        output=[analysis_tool_call(
+            "read_text_evidence",
+            {"text_field_ids": [fields["Journal"]], "context_field_ids": [],
+             "filters": [], "order_by": "source"},
+            call_id="notes",
+        )],
+    )
+
+    def fail_transport(**_kwargs):
+        from mentor.datasets import QualitativeTransportError
+        raise QualitativeTransportError("PRIVATE NOTE TEXT")
+
+    monkeypatch.setattr("mentor.chat_service.continue_qualitative_model_transport", fail_transport)
+    responses = SequenceResponses(
+        _project_source_response("gxt.garrett", "file_garrett", "PRIVATE TRANSCRIPT TEXT"),
+        [SimpleNamespace(type="response.completed", response=initial)],
+    )
+
+    events = list(ChatService(storage, SimpleNamespace(responses=responses)).stream_reply(
+        thread_id, "Teach me one GxT concept using Garrett, then use my approved notes.",
+        include_approved_notes=True,
+    ))
+
+    assert [event.type for event in events] == ["error"]
+    assert events[0].error_classification == "qualitative_continuation_error"
+    assert events[0].source_diagnostics["final_synthesis"] == "failed"
+    assert events[0].source_diagnostics["failure_stage"] == "project/local-tool continuation"
+    assert "PRIVATE" not in json.dumps(events[0].source_diagnostics)
+
+
+def test_project_finalization_failure_does_not_persist_a_success_diagnostic(tmp_path, monkeypatch):
+    storage = Storage(tmp_path / "mentor.sqlite3")
+    storage.initialize()
+    project = storage.create_project("GxT")
+    thread_id = storage.create_thread(
+        "Project", behavior=ThreadSourceBehavior.PROJECT, project_id=project.id
+    )
+    _add_project_library(
+        storage, project.id, "gxt.garrett", "vs_garrett", file_id="file_garrett"
+    )
+    responses = SequenceResponses(
+        _project_source_response("gxt.garrett", "file_garrett", "Garrett evidence."),
+        [SimpleNamespace(type="response.completed", response=terminal_response("Bounded answer."))],
+    )
+
+    def fail_display_turn(*_args, **_kwargs):
+        raise RuntimeError("display persistence failed")
+
+    monkeypatch.setattr(storage, "record_display_turn", fail_display_turn)
+    events = list(ChatService(storage, SimpleNamespace(responses=responses)).stream_reply(
+        thread_id, "Teach me one core GxT concept."
+    ))
+
+    assert [event.type for event in events] == ["error"]
+    assert events[0].error_classification == "final_synthesis_error"
+    assert events[0].source_diagnostics["final_synthesis"] == "failed"
+    assert events[0].source_diagnostics["failure_stage"] == "replay/finalization"
+    assert storage.response_diagnostics(thread_id) == []
+
+
 def test_project_research_keeps_no_result_as_scoped_absence_not_a_fabricated_disagreement(tmp_path):
     storage = Storage(tmp_path / "mentor.sqlite3")
     storage.initialize()
@@ -284,8 +700,10 @@ def test_project_research_keeps_no_result_as_scoped_absence_not_a_fabricated_dis
     absent = SimpleNamespace(
         id="resp_absent", model="gpt-5.6-sol", status="completed", usage=None,
         output=[
-            {"type": "file_search_call", "queries": ["gxt.afyz X"], "results": []},
-            {"type": "message", "role": "assistant", "content": [{
+            {"type": "file_search_call", "id": "fs_absent", "status": "completed",
+             "queries": ["gxt.afyz X"], "results": []},
+            {"type": "message", "id": "msg_absent", "status": "completed",
+             "role": "assistant", "content": [{
                 "type": "output_text", "text": "No relevant Afyz evidence was found in this scoped search.",
                 "annotations": [],
             }]},
@@ -2395,6 +2813,7 @@ def test_reply_persists_continuation_state_and_extracts_evidence(tmp_path):
                 "auto_mapping_policy_upgraded": False,
                 "source_scope": None,
                 "mentor_search_calls": {},
+                "project_source_research": None,
             },
             "response_id": storage.response_diagnostics(thread_id)[0]["response_id"],
             "status": "completed",
